@@ -132,7 +132,7 @@ pub async fn read_snapshot(pool: &PgPool, limits: &Limits) -> Result<GlobalSnaps
         )
         .fetch_one(&mut *tx)
         .await?;
-    let pending_effects = read_pending_effects(&mut *tx, limits).await?;
+    let pending_effects = read_pending_effects(&mut tx, limits).await?;
     tx.commit().await?;
     Ok(GlobalSnapshot {
         read_at,

@@ -196,7 +196,7 @@ async fn apply_once(
 ) -> Result<(ApplyReport, crate::counters::Deltas)> {
     let mut tx = pool.begin().await?;
     let parts = {
-        let mut t = Txn::start(&mut *tx, ctx.limits, ctx.gates).await?;
+        let mut t = Txn::start(&mut tx, ctx.limits, ctx.gates).await?;
         if let Origin::Listing { stamp_read_at, .. } = &batch.origin {
             check_stamp_fresh(&mut t, *stamp_read_at).await?;
         }

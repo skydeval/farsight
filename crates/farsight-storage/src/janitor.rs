@@ -155,7 +155,7 @@ pub async fn process_purges(
         let owner_did = Did::parse(&owner).map_err(|e| StorageError::Invariant(e.to_string()))?;
         let mut tx = pool.begin().await?;
         let (report, deltas, deleted, finished) = {
-            let mut t = Txn::start(&mut *tx, limits, Gates::default()).await?;
+            let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
             t.lock_authors(&[keys::author_lock_key(&owner)].into_iter().collect())
                 .await?;
             t.lock_lists(
@@ -265,7 +265,7 @@ async fn fire_event_guarded(
     };
     let mut tx = pool.begin().await?;
     let (report, deltas) = {
-        let mut t = Txn::start(&mut *tx, limits, Gates::default()).await?;
+        let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
         t.lock_lists(
             &[(keys::list_lock_key(&owner, &rkey), true)]
                 .into_iter()
@@ -314,7 +314,7 @@ pub async fn purge_account_batch(
 ) -> Result<bool> {
     let mut tx = pool.begin().await?;
     let (done, deltas) = {
-        let mut t = Txn::start(&mut *tx, limits, Gates::default()).await?;
+        let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
         t.lock_authors(&[keys::author_lock_key(did.as_str())].into_iter().collect())
             .await?;
         let Some(author_id) = t.actor_id(did.as_str()).await? else {

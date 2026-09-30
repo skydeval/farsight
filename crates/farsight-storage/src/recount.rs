@@ -64,7 +64,7 @@ pub async fn recount_lists(
         last = Some(id);
         let mut tx = pool.begin().await?;
         let deltas = {
-            let mut t = Txn::start(&mut *tx, limits, Gates::default()).await?;
+            let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
             t.lock_lists(
                 &[(keys::list_lock_key(&owner, &rkey), true)]
                     .into_iter()
@@ -345,7 +345,7 @@ pub async fn reevaluate_uncounted(
 ) -> Result<ReevalReport> {
     let mut tx = pool.begin().await?;
     let (report, deltas) = {
-        let mut t = Txn::start(&mut *tx, limits, Gates::default()).await?;
+        let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
         t.lock_authors(&[keys::author_lock_key(did.as_str())].into_iter().collect())
             .await?;
         let author = t.author(did).await?;
