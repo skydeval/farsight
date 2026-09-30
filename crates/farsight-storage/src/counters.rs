@@ -215,7 +215,7 @@ async fn flush_deltas(
              ON CONFLICT (name, shard) DO UPDATE
                SET value = stats_counters.value + EXCLUDED.value, updated_at = now()",
         )
-        .bind(**name)
+        .bind(*name)
         .bind(shard)
         .bind(v)
         .execute(&mut *tx)

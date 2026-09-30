@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn orders_bytewise() {
-        let mut v = vec![
+        let mut v = [
             Did::parse("did:web:b.example").unwrap(),
             Did::parse("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
             Did::parse("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
