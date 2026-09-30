@@ -7,7 +7,27 @@ repository.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Builds the stage-1 Phase B harness binary. Off by default so release
+# builds never contain it.
+harness = []
+
+[[bin]]
+name = "farsight-stage1-harness"
+path = "src/bin/stage1_harness/main.rs"
+required-features = ["harness"]
+
 [dependencies]
+chrono.workspace = true
+farsight-core.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
