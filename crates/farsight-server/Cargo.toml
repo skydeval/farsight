@@ -1,0 +1,16 @@
+[package]
+name = "farsight-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "farsight"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

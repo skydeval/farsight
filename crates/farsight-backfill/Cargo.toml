@@ -1,0 +1,19 @@
+[package]
+name = "farsight-backfill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "farsight-backfill"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,81 @@
+# Farsight deployment: server, backfill worker, Postgres.
+# Quick start: docker compose up -d, open http://<host>:8080,
+# get the setup token with: docker logs farsight
+#
+# Disk: the farsight-pgdata volume holds the index. Plan for roughly
+# 30-50 GB after the first full sweep plus ~17-19 GB/year of growth;
+# 500 GB is recommended. See README.md, "Storage and hardware".
+
+name: farsight
+
+x-farsight-common: &farsight-common
+  image: ghcr.io/skydeval/farsight:latest
+  restart: unless-stopped
+  user: "10001:10001"
+  env_file:
+    - path: farsight.env
+      required: false
+  environment:
+    FARSIGHT__STORAGE__DATABASE_URL: postgres://farsight:${POSTGRES_PASSWORD:-farsight}@postgres:5432/farsight
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  farsight:
+    <<: *farsight-common
+    container_name: farsight
+    command: ["farsight"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - farsight-config:/etc/farsight
+    healthcheck:
+      # 200 when the firehose is connected and the database answers.
+      # Status only; compose does not restart on unhealthy.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  farsight-backfill:
+    <<: *farsight-common
+    container_name: farsight-backfill
+    command: ["farsight-backfill"]
+    volumes:
+      - farsight-config:/etc/farsight:ro
+
+  postgres:
+    image: postgres:16
+    container_name: farsight-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: farsight
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-farsight}
+      POSTGRES_DB: farsight
+    command:
+      - postgres
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=5GB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - wal_compression=on
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - random_page_cost=1.1
+    volumes:
+      - farsight-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U farsight -d farsight"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  farsight-config:
+  farsight-pgdata:

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/farsight-core",
+    "crates/farsight-storage",
+    "crates/farsight-ingest",
+    "crates/farsight-backfill",
+    "crates/farsight-api",
+    "crates/farsight-web",
+    "crates/farsight-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/skydeval/horizon-farsight"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
