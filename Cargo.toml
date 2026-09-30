@@ -17,6 +17,21 @@ rust-version = "1.85"
 repository = "https://github.com/skydeval/horizon-farsight"
 license = "MIT OR Apache-2.0"
 
+[workspace.dependencies]
+farsight-core = { path = "crates/farsight-core" }
+chrono = { version = "0.4.42", default-features = false, features = ["std", "clock", "serde"] }
+ipnet = { version = "2.11", features = ["serde"] }
+proptest = "1.6"
+psl = "2"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.8"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "chrono"] }
+thiserror = "2.0.12"
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "time", "sync", "process"] }
+toml = "0.8.23"
+url = "2.5.4"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
