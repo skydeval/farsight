@@ -656,7 +656,7 @@ pub enum StartMode {
     /// No config file and `FARSIGHT_SKIP_WIZARD` unset: run the wizard.
     Setup,
     /// A valid config, from the file or the environment.
-    Normal(LoadedConfig),
+    Normal(Box<LoadedConfig>),
 }
 
 /// A validated config plus provenance.
@@ -689,13 +689,13 @@ pub fn load(path: &Path, env: &[(String, String)]) -> Result<StartMode, ConfigEr
             path: path.display().to_string(),
             source,
         })?;
-        return load_from_parts(Some(&text), env).map(StartMode::Normal);
+        return load_from_parts(Some(&text), env).map(|l| StartMode::Normal(Box::new(l)));
     }
     let skip = env
         .iter()
         .any(|(k, v)| k == SKIP_WIZARD_ENV && !v.is_empty() && v != "0" && v != "false");
     if skip {
-        return load_from_parts(None, env).map(StartMode::Normal);
+        return load_from_parts(None, env).map(|l| StartMode::Normal(Box::new(l)));
     }
     Ok(StartMode::Setup)
 }

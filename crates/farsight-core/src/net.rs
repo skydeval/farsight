@@ -168,7 +168,7 @@ pub fn check_url(url: &Url, config: &SafeClientConfig) -> Result<(), OutboundErr
         .to_ascii_lowercase();
     match url.scheme() {
         "https" => {}
-        "http" if config.allow_http_hosts.iter().any(|h| *h == host) => {}
+        "http" if config.allow_http_hosts.contains(&host) => {}
         other => return Err(OutboundError::Scheme(other.to_owned())),
     }
     // Literal IPs are checked here; names are checked after resolution.

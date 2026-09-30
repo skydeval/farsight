@@ -164,4 +164,20 @@ mod tests {
         }
         assert!(Tid::from_i64(-1).is_none());
     }
+
+    proptest::proptest! {
+        #[test]
+        fn encode_parse_round_trip(v in 0i64..=i64::MAX) {
+            let t = Tid::from_i64(v).unwrap();
+            let s = t.encode();
+            proptest::prop_assert_eq!(s.len(), TID_LEN);
+            proptest::prop_assert_eq!(Tid::parse(&s).unwrap(), t);
+        }
+
+        #[test]
+        fn string_order_is_numeric_order(a in 0i64..=i64::MAX, b in 0i64..=i64::MAX) {
+            let (ta, tb) = (Tid::from_i64(a).unwrap(), Tid::from_i64(b).unwrap());
+            proptest::prop_assert_eq!(ta.encode().cmp(&tb.encode()), a.cmp(&b));
+        }
+    }
 }
