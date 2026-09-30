@@ -168,3 +168,17 @@ says which of the two applies.
   backlink index and a record/identity cache. Farsight can use a
   Constellation-compatible backlink API for optional subject
   discovery, and a Slingshot-style resolver. Both are off by default.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this work, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms
+or conditions.
