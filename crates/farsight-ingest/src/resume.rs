@@ -53,9 +53,10 @@ pub enum Cursor {
 pub enum GapRule {
     /// Exact resume or first start: no gap.
     None,
-    /// Gap `[from_us, first event]` if the first event's witness is more
-    /// than `threshold` after `requested_us`, or the server announces it
-    /// clamped the cursor (`#info OutdatedCursor`).
+    /// Gap `[from_us, first event]` if the cursor was clamped — the first
+    /// event's witness is more than `threshold` after `requested_us`, or
+    /// the server announced it (`#info OutdatedCursor`) — and the first
+    /// event lies after `from_us` (otherwise the replay covers us).
     IfClamped {
         /// The requested timestamp.
         requested_us: i64,
@@ -175,8 +176,12 @@ pub fn gap_for_first_event(
             from_us,
             cause,
         } => {
-            if clamped_notice || first_us - requested_us > us(t.gap_threshold) {
-                Some((from_us.min(first_us), first_us, cause))
+            // A clamp loses data only if the server's first event is past
+            // our position; if it replayed from an older floor, nothing
+            // was skipped.
+            let clamped = clamped_notice || first_us - requested_us > us(t.gap_threshold);
+            if clamped && first_us > from_us {
+                Some((from_us, first_us, cause))
             } else {
                 None
             }
@@ -249,8 +254,11 @@ mod tests {
         let p = plan(&persisted(Protocol::V1), A, Protocol::V2, None, &T);
         assert!(matches!(p.cursor, Cursor::TimeUs(_)));
         assert!(matches!(p.gap, GapRule::IfClamped { .. }));
-        // An OutdatedCursor notice records the gap even if events look close.
-        assert!(gap_for_first_event(p.gap, 9_890 * S, true, &T).is_some());
+        // An OutdatedCursor notice records the gap even if the first event
+        // is close to the request, as long as it is past our position.
+        assert!(gap_for_first_event(p.gap, 10_001 * S, true, &T).is_some());
+        // A clamp to a floor older than our position loses nothing.
+        assert!(gap_for_first_event(p.gap, 9_000 * S, true, &T).is_none());
     }
 
     #[test]

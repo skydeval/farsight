@@ -55,6 +55,9 @@ pub struct IngestConfig {
     pub reader: reader::ReaderConfig,
     /// Limits for `apply`.
     pub limits: Limits,
+    /// Harness: receives a copy of every event read from the network.
+    #[cfg(feature = "harness")]
+    pub tap: Option<mpsc::UnboundedSender<frame::InEvent>>,
 }
 
 impl IngestConfig {
@@ -73,6 +76,8 @@ impl IngestConfig {
                 compress: true,
             },
             limits: Limits::from_config(c),
+            #[cfg(feature = "harness")]
+            tap: None,
         }
     }
 }
@@ -153,6 +158,11 @@ impl Ingest {
             tx,
             control: ctl_rx,
             stats: stats.clone(),
+            #[cfg(feature = "harness")]
+            tap: cfg.tap.clone(),
+            #[cfg(feature = "harness")]
+            rewind: None,
+            repairs: reader::Repairs::default(),
         };
         let flusher = {
             let counters = counters.clone();

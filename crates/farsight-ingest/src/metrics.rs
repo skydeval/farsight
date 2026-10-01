@@ -71,6 +71,42 @@ pub fn describe() {
         DROPPED,
         "events dropped before apply by reason (invalid, foreign_listitem, poisoned)"
     );
+    register_zeroes();
+}
+
+/// Registers every known label set at zero, so dashboards and the
+/// harness see each series before its first event.
+pub fn register_zeroes() {
+    for reason in ["invalid", "foreign_listitem", "poisoned"] {
+        metrics::counter!(DROPPED, "reason" => reason).increment(0);
+    }
+    for reason in [
+        "connect_error",
+        "stall",
+        "closed",
+        "error",
+        "server_error",
+        "kill",
+        "failover",
+        "cursor_too_old",
+    ] {
+        metrics::counter!(RECONNECTS, "reason" => reason).increment(0);
+    }
+    for c in farsight_core::nsid::INDEXED_COLLECTIONS {
+        for op in ["create", "update", "delete"] {
+            for outcome in ["applied", "stale", "refused", "dropped"] {
+                metrics::counter!(EVENTS, "collection" => c, "op" => op, "outcome" => outcome)
+                    .increment(0);
+            }
+        }
+    }
+    for p in ["v1", "v2"] {
+        metrics::gauge!(CONNECTED, "protocol" => p).set(0.0);
+    }
+    metrics::gauge!(LAG).set(0.0);
+    metrics::gauge!(SOURCE_LAG).set(0.0);
+    metrics::gauge!(OPEN_GAPS).set(0.0);
+    metrics::gauge!(BUFFER_DEPTH).set(0.0);
 }
 
 /// Installs the global recorder with an HTTP listener on `bind`

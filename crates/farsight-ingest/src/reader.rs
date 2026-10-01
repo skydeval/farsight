@@ -24,6 +24,15 @@ use crate::writer::Item;
 /// Consecutive failed sessions on one instance before failing over.
 pub const FAILOVER_AFTER: u32 = 3;
 
+/// Seam repair: how long after a resumed session's first event the side
+/// replay starts, and how far past that event it reads. Public instances
+/// were observed (stage-2 Phase B) to drop events witnessed within about a
+/// second of a timestamp-cursor resume — at the hand-over from replay to
+/// the live tail — while a later replay of the same window returns them.
+pub const SEAM_DELAY: Duration = Duration::from_secs(60);
+/// See [`SEAM_DELAY`].
+pub const SEAM_COVER_US: i64 = 30_000_000;
+
 /// Commands from the embedding process.
 #[derive(Debug)]
 pub enum Control {
@@ -32,6 +41,14 @@ pub enum Control {
     /// Feed these events into the pipeline as if received (harness:
     /// poisoned events, synthesized `#sync`).
     Inject(Vec<InEvent>),
+    /// Harness: drop the websocket and, before reconnecting, set the
+    /// persisted cursor and `applied_through` back to `us` (v2 seq to 1),
+    /// simulating an outage longer than the instance's retention.
+    #[cfg(feature = "harness")]
+    KillAndRewind {
+        /// Witness µs to rewind to.
+        us: i64,
+    },
     /// Stop.
     Shutdown,
 }
@@ -61,6 +78,27 @@ pub struct Reader {
     pub control: mpsc::Receiver<Control>,
     /// Stats.
     pub stats: Arc<IngestStats>,
+    /// Harness: a copy of every event received from the network.
+    #[cfg(feature = "harness")]
+    pub tap: Option<mpsc::UnboundedSender<InEvent>>,
+    /// Harness: rewind requested by [`Control::KillAndRewind`].
+    #[cfg(feature = "harness")]
+    pub rewind: Option<i64>,
+    /// Pending seam repairs; aborted when the reader goes away.
+    pub repairs: Repairs,
+}
+
+/// Seam-repair tasks, aborted on drop (they hold a sender to the writer,
+/// which would otherwise keep the pipeline alive after shutdown).
+#[derive(Debug, Default)]
+pub struct Repairs(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for Repairs {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
 }
 
 enum End {
@@ -115,7 +153,7 @@ impl Reader {
         &self,
         url: &str,
         lag: Option<Duration>,
-    ) -> Result<(Session, GapRule), ConnectError> {
+    ) -> Result<(Session, GapRule, Cursor), ConnectError> {
         let p = self.persisted().await;
         let t = &self.cfg.tuning;
         let mut compress = self.cfg.compress;
@@ -123,7 +161,7 @@ impl Reader {
         while let Some(proto) = protocols.first().copied() {
             let Plan { cursor, gap } = resume::plan(&p, url, proto, lag, t);
             match conn::connect(url, proto, cursor, compress).await {
-                Ok(s) => return Ok((s, gap)),
+                Ok(s) => return Ok((s, gap, cursor)),
                 Err(ConnectError::NotOffered(code)) if proto == Protocol::V2 => {
                     tracing::debug!(url, code, "v2 not offered; falling back to v1");
                     protocols.remove(0);
@@ -147,6 +185,7 @@ impl Reader {
                             from_us: from,
                             cause: GapCause::CursorTooOld,
                         },
+                        Cursor::Live,
                     ));
                 }
                 Err(e) => return Err(e),
@@ -170,6 +209,21 @@ impl Reader {
             if !self.barrier().await {
                 return;
             }
+            #[cfg(feature = "harness")]
+            if let Some(us) = self.rewind.take() {
+                let t = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(us)
+                    .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+                let r = sqlx::query(
+                    "UPDATE firehose_state SET cursor_us = $1, applied_through = $2,
+                       cursor_seq = CASE WHEN protocol = 2 THEN 1 ELSE cursor_seq END
+                     WHERE id = 1",
+                )
+                .bind(us)
+                .bind(t)
+                .execute(&self.pool)
+                .await;
+                tracing::warn!(us, ok = r.is_ok(), "harness rewind applied");
+            }
             let url = self.cfg.urls[idx % self.cfg.urls.len()].clone();
             let failover_lag =
                 if current_url.as_deref() == Some(url.as_str()) || current_url.is_none() {
@@ -178,7 +232,7 @@ impl Reader {
                     prev_instance_lag
                 };
             let opened = self.open(&url, failover_lag).await;
-            let (mut session, rule) = match opened {
+            let (mut session, rule, cursor) = match opened {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!(url, error = %e, "connect failed");
@@ -225,7 +279,7 @@ impl Reader {
                 return;
             }
             let end = self
-                .read_session(&mut session, rule, &mut lag, &mut failures)
+                .read_session(&mut session, rule, cursor, &mut lag, &mut failures)
                 .await;
             session.close().await;
             set_connected_gauge(None);
@@ -256,6 +310,58 @@ impl Reader {
         }
     }
 
+    /// Re-reads `[cursor, resume moment + SEAM_COVER]` a minute later, through
+    /// the normal pipeline (LWW makes the duplicates stale no-ops), to
+    /// recover events the instance dropped at the resume seam.
+    fn spawn_seam_repair(&mut self, url: &str, protocol: Protocol, cursor: Cursor, first_us: i64) {
+        self.repairs.0.retain(|h| !h.is_finished());
+        let url = url.to_owned();
+        let tx = self.tx.clone();
+        let stats = self.stats.clone();
+        let compress = self.cfg.compress;
+        #[cfg(feature = "harness")]
+        let tap = self.tap.clone();
+        // The seam is at the moment of the resume, not at the replay's first
+        // event (which is up to 120 s earlier on v1).
+        let until = first_us.max(chrono::Utc::now().timestamp_micros()) + SEAM_COVER_US;
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(SEAM_DELAY).await;
+            let mut s = match conn::connect(&url, protocol, cursor, compress).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "seam repair: connect failed");
+                    return;
+                }
+            };
+            let mut n = 0u64;
+            loop {
+                match tokio::time::timeout(Duration::from_secs(30), s.next_frame()).await {
+                    Ok(Some(Ok(Frame::Event(ev)))) => {
+                        let past = ev.witness_us > until;
+                        #[cfg(feature = "harness")]
+                        if let Some(tap) = &tap {
+                            let _ = tap.send(ev.clone());
+                        }
+                        if tx.send(Item::Event(ev)).await.is_err() {
+                            break;
+                        }
+                        n += 1;
+                        if past {
+                            break;
+                        }
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    _ => break,
+                }
+            }
+            s.close().await;
+            stats.seam_repairs.fetch_add(1, Ordering::Relaxed);
+            stats.seam_repair_events.fetch_add(n, Ordering::Relaxed);
+            tracing::info!(events = n, "seam repair replayed");
+        });
+        self.repairs.0.push(handle);
+    }
+
     async fn sleep_or_shutdown(&mut self, d: Duration) -> bool {
         tokio::select! {
             _ = tokio::time::sleep(d) => false,
@@ -267,6 +373,7 @@ impl Reader {
         &mut self,
         session: &mut Session,
         rule: GapRule,
+        cursor: Cursor,
         lag: &mut LagTracker,
         failures: &mut u32,
     ) -> End {
@@ -277,6 +384,11 @@ impl Reader {
             let frame = tokio::select! {
                 c = self.control.recv() => match c {
                     Some(Control::KillSocket) => return End::Reconnect("kill"),
+                    #[cfg(feature = "harness")]
+                    Some(Control::KillAndRewind { us }) => {
+                        self.rewind = Some(us);
+                        return End::Reconnect("kill");
+                    }
                     Some(Control::Inject(evs)) => {
                         for ev in evs {
                             if self.tx.send(Item::Event(ev)).await.is_err() {
@@ -323,6 +435,14 @@ impl Reader {
             if first {
                 first = false;
                 *failures = 0;
+                if cursor != Cursor::Live {
+                    self.spawn_seam_repair(
+                        &session.url_base,
+                        session.protocol,
+                        cursor,
+                        ev.witness_us,
+                    );
+                }
                 if let Some((from_us, to_us, cause)) = resume::gap_for_first_event(
                     rule,
                     ev.witness_us,
@@ -354,6 +474,10 @@ impl Reader {
                 if let Some(s) = lag.source_lag_seconds(now) {
                     metrics::gauge!(m::SOURCE_LAG).set(s);
                 }
+            }
+            #[cfg(feature = "harness")]
+            if let Some(tap) = &self.tap {
+                let _ = tap.send(ev.clone());
             }
             if self.tx.send(Item::Event(ev)).await.is_err() {
                 return End::Shutdown;

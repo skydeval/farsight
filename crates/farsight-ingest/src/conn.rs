@@ -111,6 +111,8 @@ pub struct Session {
     dict: Option<&'static [u8]>,
     /// The URL connected to.
     pub url: String,
+    /// The instance base URL (as passed to [`connect`]).
+    pub url_base: String,
 }
 
 fn xrpc_error_name(body: &[u8]) -> Option<(String, String)> {
@@ -172,6 +174,7 @@ pub async fn connect(
         protocol,
         dict,
         url,
+        url_base: base.to_owned(),
     })
 }
 

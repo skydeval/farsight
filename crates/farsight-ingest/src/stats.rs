@@ -26,6 +26,10 @@ pub struct IngestStats {
     pub reconnects: AtomicU64,
     /// Transient storage failures retried.
     pub transient_retries: AtomicU64,
+    /// Seam repairs completed (see `reader::SEAM_DELAY`).
+    pub seam_repairs: AtomicU64,
+    /// Events re-read by seam repairs.
+    pub seam_repair_events: AtomicU64,
     /// Protocol and URL of the current session.
     pub current: Mutex<Option<(String, Protocol)>>,
 }
@@ -43,6 +47,8 @@ impl IngestStats {
             sessions: self.sessions.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
             transient_retries: self.transient_retries.load(Ordering::Relaxed),
+            seam_repairs: self.seam_repairs.load(Ordering::Relaxed),
+            seam_repair_events: self.seam_repair_events.load(Ordering::Relaxed),
             current: self
                 .current
                 .lock()
@@ -73,6 +79,10 @@ pub struct StatsSnapshot {
     pub reconnects: u64,
     /// See [`IngestStats::transient_retries`].
     pub transient_retries: u64,
+    /// See [`IngestStats::seam_repairs`].
+    pub seam_repairs: u64,
+    /// See [`IngestStats::seam_repair_events`].
+    pub seam_repair_events: u64,
     /// See [`IngestStats::current`].
     pub current: Option<(String, Protocol)>,
 }
