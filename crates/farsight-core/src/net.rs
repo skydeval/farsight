@@ -229,6 +229,19 @@ impl SafeClient {
         }
     }
 
+    /// The addresses `host` resolves to (cap buckets by address block,
+    /// §11.2). Resolution only; nothing is contacted.
+    pub async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, OutboundError> {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        self.dns
+            .lookup_ip(host)
+            .await
+            .map(|r| r.iter().collect())
+            .map_err(|e| OutboundError::Transport(e.to_string()))
+    }
+
     async fn get_once(&self, url: &Url) -> Result<OutboundResponse, OutboundError> {
         let mut resp = self
             .http
