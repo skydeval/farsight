@@ -27,6 +27,13 @@ pub fn list_lock_key(owner_did: &str, rkey: &str) -> i64 {
     hash64(&format!("l:{owner_did}/{rkey}"))
 }
 
+/// `hash64("i:" || did)`: the intern lock for creating `actors` row `did`.
+/// Taken after the author and list locks, ascending (the third class of
+/// the §4.3 order; see `apply`).
+pub fn intern_lock_key(did: &str) -> i64 {
+    hash64(&format!("i:{did}"))
+}
+
 /// The limits the storage layer enforces, taken from `[limits]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Limits {

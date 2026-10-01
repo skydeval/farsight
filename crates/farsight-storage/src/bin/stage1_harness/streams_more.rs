@@ -629,11 +629,11 @@ pub async fn s8_lock_contention(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
     consistency(env, c, "after contention").await?;
 
-    // Part B: forced conflict. Two writers with disjoint authors (no shared
-    // advisory lock) intern the same 200 new subjects in opposite orders;
-    // the unique index on actors.did makes them wait on each other, which
-    // Postgres resolves by aborting one with 40P01. `apply` must retry.
-    let mut rounds_with_deadlock = 0;
+    // Part B: two writers with disjoint authors (no shared advisory lock)
+    // intern the same 200 new subjects in opposite orders. Before the
+    // intern locks, the unique index on actors.did made them deadlock
+    // repeatedly (a batch exhausted its retries). With intern locks taken in
+    // ascending order this must commit with no deadlock at all.
     let mut failures = Vec::new();
     let mut max_retries = 0;
     for r in 0..10u64 {
@@ -652,6 +652,61 @@ pub async fn s8_lock_contention(env: &mut Env, c: &mut Checks) -> Result<()> {
             .map(|(i, s)| block(&y, &format!("k{i}"), s, rev(10 + i as u64)))
             .collect();
         let (p, q) = tokio::join!(env.firehose(w1), env.firehose(w2));
+        for res in [p, q] {
+            match res {
+                Ok(rep) => max_retries = max_retries.max(rep.deadlock_retries),
+                Err(e) => failures.push(e.to_string()),
+            }
+        }
+    }
+    c.check(
+        "shared new subjects, opposite orders: every batch committed",
+        failures.is_empty(),
+        format!("{} failures; first: {:?}", failures.len(), failures.first()),
+    );
+    c.eq(
+        "shared new subjects, opposite orders: intern locks prevent deadlock (0 retries)",
+        max_retries,
+        0,
+    );
+    let n = scalar(env, "SELECT count(*) FROM blocks WHERE rkey LIKE 'k%'").await?;
+    c.eq(
+        "shared new subjects: all 4,000 blocks stored exactly once",
+        n,
+        4_000,
+    );
+
+    // Part C: a deadlock that ordering does not prevent, to exercise the
+    // retry path. did:web authors are charged to their domain's bucket key;
+    // writer 1 charges bucket d1 then d2, writer 2 charges d2 then d1, so
+    // their intern_rate row locks cross. Postgres aborts one with 40P01 and
+    // `apply` must retry it to completion.
+    let mut rounds_with_deadlock = 0;
+    let mut failures = Vec::new();
+    let mut max_retries = 0;
+    let web = |host: String| farsight_core::Did::parse(&format!("did:web:{host}")).expect("valid");
+    for r in 0..10u64 {
+        let d1 = format!("forcedalpha{r}.com");
+        let d2 = format!("forcedbeta{r}.com");
+        let (a1, b2) = (web(format!("a.{d1}")), web(format!("b.{d2}")));
+        let (c2, e1) = (web(format!("c.{d2}")), web(format!("e.{d1}")));
+        let seg = |author: &farsight_core::Did, tag: &str| -> Vec<farsight_storage::apply::Write> {
+            (0..50u64)
+                .map(|i| {
+                    block(
+                        author,
+                        &format!("m{i}"),
+                        &plc(tag, r * 1000 + i),
+                        rev(10 + i),
+                    )
+                })
+                .collect()
+        };
+        let mut w1 = seg(&a1, "ratesubja");
+        w1.extend(seg(&b2, "ratesubjb"));
+        let mut w2 = seg(&c2, "ratesubjc");
+        w2.extend(seg(&e1, "ratesubje"));
+        let (p, q) = tokio::join!(env.firehose(w1), env.firehose(w2));
         let mut any = false;
         for res in [p, q] {
             match res {
@@ -667,27 +722,28 @@ pub async fn s8_lock_contention(env: &mut Env, c: &mut Checks) -> Result<()> {
         }
     }
     c.check(
-        "forced conflict: every batch eventually committed (no livelock)",
+        "crossed rate rows: every batch eventually committed (no livelock)",
         failures.is_empty(),
         format!("{} failures; first: {:?}", failures.len(), failures.first()),
     );
     if rounds_with_deadlock == 0 {
         c.unverified(
-            "forced conflict: deadlock retry path exercised",
+            "crossed rate rows: deadlock retry path exercised",
             "no 40P01 occurred in 10 rounds; the retry path was not exercised by this run",
         );
     } else {
         c.check(
-            "forced conflict: deadlock retry path exercised",
+            "crossed rate rows: deadlock retry path exercised",
             true,
             format!("{rounds_with_deadlock}/10 rounds hit a deadlock; max retries {max_retries}"),
         );
     }
-    let n = scalar(env, "SELECT count(*) FROM blocks WHERE rkey LIKE 'k%'").await?;
+    let n = scalar(env, "SELECT count(*) FROM blocks WHERE rkey LIKE 'm%'").await?;
+    // 10 rounds × 2 writers × 2 authors × 50 blocks.
     c.eq(
-        "forced conflict: all 4,000 blocks stored exactly once",
+        "crossed rate rows: all 2,000 blocks stored exactly once",
         n,
-        4_000,
+        2_000,
     );
     Ok(())
 }
@@ -856,13 +912,16 @@ pub async fn s9_coverage_plumbing(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
 
     // Gaps: the v1 interval is one open gap, idempotently.
-    let g1 = firehose::open_sync_unavailable(&env.pool, w3).await?;
-    let g2 = firehose::open_sync_unavailable(&env.pool, w3).await?;
+    // applied_through is w2 here (the admission batch carried no progress),
+    // so the gap opens at w2 for [t, applied_through] to be non-empty.
+    let g1 = firehose::open_sync_unavailable(&env.pool, w2).await?;
+    let g2 = firehose::open_sync_unavailable(&env.pool, w2).await?;
     c.eq("v1-interval gap open is idempotent", g1, g2);
     let snap = coverage::read_snapshot(&env.pool, &env.limits).await?;
     c.check(
         "open v1 gap ⇒ nothing after it covered, sync_events_unavailable",
-        !snap.covered(Some(w3), lag)
+        !snap.covered(Some(w2), lag)
+            && !snap.covered(Some(w1), lag)
             && coverage::network_scope(&snap, 1, lag)
                 .reasons
                 .contains(&"sync_events_unavailable"),

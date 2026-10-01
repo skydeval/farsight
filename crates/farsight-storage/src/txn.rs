@@ -230,6 +230,36 @@ impl<'c> Txn<'c> {
         Ok(())
     }
 
+    /// Takes intern locks, ascending by key, for those of `dids` that have
+    /// no `actors` row yet. Every `actors` insert by `apply` then happens
+    /// under its DID's intern lock, so concurrent batches never wait on each
+    /// other's uncommitted inserts in the unique index. Call after the list
+    /// locks.
+    pub async fn lock_new_dids(&mut self, dids: &[&str]) -> Result<()> {
+        if dids.is_empty() {
+            return Ok(());
+        }
+        let wanted: Vec<String> = dids.iter().map(|d| (*d).to_owned()).collect();
+        let existing: Vec<String> =
+            sqlx::query_scalar("SELECT did FROM actors WHERE did = ANY($1)")
+                .bind(&wanted)
+                .fetch_all(&mut *self.conn)
+                .await?;
+        let existing: BTreeSet<&str> = existing.iter().map(String::as_str).collect();
+        let keys: BTreeSet<i64> = wanted
+            .iter()
+            .filter(|d| !existing.contains(d.as_str()))
+            .map(|d| keys::intern_lock_key(d))
+            .collect();
+        for k in &keys {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(*k)
+                .execute(&mut *self.conn)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// `actors.id` for a DID, without creating it.
     pub async fn actor_id(&mut self, did: &str) -> Result<Option<i64>> {
         Ok(sqlx::query_scalar("SELECT id FROM actors WHERE did = $1")

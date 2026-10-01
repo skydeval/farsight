@@ -165,14 +165,18 @@ pub async fn apply(pool: &PgPool, ctx: &ApplyCtx<'_>, batch: &Batch) -> Result<A
     }
 }
 
-/// Backoff before retry `attempt` (1-based): 5 ms × attempt plus up to
-/// 15 ms of jitter, so two colliding writers do not retry in lockstep.
+/// Backoff before retry `attempt` (1-based): exponential from 10 ms,
+/// capped at 1 s, plus up to the same again as jitter, so the aborted
+/// writer re-enters after the surviving one has usually committed and two
+/// colliding writers do not retry in lockstep.
 pub fn deadlock_backoff(attempt: u32) -> Duration {
+    let base = 10u64 << attempt.saturating_sub(1).min(7);
+    let base = base.min(1_000);
     let jitter = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::from(d.subsec_nanos() % 15))
+        .map(|d| u64::from(d.subsec_nanos()) % (base + 1))
         .unwrap_or(0);
-    Duration::from_millis(5 * u64::from(attempt) + jitter)
+    Duration::from_millis(base + jitter)
 }
 
 /// Lock set of a batch: list keys and whether exclusive.
@@ -240,24 +244,34 @@ async fn apply_once(
                     .push(w.rkey.as_str().to_owned());
             }
         }
+        // Discovery reads only: an author without an `actors` row has no
+        // stored rows, and its row is created later, under its intern lock.
         for ((author, collection), rkeys) in &stored_keys {
-            let a = t.author(author).await?;
-            for (owner, lrkey) in stored_list_targets(&mut t, &a, *collection, rkeys).await? {
+            let Some(author_id) = t.actor_id(author.as_str()).await? else {
+                continue;
+            };
+            for (owner, lrkey) in stored_list_targets(&mut t, author_id, *collection, rkeys).await?
+            {
                 locks.add(&owner, &lrkey, *collection == Collection::ListBlock);
             }
         }
         let mut candidates: Vec<Vec<String>> = Vec::with_capacity(batch.reconciles.len());
         for r in &batch.reconciles {
-            let a = t.author(&r.author).await?;
-            let c = reconcile_candidates(&mut t, &a, r).await?;
+            let Some(author_id) = t.actor_id(r.author.as_str()).await? else {
+                candidates.push(Vec::new());
+                continue;
+            };
+            let c = reconcile_candidates(&mut t, author_id, r).await?;
             if matches!(r.collection, Collection::ListBlock | Collection::ListItem) {
-                for (owner, lrkey) in stored_list_targets(&mut t, &a, r.collection, &c).await? {
+                for (owner, lrkey) in
+                    stored_list_targets(&mut t, author_id, r.collection, &c).await?
+                {
                     locks.add(&owner, &lrkey, r.collection == Collection::ListBlock);
                 }
             }
             if r.collection == Collection::List {
                 for rkey in &c {
-                    locks.add(a.did.as_str(), rkey, true);
+                    locks.add(r.author.as_str(), rkey, true);
                 }
             }
             candidates.push(c);
@@ -265,6 +279,30 @@ async fn apply_once(
 
         // 3. List locks.
         t.lock_lists(&locks.0).await?;
+
+        // 3b. Intern locks for every DID this batch may create an `actors`
+        // row for, ascending. Without them two batches interning the same
+        // new DIDs in opposite orders wait on each other's uncommitted
+        // inserts into the unique index and deadlock repeatedly (observed:
+        // retries exhausted). Taken last, so the global order is authors,
+        // lists, interns.
+        let mut dids: BTreeSet<&str> = authors.iter().map(|d| d.as_str()).collect();
+        for w in &batch.writes {
+            match &w.action {
+                WriteAction::Upsert(Record::Block(r)) => {
+                    dids.insert(r.subject.as_str());
+                }
+                WriteAction::Upsert(Record::ListBlock(r)) => {
+                    dids.insert(r.subject.authority.as_str());
+                }
+                WriteAction::Upsert(Record::ListItem(r)) => {
+                    dids.insert(r.subject.as_str());
+                }
+                _ => {}
+            }
+        }
+        t.lock_new_dids(&dids.into_iter().collect::<Vec<_>>())
+            .await?;
 
         // 4. Writes, then reconciles.
         for w in &batch.writes {
@@ -305,7 +343,7 @@ async fn check_stamp_fresh(t: &mut Txn<'_>, stamp_read_at: DateTime<Utc>) -> Res
 /// `rkeys` point to.
 async fn stored_list_targets(
     t: &mut Txn<'_>,
-    author: &AuthorInfo,
+    author_id: i64,
     collection: Collection,
     rkeys: &[String],
 ) -> Result<Vec<(String, String)>> {
@@ -326,7 +364,7 @@ async fn stored_list_targets(
         _ => return Ok(Vec::new()),
     };
     Ok(sqlx::query_as(sql)
-        .bind(author.id)
+        .bind(author_id)
         .bind(rkeys)
         .fetch_all(&mut *t.conn)
         .await?)
@@ -1230,7 +1268,7 @@ async fn list_delete(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<
 
 async fn reconcile_candidates(
     t: &mut Txn<'_>,
-    author: &AuthorInfo,
+    author_id: i64,
     r: &Reconcile,
 ) -> Result<Vec<String>> {
     let sql = match r.collection {
@@ -1258,7 +1296,7 @@ async fn reconcile_candidates(
     };
     let keep: Vec<String> = r.keep.iter().map(|k| k.as_str().to_owned()).collect();
     Ok(sqlx::query_scalar(sql)
-        .bind(author.id)
+        .bind(author_id)
         .bind(r.stamp)
         .bind(r.after.as_ref().map(|k| k.as_str().to_owned()))
         .bind(r.through.as_ref().map(|k| k.as_str().to_owned()))
@@ -1329,9 +1367,11 @@ mod tests {
 
     #[test]
     fn backoff_grows() {
-        assert!(deadlock_backoff(1) >= Duration::from_millis(5));
-        assert!(deadlock_backoff(4) >= Duration::from_millis(20));
-        assert!(deadlock_backoff(4) < Duration::from_millis(40));
+        let b1 = deadlock_backoff(1);
+        assert!(b1 >= Duration::from_millis(10) && b1 <= Duration::from_millis(20));
+        let b4 = deadlock_backoff(4);
+        assert!(b4 >= Duration::from_millis(80) && b4 <= Duration::from_millis(160));
+        assert!(deadlock_backoff(30) <= Duration::from_millis(2_000));
     }
 
     #[test]
