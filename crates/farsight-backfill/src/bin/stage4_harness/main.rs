@@ -69,12 +69,14 @@ static LAST_US: AtomicU64 = AtomicU64::new(0);
 /// A fresh, strictly increasing TID at "now".
 fn tid_now() -> String {
     let now = Utc::now().timestamp_micros() as u64;
-    let us = LAST_US
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| {
-            Some(l.max(now - 1) + 1)
-        })
-        .map(|l| l.max(now - 1) + 1)
-        .unwrap_or(now);
+    let mut last = LAST_US.load(Ordering::SeqCst);
+    let us = loop {
+        let next = last.max(now - 1) + 1;
+        match LAST_US.compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break next,
+            Err(cur) => last = cur,
+        }
+    };
     Tid::from_parts(us, 7).expect("tid").encode()
 }
 
