@@ -20,5 +20,5 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # The Phase B harnesses are feature-gated; compile and lint them too (not run).
-      - run: cargo clippy --workspace --all-targets --features farsight-storage/harness,farsight-ingest/harness,farsight-api/harness,farsight-server/harness -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features farsight-storage/harness,farsight-ingest/harness,farsight-api/harness,farsight-server/harness,farsight-backfill/harness -- -D warnings
       - run: cargo test --workspace
