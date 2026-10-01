@@ -6,6 +6,8 @@
 //! hands the resulting [`crate::txn::Gates`] to every apply, and records
 //! global refusal intervals with [`record_refusal_transition`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
@@ -30,6 +32,32 @@ pub struct GateState {
     pub sweep_paused: bool,
     /// ≥ 110% of budget: dashboard critical.
     pub critical: bool,
+}
+
+/// Gates shared between the budget monitor (writer of the state) and every
+/// long-lived writer (ingest, server tasks), read once per transaction.
+#[derive(Debug, Default)]
+pub struct SharedGates {
+    budget_refusing: AtomicBool,
+    ceiling_refusing: AtomicBool,
+}
+
+impl SharedGates {
+    /// The gates in force now.
+    pub fn load(&self) -> Gates {
+        Gates {
+            budget_refusing: self.budget_refusing.load(Ordering::Relaxed),
+            ceiling_refusing: self.ceiling_refusing.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Publishes a new gate state.
+    pub fn store(&self, g: Gates) {
+        self.budget_refusing
+            .store(g.budget_refusing, Ordering::Relaxed);
+        self.ceiling_refusing
+            .store(g.ceiling_refusing, Ordering::Relaxed);
+    }
 }
 
 fn pct(bytes: u64, budget: u64, p: u64) -> bool {

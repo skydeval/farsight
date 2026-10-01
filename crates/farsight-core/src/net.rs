@@ -6,10 +6,8 @@
 //! hosts), resolves DNS itself and refuses non-public addresses on every
 //! hop (max 3 redirects), and applies the size/time caps of §5.2.
 //!
-//! Stage 1 defines the contract: [`OutboundClient`], the rules
-//! ([`check_url`], [`blocked_ip_reason`]) and [`SafeClientConfig`]. The
-//! network I/O in [`SafeClient`] is filled in by the ingest/backfill
-//! stage; no stage-1 crate makes outbound requests.
+//! [`OutboundClient`] is the contract (tests substitute a fake);
+//! [`SafeClient`] is the production implementation.
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -122,22 +120,168 @@ pub trait OutboundClient: Send + Sync {
     ) -> impl Future<Output = Result<OutboundResponse, OutboundError>> + Send;
 }
 
-/// The production [`OutboundClient`].
-#[derive(Debug, Clone)]
+/// The production [`OutboundClient`]: resolves names itself (refusing
+/// non-public addresses), connects by the vetted address with SNI for the
+/// name, follows at most [`MAX_REDIRECTS`] redirects re-checking every hop,
+/// and enforces the timeout and body cap.
+#[derive(Clone)]
 pub struct SafeClient {
     config: SafeClientConfig,
+    http: reqwest::Client,
+    dns: std::sync::Arc<hickory_resolver::TokioResolver>,
+}
+
+impl std::fmt::Debug for SafeClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SafeClient")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Resolver used by the HTTP client: every resolved address is checked
+/// with [`blocked_ip_reason`]; forbidden ones are dropped, and a name with
+/// only forbidden addresses fails.
+#[derive(Clone)]
+struct VettingResolver {
+    dns: std::sync::Arc<hickory_resolver::TokioResolver>,
+}
+
+impl reqwest::dns::Resolve for VettingResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let dns = self.dns.clone();
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let ips = dns
+                .lookup_ip(host.as_str())
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            let mut first_refusal = None;
+            let mut allowed = Vec::new();
+            for ip in ips.iter() {
+                match blocked_ip_reason(ip) {
+                    None => allowed.push(std::net::SocketAddr::new(ip, 0)),
+                    Some(reason) => {
+                        first_refusal
+                            .get_or_insert(OutboundError::ForbiddenAddress { addr: ip, reason });
+                    }
+                }
+            }
+            if allowed.is_empty() {
+                let err = first_refusal
+                    .unwrap_or_else(|| OutboundError::Transport(format!("{host}: no addresses")));
+                return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let addrs: reqwest::dns::Addrs = Box::new(allowed.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+fn system_resolver() -> hickory_resolver::TokioResolver {
+    use hickory_resolver::config::ResolverConfig;
+    use hickory_resolver::name_server::TokioConnectionProvider;
+    match hickory_resolver::TokioResolver::builder_tokio() {
+        Ok(b) => b.build(),
+        Err(_) => hickory_resolver::TokioResolver::builder_with_config(
+            ResolverConfig::default(),
+            TokioConnectionProvider::default(),
+        )
+        .build(),
+    }
 }
 
 impl SafeClient {
-    /// Creates a client.
+    /// Creates a client using the system DNS configuration.
     pub fn new(config: SafeClientConfig) -> SafeClient {
-        SafeClient { config }
+        let dns = std::sync::Arc::new(system_resolver());
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(std::sync::Arc::new(VettingResolver { dns: dns.clone() }))
+            .user_agent(config.user_agent.clone())
+            .timeout(config.timeout)
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("HTTP client builds");
+        SafeClient { config, http, dns }
     }
 
     /// The client's settings.
     pub fn config(&self) -> &SafeClientConfig {
         &self.config
     }
+
+    /// TXT records of `name` (e.g. `_atproto.<handle>`, design §8.6). A
+    /// missing name or record set is an empty list.
+    pub async fn txt(&self, name: &str) -> Result<Vec<String>, OutboundError> {
+        match self.dns.txt_lookup(name).await {
+            Ok(r) => Ok(r
+                .iter()
+                .map(|t| {
+                    t.txt_data()
+                        .iter()
+                        .map(|d| String::from_utf8_lossy(d).into_owned())
+                        .collect::<String>()
+                })
+                .collect()),
+            Err(e) if e.is_no_records_found() => Ok(Vec::new()),
+            Err(e) => Err(OutboundError::Transport(e.to_string())),
+        }
+    }
+
+    async fn get_once(&self, url: &Url) -> Result<OutboundResponse, OutboundError> {
+        let mut resp = self
+            .http
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(map_reqwest)?;
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        if resp
+            .content_length()
+            .is_some_and(|len| len > self.config.max_body_bytes)
+        {
+            return Err(OutboundError::TooLarge(self.config.max_body_bytes));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(map_reqwest)? {
+            if (body.len() + chunk.len()) as u64 > self.config.max_body_bytes {
+                return Err(OutboundError::TooLarge(self.config.max_body_bytes));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(OutboundResponse {
+            status,
+            headers,
+            body,
+            final_url: url.clone(),
+        })
+    }
+}
+
+fn map_reqwest(e: reqwest::Error) -> OutboundError {
+    if e.is_timeout() {
+        return OutboundError::Timeout;
+    }
+    // A refusal from the vetting resolver surfaces as the error source.
+    let mut src: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+    while let Some(s) = src {
+        if let Some(o) = s.downcast_ref::<OutboundError>() {
+            return o.clone();
+        }
+        src = s.source();
+    }
+    OutboundError::Transport(e.to_string())
 }
 
 impl OutboundClient for SafeClient {
@@ -145,14 +289,27 @@ impl OutboundClient for SafeClient {
         &self,
         url: &Url,
     ) -> impl Future<Output = Result<OutboundResponse, OutboundError>> + Send {
-        let checked = check_url(url, &self.config);
+        let start = url.clone();
         async move {
-            checked?;
-            todo!(
-                "ingest/backfill stage: resolve DNS, refuse blocked_ip_reason addresses, \
-                 connect by IP with SNI, follow <= 3 redirects re-checking each hop, \
-                 enforce timeout and body cap"
-            )
+            let mut url = start;
+            let mut hops = 0u8;
+            loop {
+                check_url(&url, &self.config)?;
+                let resp = self.get_once(&url).await?;
+                if !(300..400).contains(&resp.status) {
+                    return Ok(resp);
+                }
+                let Some((_, location)) = resp.headers.iter().find(|(k, _)| k == "location") else {
+                    return Ok(resp);
+                };
+                if hops >= self.config.max_redirects {
+                    return Err(OutboundError::TooManyRedirects);
+                }
+                hops += 1;
+                url = url
+                    .join(location)
+                    .map_err(|e| OutboundError::InvalidUrl(e.to_string()))?;
+            }
         }
     }
 }

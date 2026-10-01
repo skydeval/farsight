@@ -20,10 +20,11 @@ use farsight_storage::codes::GapCause;
 use farsight_storage::counters::CounterSink;
 use farsight_storage::error::StorageError;
 use farsight_storage::firehose::{self, FirehoseProgress};
+use farsight_storage::gates::SharedGates;
 use farsight_storage::janitor;
 use farsight_storage::keys::Limits;
 use farsight_storage::repo_events::{RepoEvent, record_poisoned};
-use farsight_storage::txn::{ApplyReport, Gates};
+use farsight_storage::txn::ApplyReport;
 use sqlx::PgPool;
 use tokio::sync::{mpsc, oneshot};
 
@@ -83,9 +84,9 @@ pub struct Writer {
     pub pool: PgPool,
     /// Limits.
     pub limits: Limits,
-    /// Gates. Stage 2 runs with open gates; the budget monitor that feeds
-    /// them is a server task (server stage).
-    pub gates: Gates,
+    /// Gates, published by the server's budget monitor (§11.2) and read
+    /// once per batch.
+    pub gates: Arc<SharedGates>,
     /// Counter sink (flushed by the caller's task).
     pub counters: Arc<CounterSink>,
     /// Shared stats.
@@ -192,7 +193,7 @@ impl Writer {
     fn ctx(&self) -> ApplyCtx<'_> {
         ApplyCtx {
             limits: &self.limits,
-            gates: self.gates,
+            gates: self.gates.load(),
             counters: &self.counters,
         }
     }

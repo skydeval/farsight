@@ -7,6 +7,8 @@
 #![warn(missing_docs)]
 
 pub mod apply;
+pub mod auth;
+pub mod backfill_api;
 pub mod codes;
 pub mod counters;
 pub mod coverage;
@@ -16,6 +18,7 @@ pub mod firehose;
 pub mod gates;
 pub mod janitor;
 pub mod keys;
+pub mod queries;
 pub mod queue;
 pub mod recount;
 pub mod repo_events;
@@ -126,6 +129,9 @@ mod tests {
             ("firehose.rs", include_str!("firehose.rs")),
             ("counters.rs", include_str!("counters.rs")),
             ("coverage.rs", include_str!("coverage.rs")),
+            ("queries.rs", include_str!("queries.rs")),
+            ("auth.rs", include_str!("auth.rs")),
+            ("backfill_api.rs", include_str!("backfill_api.rs")),
         ] {
             let lower = src.to_ascii_lowercase();
             assert!(

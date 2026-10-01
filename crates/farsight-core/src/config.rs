@@ -967,7 +967,7 @@ impl Config {
         let mut warnings = Vec::new();
         for net in &self.proxy.trusted {
             validate_trusted_proxy(net).map_err(|r| invalid("proxy.trusted", r))?;
-            if is_public_net(net) {
+            if is_public_net(net) && !crate::cloudflare::contains_net(net) {
                 warnings.push(format!(
                     "proxy.trusted contains public range {net}; confirm it belongs to your proxy"
                 ));
@@ -981,6 +981,70 @@ impl Config {
         }
         Ok(warnings)
     }
+}
+
+/// Serializes a config as TOML for `config.toml`.
+pub fn to_toml(config: &Config) -> Result<String, ConfigError> {
+    toml::to_string_pretty(config).map_err(|e| ConfigError::Schema(e.to_string()))
+}
+
+fn temp_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".tmp-{}-{}", std::process::id(), unique_suffix()));
+    path.with_file_name(name)
+}
+
+fn unique_suffix() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    t ^ N.fetch_add(1, Ordering::Relaxed).rotate_left(32)
+}
+
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()
+}
+
+/// Writes `text` to `path` only if `path` does not exist yet (design
+/// §8.3 "first writer wins"): the content goes to a temp file (0600) that
+/// is then hard-linked into place, which fails if another writer got
+/// there first. Returns `Ok(false)` in that case.
+pub fn write_new(path: &Path, text: &str) -> std::io::Result<bool> {
+    let tmp = temp_path(path);
+    write_private(&tmp, text)?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Atomically replaces `path` with `text` (temp file, 0600, then rename;
+/// settings edits, §8.6).
+pub fn write_replace(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = temp_path(path);
+    write_private(&tmp, text)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 #[cfg(test)]
@@ -1091,7 +1155,11 @@ gap_threshold = "300s"
         let loaded = load_from_parts(Some(text), &[]).unwrap();
         assert_eq!(loaded.config.proxy.mode, ProxyMode::Cloudflare);
         assert_eq!(loaded.config.proxy.trusted.len(), 1);
-        // A public range outside a bundled set is a warning, not an error.
+        // A range inside the bundled Cloudflare set is not warned about
+        // (§9.2); other public space is a warning, not an error.
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let other = text.replace("173.245.48.0/20", "203.0.113.0/24");
+        let loaded = load_from_parts(Some(&other), &[]).unwrap();
         assert!(!loaded.warnings.is_empty());
     }
 

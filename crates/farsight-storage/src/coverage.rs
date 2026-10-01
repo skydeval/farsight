@@ -59,6 +59,8 @@ pub struct PendingEffects {
     /// Pending lists considered (pending, plus purging lists that will be
     /// re-admitted).
     pub considered: i64,
+    /// Their ids, sorted (the live rule of §3.7.1 compares against it).
+    pub considered_ids: Vec<i64>,
     /// `excludedPendingLists`: no relevant listblocks, or beyond the
     /// per-owner-key bound.
     pub excluded: i64,
@@ -243,8 +245,10 @@ async fn read_pending_effects(
 pub fn pending_effects(lists: &[PendingList], per_owner_key: usize) -> PendingEffects {
     let mut out = PendingEffects {
         considered: lists.len() as i64,
+        considered_ids: lists.iter().map(|l| l.id).collect(),
         ..PendingEffects::default()
     };
+    out.considered_ids.sort_unstable();
     let mut by_key: BTreeMap<&str, Vec<&PendingList>> = BTreeMap::new();
     for l in lists {
         if l.relevant == 0 {

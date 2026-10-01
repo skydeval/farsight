@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use farsight_core::Config;
 use farsight_storage::counters::{CounterSink, FLUSH_INTERVAL};
+use farsight_storage::gates::SharedGates;
 use farsight_storage::keys::Limits;
-use farsight_storage::txn::Gates;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -55,6 +55,8 @@ pub struct IngestConfig {
     pub reader: reader::ReaderConfig,
     /// Limits for `apply`.
     pub limits: Limits,
+    /// Write gates, shared with the budget monitor (§11.2).
+    pub gates: Arc<SharedGates>,
     /// Harness: receives a copy of every event read from the network.
     #[cfg(feature = "harness")]
     pub tap: Option<mpsc::UnboundedSender<frame::InEvent>>,
@@ -82,6 +84,7 @@ impl IngestConfig {
                 },
             },
             limits: Limits::from_config(c),
+            gates: Arc::new(SharedGates::default()),
             #[cfg(feature = "harness")]
             tap: None,
         }
@@ -202,7 +205,7 @@ impl Ingest {
         let writer = writer::Writer {
             pool: pool.clone(),
             limits: cfg.limits.clone(),
-            gates: Gates::default(),
+            gates: cfg.gates.clone(),
             counters: counters.clone(),
             stats: stats.clone(),
             #[cfg(feature = "harness")]
