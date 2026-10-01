@@ -493,7 +493,13 @@ impl Writer {
                 return Err(StorageError::Invariant("injected fault (harness)".into()));
             }
             match apply::apply(&self.pool, &self.ctx(), batch).await {
-                Ok(r) => return Ok(r),
+                Ok(r) => {
+                    for x in &r.refusals {
+                        metrics::counter!(crate::metrics::ABUSE_CAPPED, "kind" => x.refusal.cap_type().label())
+                            .increment(1);
+                    }
+                    return Ok(r);
+                }
                 Err(e) if is_transient(&e) => {
                     tracing::warn!(error = %e, "transient apply failure; retrying");
                     self.stats.transient_retries.fetch_add(1, Ordering::Relaxed);

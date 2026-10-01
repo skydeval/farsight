@@ -12,6 +12,9 @@ pub const LAG: &str = "farsight_firehose_lag_seconds";
 pub const SOURCE_LAG: &str = "farsight_firehose_source_lag_seconds";
 /// `farsight_firehose_events_total{collection,op,outcome}` (counter).
 pub const EVENTS: &str = "farsight_firehose_events_total";
+/// `farsight_abuse_capped_total{kind}`: writes refused or uncounted by a
+/// cap, rate or gate (§13), counted from every applied batch.
+pub const ABUSE_CAPPED: &str = "farsight_abuse_capped_total";
 /// `farsight_firehose_reconnects_total{reason}` (counter).
 pub const RECONNECTS: &str = "farsight_firehose_reconnects_total";
 /// `farsight_firehose_open_gaps` (gauge).
@@ -116,6 +119,9 @@ pub fn register_zeroes() {
         metrics::counter!(SEAM_REPAIRS, "trigger" => trigger).increment(0);
     }
     metrics::counter!(SEAM_REPAIR_EVENTS).increment(0);
+    for c in farsight_storage::codes::CapType::ALL {
+        metrics::counter!(ABUSE_CAPPED, "kind" => c.label()).increment(0);
+    }
     metrics::counter!(EVENTS, "collection" => "account", "op" => "activate", "outcome" => "applied")
         .increment(0);
     for p in ["v1", "v2"] {

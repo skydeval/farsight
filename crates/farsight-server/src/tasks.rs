@@ -28,8 +28,9 @@ pub const STORAGE_BUDGET_RATIO: &str = "farsight_storage_budget_ratio";
 pub const STORAGE_TABLE_BYTES: &str = "farsight_storage_table_bytes";
 /// `farsight_records{collection}`.
 pub const RECORDS: &str = "farsight_records";
-/// `farsight_abuse_capped_total{kind}` is counted by the apply path; the
-/// monitor only publishes gauges.
+/// `farsight_abuse_capped_total{kind}` is counted where batches are
+/// applied (ingest writer, backfill jobs); the monitor only publishes
+/// gauges.
 const TABLES: [&str; 8] = [
     "blocks",
     "list_items",
