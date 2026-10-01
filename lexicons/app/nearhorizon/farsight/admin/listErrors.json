@@ -1,0 +1,96 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.admin.listErrors",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Recent operational errors, newest first. Unstable: admin token only, outside the stability contract.",
+      "parameters": {
+        "type": "params",
+        "required": [],
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 100
+          },
+          "cursor": {
+            "type": "string"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "errors"
+          ],
+          "properties": {
+            "errors": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#error"
+              }
+            },
+            "cursor": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ]
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "id",
+        "at",
+        "component",
+        "message"
+      ],
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "at": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "component": {
+          "type": "string"
+        },
+        "did": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

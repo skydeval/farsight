@@ -1,0 +1,169 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.defs",
+  "defs": {
+    "freshness": {
+      "type": "object",
+      "required": [
+        "asOf",
+        "firehoseConnected",
+        "coverage"
+      ],
+      "properties": {
+        "asOf": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Server time the response was built."
+        },
+        "indexedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Scope watermark (witness clock), at or before `firehoseAppliedThrough`: everything witnessed at or before it is reflected for this scope, within the level. Absent before the first firehose batch."
+        },
+        "firehoseAppliedThrough": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Running maximum of the Jetstream witness time of applied events. Absent before the first batch."
+        },
+        "firehoseLagSeconds": {
+          "type": "unknown",
+          "description": "`asOf` minus `firehoseAppliedThrough`; includes the coverage snapshot's age (at most 10 s). JSON number (fractional seconds). Lexicon has no floating-point type, so this field is declared `unknown`; it is always a non-negative number when present."
+        },
+        "sourceLagSeconds": {
+          "type": "unknown",
+          "description": "`asOf` minus the median rev commit time of the last 1000 applied events. Informational. JSON number (fractional seconds). Lexicon has no floating-point type, so this field is declared `unknown`; it is always a non-negative number when present."
+        },
+        "firehoseConnected": {
+          "type": "boolean",
+          "description": "Whether the firehose stream is connected."
+        },
+        "coverage": {
+          "type": "ref",
+          "ref": "#coverage"
+        }
+      },
+      "description": "What Farsight can claim about the completeness of this response. Every read response carries it."
+    },
+    "coverage": {
+      "type": "object",
+      "required": [
+        "level",
+        "reasons",
+        "exceptions",
+        "pendingLists"
+      ],
+      "properties": {
+        "level": {
+          "type": "string",
+          "knownValues": [
+            "complete",
+            "assisted",
+            "partial"
+          ],
+          "description": "Coverage level. Open enum: treat any unknown value as `partial`."
+        },
+        "completeSince": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Witness time since which the level holds."
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "knownValues": [
+              "sweep_incomplete",
+              "firehose_gap",
+              "firehose_disconnected",
+              "firehose_lagging",
+              "sync_events_unavailable",
+              "storage_refusal",
+              "list_pending",
+              "list_pending_historical",
+              "list_capped",
+              "list_unavailable",
+              "list_missing",
+              "list_deferred",
+              "list_not_tracked",
+              "discovery_truncated",
+              "party_debt"
+            ],
+            "description": "Why coverage is not `complete`, or what a `complete` scope excludes. Open enum."
+          }
+        },
+        "exceptions": {
+          "type": "ref",
+          "ref": "#exceptions"
+        },
+        "pendingLists": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Global count of `pending` lists."
+        }
+      },
+      "description": "Coverage of the response's scope. Stable contract: `complete` means that, for the response's scope, every record Farsight is not excluding is reflected as of `indexedAt`. For `checkBlocks`, the response-level level applies only to pairs **not** listed in `partialFor`; each pair listed there is `partial` for the reasons given. `partialFor` is a required field (possibly empty). The **only** exclusions are the ones counted in `exceptions`, and an exclusion stops being counted only when the excluded data has been re-listed."
+    },
+    "exceptions": {
+      "type": "object",
+      "required": [
+        "unreachableRepos",
+        "pendingResyncs",
+        "cappedAuthors",
+        "refusedAuthors",
+        "unavailableLists",
+        "missingLists",
+        "deferredLists",
+        "cappedLists",
+        "excludedPendingLists"
+      ],
+      "properties": {
+        "unreachableRepos": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Actors whose repo could not be listed (terminal failure, or reconcile skipped)."
+        },
+        "pendingResyncs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Actors awaiting a re-list (#sync, desynchronized, reactivation, divergence, poisoned event)."
+        },
+        "cappedAuthors": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Actors with records refused or uncounted by a per-author cap or a daily rate."
+        },
+        "refusedAuthors": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Actors with writes refused by a host-bucket cap or the storage budget."
+        },
+        "unavailableLists": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lists in `unavailable`."
+        },
+        "missingLists": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lists in `missing`."
+        },
+        "deferredLists": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lists in `deferred`."
+        },
+        "cappedLists": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tracked lists whose stored item set is capped."
+        },
+        "excludedPendingLists": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Pending lists without effect on coverage (no relevant listblocks, or beyond the per-owner-key bound)."
+        }
+      },
+      "description": "The only exclusions behind a `complete` level; always present. An exclusion stops being counted only when the excluded data has been re-listed."
+    }
+  }
+}

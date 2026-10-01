@@ -1,0 +1,114 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.query.getIncomingBlocks",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Direct blocks naming `actor`, ordered by blocker actor id, then record key. Duplicate block records from one blocker are all returned; consumers dedupe on `did`.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "actor"
+        ],
+        "properties": {
+          "actor": {
+            "type": "string",
+            "format": "did",
+            "description": "The blocked account. DIDs only; a handle is `InvalidRequest`."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 100,
+            "description": "Page size."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque keyset cursor from a previous page. Stays valid across writes: items inserted behind it are not returned, items deleted ahead of it are skipped."
+          },
+          "includeInactive": {
+            "type": "boolean",
+            "default": false,
+            "description": "Include rows authored by accounts whose status is hidden (deactivated, takendown, suspended, deleted). Default false."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "actor",
+            "blocks",
+            "freshness"
+          ],
+          "properties": {
+            "actor": {
+              "type": "string",
+              "format": "did"
+            },
+            "blocks": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#block"
+              }
+            },
+            "cursor": {
+              "type": "string"
+            },
+            "freshness": {
+              "type": "ref",
+              "ref": "app.nearhorizon.farsight.defs#freshness"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ]
+    },
+    "block": {
+      "type": "object",
+      "required": [
+        "did",
+        "uri"
+      ],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "The blocker."
+        },
+        "uri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "The `app.bsky.graph.block` record."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Author-claimed `createdAt` of the record; display only."
+        }
+      }
+    }
+  }
+}

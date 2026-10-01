@@ -1,0 +1,81 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.admin.createApiKey",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Creates an API key. The token is returned once and stored only as a hash. Unstable: admin token only, outside the stability contract.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "name",
+            "scopes"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 200
+            },
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "knownValues": [
+                  "read",
+                  "backfill",
+                  "backfill:high"
+                ]
+              }
+            },
+            "readRps": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Per-key read rate override (requests/s)."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ],
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "id",
+            "token"
+          ],
+          "properties": {
+            "id": {
+              "type": "integer"
+            },
+            "token": {
+              "type": "string",
+              "description": "`fsk_` followed by 43 base64url characters."
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,133 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.query.getBackfillStatus",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Backfill status of one account. A pure read: never enqueues. Requires a bearer token with the `backfill` scope (or the admin token). Not cacheable.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "actor"
+        ],
+        "properties": {
+          "actor": {
+            "type": "string",
+            "format": "did",
+            "description": "DIDs only."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "actor",
+            "repo",
+            "discovery"
+          ],
+          "properties": {
+            "actor": {
+              "type": "string",
+              "format": "did"
+            },
+            "repo": {
+              "type": "ref",
+              "ref": "app.nearhorizon.farsight.query.getBackfillStatus#repo"
+            },
+            "discovery": {
+              "type": "ref",
+              "ref": "app.nearhorizon.farsight.query.getBackfillStatus#discovery"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ]
+    },
+    "repo": {
+      "type": "object",
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "knownValues": [
+            "never",
+            "queued",
+            "running",
+            "done",
+            "failed",
+            "covered_by_sweep"
+          ],
+          "description": "Open enum. `covered_by_sweep`: no per-account record exists, but a completed sweep baseline covers the repo."
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Waiting entries of the same tier ahead of this one."
+        },
+        "lastBackfilledAt": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "lastError": {
+          "type": "string"
+        }
+      }
+    },
+    "discovery": {
+      "type": "object",
+      "required": [
+        "state",
+        "truncated"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "knownValues": [
+            "disabled",
+            "never",
+            "queued",
+            "running",
+            "done",
+            "failed"
+          ],
+          "description": "Open enum. `disabled` when no backlink source is configured."
+        },
+        "completedAt": {
+          "type": "string",
+          "format": "datetime"
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "Stopped at the reference cap; incoming coverage stays partial."
+        },
+        "source": {
+          "type": "string",
+          "description": "Backlink source of the last run."
+        }
+      }
+    }
+  }
+}

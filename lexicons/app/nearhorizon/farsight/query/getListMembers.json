@@ -1,0 +1,148 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.query.getListMembers",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Members of a list, ordered by member actor id, then listitem record key. Members are returned for `ready` and `retained` lists only; a `pending` list returns no members and partial coverage (not yet indexed, never a partial answer).",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "list"
+        ],
+        "properties": {
+          "list": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "The `app.bsky.graph.list` record."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 100,
+            "description": "Page size."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque keyset cursor from a previous page. Stays valid across writes: items inserted behind it are not returned, items deleted ahead of it are skipped."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "list",
+            "state",
+            "capped",
+            "listblockCount",
+            "members",
+            "freshness"
+          ],
+          "properties": {
+            "list": {
+              "type": "string",
+              "format": "at-uri"
+            },
+            "state": {
+              "type": "string",
+              "knownValues": [
+                "ready",
+                "retained",
+                "pending",
+                "untracked",
+                "missing",
+                "dead",
+                "unavailable",
+                "deferred"
+              ],
+              "description": "Tracking state of the list. Open enum. `purging` is reported as `pending` if the list will be re-admitted, else `untracked`."
+            },
+            "capped": {
+              "type": "boolean",
+              "description": "The stored member set is a prefix: a cap refused further items."
+            },
+            "purpose": {
+              "type": "string",
+              "knownValues": [
+                "modlist",
+                "curatelist",
+                "referencelist",
+                "other"
+              ],
+              "description": "List purpose: `modlist`, `curatelist`, `referencelist` or `other` (any other `app.bsky.graph.list` purpose). Open enum: treat unknown values like `other`."
+            },
+            "name": {
+              "type": "string",
+              "description": "Truncated to 128 characters."
+            },
+            "listblockCount": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Counted listblocks on the list."
+            },
+            "members": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#member"
+              }
+            },
+            "cursor": {
+              "type": "string"
+            },
+            "freshness": {
+              "type": "ref",
+              "ref": "app.nearhorizon.farsight.defs#freshness"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ]
+    },
+    "member": {
+      "type": "object",
+      "required": [
+        "did",
+        "itemUri"
+      ],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "itemUri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "The `app.bsky.graph.listitem` record."
+        },
+        "addedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Author-claimed `createdAt` of the listitem; display only."
+        }
+      }
+    }
+  }
+}

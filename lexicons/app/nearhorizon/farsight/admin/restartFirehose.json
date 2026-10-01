@@ -1,0 +1,52 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.admin.restartFirehose",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Drops and re-opens the firehose session. Unstable: admin token only, outside the stability contract.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ],
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "restarted"
+          ],
+          "properties": {
+            "restarted": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    }
+  }
+}

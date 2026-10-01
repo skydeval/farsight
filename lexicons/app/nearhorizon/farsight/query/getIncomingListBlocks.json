@@ -1,0 +1,145 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.query.getIncomingListBlocks",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "For each ready or retained list naming `actor`, every listblock on it, flattened to (list, blocker) pairs ordered by list id, blocker actor id, then listblock record key. A subject named twice in one list yields one pair per listblock. Every stored listblock on such a list is returned, counted or not (an uncounted listblock is still a real block). Lists whose record is deleted or unknown, and lists not ready or retained, are excluded and accounted for in `freshness`. A hidden list owner suppresses its lists unless `includeInactive`.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "actor"
+        ],
+        "properties": {
+          "actor": {
+            "type": "string",
+            "format": "did",
+            "description": "The listed account. DIDs only."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 100,
+            "description": "Page size."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque keyset cursor from a previous page. Stays valid across writes: items inserted behind it are not returned, items deleted ahead of it are skipped."
+          },
+          "includeInactive": {
+            "type": "boolean",
+            "default": false,
+            "description": "Include rows authored by accounts whose status is hidden (deactivated, takendown, suspended, deleted). Default false."
+          },
+          "purpose": {
+            "type": "string",
+            "knownValues": [
+              "modlist",
+              "curatelist",
+              "referencelist",
+              "other"
+            ],
+            "description": "Only lists with this purpose (`modlist`, `curatelist`, `referencelist`, `other`)."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "actor",
+            "items",
+            "freshness"
+          ],
+          "properties": {
+            "actor": {
+              "type": "string",
+              "format": "did"
+            },
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#item"
+              }
+            },
+            "cursor": {
+              "type": "string"
+            },
+            "freshness": {
+              "type": "ref",
+              "ref": "app.nearhorizon.farsight.defs#freshness"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ]
+    },
+    "item": {
+      "type": "object",
+      "required": [
+        "list",
+        "listPurpose",
+        "blocker",
+        "listblockUri"
+      ],
+      "properties": {
+        "list": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "The `app.bsky.graph.list` record."
+        },
+        "listPurpose": {
+          "type": "string",
+          "knownValues": [
+            "modlist",
+            "curatelist",
+            "referencelist",
+            "other"
+          ],
+          "description": "List purpose: `modlist`, `curatelist`, `referencelist` or `other` (any other `app.bsky.graph.list` purpose). Open enum: treat unknown values like `other`."
+        },
+        "listName": {
+          "type": "string",
+          "description": "The list's name, truncated to 128 characters."
+        },
+        "blocker": {
+          "type": "string",
+          "format": "did",
+          "description": "The account holding the listblock."
+        },
+        "listblockUri": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "The `app.bsky.graph.listblock` record."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Author-claimed `createdAt` of the listblock; display only."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.admin.requestBackfill",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Requests a tier-1 repo job for `actor` and, if a backlink source is configured, a subject discovery. Already queued: no new work (priority raised if higher). Running: no new work unless `force`, which queues a run after the current one. Done within the fresh window and not `force`: no new work. Otherwise enqueued. `high` requires the `backfill:high` scope, else it is downgraded. Requires a bearer token with the `backfill` scope (or the admin token). Responds 202 with the `getBackfillStatus` body plus `enqueued` and `downgraded`. The query-parameter form (`?actor=&priority=&force=`) is also accepted.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "actor"
+          ],
+          "properties": {
+            "actor": {
+              "type": "string",
+              "format": "did",
+              "description": "DIDs only."
+            },
+            "priority": {
+              "type": "string",
+              "knownValues": [
+                "normal",
+                "high"
+              ],
+              "description": "Default `normal`."
+            },
+            "force": {
+              "type": "boolean",
+              "default": false,
+              "description": "Run even if recently done or running."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        },
+        {
+          "name": "QueueFull"
+        }
+      ],
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "actor",
+            "repo",
+            "discovery",
+            "enqueued",
+            "downgraded"
+          ],
+          "properties": {
+            "actor": {
+              "type": "string",
+              "format": "did"
+            },
+            "repo": {
+              "type": "ref",
+              "ref": "app.nearhorizon.farsight.query.getBackfillStatus#repo"
+            },
+            "discovery": {
+              "type": "ref",
+              "ref": "app.nearhorizon.farsight.query.getBackfillStatus#discovery"
+            },
+            "enqueued": {
+              "type": "boolean",
+              "description": "New work was added."
+            },
+            "downgraded": {
+              "type": "boolean",
+              "description": "`high` was lowered to `normal`."
+            }
+          }
+        }
+      }
+    }
+  }
+}

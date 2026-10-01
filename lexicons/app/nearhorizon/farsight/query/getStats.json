@@ -1,0 +1,238 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.query.getStats",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Counts from maintained counters, firehose and backfill status, and global freshness. `detail` is unstable.",
+      "parameters": {
+        "type": "params",
+        "required": [],
+        "properties": {}
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "service",
+            "counts",
+            "firehose",
+            "backfill",
+            "freshness"
+          ],
+          "properties": {
+            "service": {
+              "type": "ref",
+              "ref": "#service"
+            },
+            "counts": {
+              "type": "ref",
+              "ref": "#counts"
+            },
+            "firehose": {
+              "type": "ref",
+              "ref": "#firehose"
+            },
+            "backfill": {
+              "type": "ref",
+              "ref": "#backfill"
+            },
+            "freshness": {
+              "type": "ref",
+              "ref": "app.nearhorizon.farsight.defs#freshness"
+            },
+            "detail": {
+              "type": "unknown",
+              "description": "Unstable diagnostic detail, including itemized exceptions. Outside the stability contract."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ]
+    },
+    "service": {
+      "type": "object",
+      "required": [
+        "version",
+        "hostname",
+        "contact"
+      ],
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "contact": {
+          "type": "string"
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "required": [
+        "blocks",
+        "listBlocks",
+        "lists",
+        "trackedLists",
+        "listItems",
+        "actors"
+      ],
+      "properties": {
+        "blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "listBlocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lists": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "trackedLists": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "listItems": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "actors": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "firehose": {
+      "type": "object",
+      "required": [
+        "connected",
+        "openGaps"
+      ],
+      "properties": {
+        "connected": {
+          "type": "boolean"
+        },
+        "protocol": {
+          "type": "string",
+          "knownValues": [
+            "v1",
+            "v2"
+          ],
+          "description": "Jetstream protocol of the current session."
+        },
+        "lagSeconds": {
+          "type": "unknown",
+          "description": "Now minus the applied-through witness time. JSON number (fractional seconds). Lexicon has no floating-point type, so this field is declared `unknown`; it is always a non-negative number when present."
+        },
+        "sourceLagSeconds": {
+          "type": "unknown",
+          "description": "Now minus the median rev commit time of recent events. JSON number (fractional seconds). Lexicon has no floating-point type, so this field is declared `unknown`; it is always a non-negative number when present."
+        },
+        "openGaps": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "backfill": {
+      "type": "object",
+      "required": [
+        "queue",
+        "reposPerHour"
+      ],
+      "properties": {
+        "sweep": {
+          "type": "ref",
+          "ref": "#sweep"
+        },
+        "queue": {
+          "type": "ref",
+          "ref": "#queue"
+        },
+        "reposPerHour": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "sweep": {
+      "type": "object",
+      "required": [
+        "cycle",
+        "source",
+        "state"
+      ],
+      "properties": {
+        "cycle": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "source": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string",
+          "knownValues": [
+            "running",
+            "completed",
+            "paused"
+          ],
+          "description": "Open enum."
+        },
+        "progress": {
+          "type": "unknown",
+          "description": "Fraction of the cycle done, 0 to 1. JSON number (fractional seconds). Lexicon has no floating-point type, so this field is declared `unknown`; it is always a non-negative number when present."
+        },
+        "etaSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completedAt": {
+          "type": "string",
+          "format": "datetime"
+        }
+      }
+    },
+    "queue": {
+      "type": "object",
+      "required": [
+        "onDemand",
+        "active"
+      ],
+      "properties": {
+        "onDemand": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "active": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

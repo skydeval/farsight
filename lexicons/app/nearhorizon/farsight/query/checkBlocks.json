@@ -1,0 +1,177 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.query.checkBlocks",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Hydration endpoint: for each DID in `others`, whether a block exists between it and `actor` in either direction, directly or via a ready or retained list. Only DIDs with at least one relation are listed in `results`; absent means none known. The response-level `freshness.coverage` applies only to pairs not listed in `partialFor`. `complete` means that, for the response's scope, every record Farsight is not excluding is reflected as of `indexedAt`. For `checkBlocks`, the response-level level applies only to pairs **not** listed in `partialFor`; each pair listed there is `partial` for the reasons given. `partialFor` is a required field (possibly empty). The **only** exclusions are the ones counted in `exceptions`, and an exclusion stops being counted only when the excluded data has been re-listed.",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "actor",
+          "others"
+        ],
+        "properties": {
+          "actor": {
+            "type": "string",
+            "format": "did",
+            "description": "The viewer. DIDs only."
+          },
+          "others": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "did"
+            },
+            "maxLength": 100,
+            "description": "Up to 100 DIDs (e.g. the authors on one page)."
+          },
+          "includeInactive": {
+            "type": "boolean",
+            "default": false,
+            "description": "Include rows authored by accounts whose status is hidden (deactivated, takendown, suspended, deleted). Default false."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "actor",
+            "results",
+            "partialFor",
+            "freshness"
+          ],
+          "properties": {
+            "actor": {
+              "type": "string",
+              "format": "did"
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#result"
+              }
+            },
+            "partialFor": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#partial"
+              },
+              "description": "Required, possibly empty: each `others` DID whose pair is not fully covered, with reasons. Part of the stable definition of `complete`."
+            },
+            "freshness": {
+              "type": "ref",
+              "ref": "app.nearhorizon.farsight.defs#freshness"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ]
+    },
+    "result": {
+      "type": "object",
+      "required": [
+        "did",
+        "blocksActor",
+        "blockedByActor"
+      ],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "blocksActor": {
+          "type": "ref",
+          "ref": "#relation",
+          "description": "Blocks held by `did` against `actor`."
+        },
+        "blockedByActor": {
+          "type": "ref",
+          "ref": "#relation",
+          "description": "Blocks held by `actor` against `did`."
+        }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "required": [
+        "direct",
+        "lists"
+      ],
+      "properties": {
+        "direct": {
+          "type": "boolean",
+          "description": "A direct `app.bsky.graph.block` exists."
+        },
+        "lists": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "at-uri"
+          },
+          "description": "Lists naming the blocked party that the blocking party listblocks."
+        }
+      }
+    },
+    "partial": {
+      "type": "object",
+      "required": [
+        "did",
+        "reasons"
+      ],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "knownValues": [
+              "sweep_incomplete",
+              "firehose_gap",
+              "firehose_disconnected",
+              "firehose_lagging",
+              "sync_events_unavailable",
+              "storage_refusal",
+              "list_pending",
+              "list_pending_historical",
+              "list_capped",
+              "list_unavailable",
+              "list_missing",
+              "list_deferred",
+              "list_not_tracked",
+              "discovery_truncated",
+              "party_debt"
+            ],
+            "description": "Why coverage is not `complete`, or what a `complete` scope excludes. Open enum."
+          }
+        }
+      }
+    }
+  }
+}
