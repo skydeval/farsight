@@ -218,6 +218,7 @@ impl Ingest {
             #[cfg(feature = "harness")]
             rewind: None,
             repairs: reader::Repairs::default(),
+            pending_inject: Vec::new(),
         };
         let flusher = {
             let counters = counters.clone();

@@ -41,8 +41,14 @@ pub const POISON_STRIKES: u32 = 3;
 /// What the reader sends the writer.
 #[derive(Debug)]
 pub enum Item {
-    /// An event.
+    /// An event of the live session.
     Event(InEvent),
+    /// Events re-read by a seam repair (§6.3). Applied like any other
+    /// event but never advance the cursor, `applied_through` or the clock:
+    /// the live session may still be catching up behind them (a resume
+    /// after an outage), and a cursor moved past un-replayed data would
+    /// make the next reconnect skip it.
+    Repair(Vec<InEvent>),
     /// A session to `url` speaking `protocol` started.
     Session {
         /// Instance URL (as configured).
@@ -243,6 +249,12 @@ impl Writer {
         self.flush(buf, session).await;
         match item {
             Item::Event(_) => unreachable!("events are batched by run()"),
+            Item::Repair(events) => {
+                for chunk in events.chunks(BATCH_MAX) {
+                    let mut b = chunk.to_vec();
+                    self.flush_events(&mut b, session, false).await;
+                }
+            }
             Item::Session { url, protocol } => {
                 let u = url.clone();
                 self.retry_transient(|| {
@@ -311,6 +323,18 @@ impl Writer {
     }
 
     async fn flush(&self, buf: &mut Vec<InEvent>, session: &mut Option<SessionState>) {
+        self.flush_events(buf, session, true).await;
+    }
+
+    /// Applies `buf` in one batch. `live` batches carry the firehose
+    /// progress (cursor, `applied_through`, clock row); repair batches do
+    /// not.
+    async fn flush_events(
+        &self,
+        buf: &mut Vec<InEvent>,
+        session: &mut Option<SessionState>,
+        live: bool,
+    ) {
         if buf.is_empty() {
             return;
         }
@@ -321,7 +345,7 @@ impl Writer {
         };
         let started = Instant::now();
         let first_us = events[0].witness_us;
-        if s.open_v1_gap {
+        if live && s.open_v1_gap {
             let from = self
                 .retry_transient(|| firehose::read_state(&self.pool))
                 .await
@@ -331,7 +355,7 @@ impl Writer {
                 .await;
             s.open_v1_gap = false;
         }
-        if s.close_v1_gap {
+        if live && s.close_v1_gap {
             self.retry_transient(|| firehose::close_sync_unavailable(&self.pool, dt(first_us)))
                 .await;
             s.close_v1_gap = false;
@@ -372,7 +396,9 @@ impl Writer {
                 }
             }
         }
-        batch.firehose = Some(progress);
+        if live {
+            batch.firehose = Some(progress);
+        }
 
         let n_writes = batch.writes.len();
         let n_events = batch.events.len();
@@ -392,7 +418,9 @@ impl Writer {
             metrics::counter!(m::EVENTS, "collection" => c.nsid(), "op" => *op, "outcome" => outcome.label())
                 .increment(1);
         }
-        self.stats.batches.fetch_add(1, Ordering::Relaxed);
+        if live {
+            self.stats.batches.fetch_add(1, Ordering::Relaxed);
+        }
         self.stats
             .events
             .fetch_add(events.len() as u64, Ordering::Relaxed);
@@ -409,7 +437,9 @@ impl Writer {
         .num_microseconds()
         .unwrap_or(0) as f64
             / 1e6;
-        metrics::gauge!(m::LAG).set(lag.max(0.0));
+        if live {
+            metrics::gauge!(m::LAG).set(lag.max(0.0));
+        }
         // §7.4: purge accounts that became `deleted` (multi-transaction,
         // after the status commit; resumed at start-up if interrupted).
         let purge_started = Instant::now();
@@ -556,6 +586,9 @@ impl Writer {
         }
         // Progress on its own, so the cursor never runs ahead of applied
         // (or poison-recorded) events.
+        if batch.firehose.is_none() {
+            return Some(merged);
+        }
         let mut tail = Batch::new(Origin::Firehose);
         tail.firehose = batch.firehose.clone();
         match self.apply_resilient(&tail).await {

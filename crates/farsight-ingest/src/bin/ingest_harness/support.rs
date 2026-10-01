@@ -105,6 +105,9 @@ impl Pg {
             &name,
             "--label",
             "farsight.stage2-harness=1",
+            // The whole-run model comparison runs parallel hash joins that
+            // outgrow Docker's 64 MB /dev/shm default.
+            "--shm-size=1g",
             "-e",
             "POSTGRES_PASSWORD=harness",
             "-e",

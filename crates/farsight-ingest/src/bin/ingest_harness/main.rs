@@ -374,6 +374,23 @@ fn check_no_loss(
             missing.push(format!("{k} @{}", ev.witness_us));
         }
     }
+    if !missing.is_empty() {
+        // Missing events per minute of witness time, for diagnosis.
+        let mut per_min: BTreeMap<i64, usize> = BTreeMap::new();
+        for m in &missing {
+            if let Some(us) = m.rsplit('@').next().and_then(|x| x.parse::<i64>().ok()) {
+                *per_min.entry(us / 60_000_000).or_insert(0) += 1;
+            }
+        }
+        let fmt: Vec<String> = per_min
+            .iter()
+            .map(|(m, n)| {
+                let t = chrono::DateTime::<Utc>::from_timestamp(m * 60, 0).unwrap_or_default();
+                format!("{}:{n}", t.format("%H:%M"))
+            })
+            .collect();
+        println!("  {label}: missing per minute (UTC): {}", fmt.join(" "));
+    }
     if compared == 0 {
         c.unverified(
             format!("{label}: no event lost relative to the reference connection"),
@@ -816,6 +833,7 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
     let (mut next_check, mut next_kill, mut next_restart) =
         (check_every, kill_every, restart_every);
     let (mut did_rewind, mut did_poison) = (false, false);
+    let mut replay_slice: Option<i64> = None;
     let mut counted_snapshot: HashSet<(i64, String)> = HashSet::new();
     let mut period = 0u32;
     let mut excluded_from_monotonic: Vec<(i64, i64)> = Vec::new();
@@ -929,6 +947,16 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
                         format!("new gaps {new:?}; expected cause {expected_cause:?} from {target} to ≈ floor {floor_us}"),
                     );
                     excluded_from_monotonic.push((rewind_start, Utc::now().timestamp_micros()));
+                    // Reconnect mid-replay, after the outage's seam repair:
+                    // the replay must continue where it was, not from the
+                    // repair's (newer) events.
+                    tokio::time::sleep(Duration::from_secs(45)).await;
+                    println!(
+                        "[{:>5}s] kill during the outage replay",
+                        t0.elapsed().as_secs()
+                    );
+                    let _ = ingest.control.send(Control::KillSocket).await;
+                    replay_slice = Some(floor_us + 6 * 3_600_000_000);
                 }
                 None => c.unverified(
                     "simulated cursor-too-old",
@@ -1074,6 +1102,9 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
         );
     }
     check_no_loss(c, "whole run", &tapped, &ref_events, &ref_intervals);
+    if let Some(start) = replay_slice {
+        check_replay_slice(c, &url, start, &tapped).await;
+    }
     check_model(&run.pool, c, "whole run", &tapped)
         .await
         .map_err(|e| e.to_string())?;
@@ -1203,6 +1234,52 @@ async fn mode_p(cfg: &Config, rounds: u64, c: &mut Checks) -> Result<(), String>
         );
     }
     Ok(())
+}
+
+/// After a simulated outage: an independent connection replays a 20-minute
+/// slice from inside the replayed window; every commit in it must have
+/// reached ingest (a replay skipped after a reconnect would miss it).
+async fn check_replay_slice(c: &mut Checks, url: &str, start_us: i64, tapped: &[InEvent]) {
+    let end_us = start_us + 20 * 60_000_000;
+    let got: HashSet<String> = tapped.iter().filter_map(model::event_key).collect();
+    let mut s = match conn::connect(url, Protocol::V2, Cursor::TimeUs(start_us), true).await {
+        Ok(s) => s,
+        Err(_) => match conn::connect(url, Protocol::V1, Cursor::TimeUs(start_us), true).await {
+            Ok(s) => s,
+            Err(e) => {
+                c.unverified("outage replay slice fully applied", format!("connect: {e}"));
+                return;
+            }
+        },
+    };
+    let (mut compared, mut missing) = (0usize, Vec::new());
+    loop {
+        match tokio::time::timeout(Duration::from_secs(30), s.next_frame()).await {
+            Ok(Some(Ok(farsight_ingest::frame::Frame::Event(ev)))) => {
+                if ev.witness_us > end_us {
+                    break;
+                }
+                if let (Body::Commit(_), Some(k)) = (&ev.body, model::event_key(&ev)) {
+                    compared += 1;
+                    if !got.contains(&k) {
+                        missing.push(k);
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    s.close().await;
+    c.check(
+        "outage replay slice fully applied (no replay skipped after a mid-replay reconnect)",
+        compared > 0 && missing.is_empty(),
+        format!(
+            "{compared} commits in [{start_us}, {end_us}]; {} missing {:?}",
+            missing.len(),
+            missing.iter().take(3).collect::<Vec<_>>()
+        ),
+    );
 }
 
 /// The instance's retention floor: the witness time of the first event

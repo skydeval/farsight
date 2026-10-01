@@ -40,6 +40,12 @@ pub struct SeamRepair {
     pub delay: Duration,
 }
 
+/// A session has caught up (reached its seam) once an event's witness time
+/// passes the connect moment (allowing this much clock skew) …
+pub const SEAM_SKEW_US: i64 = 2_000_000;
+/// … or is within this much of now.
+pub const CAUGHT_UP_US: i64 = 10_000_000;
+
 impl Default for SeamRepair {
     fn default() -> Self {
         SeamRepair {
@@ -105,6 +111,8 @@ pub struct Reader {
     pub rewind: Option<i64>,
     /// Pending seam repairs; aborted when the reader goes away.
     pub repairs: Repairs,
+    /// Events injected while the pipeline was full, sent next.
+    pub pending_inject: Vec<InEvent>,
 }
 
 /// Seam-repair tasks, aborted on drop (they hold a sender to the writer,
@@ -250,6 +258,8 @@ impl Reader {
             if let Some(us) = self.rewind.take() {
                 let t = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(us)
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+                // Both the session copy and every instance's own cursor
+                // (r17.2: resumes read firehose_cursors).
                 let r = sqlx::query(
                     "UPDATE firehose_state SET cursor_us = $1, applied_through = $2,
                        cursor_seq = CASE WHEN protocol = 2 THEN 1 ELSE cursor_seq END
@@ -259,7 +269,15 @@ impl Reader {
                 .bind(t)
                 .execute(&self.pool)
                 .await;
-                tracing::warn!(us, ok = r.is_ok(), "harness rewind applied");
+                let r2 = sqlx::query(
+                    "UPDATE firehose_cursors SET cursor_us = $1, last_applied_through = $2,
+                       cursor_seq = CASE WHEN protocol = 2 THEN 1 ELSE cursor_seq END",
+                )
+                .bind(us)
+                .bind(t)
+                .execute(&self.pool)
+                .await;
+                tracing::warn!(us, ok = r.is_ok() && r2.is_ok(), "harness rewind applied");
             }
             let url = self.cfg.urls[idx % self.cfg.urls.len()].clone();
             let failover_lag =
@@ -356,7 +374,8 @@ impl Reader {
         &mut self,
         url: &str,
         protocol: Protocol,
-        first_us: i64,
+        connect_us: i64,
+        caught_up_us: i64,
         trigger: &'static str,
     ) {
         self.repairs.0.retain(|h| !h.is_finished());
@@ -366,15 +385,17 @@ impl Reader {
         let compress = self.cfg.compress;
         #[cfg(feature = "harness")]
         let tap = self.tap.clone();
-        // The seam is at the moment of the resume, not at the replay's first
-        // event (which is up to 120 s earlier on v1, or hours on a rewind).
-        // Read [seam − before, seam + after] with a timestamp cursor (both
+        // The lossy hand-over lies between the session's connect (where the
+        // instance fixes the end of its replay) and the moment the session
+        // caught up to live. For an ordinary resume the two coincide; after
+        // a long replay they can be minutes apart. Read
+        // [connect − before, caught up + after] with a timestamp cursor (both
         // protocols accept µs).
         let cfg = self.cfg.seam;
         let us = |d: Duration| i64::try_from(d.as_micros()).unwrap_or(i64::MAX);
-        let seam = first_us.max(chrono::Utc::now().timestamp_micros());
-        let until = seam + us(cfg.after);
-        let cursor = Cursor::TimeUs(seam - us(cfg.before));
+        let until = caught_up_us + us(cfg.after);
+        let cursor = Cursor::TimeUs(connect_us - us(cfg.before));
+        tracing::info!(connect_us, caught_up_us, trigger, "seam repair scheduled");
         let handle = tokio::spawn(async move {
             tokio::time::sleep(cfg.delay).await;
             let mut s = match conn::connect(&url, protocol, cursor, compress).await {
@@ -384,25 +405,31 @@ impl Reader {
                     return;
                 }
             };
-            let mut n = 0u64;
+            let mut events = Vec::new();
             loop {
                 match tokio::time::timeout(Duration::from_secs(30), s.next_frame()).await {
                     Ok(Some(Ok(Frame::Event(ev)))) => {
                         let past = ev.witness_us > until;
-                        #[cfg(feature = "harness")]
-                        if let Some(tap) = &tap {
-                            let _ = tap.send(ev.clone());
-                        }
-                        if tx.send(Item::Event(ev)).await.is_err() {
-                            break;
-                        }
-                        n += 1;
+                        events.push(ev);
                         if past {
                             break;
                         }
                     }
                     Ok(Some(Ok(_))) => {}
                     _ => break,
+                }
+            }
+            let n = events.len() as u64;
+            // A repair never advances the cursor (see `Item::Repair`).
+            #[cfg(feature = "harness")]
+            let copy = events.clone();
+            if tx.send(Item::Repair(events)).await.is_ok() {
+                // Tapped only once delivered (see read_session).
+                #[cfg(feature = "harness")]
+                if let Some(tap) = &tap {
+                    for ev in copy {
+                        let _ = tap.send(ev);
+                    }
                 }
             }
             s.close().await;
@@ -434,6 +461,15 @@ impl Reader {
         let mut first = true;
         let mut clamped_notice = false;
         let mut since_gauge = 0u32;
+        // The seam is where the replay hands over to the live tail: when
+        // the session catches up, which for a long replay is long after the
+        // resume. The repair is anchored there (§6.3).
+        let connect_us = chrono::Utc::now().timestamp_micros();
+        let mut seam_trigger: Option<&'static str> = None;
+        // Stream position of the last delivered event: injected events are
+        // re-stamped to it, so a synthetic event never carries the cursor
+        // past a replay still in progress.
+        let mut position_us: Option<i64> = None;
         loop {
             let frame = tokio::select! {
                 c = self.control.recv() => match c {
@@ -445,6 +481,7 @@ impl Reader {
                     }
                     Some(Control::Inject(evs)) => {
                         for ev in evs {
+                            let ev = at_position(ev, position_us);
                             if self.tx.send(Item::Event(ev)).await.is_err() {
                                 return End::Shutdown;
                             }
@@ -498,19 +535,13 @@ impl Reader {
                 // §6.3: after any resume with a prior position (skipped only
                 // on the first-ever start).
                 if prior {
-                    let trigger = if gap.is_some() {
+                    seam_trigger = Some(if gap.is_some() {
                         "clamp_recovery"
                     } else if failover {
                         "failover"
                     } else {
                         "resume"
-                    };
-                    self.spawn_seam_repair(
-                        &session.url_base,
-                        session.protocol,
-                        ev.witness_us,
-                        trigger,
-                    );
+                    });
                 }
                 if let Some((from_us, to_us, cause)) = gap {
                     tracing::warn!(from_us, to_us, ?cause, "resume gap");
@@ -542,33 +573,79 @@ impl Reader {
                         .store((s * 1000.0) as i64, Ordering::Relaxed);
                 }
             }
-            #[cfg(feature = "harness")]
-            if let Some(tap) = &self.tap {
-                let _ = tap.send(ev.clone());
+            if let Some(trigger) = seam_trigger {
+                let now = chrono::Utc::now().timestamp_micros();
+                if ev.witness_us >= connect_us - SEAM_SKEW_US || now - ev.witness_us <= CAUGHT_UP_US
+                {
+                    seam_trigger = None;
+                    tracing::warn!(
+                        connect_us,
+                        caught_up_us = now,
+                        lag_secs = (now - connect_us) / 1_000_000,
+                        trigger,
+                        "session caught up; seam repair scheduled"
+                    );
+                    self.spawn_seam_repair(
+                        &session.url_base,
+                        session.protocol,
+                        connect_us,
+                        now,
+                        trigger,
+                    );
+                }
             }
             // Stay responsive to commands while the channel is full
-            // (backpressure). An event abandoned here was never applied, so
-            // the reconnect re-reads it from the persisted cursor.
+            // (backpressure), without losing the event in hand: a kill
+            // abandons it (never applied, so the reconnect re-reads it from
+            // the persisted cursor); an injection waits for it.
+            #[cfg(feature = "harness")]
+            let tapped = ev.clone();
+            let witness_us = ev.witness_us;
             let tx = self.tx.clone();
-            tokio::select! {
-                r = tx.send(Item::Event(ev)) => {
-                    if r.is_err() {
-                        return End::Shutdown;
+            let send = tx.send(Item::Event(ev));
+            tokio::pin!(send);
+            loop {
+                tokio::select! {
+                    r = &mut send => {
+                        if r.is_err() {
+                            return End::Shutdown;
+                        }
+                        break;
                     }
+                    c = self.control.recv() => match c {
+                        Some(Control::KillSocket) => return End::Reconnect("kill"),
+                        #[cfg(feature = "harness")]
+                        Some(Control::KillAndRewind { us }) => {
+                            self.rewind = Some(us);
+                            return End::Reconnect("kill");
+                        }
+                        Some(Control::Inject(evs)) => self.pending_inject.extend(evs),
+                        Some(Control::Shutdown) | None => return End::Shutdown,
+                    },
                 }
-                c = self.control.recv() => match c {
-                    Some(Control::KillSocket) => return End::Reconnect("kill"),
-                    #[cfg(feature = "harness")]
-                    Some(Control::KillAndRewind { us }) => {
-                        self.rewind = Some(us);
-                        return End::Reconnect("kill");
-                    }
-                    Some(Control::Inject(_)) => {
-                        tracing::warn!("inject ignored while the pipeline is full");
-                    }
-                    Some(Control::Shutdown) | None => return End::Shutdown,
-                },
+            }
+            // Tapped only once delivered, so the harness model never holds an
+            // event the writer did not get.
+            #[cfg(feature = "harness")]
+            if let Some(tap) = &self.tap {
+                let _ = tap.send(tapped);
+            }
+            position_us = Some(witness_us);
+            for ev in std::mem::take(&mut self.pending_inject) {
+                let ev = at_position(ev, position_us);
+                if self.tx.send(Item::Event(ev)).await.is_err() {
+                    return End::Shutdown;
+                }
             }
         }
     }
+}
+
+/// An injected event placed at the stream's current position (unchanged
+/// before the session's first delivered event).
+fn at_position(mut ev: InEvent, position_us: Option<i64>) -> InEvent {
+    if let Some(us) = position_us {
+        ev.witness_us = us;
+    }
+    ev
 }
