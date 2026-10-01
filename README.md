@@ -10,10 +10,9 @@ mentions. On its own it only sees blocks from accounts it already
 indexes, so it misses everyone else. Farsight closes that gap without
 depending on a third-party index.
 
-> **Status: in development.** Storage, ingest, the API, the web UI and
-> the setup wizard are built; the background backfill process is next.
-> No image is published yet: `docker compose` builds it from this
-> checkout.
+> **Status: v1 feature-complete.** Storage, ingest, backfill, the API,
+> the web UI and the setup wizard are built. No image is published yet:
+> `docker compose` builds it from this checkout.
 
 ## What Farsight is
 
@@ -93,6 +92,15 @@ It then writes `/etc/farsight/config.toml` and switches Farsight to
 normal mode in-process: it runs migrations, connects to the firehose and
 starts serving the API. A config reset (Settings → Reset) returns it to
 the wizard; the database is kept.
+
+The `farsight-backfill` container starts with the others. It idles
+until the wizard has written the config and the server has migrated the
+database, then works through on-demand requests, recently active
+accounts, list fetches and (if enabled in the wizard) the systematic
+sweep. It talks to PDS hosts at a polite per-host rate, to the PLC
+directory and to the relay set in `backfill.relay_url`; progress, ETA
+and queue depths are on the dashboard and on its metrics port (9465,
+not published).
 
 For automated deployments, set `FARSIGHT_SKIP_WIZARD=1` and supply the
 config as a file, or entirely through environment variables. Nested

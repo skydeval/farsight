@@ -46,9 +46,8 @@ services:
   farsight-backfill:
     <<: *farsight-common
     container_name: farsight-backfill
-    # The backfill process ships in a later stage; enable it then with
-    # `docker compose --profile backfill up -d`.
-    profiles: ["backfill"]
+    # Idles until the setup wizard has written the config, then waits for
+    # the server's migrations. Metrics on :9465 inside the network only.
     command: ["farsight-backfill"]
     volumes:
       - farsight-config:/etc/farsight:ro
