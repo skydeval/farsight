@@ -10,9 +10,9 @@ mentions. On its own it only sees blocks from accounts it already
 indexes, so it misses everyone else. Farsight closes that gap without
 depending on a third-party index.
 
-> **Status: design complete, implementation not started.** The design
-> is locked; implementation planning is next. The commands below
-> describe the intended deployment. No image is published yet.
+> **Status: in development.** The design is locked and the storage
+> layer is built; ingest is in progress. The commands below describe
+> the intended deployment. No image is published yet.
 
 ## What Farsight is
 
