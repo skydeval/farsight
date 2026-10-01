@@ -32,6 +32,11 @@ pub const FAILOVER_AFTER: u32 = 3;
 pub const SEAM_DELAY: Duration = Duration::from_secs(60);
 /// See [`SEAM_DELAY`].
 pub const SEAM_COVER_US: i64 = 30_000_000;
+/// How far before the resume moment the seam repair starts reading. The
+/// observed drops are within about a second of the seam; the repair reads a
+/// short window around it, never the whole resumed range (after a long
+/// rewind that would re-read hours of events).
+pub const SEAM_LOOKBACK_US: i64 = 150_000_000;
 
 /// Commands from the embedding process.
 #[derive(Debug)]
@@ -310,7 +315,7 @@ impl Reader {
         }
     }
 
-    /// Re-reads `[cursor, resume moment + SEAM_COVER]` a minute later, through
+    /// Re-reads `[resume moment − 150 s, resume moment + 30 s]` a minute later, through
     /// the normal pipeline (LWW makes the duplicates stale no-ops), to
     /// recover events the instance dropped at the resume seam.
     fn spawn_seam_repair(&mut self, url: &str, protocol: Protocol, cursor: Cursor, first_us: i64) {
@@ -322,8 +327,16 @@ impl Reader {
         #[cfg(feature = "harness")]
         let tap = self.tap.clone();
         // The seam is at the moment of the resume, not at the replay's first
-        // event (which is up to 120 s earlier on v1).
-        let until = first_us.max(chrono::Utc::now().timestamp_micros()) + SEAM_COVER_US;
+        // event (which is up to 120 s earlier on v1, or hours on a rewind).
+        // Read [seam − lookback, seam + cover] with a timestamp cursor (both
+        // protocols accept µs), never from before the session's own cursor.
+        let seam = first_us.max(chrono::Utc::now().timestamp_micros());
+        let until = seam + SEAM_COVER_US;
+        let start = (seam - SEAM_LOOKBACK_US).max(match cursor {
+            Cursor::TimeUs(t) => t,
+            _ => i64::MIN,
+        });
+        let cursor = Cursor::TimeUs(start);
         let handle = tokio::spawn(async move {
             tokio::time::sleep(SEAM_DELAY).await;
             let mut s = match conn::connect(&url, protocol, cursor, compress).await {
@@ -479,8 +492,28 @@ impl Reader {
             if let Some(tap) = &self.tap {
                 let _ = tap.send(ev.clone());
             }
-            if self.tx.send(Item::Event(ev)).await.is_err() {
-                return End::Shutdown;
+            // Stay responsive to commands while the channel is full
+            // (backpressure). An event abandoned here was never applied, so
+            // the reconnect re-reads it from the persisted cursor.
+            let tx = self.tx.clone();
+            tokio::select! {
+                r = tx.send(Item::Event(ev)) => {
+                    if r.is_err() {
+                        return End::Shutdown;
+                    }
+                }
+                c = self.control.recv() => match c {
+                    Some(Control::KillSocket) => return End::Reconnect("kill"),
+                    #[cfg(feature = "harness")]
+                    Some(Control::KillAndRewind { us }) => {
+                        self.rewind = Some(us);
+                        return End::Reconnect("kill");
+                    }
+                    Some(Control::Inject(_)) => {
+                        tracing::warn!("inject ignored while the pipeline is full");
+                    }
+                    Some(Control::Shutdown) | None => return End::Shutdown,
+                },
             }
         }
     }

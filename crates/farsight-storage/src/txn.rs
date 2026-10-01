@@ -174,6 +174,8 @@ pub struct ApplyReport {
     pub write_outcomes: Vec<WriteOutcome>,
     /// Non-commit events applied (identity, account, sync).
     pub repo_events: u64,
+    /// Account events older than the stored `status_at` (replays), skipped.
+    pub stale_repo_events: u64,
     /// `resync` debts raised by `#sync` / account events.
     pub resyncs: u64,
     /// Accounts that became `deleted`: the caller purges them after commit

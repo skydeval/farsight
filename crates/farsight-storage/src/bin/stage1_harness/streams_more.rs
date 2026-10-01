@@ -1093,6 +1093,24 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         (TrackState::Pending, 2),
     );
 
+    // A replayed, older deactivation must not overwrite the newer status.
+    let older = w - chrono::Duration::seconds(60);
+    let r = events_batch(
+        env,
+        vec![E::Account {
+            did: o.clone(),
+            witness: older,
+            active: false,
+            status: Some("takendown".into()),
+        }],
+    )
+    .await?;
+    c.eq(
+        "replayed older account event skipped (status stays active)",
+        (status_of(env, &o).await?, r.stale_repo_events),
+        (Some(st::ACTIVE), 1),
+    );
+
     // desynchronized ⇒ resync debt (shown status).
     let d = plc("evdesync", 1);
     env.firehose(vec![block(&d, "k", &b, rev(5))]).await?;

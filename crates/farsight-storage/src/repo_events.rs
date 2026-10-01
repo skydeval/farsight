@@ -136,8 +136,8 @@ impl Txn<'_> {
                 status,
             } => {
                 let new = status_code(*active, status.as_deref());
-                let known: Option<(i64, i16, bool)> = sqlx::query_as(
-                    "SELECT a.id, a.status, COALESCE(s.inactive_at_listing, false)
+                let known: Option<(i64, i16, bool, Option<DateTime<Utc>>)> = sqlx::query_as(
+                    "SELECT a.id, a.status, COALESCE(s.inactive_at_listing, false), a.status_at
                      FROM actors a LEFT JOIN backfill_state s ON s.actor_id = a.id
                      WHERE a.did = $1",
                 )
@@ -145,7 +145,7 @@ impl Txn<'_> {
                 .fetch_optional(&mut *self.conn)
                 .await?;
                 self.report.repo_events += 1;
-                let Some((id, old, inactive_at_listing)) = known else {
+                let Some((id, old, inactive_at_listing, status_at)) = known else {
                     if *active {
                         // Unknown DID becoming active: tier-2 job, no debt.
                         let author = self.author(did).await?;
@@ -162,6 +162,13 @@ impl Txn<'_> {
                     }
                     return Ok(());
                 };
+                // Account events carry no rev: order them by witness time so
+                // a replayed (older) status never overwrites a newer one and
+                // replays are idempotent.
+                if status_at.is_some_and(|at| *witness < at) {
+                    self.report.stale_repo_events += 1;
+                    return Ok(());
+                }
                 sqlx::query("UPDATE actors SET status = $2, status_at = $3 WHERE id = $1")
                     .bind(id)
                     .bind(new)
@@ -171,7 +178,7 @@ impl Txn<'_> {
                 if new != old {
                     self.notify = true;
                 }
-                if new == actor_status::DESYNCHRONIZED {
+                if new == actor_status::DESYNCHRONIZED && old != actor_status::DESYNCHRONIZED {
                     self.add_debt(id, DebtReason::Resync, None, Some(*witness))
                         .await?;
                     self.report.resyncs += 1;

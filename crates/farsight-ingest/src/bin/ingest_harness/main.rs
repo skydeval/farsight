@@ -849,10 +849,10 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
             match floor {
                 Some(floor_us) => {
                     let target = floor_us - 3_600_000_000;
-                    let gaps_before = farsight_storage::firehose::all_gaps(&run.pool)
+                    let gaps_before: HashSet<i64> = farsight_storage::firehose::all_gaps(&run.pool)
                         .await
-                        .map(|g| g.len())
-                        .unwrap_or(0);
+                        .map(|g| g.iter().map(|x| x.id).collect())
+                        .unwrap_or_default();
                     println!(
                         "[{:>5}s] rewind to {target} (instance floor {floor_us})",
                         el.as_secs()
@@ -866,7 +866,12 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
                     let gaps = farsight_storage::firehose::all_gaps(&run.pool)
                         .await
                         .map_err(|e| e.to_string())?;
-                    let new: Vec<_> = gaps.iter().skip(gaps_before).collect();
+                    // all_gaps sorts by from_at, and this gap starts in the
+                    // past: identify new gaps by id, not position.
+                    let new: Vec<_> = gaps
+                        .iter()
+                        .filter(|g| !gaps_before.contains(&g.id))
+                        .collect();
                     let expected_cause = GapCause::Heuristic;
                     let ok = new.iter().any(|g| {
                         g.cause == expected_cause
@@ -1185,6 +1190,15 @@ async fn main() {
         }
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // Library warnings (slow batches, reconnects, gaps) to stderr.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
     let mut cfg = Config::default();
     if !args.jetstream.is_empty() {
         cfg.firehose.urls = args.jetstream.clone();

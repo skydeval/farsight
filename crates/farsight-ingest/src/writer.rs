@@ -369,10 +369,14 @@ impl Writer {
         }
         batch.firehose = Some(progress);
 
+        let n_writes = batch.writes.len();
+        let n_events = batch.events.len();
+        let apply_started = Instant::now();
         let report = match self.apply_or_poison(&events, batch).await {
             Some(r) => r,
             None => return,
         };
+        let apply_secs = apply_started.elapsed().as_secs_f64();
         for (outcome, (c, op)) in report.write_outcomes.iter().zip(&labels) {
             metrics::counter!(m::EVENTS, "collection" => c.nsid(), "op" => *op, "outcome" => outcome.label())
                 .increment(1);
@@ -397,11 +401,25 @@ impl Writer {
         metrics::gauge!(m::LAG).set(lag.max(0.0));
         // §7.4: purge accounts that became `deleted` (multi-transaction,
         // after the status commit; resumed at start-up if interrupted).
+        let purge_started = Instant::now();
         for did in &report.deleted_accounts {
             self.retry_transient(|| {
                 janitor::purge_account(&self.pool, &self.limits, &self.counters, did)
             })
             .await;
+        }
+        let total = started.elapsed().as_secs_f64();
+        if total > 5.0 {
+            tracing::warn!(
+                total_secs = total,
+                apply_secs,
+                purge_secs = purge_started.elapsed().as_secs_f64(),
+                purged_accounts = report.deleted_accounts.len(),
+                writes = n_writes,
+                repo_events = n_events,
+                deadlock_retries = report.deadlock_retries,
+                "slow ingest batch"
+            );
         }
     }
 

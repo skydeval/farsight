@@ -92,6 +92,12 @@ impl Pg {
         let tag = format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp());
         let name = format!("farsight-stage2-{tag}");
         let volume = format!("farsight-stage2-{tag}");
+        // A fixed host port: `docker restart` re-assigns ephemeral ports,
+        // which would strand every pool after the restart injection.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .map_err(|e| e.to_string())?
+            .port();
         run(Command::new("docker").args([
             "run",
             "-d",
@@ -106,18 +112,11 @@ impl Pg {
             "-e",
             "POSTGRES_DB=farsight",
             "-p",
-            "127.0.0.1::5432",
+            &format!("127.0.0.1:{port}:5432"),
             "-v",
             &format!("{volume}:/var/lib/postgresql/data"),
             "postgres:16",
         ]))?;
-        let port_line = run(Command::new("docker").args(["port", &name, "5432/tcp"]))?;
-        let port = port_line
-            .lines()
-            .next()
-            .and_then(|l| l.rsplit(':').next())
-            .ok_or_else(|| format!("cannot parse docker port output {port_line:?}"))?
-            .to_owned();
         Ok(Pg {
             url: format!("postgres://harness:harness@127.0.0.1:{port}/farsight"),
             container: Some((name, volume)),
