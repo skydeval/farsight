@@ -7,6 +7,12 @@ repository.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Phase B harness support: lets the process reach loopback fake services
+# (PDS, PLC, relay) over plain HTTP. Off by default so release builds keep
+# the safe outbound client only.
+harness = ["farsight-storage/harness", "dep:bcrypt", "dep:reqwest"]
+
 [lib]
 path = "src/lib.rs"
 
@@ -15,6 +21,30 @@ name = "farsight-backfill"
 path = "src/main.rs"
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+bcrypt = { version = "0.15", optional = true }
+chrono.workspace = true
+farsight-core.workspace = true
+farsight-storage = { path = "../farsight-storage" }
+getrandom = "0.2"
+ipnet.workspace = true
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+metrics-util = { version = "0.19", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"], optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+subtle = "2.6"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi"] }
+url.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
