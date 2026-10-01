@@ -197,16 +197,7 @@ pub async fn status(
                 }
             };
             let position = if state == RepoState::Queued && queued {
-                Some(
-                    sqlx::query_scalar(
-                        "SELECT count(*) FROM backfill_queue q, backfill_queue me
-                         WHERE me.actor_id = $1 AND me.kind = 1
-                           AND q.tier = me.tier AND q.enqueued_at < me.enqueued_at",
-                    )
-                    .bind(id)
-                    .fetch_one(&mut *conn)
-                    .await?,
-                )
+                queue_position(conn, id).await?
             } else {
                 None
             };
@@ -471,4 +462,78 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
         enqueued: true,
         downgraded,
     })
+}
+
+/// Waiting entries of the same tier served before `actor_id`'s repo entry
+/// under the scheduler's order (§5.3): within its requester, `high` before
+/// `normal` 4:1, each kind oldest first; across requesters, deficit
+/// round-robin, estimated with equal per-job cost (each other requester
+/// is served about as many entries as this one's rank). Entries not yet
+/// due (`not_before` in the future) are not ahead.
+async fn queue_position(conn: &mut PgConnection, actor_id: i64) -> Result<Option<i64>> {
+    let me: Option<(i16, String, i16, DateTime<Utc>, i64)> = sqlx::query_as(
+        "SELECT tier, requester, priority, enqueued_at, id FROM backfill_queue
+         WHERE actor_id = $1 AND kind = 1",
+    )
+    .bind(actor_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((tier, requester, prio, at, qid)) = me else {
+        return Ok(None);
+    };
+    let (same_ahead, other_kind): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE priority = $3 AND (enqueued_at, id) < ($4, $5)),
+                count(*) FILTER (WHERE priority <> $3)
+         FROM backfill_queue
+         WHERE tier = $1 AND requester = $2 AND id <> $5
+           AND (not_before IS NULL OR not_before <= now())",
+    )
+    .bind(tier)
+    .bind(&requester)
+    .bind(prio)
+    .bind(at)
+    .bind(qid)
+    .fetch_one(&mut *conn)
+    .await?;
+    let rank = rank_in_requester(prio == priority::HIGH, same_ahead, other_kind);
+    let others: Vec<i64> = sqlx::query_scalar(
+        "SELECT count(*) FROM backfill_queue
+         WHERE tier = $1 AND requester <> $2 AND (not_before IS NULL OR not_before <= now())
+         GROUP BY requester",
+    )
+    .bind(tier)
+    .bind(&requester)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(Some(
+        rank + others.iter().map(|n| (*n).min(rank)).sum::<i64>(),
+    ))
+}
+
+/// Entries of its own requester served before an entry with `same_ahead`
+/// entries of its priority ahead and `other_kind` of the other priority
+/// waiting (four `high` per `normal`, §5.3).
+fn rank_in_requester(high: bool, same_ahead: i64, other_kind: i64) -> i64 {
+    let other_first = if high {
+        same_ahead / 4
+    } else {
+        4 * (same_ahead + 1)
+    };
+    same_ahead + other_kind.min(other_first)
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    #[test]
+    fn rank_follows_four_high_per_normal() {
+        // Sequence HHHHN HHHHN …: the 1st normal is the 5th pick.
+        assert_eq!(rank_in_requester(false, 0, 10), 4);
+        assert_eq!(rank_in_requester(false, 0, 2), 2);
+        assert_eq!(rank_in_requester(false, 1, 10), 9);
+        // The 6th high comes after one normal.
+        assert_eq!(rank_in_requester(true, 5, 3), 6);
+        assert_eq!(rank_in_requester(true, 3, 3), 3);
+    }
 }

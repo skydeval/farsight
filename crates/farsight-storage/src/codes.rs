@@ -166,6 +166,26 @@ impl CapType {
     pub fn is_daily_rate(self) -> bool {
         matches!(self, CapType::AdmissionRate | CapType::InternRate)
     }
+
+    /// The `kind` label of `farsight_abuse_capped_total` (§13).
+    pub fn label(self) -> &'static str {
+        match self {
+            CapType::BlocksPerAuthor => "blocks_per_author",
+            CapType::ListblocksPerAuthor => "listblocks_per_author",
+            CapType::ListsPerAuthor => "lists_per_author",
+            CapType::TriggerCap => "listblock_fetch_triggers_per_author",
+            CapType::AdmissionRate => "admission_rate",
+            CapType::InternRate => "intern_rate",
+            CapType::HostBlocks => "host_blocks",
+            CapType::HostListItems => "host_list_items",
+            CapType::HostListblocks => "host_listblocks",
+            CapType::HostLists => "host_lists",
+            CapType::InternLifetime => "host_interned_lifetime",
+            CapType::Budget => "budget",
+            CapType::Ceiling => "ceiling",
+            CapType::DeletesOnly => "deletes_only",
+        }
+    }
 }
 
 code_enum! {

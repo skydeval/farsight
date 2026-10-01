@@ -412,6 +412,143 @@ pub async fn purge_account_batch(
     Ok(done)
 }
 
+/// Run end of a list fetch run (§5.5): under list(L) exclusive, fires
+/// **OK** on `list_id` only if it is still claimed by `run_id` for its
+/// current epoch (`fetch_run_id = run_id AND fetch_run_epoch =
+/// admit_epoch`), so a list re-admitted after run start is never promoted.
+/// Returns whether OK fired.
+pub async fn promote_claimed(
+    pool: &PgPool,
+    limits: &Limits,
+    counters: &CounterSink,
+    list_id: i64,
+    run_id: i64,
+    args: FireArgs,
+) -> Result<bool> {
+    let Some((owner, rkey)) = list_owner_key(pool, list_id).await? else {
+        return Ok(false);
+    };
+    let mut tx = pool.begin().await?;
+    let (fired, deltas) = {
+        let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
+        t.lock_lists(
+            &[(keys::list_lock_key(&owner, &rkey), true)]
+                .into_iter()
+                .collect(),
+        )
+        .await?;
+        let claimed: bool = sqlx::query_scalar(
+            "SELECT fetch_run_id = $2 AND fetch_run_epoch = admit_epoch FROM lists WHERE id = $1",
+        )
+        .bind(list_id)
+        .bind(run_id)
+        .fetch_optional(&mut *t.conn)
+        .await?
+        .flatten()
+        .unwrap_or(false);
+        if claimed {
+            t.fire(list_id, Event::Ok, args).await?;
+        }
+        if t.notify {
+            t.send_notify().await?;
+        }
+        let (_, d) = t.finish();
+        (claimed, d)
+    };
+    tx.commit().await?;
+    counters.add(deltas);
+    Ok(fired)
+}
+
+/// Divergence purge of `did` (§5.2 "Divergence check"), one batch: the
+/// repo went backwards, so everything authored under its discarded history
+/// goes — blocks, listblocks (counter path), listitems and tombstones — and
+/// the DID's `lists` rows lose their stored rev (the record fields stay;
+/// the fresh listing re-applies them, which a stored rev from the discarded
+/// history would refuse as newer). Unlike an account purge no **RD** fires:
+/// the caller fires **DV** on the DID's tracked lists *before* this.
+/// Returns `true` when nothing authored remains.
+pub async fn purge_for_divergence_batch(
+    pool: &PgPool,
+    limits: &Limits,
+    counters: &CounterSink,
+    did: &Did,
+    batch: i64,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let (done, deltas) = {
+        let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
+        t.lock_authors(&[keys::author_lock_key(did.as_str())].into_iter().collect())
+            .await?;
+        let Some(author_id) = t.actor_id(did.as_str()).await? else {
+            return Ok(true);
+        };
+        let author = t.author(did).await?;
+        let blocks: Vec<String> = sqlx::query_scalar(
+            "SELECT rkey FROM blocks WHERE author_id = $1 ORDER BY rkey LIMIT $2",
+        )
+        .bind(author_id)
+        .bind(batch)
+        .fetch_all(&mut *t.conn)
+        .await?;
+        let lbs: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT r.rkey, a.did, l.rkey FROM list_blocks r
+             JOIN lists l ON l.id = r.list_id JOIN actors a ON a.id = l.owner_id
+             WHERE r.author_id = $1 ORDER BY r.rkey LIMIT $2",
+        )
+        .bind(author_id)
+        .bind(batch)
+        .fetch_all(&mut *t.conn)
+        .await?;
+        let items: Vec<(String, String)> = sqlx::query_as(
+            "SELECT r.rkey, l.rkey FROM list_items r JOIN lists l ON l.id = r.list_id
+             WHERE r.owner_id = $1 ORDER BY r.rkey LIMIT $2",
+        )
+        .bind(author_id)
+        .bind(batch)
+        .fetch_all(&mut *t.conn)
+        .await?;
+        let mut locks = std::collections::BTreeMap::new();
+        for (_, owner, lrkey) in &lbs {
+            locks.insert(keys::list_lock_key(owner, lrkey), true);
+        }
+        for (_, lrkey) in &items {
+            locks
+                .entry(keys::list_lock_key(did.as_str(), lrkey))
+                .or_insert(false);
+        }
+        t.lock_lists(&locks).await?;
+        for rk in &blocks {
+            block_delete_row(&mut t, &author, rk).await?;
+        }
+        for (rk, _, _) in &lbs {
+            listblock_delete_row(&mut t, &author, rk).await?;
+        }
+        for (rk, _) in &items {
+            item_delete_row(&mut t, &author, rk).await?;
+        }
+        let done = (blocks.len() as i64) < batch
+            && (lbs.len() as i64) < batch
+            && (items.len() as i64) < batch;
+        if done {
+            sqlx::query("DELETE FROM tombstones WHERE author_id = $1")
+                .bind(author_id)
+                .execute(&mut *t.conn)
+                .await?;
+            sqlx::query("UPDATE lists SET rev = NULL WHERE owner_id = $1")
+                .bind(author_id)
+                .execute(&mut *t.conn)
+                .await?;
+        }
+        t.send_notify().await?;
+        let (_, deltas) = t.finish();
+        (done, deltas)
+    };
+    tx.commit().await?;
+    counters.add(deltas);
+    Ok(done)
+}
+
 /// The daily retry task (§4.4): fires **GO** on `deferred` lists whose
 /// `next_retry_at` has passed (lists deferred by the owner re-admission
 /// budget get the next UTC midnight). Lists deferred by the budget, the
