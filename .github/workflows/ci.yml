@@ -19,6 +19,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # The stage-1 harness is feature-gated; compile and lint it too (not run).
-      - run: cargo clippy -p farsight-storage --features harness --all-targets -- -D warnings
+      # The Phase B harnesses are feature-gated; compile and lint them too (not run).
+      - run: cargo clippy --workspace --all-targets --features farsight-storage/harness,farsight-ingest/harness -- -D warnings
       - run: cargo test --workspace

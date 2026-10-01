@@ -982,3 +982,318 @@ pub async fn s9_coverage_plumbing(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
     Ok(())
 }
+
+async fn events_batch(
+    env: &Env,
+    events: Vec<farsight_storage::repo_events::RepoEvent>,
+) -> Result<farsight_storage::txn::ApplyReport> {
+    let mut b = Batch::new(Origin::Firehose);
+    b.events = events;
+    apply::apply(&env.pool, &env.ctx(), &b).await
+}
+
+async fn status_of(env: &Env, did: &farsight_core::Did) -> Result<Option<i16>> {
+    Ok(
+        sqlx::query_scalar("SELECT status FROM actors WHERE did = $1")
+            .bind(did.as_str())
+            .fetch_optional(&env.pool)
+            .await?,
+    )
+}
+
+async fn queue_of(env: &Env, did: &farsight_core::Did) -> Result<Option<(i16, i16, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT q.tier, q.priority, q.requester FROM backfill_queue q
+         JOIN actors a ON a.id = q.actor_id WHERE a.did = $1",
+    )
+    .bind(did.as_str())
+    .fetch_optional(&env.pool)
+    .await?)
+}
+
+/// Stream 10 (added in stage 2): non-commit firehose events through
+/// `apply` (§6.4, §7.4), the §5.3 queue collapse rule, and poisoned-event
+/// recording (§6.2).
+pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
+    use farsight_storage::codes::actor_status as st;
+    use farsight_storage::repo_events::RepoEvent as E;
+    let w = now_micros();
+    let o = plc("evowner", 1);
+    let b = plc("evblocker", 1);
+
+    // An owner with an unavailable list (pending + FT).
+    env.firehose(vec![
+        list(&o, "L", rev(1)),
+        listblock(&b, "lb", &o, "L", rev(2)),
+    ])
+    .await?;
+    let l = env.list_id(&o, "L").await?.unwrap_or(-1);
+    janitor::fire_event(
+        &env.pool,
+        &env.limits,
+        &env.counters,
+        l,
+        farsight_storage::transition::Event::FailTerminal,
+        farsight_storage::tracking::FireArgs::default(),
+    )
+    .await?;
+    c.eq(
+        "setup: list unavailable",
+        env.list_view(l).await?.state,
+        TrackState::Unavailable,
+    );
+
+    // Deactivation is a hidden status; no debt.
+    events_batch(
+        env,
+        vec![E::Account {
+            did: o.clone(),
+            witness: w,
+            active: false,
+            status: Some("deactivated".into()),
+        }],
+    )
+    .await?;
+    c.eq(
+        "account deactivated ⇒ status deactivated",
+        status_of(env, &o).await?,
+        Some(st::DEACTIVATED),
+    );
+    c.eq(
+        "deactivation raises no debt",
+        env.debt(&o, DebtReason::Resync.code()).await?,
+        None,
+    );
+
+    // Reactivation of a hidden account ⇒ resync debt + OA on unavailable lists.
+    let r = events_batch(
+        env,
+        vec![E::Account {
+            did: o.clone(),
+            witness: w,
+            active: true,
+            status: None,
+        }],
+    )
+    .await?;
+    c.eq(
+        "reactivation ⇒ status active",
+        status_of(env, &o).await?,
+        Some(st::ACTIVE),
+    );
+    c.check(
+        "reactivation ⇒ resync debt",
+        env.debt(&o, DebtReason::Resync.code()).await?.is_some(),
+        format!("{r:?}"),
+    );
+    let v = env.list_view(l).await?;
+    c.eq(
+        "reactivation fires OA: unavailable → pending (new epoch)",
+        (v.state, v.admit_epoch),
+        (TrackState::Pending, 2),
+    );
+
+    // desynchronized ⇒ resync debt (shown status).
+    let d = plc("evdesync", 1);
+    env.firehose(vec![block(&d, "k", &b, rev(5))]).await?;
+    events_batch(
+        env,
+        vec![E::Account {
+            did: d.clone(),
+            witness: w,
+            active: false,
+            status: Some("desynchronized".into()),
+        }],
+    )
+    .await?;
+    c.eq(
+        "desynchronized ⇒ status",
+        status_of(env, &d).await?,
+        Some(st::DESYNCHRONIZED),
+    );
+    c.check(
+        "desynchronized ⇒ resync debt",
+        env.debt(&d, DebtReason::Resync.code()).await?.is_some(),
+        "",
+    );
+
+    // Unknown DID becoming active ⇒ tier-2 job, no debt; unknown inactive ⇒ nothing.
+    let u = plc("evunknown", 1);
+    let gone = plc("evunknown", 2);
+    events_batch(
+        env,
+        vec![
+            E::Account {
+                did: u.clone(),
+                witness: w,
+                active: true,
+                status: None,
+            },
+            E::Account {
+                did: gone.clone(),
+                witness: w,
+                active: false,
+                status: Some("takendown".into()),
+            },
+        ],
+    )
+    .await?;
+    c.eq(
+        "unknown active DID ⇒ tier-2 repo job",
+        queue_of(env, &u).await?,
+        Some((2, 0, "system:firehose".into())),
+    );
+    c.eq(
+        "unknown active DID ⇒ no debt",
+        env.debt(&u, DebtReason::Resync.code()).await?,
+        None,
+    );
+    c.eq(
+        "unknown inactive DID ⇒ no row",
+        env.actor_id(&gone).await?,
+        None,
+    );
+
+    // #sync ⇒ resync debt + tier-1 system:resync; the collapse rule upgrades
+    // the waiting tier-2 entry instead of adding one.
+    let r = events_batch(
+        env,
+        vec![E::Sync {
+            did: u.clone(),
+            witness: w,
+        }],
+    )
+    .await?;
+    c.eq("#sync ⇒ resync debt", r.resyncs, 1);
+    c.eq(
+        "#sync upgrades the waiting entry: tier 1, system:resync",
+        queue_of(env, &u).await?,
+        Some((1, 0, "system:resync".into())),
+    );
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM backfill_queue q JOIN actors a ON a.id = q.actor_id WHERE a.did = $1",
+    )
+    .bind(u.as_str())
+    .fetch_one(&env.pool)
+    .await?;
+    c.eq("collapse: one waiting entry per (actor, kind)", n, 1);
+    // A later, less urgent request does not downgrade it.
+    let mut conn = env.pool.acquire().await?;
+    let uid = env.actor_id(&u).await?.unwrap_or(-1);
+    farsight_storage::queue::enqueue(
+        &mut conn,
+        uid,
+        farsight_storage::queue::JobKind::Repo,
+        3,
+        0,
+        "system:sweep",
+        None,
+    )
+    .await?;
+    drop(conn);
+    c.eq(
+        "collapse keeps the most urgent tier and its requester",
+        queue_of(env, &u).await?,
+        Some((1, 0, "system:resync".into())),
+    );
+
+    // identity ⇒ PDS cache cleared.
+    sqlx::query("UPDATE actors SET pds_resolved_at = now() WHERE did = $1")
+        .bind(o.as_str())
+        .execute(&env.pool)
+        .await?;
+    events_batch(
+        env,
+        vec![E::Identity {
+            did: o.clone(),
+            witness: w,
+        }],
+    )
+    .await?;
+    let cleared: Option<bool> =
+        sqlx::query_scalar("SELECT pds_resolved_at IS NULL FROM actors WHERE did = $1")
+            .bind(o.as_str())
+            .fetch_optional(&env.pool)
+            .await?;
+    c.eq("identity ⇒ PDS cache cleared", cleared, Some(true));
+
+    // deleted ⇒ reported for purge; the purge removes authored rows and
+    // fires RD on the account's lists.
+    let r = events_batch(
+        env,
+        vec![E::Account {
+            did: o.clone(),
+            witness: w,
+            active: false,
+            status: Some("deleted".into()),
+        }],
+    )
+    .await?;
+    c.eq(
+        "deleted ⇒ reported for purge",
+        r.deleted_accounts,
+        vec![o.clone()],
+    );
+    janitor::purge_account(&env.pool, &env.limits, &env.counters, &o).await?;
+    let v = env.list_view(l).await?;
+    c.eq(
+        "purge: list record deleted, RD fired",
+        (v.record_state, v.state, v.purge_then),
+        (2, TrackState::Purging, Some(TrackState::Dead)),
+    );
+    c.eq(
+        "purge: nothing pending",
+        janitor::accounts_pending_purge(&env.pool, 10).await?.len(),
+        0,
+    );
+
+    // Poisoned event recording.
+    let p = plc("evpoison", 1);
+    farsight_storage::repo_events::record_poisoned(
+        &env.pool,
+        &env.limits,
+        &env.counters,
+        &p,
+        "test",
+        w,
+    )
+    .await?;
+    let errs: i64 = sqlx::query_scalar("SELECT count(*) FROM op_errors WHERE did = $1")
+        .bind(p.as_str())
+        .fetch_one(&env.pool)
+        .await?;
+    c.eq("poisoned ⇒ op_errors row", errs, 1);
+    c.check(
+        "poisoned ⇒ resync debt",
+        env.debt(&p, DebtReason::Resync.code()).await?.is_some(),
+        "",
+    );
+    c.eq(
+        "poisoned ⇒ tier-1 system:resync",
+        queue_of(env, &p).await?,
+        Some((1, 0, "system:resync".into())),
+    );
+
+    // Resync debts turn into unreachable after 7 days.
+    sqlx::query("UPDATE relist_debt SET created_at = now() - interval '8 days' WHERE reason = 2 AND actor_id = (SELECT id FROM actors WHERE did = $1)")
+        .bind(p.as_str())
+        .execute(&env.pool)
+        .await?;
+    let n = farsight_storage::debts::expire_resyncs(
+        &env.pool,
+        chrono::Utc::now(),
+        Duration::from_secs(7 * 86_400),
+    )
+    .await?;
+    c.eq("one resync debt expired", n, 1);
+    c.check(
+        "expired resync ⇒ unreachable, resync gone",
+        env.debt(&p, DebtReason::Unreachable.code())
+            .await?
+            .is_some()
+            && env.debt(&p, DebtReason::Resync.code()).await?.is_none(),
+        "",
+    );
+    consistency(env, c, "after repo events").await?;
+    Ok(())
+}

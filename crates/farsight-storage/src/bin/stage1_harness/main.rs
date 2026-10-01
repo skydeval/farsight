@@ -100,6 +100,11 @@ fn streams() -> Vec<Stream> {
             name: "coverage plumbing: NOTIFY, clock, gaps, snapshot",
             run: stream!(streams_more::s9_coverage_plumbing),
         },
+        Stream {
+            n: 10,
+            name: "account/identity/sync events, queue collapse, poison recording",
+            run: stream!(streams_more::s10_repo_events),
+        },
     ]
 }
 
