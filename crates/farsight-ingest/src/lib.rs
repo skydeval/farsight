@@ -99,7 +99,54 @@ pub struct IngestHandle {
     limits: Limits,
 }
 
+/// The dashboard / `getStats` firehose fields (§3.2, §8.6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FirehoseStatus {
+    /// `firehoseConnected` (the persisted flag; disconnection is the
+    /// synthetic gap of §3.7.1).
+    pub connected: bool,
+    /// Protocol of the last committed batch.
+    pub protocol: Option<frame::Protocol>,
+    /// `lagSeconds`: now − `applied_through`.
+    pub lag_seconds: Option<f64>,
+    /// `sourceLagSeconds`: now − median rev time of the last 1000 events.
+    pub source_lag_seconds: Option<f64>,
+    /// `openGaps`: unhealed gaps.
+    pub open_gaps: usize,
+}
+
+/// Reads the firehose status from `firehose_state`, the unhealed gap set
+/// and (for source lag) the running ingest's in-memory window.
+pub async fn firehose_status(
+    pool: &PgPool,
+    stats: Option<&IngestStats>,
+) -> Result<FirehoseStatus, farsight_storage::StorageError> {
+    let st = farsight_storage::firehose::read_state(pool).await?;
+    let gaps = farsight_storage::firehose::unhealed_gaps(pool).await?;
+    let now = chrono::Utc::now();
+    Ok(FirehoseStatus {
+        connected: st.connected,
+        protocol: st.protocol.map(|p| match p {
+            farsight_storage::codes::Protocol::V1 => frame::Protocol::V1,
+            farsight_storage::codes::Protocol::V2 => frame::Protocol::V2,
+        }),
+        lag_seconds: st
+            .applied_through
+            .map(|a| ((now - a).num_milliseconds() as f64 / 1000.0).max(0.0)),
+        source_lag_seconds: stats.and_then(|s| {
+            let ms = s.source_lag_ms.load(std::sync::atomic::Ordering::Relaxed);
+            (ms >= 0).then(|| ms as f64 / 1000.0)
+        }),
+        open_gaps: gaps.len(),
+    })
+}
+
 impl IngestHandle {
+    /// [`firehose_status`] for this ingest.
+    pub async fn status(&self) -> Result<FirehoseStatus, farsight_storage::StorageError> {
+        firehose_status(&self.pool, Some(&self.stats)).await
+    }
+
     /// Stops reading, lets the writer drain, waits for both tasks and
     /// flushes the approximate counters one last time.
     pub async fn shutdown(self) {
@@ -129,6 +176,9 @@ impl Ingest {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let counters = Arc::new(CounterSink::new(0));
         let stats = Arc::new(IngestStats::default());
+        stats
+            .source_lag_ms
+            .store(-1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "harness")]
         let faults = Arc::new(FaultHook::default());
 

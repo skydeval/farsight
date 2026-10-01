@@ -579,6 +579,7 @@ async fn mode_a(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
     let late = scrape(&args.metrics).await?;
     let ingest = run.ingest.take().expect("running");
     let final_stats = ingest.stats.snapshot();
+    let status = ingest.status().await.map_err(|e| e.to_string())?;
     ingest.shutdown().await;
     let (ref_events, ref_intervals, ref_protocol) = reference.stop().await;
     run.tap_task.abort();
@@ -661,6 +662,16 @@ async fn mode_a(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
     );
     // 7: metrics.
     check_metrics(c, &early, &late, run_secs);
+    // Dashboard fields produced from firehose_state and the open-gap set.
+    c.check(
+        "dashboard fields: connected, protocol, lag, source lag, open gaps",
+        status.connected
+            && status.protocol == negotiated
+            && status.lag_seconds.is_some_and(|l| (0.0..60.0).contains(&l))
+            && status.source_lag_seconds.is_some_and(|l| l >= 0.0)
+            && status.open_gaps == gaps.iter().filter(|g| g.healed_witness.is_none()).count(),
+        format!("{status:?}"),
+    );
     summary(
         &final_stats,
         &late,

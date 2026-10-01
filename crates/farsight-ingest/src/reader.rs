@@ -486,6 +486,9 @@ impl Reader {
                 let now = chrono::Utc::now().timestamp_micros();
                 if let Some(s) = lag.source_lag_seconds(now) {
                     metrics::gauge!(m::SOURCE_LAG).set(s);
+                    self.stats
+                        .source_lag_ms
+                        .store((s * 1000.0) as i64, Ordering::Relaxed);
                 }
             }
             #[cfg(feature = "harness")]

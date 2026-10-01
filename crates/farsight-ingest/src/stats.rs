@@ -30,6 +30,8 @@ pub struct IngestStats {
     pub seam_repairs: AtomicU64,
     /// Events re-read by seam repairs.
     pub seam_repair_events: AtomicU64,
+    /// Latest source lag in milliseconds (`-1` = unmeasured).
+    pub source_lag_ms: std::sync::atomic::AtomicI64,
     /// Protocol and URL of the current session.
     pub current: Mutex<Option<(String, Protocol)>>,
 }
