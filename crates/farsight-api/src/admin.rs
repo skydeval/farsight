@@ -277,15 +277,13 @@ pub async fn start_repair_cycle(st: &ApiState) -> Result<RepairStart, XrpcError>
     let (cycle, from) = match existing {
         Some((id, f)) => (id, f),
         None => {
-            let source = serde_json::to_value(st.config.current().config.backfill.sweep.source)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "relay_collections".to_owned());
+            // §7.5: repairs enumerate the relay's listRepos whatever the
+            // sweep source; the backfill process sets S_C, claims the gaps
+            // and falls back to known DIDs if the relay is down.
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO sweep_cycles (kind, source, collections, started_at, repair_from)
-                 VALUES (2, $1, '{1,2,3,4}', now(), $2) RETURNING id",
+                 VALUES (2, 'relay_repos', '{1,2,3,4}', now(), $1) RETURNING id",
             )
-            .bind(source)
             .bind(from)
             .fetch_one(&mut *tx)
             .await?;
