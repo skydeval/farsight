@@ -125,8 +125,13 @@ async fn run() -> ExitCode {
         let mode = match config::load(&path, &env) {
             Ok(m) => m,
             Err(e) => {
-                tracing::error!(error = %e, path = %path.display(), "invalid configuration");
-                eprintln!("farsight: invalid configuration in {}: {e}", path.display());
+                let source = if path.exists() {
+                    path.display().to_string()
+                } else {
+                    "the environment (FARSIGHT_SKIP_WIZARD)".to_owned()
+                };
+                tracing::error!(error = %e, source, "invalid configuration");
+                eprintln!("farsight: invalid configuration in {source}: {e}");
                 return ExitCode::from(1);
             }
         };
