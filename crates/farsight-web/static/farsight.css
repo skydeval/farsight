@@ -1,0 +1,64 @@
+/* Farsight UI: one stylesheet, no build step. */
+:root {
+  --bg: #f7f7f5; --fg: #1d1d1f; --muted: #66666c; --line: #d9d9d6;
+  --card: #ffffff; --accent: #2b5fab; --ok: #1f7a3d; --warn: #9a6200; --bad: #b3261e;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 15px; line-height: 1.5;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151517; --fg: #ececee; --muted: #a0a0a8; --line: #333338;
+          --card: #1e1e21; --accent: #7aa7ec; --ok: #5cc27f; --warn: #e0a440; --bad: #f07067; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); }
+header.top { display: flex; gap: 1.5rem; align-items: center; padding: .75rem 1.25rem;
+  border-bottom: 1px solid var(--line); background: var(--card); flex-wrap: wrap; }
+header.top .brand { font-weight: 700; letter-spacing: .02em; }
+header.top nav { display: flex; gap: 1rem; flex-wrap: wrap; }
+header.top nav a { color: var(--fg); text-decoration: none; }
+header.top nav a:hover { color: var(--accent); }
+main { max-width: 72rem; margin: 0 auto; padding: 1.25rem; }
+h1 { font-size: 1.4rem; margin: .25rem 0 1rem; }
+h2 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; }
+a { color: var(--accent); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: 1rem 1.25rem; margin: 0 0 1rem; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 1rem; }
+.stat .n { font-size: 1.3rem; font-weight: 600; }
+.stat .l { color: var(--muted); font-size: .85rem; }
+.muted { color: var(--muted); }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+.banner { border-left: 4px solid var(--warn); background: var(--card); padding: .6rem 1rem;
+  margin: 0 0 .75rem; border-radius: 4px; }
+.banner.bad { border-color: var(--bad); } .banner.ok { border-color: var(--ok); }
+table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line);
+  vertical-align: top; overflow-wrap: anywhere; }
+th { color: var(--muted); font-weight: 500; }
+code, pre, textarea.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .88rem; }
+pre { background: var(--bg); border: 1px solid var(--line); padding: .75rem; overflow: auto;
+  border-radius: 4px; }
+form.stack label { display: block; margin: .75rem 0 .25rem; font-weight: 500; }
+form.stack .hint { color: var(--muted); font-size: .85rem; margin-top: .2rem; }
+input[type=text], input[type=password], input[type=number], input[type=url], select, textarea {
+  width: 100%; max-width: 40rem; padding: .45rem .55rem; border: 1px solid var(--line);
+  border-radius: 4px; background: var(--card); color: var(--fg); font: inherit; }
+textarea { min-height: 6rem; }
+textarea.mono { min-height: 28rem; max-width: 100%; }
+button, .button { display: inline-block; padding: .45rem .9rem; border-radius: 4px;
+  border: 1px solid var(--accent); background: var(--accent); color: #fff; font: inherit;
+  cursor: pointer; text-decoration: none; }
+button.secondary, .button.secondary { background: transparent; color: var(--accent); }
+button.danger { background: var(--bad); border-color: var(--bad); }
+.row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin-top: 1rem; }
+ol.steps { display: flex; gap: .4rem; flex-wrap: wrap; list-style: none; padding: 0;
+  margin: 0 0 1rem; font-size: .85rem; }
+ol.steps li { padding: .15rem .55rem; border: 1px solid var(--line); border-radius: 999px;
+  color: var(--muted); }
+ol.steps li.cur { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+ol.steps li.done { color: var(--ok); }
+.secret { font-family: ui-monospace, monospace; font-size: 1.05rem; padding: .6rem;
+  border: 1px dashed var(--warn); border-radius: 4px; overflow-wrap: anywhere; }
+.pill { display: inline-block; padding: 0 .5rem; border-radius: 999px; font-size: .8rem;
+  border: 1px solid var(--line); }

@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Farsight — reset{% endblock %}
+{% block content %}
+<h1>Reset configuration</h1>
+{% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
+{% if unavailable %}
+<div class="banner">Reset is unavailable: this instance's configuration comes from the environment (FARSIGHT_SKIP_WIZARD).</div>
+{% else %}
+<form class="stack card" method="post" action="/reset">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<p>This deletes <code>config.toml</code>, signs out every admin session, invalidates the admin
+token <strong>and every API key</strong>, prints a new setup token to the log and returns this
+instance to the setup wizard. The database is kept; the wizard's storage step recognizes it.</p>
+<label for="hostname">Type the hostname <code>{{ hostname }}</code> to confirm</label>
+<input type="text" id="hostname" name="hostname" autocomplete="off">
+<div class="row"><button class="danger" type="submit">Reset</button></div>
+</form>
+{% endif %}
+{% endblock %}

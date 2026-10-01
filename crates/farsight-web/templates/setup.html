@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Farsight setup — {{ title }}</title>
+<link rel="stylesheet" href="/static/farsight.css">
+</head>
+<body>
+<header class="top"><span class="brand">Farsight</span><span class="muted">first-run setup · {{ version }}</span></header>
+<main>
+{% if step != "token" %}
+<ol class="steps">
+{% for s in nav %}<li class="{{ s.class }}">{{ loop.index }}. {{ s.title }}</li>{% endfor %}
+</ol>
+{% endif %}
+<h1>{{ title }}</h1>
+{% if let Some(w) = expiry_warning %}<div class="banner">{{ w }}</div>{% endif %}
+{% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
+
+{% if step == "token" %}
+<div class="card">
+<p>This instance has no configuration yet. Enter the setup token to continue. It is printed in
+the server log at start-up and every 10 minutes:</p>
+<pre>docker logs farsight</pre>
+<p class="muted">or print it again with <code>docker exec farsight farsight setup-token</code>
+(add <code>--rotate</code> for a new one).</p>
+<form class="stack" method="post" action="/setup">
+<label for="token">Setup token</label>
+<input type="text" id="token" name="token" autocomplete="off" autofocus placeholder="fst-XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX">
+<div class="row"><button type="submit">Continue</button></div>
+</form>
+</div>
+
+{% else if step == "welcome" %}
+<div class="card">
+<p>Farsight indexes the ATProto block graph — direct blocks, moderation-list blocks, lists
+and list members — and answers, per account, <em>who blocks this account</em>, for any AppView
+that asks over HTTP. Every answer says how complete it is.</p>
+<p>It stores four record types for the whole network: <code>app.bsky.graph.block</code>,
+<code>listblock</code>, <code>list</code>, and <code>listitem</code> (only for lists someone
+listblocks). It reads them live from a Jetstream firehose and, in the background, from each
+account's repo.</p>
+<h2>Disk</h2>
+<table>
+<tr><th>Stage</th><th>Data + indexes</th><th>With ~25% overhead</th></tr>
+{% for r in self.projection() %}<tr><td>{{ r.0 }}</td><td>{{ r.1 }}</td><td>{{ r.2 }}</td></tr>{% endfor %}
+</table>
+<p class="muted">Recommended: 4 vCPU, 8 GB RAM, 500 GB SSD. About 100 GB works with caveats
+(the next steps explain them).</p>
+<form method="post" action="/setup/welcome"><input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="row"><button type="submit">Next</button></div></form>
+</div>
+
+{% else if step == "identity" %}
+<form class="stack card" method="post" action="/setup/identity">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="hostname">Public hostname</label>
+<input type="text" id="hostname" name="hostname" value="{{ w.hostname }}" placeholder="farsight.example.org">
+<div class="hint">Used for absolute links and in Farsight's User-Agent. No scheme or path.</div>
+<label for="contact">Admin contact</label>
+<input type="text" id="contact" name="contact" value="{{ w.contact }}" placeholder="mailto:ops@example.org">
+<div class="hint">Shown in <code>getStats</code> and in the User-Agent, so PDS operators can reach you.</div>
+<div class="row"><a class="button secondary" href="/setup/welcome">Back</a><button type="submit">Next</button></div>
+</form>
+
+{% else if step == "firehose" %}
+<form class="stack card" method="post" action="/setup/firehose">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="urls">Jetstream URL(s), one per line</label>
+<textarea id="urls" name="urls">{{ urls_text }}</textarea>
+<div class="hint">The first is used; the others are failover instances.</div>
+<div class="row">
+<button type="submit" formaction="/setup/firehose/test" class="secondary">Test connection (≤ 10 s)</button>
+<a class="button secondary" href="/setup/identity">Back</a>
+<button type="submit">Next</button>
+</div>
+{% if !w.firehose_test.is_empty() %}<pre>{% for l in w.firehose_test %}{{ l }}
+{% endfor %}</pre>{% endif %}
+{% if !w.v2_seen %}
+<div class="banner">
+<strong>Complete coverage requires a v2 Jetstream.</strong> Farsight can only report
+<code>complete</code> coverage on a Jetstream that offers the v2 protocol, which carries
+<code>#sync</code> events. No public Bluesky Jetstream instance is known to offer v2 at this
+release: <code>wss://jetstream1.us-east.bsky.network</code>,
+<code>wss://jetstream2.us-east.bsky.network</code>,
+<code>wss://jetstream1.us-west.bsky.network</code> and
+<code>wss://jetstream2.us-west.bsky.network</code> served v1 only when checked on 2026-10-01.
+On v1 Farsight runs honestly as <code>partial</code> with reason
+<code>sync_events_unavailable</code>. Operators who need <code>complete</code> run their own v2
+Jetstream and enter it here.
+</div>
+{% else %}
+<div class="banner ok">A tested instance offers v2.</div>
+{% endif %}
+</form>
+
+{% else if step == "backfill" %}
+<form class="stack card" method="post" action="/setup/backfill">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label><input type="checkbox" name="sweep" {% if w.sweep %}checked{% endif %}> Run the systematic sweep</label>
+<div class="hint">The sweep lists every repo that holds blocks, listblocks or lists, so that
+incoming answers become complete. Without it, coverage stays <code>partial</code> +
+<code>sweep_incomplete</code>.</div>
+<label for="source">Sweep source</label>
+<select id="source" name="source">
+<option value="relay_collections" {% if w.source == "relay_collections" %}selected{% endif %}>Relay collection directory (default; a few million repos)</option>
+<option value="relay_repos" {% if w.source == "relay_repos" %}selected{% endif %}>Relay repo list (all repos, ~40M+)</option>
+<option value="plc" {% if w.source == "plc" %}selected{% endif %}>PLC export (exhaustive for did:plc)</option>
+</select>
+<label for="per_host_rps">Requests per second per PDS host</label>
+<input type="number" id="per_host_rps" name="per_host_rps" min="1" value="{{ w.per_host_rps }}">
+<label for="concurrency">Worker concurrency</label>
+<input type="number" id="concurrency" name="concurrency" min="1" value="{{ w.concurrency }}">
+<label for="max_repos_per_hour">Repos per hour cap (0 = bounded by hosts only)</label>
+<input type="number" id="max_repos_per_hour" name="max_repos_per_hour" min="0" value="{{ w.max_repos_per_hour }}">
+<label for="plc_url">PLC directory URL</label>
+<input type="url" id="plc_url" name="plc_url" value="{{ w.plc_url }}">
+<label><input type="checkbox" name="plc_seed" {% if w.plc_seed %}checked{% endif %}> Seed PDS resolution from the PLC export</label>
+<div class="hint">Resolution is the sweep's bottleneck (~4–6 days at 10 requests/s); seeding
+from the export or a PLC mirror shortens it.</div>
+<label for="disk_gb">Disk available to Postgres (GB)</label>
+<input type="number" id="disk_gb" name="disk_gb" min="1" value="{{ w.disk_gb }}">
+<div class="hint">The storage budget is 70% of it ({{ budget_text }} now). At 90% of the budget
+the sweep pauses; at 100% new list admissions are deferred and writes from non-large hosts are
+refused (and counted).</div>
+{% if let Some(d) = disk_warning %}<div class="banner">{{ d }}</div>{% endif %}
+<table>
+<tr><th>Stage</th><th>Data + indexes</th><th>With ~25% overhead</th></tr>
+{% for r in self.projection() %}<tr><td>{{ r.0 }}</td><td>{{ r.1 }}</td><td>{{ r.2 }}</td></tr>{% endfor %}
+</table>
+<label for="backlinks_url">Backlink source (optional)</label>
+<input type="url" id="backlinks_url" name="backlinks_url" value="{{ w.backlinks_url }}" placeholder="https://…">
+<div class="hint">Off by default. With a backlink index (the API shape of an existing public
+backlink index), an on-demand backfill also discovers who blocks the account, so its incoming
+answers reach <code>assisted</code> within minutes instead of waiting for the sweep. Every
+reference is verified at the author's PDS. Without one, "who blocks this member" is only as
+complete as the sweep, and responses say so.</div>
+<div class="row"><a class="button secondary" href="/setup/firehose">Back</a><button type="submit">Next</button></div>
+</form>
+
+{% else if step == "access" %}
+<form class="stack card" method="post" action="/setup/access">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="reads">Read queries</label>
+<select id="reads" name="reads">
+<option value="public" {% if self.reads_is("public") %}selected{% endif %}>Public (anyone; rate-limited per IP)</option>
+<option value="api_key" {% if self.reads_is("api_key") %}selected{% endif %}>API key required</option>
+<option value="disabled" {% if self.reads_is("disabled") %}selected{% endif %}>Disabled (admin only)</option>
+</select>
+<label for="ui">Web UI</label>
+<select id="ui" name="ui">
+<option value="public_read" {% if self.ui_is("public_read") %}selected{% endif %}>Dashboard and lookups public; admin pages need login</option>
+<option value="auth_all" {% if self.ui_is("auth_all") %}selected{% endif %}>Everything needs login</option>
+<option value="disabled" {% if self.ui_is("disabled") %}selected{% endif %}>Disabled (API only)</option>
+</select>
+<label for="password">Admin password</label>
+<input type="password" id="password" name="password" autocomplete="new-password">
+<label for="password2">Repeat password</label>
+<input type="password" id="password2" name="password2" autocomplete="new-password">
+<div class="hint">12 characters to 72 bytes. Not needed when the UI is disabled.
+{% if w.password_bcrypt.is_some() %}A password is already set; leave empty to keep it.{% endif %}</div>
+<h2>Admin token</h2>
+{% if show_token %}
+<p>The admin token authorizes every API call, including admin procedures. It is shown
+<strong>once</strong>; Farsight stores only its hash.</p>
+<div class="secret">{{ w.admin_token }}</div>
+<label><input type="checkbox" name="token_saved"> I have saved this token</label>
+{% else %}
+<p class="muted">Saved. It is not shown again.</p>
+{% endif %}
+<div class="row"><a class="button secondary" href="/setup/backfill">Back</a><button type="submit">Next</button></div>
+</form>
+
+{% else if step == "proxy" %}
+<form class="stack card" method="post" action="/setup/proxy">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<p>How do requests reach Farsight? This decides which address rate limits use; trusting the
+wrong proxy lets clients choose their own IP.</p>
+<label><input type="radio" name="proxy_choice" value="none" {% if w.proxy_choice == "none" %}checked{% endif %}> No proxy (clients connect directly)</label>
+<label><input type="radio" name="proxy_choice" value="cloudflare" {% if w.proxy_choice == "cloudflare" %}checked{% endif %}> Cloudflare (proxied DNS; trusts the bundled Cloudflare ranges dated {{ cf_as_of }})</label>
+<label><input type="radio" name="proxy_choice" value="local" {% if w.proxy_choice == "local" %}checked{% endif %}> Cloudflare Tunnel or a local reverse proxy</label>
+<input type="text" name="local_cidr" placeholder="CIDR of cloudflared or your proxy, e.g. 172.18.0.0/16" value="{% if w.proxy_choice == "local" %}{{ trusted_text }}{% endif %}">
+<select name="local_kind">
+<option value="cloudflared" {% if w.proxy_choice == "local" && self.mode_is("cloudflare") %}selected{% endif %}>cloudflared (uses CF-Connecting-IP)</option>
+<option value="forwarded" {% if w.proxy_choice == "local" && self.mode_is("forwarded") %}selected{% endif %}>reverse proxy (uses X-Forwarded-For)</option>
+</select>
+<label><input type="radio" name="proxy_choice" value="custom" {% if w.proxy_choice == "custom" %}checked{% endif %}> Custom</label>
+<textarea name="custom_cidrs" placeholder="Trusted CIDRs, one per line">{% if w.proxy_choice == "custom" %}{{ trusted_text }}{% endif %}</textarea>
+<select name="custom_mode">
+<option value="forwarded" {% if self.mode_is("forwarded") %}selected{% endif %}>X-Forwarded-For</option>
+<option value="cloudflare" {% if self.mode_is("cloudflare") %}selected{% endif %}>CF-Connecting-IP</option>
+</select>
+<label><input type="checkbox" name="proxy_ack" {% if w.proxy_ack %}checked{% endif %}> I confirm any public range above belongs to my proxy</label>
+<div class="row">
+<button type="submit" formaction="/setup/proxy/preview" class="secondary">Preview</button>
+<a class="button secondary" href="/setup/access">Back</a>
+<button type="submit">Next</button>
+</div>
+{% if !preview.is_empty() %}<h2>This request</h2><pre>{% for l in preview %}{{ l }}
+{% endfor %}</pre>{% endif %}
+</form>
+
+{% else if step == "storage" %}
+<form class="stack card" method="post" action="/setup/storage">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="dsn">PostgreSQL connection string</label>
+<input type="text" id="dsn" name="dsn" value="{{ w.dsn }}" placeholder="postgres://farsight:…@postgres:5432/farsight">
+<div class="hint">PostgreSQL 15 or newer. The database must be empty or already hold Farsight's
+schema (its data is then kept).</div>
+<div class="row">
+<button type="submit" formaction="/setup/storage/test" class="secondary">Test</button>
+<a class="button secondary" href="/setup/proxy">Back</a>
+<button type="submit">Next</button>
+</div>
+{% if !w.storage_report.is_empty() %}<pre>{% for l in w.storage_report %}{{ l }}
+{% endfor %}</pre>{% endif %}
+</form>
+
+{% else if step == "review" %}
+<div class="card">
+<p>This is the configuration that will be written to <code>config.toml</code> (0600). Secrets
+are redacted here. Every earlier step can still be revisited.</p>
+<pre>{{ review }}</pre>
+<form method="post" action="/setup/finish"><input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="row"><a class="button secondary" href="/setup/storage">Back</a><button type="submit">Write configuration and start</button></div>
+</form>
+</div>
+{% endif %}
+</main>
+</body>
+</html>

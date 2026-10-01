@@ -1,0 +1,22 @@
+<div id="dash" hx-get="/dashboard/fragment" hx-trigger="every 10s" hx-swap="outerHTML">
+{% if let Some(e) = error %}<div class="banner bad">Could not load: {{ e }}</div>{% endif %}
+{% for w in d.warnings %}<div class="banner {{ w.class }}">{{ w.text }}</div>{% endfor %}
+<div class="card"><strong>Coverage:</strong> {{ d.coverage }}</div>
+<div class="grid">
+<div class="card"><h2>Index</h2>{% for s in d.counts %}<div class="stat"><div class="n">{{ s.value }}</div><div class="l">{{ s.label }}</div></div>{% endfor %}</div>
+<div class="card"><h2>Firehose</h2><table>{% for s in d.firehose %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table>
+{% if !d.gaps.is_empty() %}<h2>Unrepaired gaps</h2><ul>{% for g in d.gaps %}<li>{{ g }}</li>{% endfor %}</ul>{% endif %}</div>
+<div class="card"><h2>Backfill</h2><table>{% for s in d.backfill %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table></div>
+<div class="card"><h2>Storage</h2>{% if d.storage.is_empty() %}<p class="muted">Not measured yet.</p>{% endif %}<table>{% for s in d.storage %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table></div>
+</div>
+<div class="grid">
+<div class="card"><h2>Exceptions</h2><table>{% for s in d.exceptions %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table></div>
+<div class="card"><h2>Lists by state</h2><table>{% for s in d.lists %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table></div>
+</div>
+<div class="card"><h2>Oldest pending lists</h2>
+{% if d.pending.is_empty() %}<p class="muted">None.</p>{% else %}<table><tr><th>List</th><th>Pending for</th></tr>{% for p in d.pending %}<tr><td><a href="/lookup/list?q={{ p.0|urlencode }}">{{ p.0 }}</a></td><td>{{ p.1 }}</td></tr>{% endfor %}</table>{% endif %}
+</div>
+<div class="card"><h2>Host buckets by lifetime interning</h2>
+{% if d.buckets.is_empty() %}<p class="muted">None yet.</p>{% else %}<table><tr><th>Bucket</th><th>Interned</th><th>Stored</th><th></th></tr>{% for b in d.buckets %}<tr><td>{{ b.0 }}</td><td>{{ b.1 }}</td><td>{{ b.2 }}</td><td>{{ b.3 }}</td></tr>{% endfor %}</table>{% endif %}
+</div>
+</div>

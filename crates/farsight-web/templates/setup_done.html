@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Farsight setup — done</title>
+<link rel="stylesheet" href="/static/farsight.css">
+</head>
+<body>
+<header class="top"><span class="brand">Farsight</span></header>
+<main>
+{% if let Some(e) = error %}
+<h1>Setup not completed</h1>
+<div class="banner bad">{{ e }}</div>
+<p><a href="/login">Go to login</a></p>
+{% else %}
+<h1>Done</h1>
+<div class="card">
+<p>The configuration is written and the setup token is deleted. Farsight is switching to
+normal mode: it runs migrations, connects to the firehose and starts serving the API.</p>
+{% if ui %}<p><a class="button" href="/login">Log in</a></p>
+<p class="muted">If the page does not load yet, wait a few seconds and reload.</p>
+{% else %}<p>The web UI is disabled; use the API with the admin token.</p>{% endif %}
+</div>
+{% endif %}
+</main>
+</body>
+</html>

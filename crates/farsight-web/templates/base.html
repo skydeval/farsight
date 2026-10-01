@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Farsight{% endblock %}</title>
+<link rel="stylesheet" href="/static/farsight.css">
+<script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+<header class="top">
+<span class="brand">Farsight</span>
+<nav>
+<a href="/">Dashboard</a>
+{% if nav.lookups %}<a href="/lookup/did">DID lookup</a><a href="/lookup/list">List lookup</a>{% endif %}
+{% if nav.admin %}<a href="/ops">Operations</a><a href="/settings">Settings</a>{% endif %}
+</nav>
+<span style="margin-left:auto">
+{% if nav.admin %}
+<form method="post" action="/logout" style="display:inline"><input type="hidden" name="csrf" value="{{ nav.csrf }}"><button class="secondary" type="submit">Log out</button></form>
+{% else %}<a href="/login">Log in</a>{% endif %}
+</span>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

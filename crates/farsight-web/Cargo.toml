@@ -8,6 +8,25 @@ license.workspace = true
 publish = false
 
 [dependencies]
+askama = "0.12"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "tokio"] }
+base64 = "0.22"
+bcrypt = "0.15"
+chrono.workspace = true
+farsight-api = { path = "../farsight-api" }
+farsight-core.workspace = true
+farsight-ingest = { path = "../farsight-ingest" }
+farsight-storage = { path = "../farsight-storage" }
+ipnet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+subtle = "2.6"
+tokio = { workspace = true, features = ["net"] }
+toml.workspace = true
+tracing = "0.1"
+url.workspace = true
 
 [lints]
 workspace = true

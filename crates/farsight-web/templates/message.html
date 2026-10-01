@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}Farsight — {{ title }}{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<div class="card"><p>{{ message }}</p>
+{% if let Some(l) = link %}<p><a class="button" href="{{ l.0 }}">{{ l.1 }}</a></p>{% endif %}
+</div>
+{% endblock %}

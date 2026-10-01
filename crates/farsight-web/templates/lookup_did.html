@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Farsight — DID lookup{% endblock %}
+{% block content %}
+<h1>DID lookup</h1>
+<form class="card row" method="get" action="/lookup/did">
+<input type="text" name="q" value="{{ q }}" placeholder="did:plc:… or handle.example" autofocus>
+<button type="submit">Look up</button>
+</form>
+{% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
+{% if let Some(d) = did %}
+<p><strong>{{ d }}</strong></p>
+{% if !backfill.is_empty() %}<div class="card"><h2>Backfill</h2>{% for l in backfill %}<div>{{ l }}</div>{% endfor %}</div>{% endif %}
+{% for s in sections %}
+<div class="card">
+<h2>{{ s.title }}</h2>
+{% if let Some(e) = s.error %}<div class="banner bad">{{ e }}</div>{% endif %}
+<p class="muted">{{ s.coverage }}</p>
+{% if s.rows.is_empty() %}<p class="muted">None known.</p>{% else %}
+<table><tr>{% for c in s.columns %}<th>{{ c }}</th>{% endfor %}</tr>
+{% for r in s.rows %}<tr>{% for v in r %}<td>{{ v }}</td>{% endfor %}</tr>{% endfor %}</table>{% endif %}
+{% if let Some(n) = s.next %}<p><a href="{{ n }}">Next page</a></p>{% endif %}
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}

@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Farsight — operations{% endblock %}
+{% block content %}
+<h1>Operations</h1>
+{% if let Some(n) = notice %}<div class="banner ok">{{ n }}</div>{% endif %}
+{% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
+{% if let Some(k) = new_key %}<div class="card"><p>New API key, shown <strong>once</strong>:</p><div class="secret">{{ k }}</div></div>{% endif %}
+
+<form class="stack card" method="post" action="/ops/backfill">
+<h2>Enqueue backfill</h2>
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="actor">Account (DID or handle)</label>
+<input type="text" id="actor" name="actor">
+<label for="priority">Priority</label>
+<select id="priority" name="priority"><option value="normal">normal</option><option value="high">high</option></select>
+<label><input type="checkbox" name="force"> Force (even if running or recently done)</label>
+<div class="row"><button type="submit">Enqueue</button></div>
+</form>
+
+<div class="card">
+<h2>Firehose and sweep</h2>
+<div class="row">
+<form method="post" action="/ops/restart-firehose"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">Restart firehose</button></form>
+{% if env_managed %}<span class="muted">The sweep toggle is managed through the environment.</span>{% else %}
+<form method="post" action="/ops/sweep"><input type="hidden" name="csrf" value="{{ csrf }}">
+{% if sweep_enabled %}<input type="hidden" name="paused" value="true"><button type="submit">Pause sweep</button>{% else %}<input type="hidden" name="paused" value="false"><button type="submit">Resume sweep</button>{% endif %}
+</form>{% endif %}
+<form method="post" action="/ops/repair"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">Start repair</button></form>
+</div>
+</div>
+
+<div class="card">
+<h2>API keys</h2>
+{% if keys.is_empty() %}<p class="muted">No keys.</p>{% else %}
+<table><tr><th>Id</th><th>Name</th><th>Scopes</th><th>Created</th><th>Last used</th><th>Revoked</th><th></th></tr>
+{% for k in keys %}<tr><td>{{ k.0 }}</td><td>{{ k.1 }}</td><td>{{ k.2 }}</td><td>{{ k.3 }}</td><td>{{ k.4 }}</td><td>{{ k.5 }}</td>
+<td>{% if k.5.is_empty() %}<form method="post" action="/ops/keys-revoke"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ k.0 }}"><button class="danger" type="submit">Revoke</button></form>{% endif %}</td></tr>{% endfor %}
+</table>{% endif %}
+<form class="stack" method="post" action="/ops/keys-create">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="name">Name</label><input type="text" id="name" name="name">
+<label>Scopes</label>
+<label><input type="checkbox" name="scope" value="read" checked> read</label>
+<label><input type="checkbox" name="scope" value="backfill"> backfill</label>
+<label><input type="checkbox" name="scope" value="backfill:high"> backfill:high</label>
+<label for="read_rps">Read rate override (requests/s, optional)</label><input type="number" id="read_rps" name="read_rps" min="1">
+<div class="row"><button type="submit">Create key</button></div>
+</form>
+</div>
+
+<div class="card">
+<h2>Recent errors</h2>
+{% if errors.is_empty() %}<p class="muted">None.</p>{% else %}
+<table><tr><th>When (UTC)</th><th>Component</th><th>DID</th><th>Message</th></tr>
+{% for e in errors %}<tr><td>{{ e.0 }}</td><td>{{ e.1 }}</td><td>{{ e.2 }}</td><td>{{ e.3 }}</td></tr>{% endfor %}</table>{% endif %}
+</div>
+{% endblock %}
