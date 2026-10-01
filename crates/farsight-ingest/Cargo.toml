@@ -7,7 +7,35 @@ repository.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Builds the stage-2 Phase B harness binary and the fault-injection hooks
+# it drives. Off by default so release builds contain neither.
+harness = ["farsight-storage/harness"]
+
+[[bin]]
+name = "farsight-ingest-harness"
+path = "src/bin/ingest_harness/main.rs"
+required-features = ["harness"]
+
 [dependencies]
+chrono.workspace = true
+farsight-core.workspace = true
+farsight-storage = { path = "../farsight-storage" }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+url.workspace = true
+zstd = "0.13"
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
