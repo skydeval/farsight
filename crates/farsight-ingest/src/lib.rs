@@ -78,6 +78,7 @@ impl IngestConfig {
                     before: t.seam_repair_before.get(),
                     after: t.seam_repair_after.get(),
                     delay: t.seam_repair_delay.get(),
+                    catchup_margin: t.seam_repair_catchup_margin.get(),
                 },
             },
             limits: Limits::from_config(c),

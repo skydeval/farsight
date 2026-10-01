@@ -216,12 +216,15 @@ pub struct FirehoseTuning {
     pub synthetic_gap_lag: ConfigDuration,
     /// No-message stall timeout (§6.3).
     pub stall_timeout: ConfigDuration,
-    /// Seam repair window start, before the resume moment (§6.3).
+    /// Seam repair window start, before the session's connect (§6.3).
     pub seam_repair_before: ConfigDuration,
-    /// Seam repair window end, after the resume moment (§6.3).
+    /// Seam repair window end, after the session caught up (§6.3).
     pub seam_repair_after: ConfigDuration,
-    /// Delay between a resume and its seam repair (§6.3).
+    /// Delay between catching up and the seam repair (§6.3).
     pub seam_repair_delay: ConfigDuration,
+    /// A session has caught up once an event's witness time is within this
+    /// much of wall time (§6.3).
+    pub seam_repair_catchup_margin: ConfigDuration,
 }
 
 impl Default for FirehoseTuning {
@@ -235,6 +238,7 @@ impl Default for FirehoseTuning {
             seam_repair_before: ConfigDuration::secs(150),
             seam_repair_after: ConfigDuration::secs(30),
             seam_repair_delay: ConfigDuration::secs(60),
+            seam_repair_catchup_margin: ConfigDuration::secs(5),
         }
     }
 }
@@ -1031,6 +1035,10 @@ mod tests {
         assert_eq!(
             c.firehose.tuning.seam_repair_delay,
             ConfigDuration::secs(60)
+        );
+        assert_eq!(
+            c.firehose.tuning.seam_repair_catchup_margin,
+            ConfigDuration::secs(5)
         );
     }
 

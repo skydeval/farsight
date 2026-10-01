@@ -67,7 +67,10 @@ The wizard asks for:
 - the setup token;
 - the public hostname and an admin contact;
 - the Jetstream source (it tests the connection and checks for v2
-  support);
+  support). The default is Bluesky's public instance
+  `wss://jetstream2.us-east.bsky.network`. The public instances serve
+  v1 only, so coverage stays `partial` until you point Farsight at a
+  self-hosted v2 Jetstream;
 - backfill preferences and the disk space available to Postgres;
 - access modes and an admin password, after which it shows the admin
   token once;
@@ -159,11 +162,13 @@ says which of the two applies.
 
 ## Prior art and compatible services
 
-- **Clearsky**, the public block-graph service. Farsight is a
-  self-hosted equivalent of what it provided, and its data model
-  matches Clearsky's.
+- **Clearsky**, the comparable public backlink index for blocks and
+  block lists. Farsight is a self-hosted equivalent of what it
+  provided, and its data model matches Clearsky's.
 - **Jetstream**, Bluesky's JSON firehose. It is Farsight's live
-  source.
+  source. Bluesky runs public instances at
+  `jetstream{1,2}.us-{east,west}.bsky.network`; they currently serve
+  only the v1 protocol, which carries no `#sync` events.
 - **Constellation** and **Slingshot** from the microcosm project, a
   backlink index and a record/identity cache. Farsight can use a
   Constellation-compatible backlink API for optional subject

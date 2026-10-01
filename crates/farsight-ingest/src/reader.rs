@@ -28,23 +28,21 @@ pub const FAILOVER_AFTER: u32 = 3;
 /// instances were observed (stage-2 Phase B) to drop events witnessed
 /// within about a second of a cursor resume — at the hand-over from replay
 /// to the live tail — while a later replay of the same window returns them.
-/// The repair re-reads a short window around the resume moment, never the
-/// whole resumed range (after a long rewind that would be hours of events).
+/// The repair re-reads the window from the session's connect to the moment
+/// it caught up to live, never the whole resumed range (after a long rewind
+/// that would be hours of events).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeamRepair {
-    /// Window start, before the resume moment (`seam_repair_before`).
+    /// Window start, before the connect (`seam_repair_before`).
     pub before: Duration,
-    /// Window end, after the resume moment (`seam_repair_after`).
+    /// Window end, after catching up (`seam_repair_after`).
     pub after: Duration,
-    /// Delay before the re-read (`seam_repair_delay`).
+    /// Delay between catching up and the re-read (`seam_repair_delay`).
     pub delay: Duration,
+    /// Caught up once an event's witness time is within this much of wall
+    /// time (`seam_repair_catchup_margin`).
+    pub catchup_margin: Duration,
 }
-
-/// A session has caught up (reached its seam) once an event's witness time
-/// passes the connect moment (allowing this much clock skew) …
-pub const SEAM_SKEW_US: i64 = 2_000_000;
-/// … or is within this much of now.
-pub const CAUGHT_UP_US: i64 = 10_000_000;
 
 impl Default for SeamRepair {
     fn default() -> Self {
@@ -52,6 +50,7 @@ impl Default for SeamRepair {
             before: Duration::from_secs(150),
             after: Duration::from_secs(30),
             delay: Duration::from_secs(60),
+            catchup_margin: Duration::from_secs(5),
         }
     }
 }
@@ -366,10 +365,11 @@ impl Reader {
         }
     }
 
-    /// Re-reads `[resume − seam_repair_before, resume + seam_repair_after]`
-    /// once, `seam_repair_delay` after the resume, through the normal
-    /// pipeline (LWW makes the duplicates stale no-ops), to recover events
-    /// the instance dropped at the resume seam (§6.3).
+    /// Re-reads `[connect − seam_repair_before, caught up +
+    /// seam_repair_after]` once, `seam_repair_delay` after catching up,
+    /// through `apply` without position state (LWW makes the duplicates
+    /// stale no-ops), to recover events the instance dropped at the
+    /// replay-to-live seam (§6.3, r17.3).
     fn spawn_seam_repair(
         &mut self,
         url: &str,
@@ -575,8 +575,9 @@ impl Reader {
             }
             if let Some(trigger) = seam_trigger {
                 let now = chrono::Utc::now().timestamp_micros();
-                if ev.witness_us >= connect_us - SEAM_SKEW_US || now - ev.witness_us <= CAUGHT_UP_US
-                {
+                let margin =
+                    i64::try_from(self.cfg.seam.catchup_margin.as_micros()).unwrap_or(i64::MAX);
+                if now - ev.witness_us <= margin {
                     seam_trigger = None;
                     tracing::warn!(
                         connect_us,
