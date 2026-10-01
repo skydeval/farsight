@@ -10,6 +10,8 @@ name: farsight
 
 x-farsight-common: &farsight-common
   image: ghcr.io/skydeval/farsight:latest
+  # Until an image is published, compose builds it from this checkout.
+  build: .
   restart: unless-stopped
   user: "10001:10001"
   env_file:
@@ -27,7 +29,9 @@ services:
     container_name: farsight
     command: ["farsight"]
     ports:
-      - "8080:8080"
+      # Only the web port is published. Set FARSIGHT_PORT to change the host
+      # side, e.g. FARSIGHT_PORT=127.0.0.1:8080 for SSH-tunnel setup.
+      - "${FARSIGHT_PORT:-8080}:8080"
     volumes:
       - farsight-config:/etc/farsight
     healthcheck:
@@ -42,6 +46,9 @@ services:
   farsight-backfill:
     <<: *farsight-common
     container_name: farsight-backfill
+    # The backfill process ships in a later stage; enable it then with
+    # `docker compose --profile backfill up -d`.
+    profiles: ["backfill"]
     command: ["farsight-backfill"]
     volumes:
       - farsight-config:/etc/farsight:ro
@@ -68,6 +75,11 @@ services:
       - max_wal_size=4GB
       - -c
       - random_page_cost=1.1
+      # Hot tables churn constantly: vacuum and analyze sooner (design §10).
+      - -c
+      - autovacuum_vacuum_scale_factor=0.05
+      - -c
+      - autovacuum_analyze_scale_factor=0.02
     volumes:
       - farsight-pgdata:/var/lib/postgresql/data
     healthcheck:

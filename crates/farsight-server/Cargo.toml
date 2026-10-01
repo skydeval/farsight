@@ -10,7 +10,7 @@ publish = false
 [features]
 # Builds the stage-3 Phase B harness binary and the API's harness hooks.
 # Off by default so release builds contain neither.
-harness = ["farsight-api/harness", "farsight-storage/harness"]
+harness = ["farsight-api/harness", "farsight-storage/harness", "dep:bcrypt"]
 
 [[bin]]
 name = "farsight"
@@ -22,6 +22,7 @@ path = "src/bin/stage3_harness/main.rs"
 required-features = ["harness"]
 
 [dependencies]
+bcrypt = { version = "0.15", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 chrono.workspace = true
 farsight-api = { path = "../farsight-api" }

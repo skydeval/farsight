@@ -583,6 +583,7 @@ name = "farsight-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bcrypt",
  "chrono",
  "farsight-api",
  "farsight-core",

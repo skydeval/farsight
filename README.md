@@ -10,9 +10,10 @@ mentions. On its own it only sees blocks from accounts it already
 indexes, so it misses everyone else. Farsight closes that gap without
 depending on a third-party index.
 
-> **Status: in development.** The design is locked and the storage
-> layer is built; ingest is in progress. The commands below describe
-> the intended deployment. No image is published yet.
+> **Status: in development.** Storage, ingest, the API, the web UI and
+> the setup wizard are built; the background backfill process is next.
+> No image is published yet: `docker compose` builds it from this
+> checkout.
 
 ## What Farsight is
 
@@ -54,12 +55,23 @@ depending on a third-party index.
 - It does not decide block policy. For example, it reports each list's
   purpose, and the consumer decides how to treat it.
 
-## Quick start (intended)
+## Quick start
 
 ```sh
-docker compose up -d
+export POSTGRES_PASSWORD='choose-a-password'
+docker compose up -d          # builds the image on first run
 docker logs farsight          # copy the setup token printed at startup
 # open http://<host>:8080 and walk the setup wizard
+```
+
+The setup token is re-printed every 10 minutes, and
+`docker exec farsight farsight setup-token` prints it on demand
+(`--rotate` replaces it). To keep the wizard off the network until it is
+done, publish the port on loopback only and use an SSH tunnel:
+
+```sh
+FARSIGHT_PORT=127.0.0.1:8080 docker compose up -d
+ssh -L 8080:127.0.0.1:8080 your-server   # then open http://127.0.0.1:8080
 ```
 
 The wizard asks for:
@@ -78,14 +90,23 @@ The wizard asks for:
 - the Postgres connection string.
 
 It then writes `/etc/farsight/config.toml` and switches Farsight to
-normal mode.
+normal mode in-process: it runs migrations, connects to the firehose and
+starts serving the API. A config reset (Settings → Reset) returns it to
+the wizard; the database is kept.
 
 For automated deployments, set `FARSIGHT_SKIP_WIZARD=1` and supply the
 config as a file, or entirely through environment variables. Nested
 config keys use one double underscore per level, for example
 `FARSIGHT__BACKFILL__SWEEP__ENABLED=true`.
 
-Set `POSTGRES_PASSWORD` in the environment before the first start.
+Set `POSTGRES_PASSWORD` in the environment before the first start; the
+compose file passes the matching connection string to Farsight, and the
+wizard's storage step is prefilled with it.
+
+`/health` returns 200 when the firehose is connected and the database
+answers within a second (compose uses it as a status check); `/livez`
+returns 200 while the process serves HTTP and is the right probe for
+orchestrators that restart unhealthy containers.
 
 ## Storage and hardware
 
