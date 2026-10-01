@@ -523,6 +523,21 @@ async fn start_run(pg: &Pg, cfg: &Config) -> Result<Run, String> {
     })
 }
 
+/// Waits for a session newer than `sessions`, then for two batches after it
+/// (batches alone can still come from a queued backlog before the reconnect).
+async fn wait_reconnect(ingest: &IngestHandle, sessions: u64, timeout: Duration) -> bool {
+    let t0 = Instant::now();
+    while t0.elapsed() < timeout {
+        let s = ingest.stats.snapshot();
+        if s.sessions > sessions {
+            let left = timeout.saturating_sub(t0.elapsed());
+            return wait_batches(ingest, s.batches + 2, left).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
 async fn wait_batches(ingest: &IngestHandle, at_least: u64, timeout: Duration) -> bool {
     let t0 = Instant::now();
     while t0.elapsed() < timeout {
@@ -798,7 +813,7 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
             let before = ingest.stats.snapshot();
             println!("[{:>5}s] websocket kill", el.as_secs());
             let _ = ingest.control.send(Control::KillSocket).await;
-            let ok = wait_batches(ingest, before.batches + 2, Duration::from_secs(120)).await;
+            let ok = wait_reconnect(ingest, before.sessions, Duration::from_secs(300)).await;
             let after = ingest.stats.snapshot();
             c.check(
                 format!("kill @{}s: reconnected and committing again", el.as_secs()),
