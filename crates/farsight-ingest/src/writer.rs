@@ -244,6 +244,11 @@ impl Writer {
         match item {
             Item::Event(_) => unreachable!("events are batched by run()"),
             Item::Session { url, protocol } => {
+                let u = url.clone();
+                self.retry_transient(|| {
+                    firehose::mark_connected(&self.pool, &u, protocol.storage())
+                })
+                .await;
                 *session = Some(SessionState {
                     url,
                     protocol,

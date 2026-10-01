@@ -105,6 +105,11 @@ fn streams() -> Vec<Stream> {
             name: "account/identity/sync events, queue collapse, poison recording",
             run: stream!(streams_more::s10_repo_events),
         },
+        Stream {
+            n: 11,
+            name: "per-instance cursors (r17.2)",
+            run: stream!(streams_more::s11_instance_cursors),
+        },
     ]
 }
 

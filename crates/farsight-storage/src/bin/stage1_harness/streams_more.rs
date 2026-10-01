@@ -1332,3 +1332,64 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
     consistency(env, c, "after repo events").await?;
     Ok(())
 }
+
+/// Stream 11 (r17.2): per-instance cursors in `firehose_cursors`.
+pub async fn s11_instance_cursors(env: &mut Env, c: &mut Checks) -> Result<()> {
+    let a = "wss://a.jetstream.test";
+    let b = "wss://b.jetstream.test";
+    let p = |url: &str, seq: i64, us: i64| FirehoseProgress {
+        source_url: url.to_owned(),
+        protocol: Protocol::V2,
+        cursor_seq: Some(seq),
+        cursor_us: Some(us),
+        applied_through: DateTime::<Utc>::from_timestamp_micros(us).expect("in range"),
+    };
+    let base = now_micros().timestamp_micros();
+    firehose::mark_connected(&env.pool, a, Protocol::V2).await?;
+    firehose_batch(env, vec![], p(a, 100, base)).await?;
+    firehose_batch(env, vec![], p(a, 120, base + 1_000)).await?;
+    // Failover to B: B's cursor space starts; A's cursor stays.
+    firehose_batch(env, vec![], p(b, 7, base + 2_000)).await?;
+    let ca = firehose::instance_cursor(&env.pool, a).await?;
+    let cb = firehose::instance_cursor(&env.pool, b).await?;
+    c.eq(
+        "A's cursor kept across the failover",
+        ca.as_ref().and_then(|x| x.cursor_seq),
+        Some(120),
+    );
+    c.check(
+        "A recorded its connect time",
+        ca.as_ref().is_some_and(|x| x.last_connected_at.is_some()),
+        "",
+    );
+    c.eq(
+        "B has its own cursor",
+        cb.as_ref().and_then(|x| x.cursor_seq),
+        Some(7),
+    );
+    let st = firehose::read_state(&env.pool).await?;
+    c.eq(
+        "firehose_state follows the current instance",
+        (st.source_url.as_deref(), st.cursor_seq),
+        (Some(b), Some(7)),
+    );
+    // Failback to A replaying older events: A's cursor never decreases.
+    firehose_batch(env, vec![], p(a, 110, base + 500)).await?;
+    let ca = firehose::instance_cursor(&env.pool, a).await?;
+    c.eq(
+        "A's cursor and last_applied_through are monotonic per instance",
+        ca.map(|x| {
+            (
+                x.cursor_seq,
+                x.last_applied_through.map(|t| t.timestamp_micros()),
+            )
+        }),
+        Some((Some(120), Some(base + 1_000))),
+    );
+    c.eq(
+        "unknown instance has no cursor",
+        firehose::instance_cursor(&env.pool, "wss://c.test").await?,
+        None,
+    );
+    Ok(())
+}

@@ -72,8 +72,91 @@ impl Txn<'_> {
         .bind(applied)
         .execute(&mut *self.conn)
         .await?;
+        // The instance's own cursor (§6.2, r17.2): monotonic per source_url,
+        // kept across failovers so a failback resumes from it.
+        sqlx::query(
+            "INSERT INTO firehose_cursors (source_url, protocol, cursor_seq, cursor_us,
+                                          last_applied_through)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (source_url) DO UPDATE SET
+               protocol = EXCLUDED.protocol,
+               cursor_seq = GREATEST(firehose_cursors.cursor_seq, EXCLUDED.cursor_seq),
+               cursor_us = GREATEST(firehose_cursors.cursor_us, EXCLUDED.cursor_us),
+               last_applied_through = GREATEST(firehose_cursors.last_applied_through,
+                                               EXCLUDED.last_applied_through)",
+        )
+        .bind(p.source_url.as_str())
+        .bind(p.protocol.code())
+        .bind(p.cursor_seq)
+        .bind(p.cursor_us)
+        .bind(p.applied_through)
+        .execute(&mut *self.conn)
+        .await?;
         Ok(())
     }
+}
+
+/// One instance's persisted cursor (`firehose_cursors`, §6.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceCursor {
+    /// The instance URL.
+    pub source_url: String,
+    /// Protocol of its last committed batch.
+    pub protocol: Option<Protocol>,
+    /// v2 cursor.
+    pub cursor_seq: Option<i64>,
+    /// v1 / timestamp cursor.
+    pub cursor_us: Option<i64>,
+    /// When a session to it last started.
+    pub last_connected_at: Option<DateTime<Utc>>,
+    /// Witness time of the last event applied from it.
+    pub last_applied_through: Option<DateTime<Utc>>,
+}
+
+type CursorRow = (
+    String,
+    Option<i16>,
+    Option<i64>,
+    Option<i64>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+);
+
+/// The persisted cursor of instance `source_url`, if it was ever used.
+pub async fn instance_cursor<'e>(
+    ex: impl PgExecutor<'e>,
+    source_url: &str,
+) -> Result<Option<InstanceCursor>> {
+    let row: Option<CursorRow> = sqlx::query_as(
+        "SELECT source_url, protocol, cursor_seq, cursor_us, last_connected_at,
+                last_applied_through
+         FROM firehose_cursors WHERE source_url = $1",
+    )
+    .bind(source_url)
+    .fetch_optional(ex)
+    .await?;
+    Ok(row.map(|r| InstanceCursor {
+        source_url: r.0,
+        protocol: r.1.and_then(Protocol::from_code),
+        cursor_seq: r.2,
+        cursor_us: r.3,
+        last_connected_at: r.4,
+        last_applied_through: r.5,
+    }))
+}
+
+/// Records that a session to `source_url` started (`last_connected_at`).
+pub async fn mark_connected(pool: &PgPool, source_url: &str, protocol: Protocol) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO firehose_cursors (source_url, protocol, last_connected_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (source_url) DO UPDATE SET last_connected_at = now()",
+    )
+    .bind(source_url)
+    .bind(protocol.code())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// The persisted firehose state.

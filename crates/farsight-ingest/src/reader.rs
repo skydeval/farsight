@@ -141,23 +141,41 @@ impl Reader {
         wait.await.is_ok()
     }
 
-    async fn persisted(&self) -> Persisted {
+    /// The resume inputs for instance `url` (§6.2, r17.2): that instance's
+    /// own cursor from `firehose_cursors` if it has one — so a failback
+    /// resumes exactly where the instance left off — with the global
+    /// running-max `applied_through` as the gap reference. An instance
+    /// without a cursor is planned as a failover (timestamp rewind).
+    async fn persisted(&self, url: &str) -> Persisted {
         let mut backoff = Duration::from_millis(200);
+        let to_proto = |p: farsight_storage::codes::Protocol| match p {
+            farsight_storage::codes::Protocol::V1 => Protocol::V1,
+            farsight_storage::codes::Protocol::V2 => Protocol::V2,
+        };
         loop {
-            match firehose::read_state(&self.pool).await {
-                Ok(s) => {
-                    return Persisted {
-                        source_url: s.source_url,
-                        protocol: s.protocol.map(|p| match p {
-                            farsight_storage::codes::Protocol::V1 => Protocol::V1,
-                            farsight_storage::codes::Protocol::V2 => Protocol::V2,
-                        }),
-                        cursor_seq: s.cursor_seq,
-                        cursor_us: s.cursor_us,
-                        applied_through_us: s.applied_through.map(|a| a.timestamp_micros()),
+            let state = firehose::read_state(&self.pool).await;
+            let inst = firehose::instance_cursor(&self.pool, url).await;
+            match (state, inst) {
+                (Ok(s), Ok(inst)) => {
+                    let applied_through_us = s.applied_through.map(|a| a.timestamp_micros());
+                    return match inst {
+                        Some(c) if c.cursor_seq.is_some() || c.cursor_us.is_some() => Persisted {
+                            source_url: Some(c.source_url),
+                            protocol: c.protocol.map(to_proto),
+                            cursor_seq: c.cursor_seq,
+                            cursor_us: c.cursor_us,
+                            applied_through_us,
+                        },
+                        _ => Persisted {
+                            source_url: s.source_url.filter(|u| u != url),
+                            protocol: s.protocol.map(to_proto),
+                            cursor_seq: None,
+                            cursor_us: None,
+                            applied_through_us,
+                        },
                     };
                 }
-                Err(e) => {
+                (Err(e), _) | (_, Err(e)) => {
                     tracing::warn!(error = %e, "reading firehose_state failed; retrying");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
@@ -173,7 +191,7 @@ impl Reader {
         url: &str,
         lag: Option<Duration>,
     ) -> Result<(Session, GapRule, bool), ConnectError> {
-        let p = self.persisted().await;
+        let p = self.persisted(url).await;
         let t = &self.cfg.tuning;
         let mut compress = self.cfg.compress;
         let mut protocols = vec![Protocol::V2, Protocol::V1];
