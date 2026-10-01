@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! farsight-ingest-harness --mode a [--minutes 15]
-//! farsight-ingest-harness --mode b [--minutes 180] [--check-every 15] [--kill-every 20]
+//! farsight-ingest-harness --mode b [--minutes 60] [--check-every 15] [--kill-every 20]
 //!                         [--pg-restart-every 60]
 //! common: [--jetstream wss://…]… [--database-url URL] [--metrics 127.0.0.1:9464] [--keep]
 //! ```
@@ -94,7 +94,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     if a.minutes == 0 {
-        a.minutes = if a.mode == 'a' { 15 } else { 180 };
+        a.minutes = if a.mode == 'a' { 15 } else { 60 };
     }
     Ok(a)
 }
@@ -814,8 +814,19 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
     let mut excluded_from_monotonic: Vec<(i64, i64)> = Vec::new();
     let t0 = Instant::now();
     let early = scrape(&args.metrics).await?;
+    // Ctrl-C / SIGINT ends the soak early but still runs the final checks.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                println!("interrupt: ending the soak early, running final checks");
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
 
-    while t0.elapsed() < total {
+    while t0.elapsed() < total && !stop.load(std::sync::atomic::Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let el = t0.elapsed();
         let ingest = run.ingest.as_ref().expect("running");

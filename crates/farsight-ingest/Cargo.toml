@@ -27,7 +27,7 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false, feat
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
