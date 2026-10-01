@@ -216,6 +216,12 @@ pub struct FirehoseTuning {
     pub synthetic_gap_lag: ConfigDuration,
     /// No-message stall timeout (§6.3).
     pub stall_timeout: ConfigDuration,
+    /// Seam repair window start, before the resume moment (§6.3).
+    pub seam_repair_before: ConfigDuration,
+    /// Seam repair window end, after the resume moment (§6.3).
+    pub seam_repair_after: ConfigDuration,
+    /// Delay between a resume and its seam repair (§6.3).
+    pub seam_repair_delay: ConfigDuration,
 }
 
 impl Default for FirehoseTuning {
@@ -226,6 +232,9 @@ impl Default for FirehoseTuning {
             failover_max_lag: ConfigDuration::mins(30),
             synthetic_gap_lag: ConfigDuration::mins(5),
             stall_timeout: ConfigDuration::secs(60),
+            seam_repair_before: ConfigDuration::secs(150),
+            seam_repair_after: ConfigDuration::secs(30),
+            seam_repair_delay: ConfigDuration::secs(60),
         }
     }
 }
@@ -1011,6 +1020,18 @@ mod tests {
         assert_eq!(c.rate_limit.query_timeout, ConfigDuration::secs(5));
         assert_eq!(c.metrics.backfill_bind, "0.0.0.0:9465");
         assert_eq!(c.firehose.tuning.synthetic_gap_lag, ConfigDuration::mins(5));
+        assert_eq!(
+            c.firehose.tuning.seam_repair_before,
+            ConfigDuration::secs(150)
+        );
+        assert_eq!(
+            c.firehose.tuning.seam_repair_after,
+            ConfigDuration::secs(30)
+        );
+        assert_eq!(
+            c.firehose.tuning.seam_repair_delay,
+            ConfigDuration::secs(60)
+        );
     }
 
     #[test]

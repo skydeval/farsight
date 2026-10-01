@@ -24,19 +24,31 @@ use crate::writer::Item;
 /// Consecutive failed sessions on one instance before failing over.
 pub const FAILOVER_AFTER: u32 = 3;
 
-/// Seam repair: how long after a resumed session's first event the side
-/// replay starts, and how far past that event it reads. Public instances
-/// were observed (stage-2 Phase B) to drop events witnessed within about a
-/// second of a timestamp-cursor resume — at the hand-over from replay to
-/// the live tail — while a later replay of the same window returns them.
-pub const SEAM_DELAY: Duration = Duration::from_secs(60);
-/// See [`SEAM_DELAY`].
-pub const SEAM_COVER_US: i64 = 30_000_000;
-/// How far before the resume moment the seam repair starts reading. The
-/// observed drops are within about a second of the seam; the repair reads a
-/// short window around it, never the whole resumed range (after a long
-/// rewind that would re-read hours of events).
-pub const SEAM_LOOKBACK_US: i64 = 150_000_000;
+/// Seam repair settings (§6.3, `firehose.tuning.seam_repair_*`). Public
+/// instances were observed (stage-2 Phase B) to drop events witnessed
+/// within about a second of a cursor resume — at the hand-over from replay
+/// to the live tail — while a later replay of the same window returns them.
+/// The repair re-reads a short window around the resume moment, never the
+/// whole resumed range (after a long rewind that would be hours of events).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeamRepair {
+    /// Window start, before the resume moment (`seam_repair_before`).
+    pub before: Duration,
+    /// Window end, after the resume moment (`seam_repair_after`).
+    pub after: Duration,
+    /// Delay before the re-read (`seam_repair_delay`).
+    pub delay: Duration,
+}
+
+impl Default for SeamRepair {
+    fn default() -> Self {
+        SeamRepair {
+            before: Duration::from_secs(150),
+            after: Duration::from_secs(30),
+            delay: Duration::from_secs(60),
+        }
+    }
+}
 
 /// Commands from the embedding process.
 #[derive(Debug)]
@@ -69,6 +81,8 @@ pub struct ReaderConfig {
     pub stall_timeout: Duration,
     /// Request zstd frames.
     pub compress: bool,
+    /// Seam repair (§6.3).
+    pub seam: SeamRepair,
 }
 
 /// The reader.
@@ -158,7 +172,7 @@ impl Reader {
         &self,
         url: &str,
         lag: Option<Duration>,
-    ) -> Result<(Session, GapRule, Cursor), ConnectError> {
+    ) -> Result<(Session, GapRule, bool), ConnectError> {
         let p = self.persisted().await;
         let t = &self.cfg.tuning;
         let mut compress = self.cfg.compress;
@@ -166,7 +180,7 @@ impl Reader {
         while let Some(proto) = protocols.first().copied() {
             let Plan { cursor, gap } = resume::plan(&p, url, proto, lag, t);
             match conn::connect(url, proto, cursor, compress).await {
-                Ok(s) => return Ok((s, gap, cursor)),
+                Ok(s) => return Ok((s, gap, p.applied_through_us.is_some())),
                 Err(ConnectError::NotOffered(code)) if proto == Protocol::V2 => {
                     tracing::debug!(url, code, "v2 not offered; falling back to v1");
                     protocols.remove(0);
@@ -190,7 +204,7 @@ impl Reader {
                             from_us: from,
                             cause: GapCause::CursorTooOld,
                         },
-                        Cursor::Live,
+                        p.applied_through_us.is_some(),
                     ));
                 }
                 Err(e) => return Err(e),
@@ -237,7 +251,8 @@ impl Reader {
                     prev_instance_lag
                 };
             let opened = self.open(&url, failover_lag).await;
-            let (mut session, rule, cursor) = match opened {
+            let failover = current_url.as_deref().is_some_and(|u| u != url.as_str());
+            let (mut session, rule, prior) = match opened {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!(url, error = %e, "connect failed");
@@ -284,7 +299,7 @@ impl Reader {
                 return;
             }
             let end = self
-                .read_session(&mut session, rule, cursor, &mut lag, &mut failures)
+                .read_session(&mut session, rule, prior, failover, &mut lag, &mut failures)
                 .await;
             session.close().await;
             set_connected_gauge(None);
@@ -315,10 +330,17 @@ impl Reader {
         }
     }
 
-    /// Re-reads `[resume moment − 150 s, resume moment + 30 s]` a minute later, through
-    /// the normal pipeline (LWW makes the duplicates stale no-ops), to
-    /// recover events the instance dropped at the resume seam.
-    fn spawn_seam_repair(&mut self, url: &str, protocol: Protocol, cursor: Cursor, first_us: i64) {
+    /// Re-reads `[resume − seam_repair_before, resume + seam_repair_after]`
+    /// once, `seam_repair_delay` after the resume, through the normal
+    /// pipeline (LWW makes the duplicates stale no-ops), to recover events
+    /// the instance dropped at the resume seam (§6.3).
+    fn spawn_seam_repair(
+        &mut self,
+        url: &str,
+        protocol: Protocol,
+        first_us: i64,
+        trigger: &'static str,
+    ) {
         self.repairs.0.retain(|h| !h.is_finished());
         let url = url.to_owned();
         let tx = self.tx.clone();
@@ -328,17 +350,15 @@ impl Reader {
         let tap = self.tap.clone();
         // The seam is at the moment of the resume, not at the replay's first
         // event (which is up to 120 s earlier on v1, or hours on a rewind).
-        // Read [seam − lookback, seam + cover] with a timestamp cursor (both
-        // protocols accept µs), never from before the session's own cursor.
+        // Read [seam − before, seam + after] with a timestamp cursor (both
+        // protocols accept µs).
+        let cfg = self.cfg.seam;
+        let us = |d: Duration| i64::try_from(d.as_micros()).unwrap_or(i64::MAX);
         let seam = first_us.max(chrono::Utc::now().timestamp_micros());
-        let until = seam + SEAM_COVER_US;
-        let start = (seam - SEAM_LOOKBACK_US).max(match cursor {
-            Cursor::TimeUs(t) => t,
-            _ => i64::MIN,
-        });
-        let cursor = Cursor::TimeUs(start);
+        let until = seam + us(cfg.after);
+        let cursor = Cursor::TimeUs(seam - us(cfg.before));
         let handle = tokio::spawn(async move {
-            tokio::time::sleep(SEAM_DELAY).await;
+            tokio::time::sleep(cfg.delay).await;
             let mut s = match conn::connect(&url, protocol, cursor, compress).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -370,7 +390,9 @@ impl Reader {
             s.close().await;
             stats.seam_repairs.fetch_add(1, Ordering::Relaxed);
             stats.seam_repair_events.fetch_add(n, Ordering::Relaxed);
-            tracing::info!(events = n, "seam repair replayed");
+            metrics::counter!(m::SEAM_REPAIRS, "trigger" => trigger).increment(1);
+            metrics::counter!(m::SEAM_REPAIR_EVENTS).increment(n);
+            tracing::info!(events = n, trigger, "seam repair replayed");
         });
         self.repairs.0.push(handle);
     }
@@ -386,7 +408,8 @@ impl Reader {
         &mut self,
         session: &mut Session,
         rule: GapRule,
-        cursor: Cursor,
+        prior: bool,
+        failover: bool,
         lag: &mut LagTracker,
         failures: &mut u32,
     ) -> End {
@@ -448,20 +471,30 @@ impl Reader {
             if first {
                 first = false;
                 *failures = 0;
-                if cursor != Cursor::Live {
-                    self.spawn_seam_repair(
-                        &session.url_base,
-                        session.protocol,
-                        cursor,
-                        ev.witness_us,
-                    );
-                }
-                if let Some((from_us, to_us, cause)) = resume::gap_for_first_event(
+                let gap = resume::gap_for_first_event(
                     rule,
                     ev.witness_us,
                     clamped_notice,
                     &self.cfg.tuning,
-                ) {
+                );
+                // §6.3: after any resume with a prior position (skipped only
+                // on the first-ever start).
+                if prior {
+                    let trigger = if gap.is_some() {
+                        "clamp_recovery"
+                    } else if failover {
+                        "failover"
+                    } else {
+                        "resume"
+                    };
+                    self.spawn_seam_repair(
+                        &session.url_base,
+                        session.protocol,
+                        ev.witness_us,
+                        trigger,
+                    );
+                }
+                if let Some((from_us, to_us, cause)) = gap {
                     tracing::warn!(from_us, to_us, ?cause, "resume gap");
                     if self
                         .tx

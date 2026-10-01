@@ -377,6 +377,12 @@ impl Writer {
             None => return,
         };
         let apply_secs = apply_started.elapsed().as_secs_f64();
+        // §6.4 (r17): an unknown DID becoming active is recorded only as a
+        // metric, under the `account` collection.
+        if report.unknown_activations > 0 {
+            metrics::counter!(m::EVENTS, "collection" => "account", "op" => "activate", "outcome" => "applied")
+                .increment(report.unknown_activations);
+        }
         for (outcome, (c, op)) in report.write_outcomes.iter().zip(&labels) {
             metrics::counter!(m::EVENTS, "collection" => c.nsid(), "op" => *op, "outcome" => outcome.label())
                 .increment(1);
@@ -506,6 +512,7 @@ impl Writer {
                         merged.applied += r.applied;
                         merged.write_outcomes.extend(r.write_outcomes);
                         merged.deleted_accounts.extend(r.deleted_accounts);
+                        merged.unknown_activations += r.unknown_activations;
                         break;
                     }
                     Err(e) => {

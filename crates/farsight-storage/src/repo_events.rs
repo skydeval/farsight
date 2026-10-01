@@ -5,7 +5,7 @@
 //! | Event | Effect |
 //! |---|---|
 //! | `identity` | known DID ⇒ PDS cache cleared (`pds_resolved_at = NULL`) |
-//! | `account` | known DID ⇒ status per §7.4; `desynchronized` ⇒ `resync` debt; **any** DID becoming active: known with `inactive_at_listing` or a hidden status ⇒ `resync` debt + **OA** on its `unavailable` lists; unknown ⇒ tier-2 job, no debt; `deleted` ⇒ purge after commit |
+//! | `account` | known DID ⇒ status per §7.4; `desynchronized` ⇒ `resync` debt; **any** DID becoming active: known with `inactive_at_listing` or a hidden status ⇒ `resync` debt + **OA** on its `unavailable` lists; unknown ⇒ no row, no job (counted in the report; r17, T4); `deleted` ⇒ purge after commit |
 //! | `#sync` | any DID ⇒ `resync` debt + tier-1 `system:resync` re-list |
 
 use chrono::{DateTime, Utc};
@@ -13,7 +13,7 @@ use farsight_core::Did;
 
 use crate::codes::{DebtReason, TrackState, actor_status};
 use crate::error::Result;
-use crate::queue::{self, JobKind, SYSTEM_FIREHOSE, SYSTEM_RESYNC};
+use crate::queue::{self, JobKind, SYSTEM_RESYNC};
 use crate::tracking::FireArgs;
 use crate::transition::Event;
 use crate::txn::Txn;
@@ -146,19 +146,12 @@ impl Txn<'_> {
                 .await?;
                 self.report.repo_events += 1;
                 let Some((id, old, inactive_at_listing, status_at)) = known else {
+                    // §6.4 (r17, T4): an unknown DID becoming active gets no
+                    // row and no job, only a metric. Its first authored
+                    // indexed record interns it and enqueues the tier-2 job
+                    // (see `apply`).
                     if *active {
-                        // Unknown DID becoming active: tier-2 job, no debt.
-                        let author = self.author(did).await?;
-                        queue::enqueue(
-                            &mut *self.conn,
-                            author.id,
-                            JobKind::Repo,
-                            2,
-                            priority::NORMAL,
-                            SYSTEM_FIREHOSE,
-                            None,
-                        )
-                        .await?;
+                        self.report.unknown_activations += 1;
                     }
                     return Ok(());
                 };

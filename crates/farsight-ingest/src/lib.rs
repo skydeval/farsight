@@ -74,6 +74,11 @@ impl IngestConfig {
                 },
                 stall_timeout: t.stall_timeout.get(),
                 compress: true,
+                seam: reader::SeamRepair {
+                    before: t.seam_repair_before.get(),
+                    after: t.seam_repair_after.get(),
+                    delay: t.seam_repair_delay.get(),
+                },
             },
             limits: Limits::from_config(c),
             #[cfg(feature = "harness")]

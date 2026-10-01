@@ -23,8 +23,15 @@ pub const BUFFER_DEPTH: &str = "farsight_ingest_buffer_depth";
 /// `farsight_ingest_dropped_total{reason}` (counter).
 pub const DROPPED: &str = "farsight_ingest_dropped_total";
 
+/// `farsight_firehose_seam_repairs_total{trigger}` (counter; §6.3).
+pub const SEAM_REPAIRS: &str = "farsight_firehose_seam_repairs_total";
+/// `farsight_firehose_seam_repair_events_total` (counter).
+pub const SEAM_REPAIR_EVENTS: &str = "farsight_firehose_seam_repair_events_total";
+
 /// Every stage-2 metric name.
-pub const ALL: [&str; 9] = [
+pub const ALL: [&str; 11] = [
+    SEAM_REPAIRS,
+    SEAM_REPAIR_EVENTS,
     CONNECTED,
     LAG,
     SOURCE_LAG,
@@ -57,6 +64,11 @@ pub fn describe() {
         "firehose commit events by collection, op and outcome (applied, stale, refused, dropped)"
     );
     describe_counter!(RECONNECTS, "Jetstream reconnects by reason");
+    describe_counter!(
+        SEAM_REPAIRS,
+        "seam repairs after cursor resumes, by trigger"
+    );
+    describe_counter!(SEAM_REPAIR_EVENTS, "events re-read by seam repairs");
     describe_gauge!(OPEN_GAPS, "unhealed firehose gaps");
     describe_histogram!(
         BATCH_SECONDS,
@@ -100,6 +112,12 @@ pub fn register_zeroes() {
             }
         }
     }
+    for trigger in ["resume", "failover", "clamp_recovery"] {
+        metrics::counter!(SEAM_REPAIRS, "trigger" => trigger).increment(0);
+    }
+    metrics::counter!(SEAM_REPAIR_EVENTS).increment(0);
+    metrics::counter!(EVENTS, "collection" => "account", "op" => "activate", "outcome" => "applied")
+        .increment(0);
     for p in ["v1", "v2"] {
         metrics::gauge!(CONNECTED, "protocol" => p).set(0.0);
     }

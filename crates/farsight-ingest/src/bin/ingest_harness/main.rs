@@ -428,7 +428,7 @@ fn check_metrics(c: &mut Checks, early: &Scrape, late: &Scrape, run_secs: f64) {
         })
         .collect();
     c.check(
-        "metrics: all nine stage-2 metrics exposed",
+        "metrics: all stage-2 metrics exposed",
         missing.is_empty(),
         format!("missing {missing:?}"),
     );
@@ -742,6 +742,13 @@ fn summary(
         }
     }
     println!("  events by outcome: {by_outcome:?}");
+    for (k, v) in m.iter().filter(|(k, _)| {
+        k.starts_with(im::SEAM_REPAIRS)
+            || k.starts_with(im::SEAM_REPAIR_EVENTS)
+            || k.contains("collection=\"account\"")
+    }) {
+        println!("  {k} = {v}");
+    }
     for g in gaps {
         println!(
             "  gap {:?}: {} → {:?} healed {:?}",

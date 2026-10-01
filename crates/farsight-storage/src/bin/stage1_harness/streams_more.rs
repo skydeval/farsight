@@ -1135,10 +1135,11 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         "",
     );
 
-    // Unknown DID becoming active ⇒ tier-2 job, no debt; unknown inactive ⇒ nothing.
+    // r17 (T4): an unknown DID becoming active gets no row and no job, only
+    // a count; its first authored record interns it and enqueues tier 2.
     let u = plc("evunknown", 1);
     let gone = plc("evunknown", 2);
-    events_batch(
+    let r = events_batch(
         env,
         vec![
             E::Account {
@@ -1157,18 +1158,34 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
     )
     .await?;
     c.eq(
-        "unknown active DID ⇒ tier-2 repo job",
+        "unknown active DID ⇒ counted only",
+        r.unknown_activations,
+        1,
+    );
+    c.eq("unknown active DID ⇒ no row", env.actor_id(&u).await?, None);
+    c.eq(
+        "unknown inactive DID ⇒ no row",
+        env.actor_id(&gone).await?,
+        None,
+    );
+    env.firehose(vec![block(&u, "first", &b, rev(6))]).await?;
+    c.eq(
+        "first authored record ⇒ tier-2 repo job",
         queue_of(env, &u).await?,
         Some((2, 0, "system:firehose".into())),
     );
     c.eq(
-        "unknown active DID ⇒ no debt",
+        "first authored record ⇒ no debt",
         env.debt(&u, DebtReason::Resync.code()).await?,
         None,
     );
+    // Not for listings (only the firehose's first sight of an author).
+    let listed = plc("evlisted", 1);
+    env.listing(vec![block(&listed, "k", &b, 0)], rev(7))
+        .await?;
     c.eq(
-        "unknown inactive DID ⇒ no row",
-        env.actor_id(&gone).await?,
+        "a listing's new author gets no tier-2 job",
+        queue_of(env, &listed).await?,
         None,
     );
 

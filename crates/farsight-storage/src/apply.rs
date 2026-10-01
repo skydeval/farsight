@@ -339,6 +339,25 @@ async fn apply_once(
         for (r, c) in batch.reconciles.iter().zip(candidates) {
             apply_reconcile(&mut t, r, &c).await?;
         }
+        // §6.4 (r17, T4): a DID's first authored indexed record seen on the
+        // firehose interns it (above) and takes the active-DID branch here:
+        // a tier-2 repo job, so its pre-existing records get listed.
+        if batch.origin == Origin::Firehose && !batch.writes.is_empty() {
+            let new: Vec<i64> = std::mem::take(&mut t.report.new_authors);
+            for id in &new {
+                crate::queue::enqueue(
+                    &mut *t.conn,
+                    *id,
+                    crate::queue::JobKind::Repo,
+                    2,
+                    crate::repo_events::priority::NORMAL,
+                    crate::queue::SYSTEM_FIREHOSE,
+                    None,
+                )
+                .await?;
+            }
+            t.report.new_authors = new;
+        }
         let cap = ctx.limits.system_queue_cap;
         for e in &batch.events {
             t.apply_repo_event(e, cap).await?;

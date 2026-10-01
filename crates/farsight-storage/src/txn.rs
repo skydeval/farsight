@@ -176,6 +176,10 @@ pub struct ApplyReport {
     pub repo_events: u64,
     /// Account events older than the stored `status_at` (replays), skipped.
     pub stale_repo_events: u64,
+    /// Unknown DIDs that became active: counted only (§6.4, r17).
+    pub unknown_activations: u64,
+    /// Authors whose `actors` row this transaction created.
+    pub new_authors: Vec<i64>,
     /// `resync` debts raised by `#sync` / account events.
     pub resyncs: u64,
     /// Accounts that became `deleted`: the caller purges them after commit
@@ -340,6 +344,7 @@ impl<'c> Txn<'c> {
                 self.charge_intern(&key, None).await?;
                 let id = self.insert_actor(did.as_str()).await?;
                 self.deltas.host(&buckets, CapKind::Interned, 1);
+                self.report.new_authors.push(id);
                 (id, facts)
             }
         };
