@@ -43,6 +43,8 @@ pub struct Limits {
     pub synthetic_gap_lag: Duration,
     /// `storage.tombstone_ttl`.
     pub tombstone_ttl: Duration,
+    /// `backfill.system_queue_cap` (system requesters' waiting entries).
+    pub system_queue_cap: i64,
 }
 
 impl Limits {
@@ -52,6 +54,7 @@ impl Limits {
             cfg: config.limits.clone(),
             synthetic_gap_lag: config.firehose.tuning.synthetic_gap_lag.get(),
             tombstone_ttl: config.storage.tombstone_ttl.get(),
+            system_queue_cap: clamp(config.backfill.system_queue_cap),
         }
     }
 

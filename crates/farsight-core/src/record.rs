@@ -263,7 +263,7 @@ pub fn parse_record(
             let name = value
                 .get("name")
                 .and_then(Value::as_str)
-                .map(|n| truncate_chars(n, MAX_LIST_NAME_CHARS).to_owned());
+                .map(|n| truncate_chars(n, MAX_LIST_NAME_CHARS).replace('\0', ""));
             Ok(Record::List(ListRecord {
                 purpose,
                 name,
@@ -551,6 +551,13 @@ mod tests {
         ] {
             assert_eq!(ListPurpose::from_code(p.code()), p);
         }
+    }
+
+    #[test]
+    fn list_name_nul_stripped() {
+        let r = parse_record(&did(A), Collection::List, &json!({"name": "a\u{0}b"})).unwrap();
+        let Record::List(l) = r else { panic!() };
+        assert_eq!(l.name.as_deref(), Some("ab"));
     }
 
     #[test]

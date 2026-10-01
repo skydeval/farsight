@@ -445,3 +445,34 @@ pub async fn retry_deferred(
     }
     Ok(out)
 }
+
+/// Purges every authored row of an account that became `deleted`
+/// (§7.4), batch by batch, firing RD on its lists.
+pub async fn purge_account(
+    pool: &PgPool,
+    limits: &Limits,
+    counters: &CounterSink,
+    did: &Did,
+) -> Result<()> {
+    while !purge_account_batch(pool, limits, counters, did, PURGE_BATCH).await? {}
+    Ok(())
+}
+
+/// Accounts with status `deleted` that still author rows (a purge was
+/// interrupted, e.g. by a crash after the status commit). Ingest runs
+/// these at start-up.
+pub async fn accounts_pending_purge(pool: &PgPool, limit: i64) -> Result<Vec<Did>> {
+    let dids: Vec<String> = sqlx::query_scalar(
+        "SELECT did FROM actors a WHERE a.status = $1
+           AND (a.authored_blocks > 0 OR a.authored_listblocks > 0 OR a.owned_items > 0
+                OR EXISTS (SELECT 1 FROM lists l WHERE l.owner_id = a.id AND l.record_state <> 2))
+         ORDER BY id LIMIT $2",
+    )
+    .bind(crate::codes::actor_status::DELETED)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    dids.iter()
+        .map(|d| Did::parse(d).map_err(|e| StorageError::Invariant(e.to_string())))
+        .collect()
+}

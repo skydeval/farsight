@@ -142,3 +142,27 @@ pub async fn counts_by_reason<'e>(ex: impl PgExecutor<'e>) -> Result<HashMap<Deb
         .filter_map(|(r, n)| DebtReason::from_code(r).map(|r| (r, n)))
         .collect())
 }
+
+/// `resync` debts older than `after` (by `created_at`, the first cause)
+/// become terminal: replaced by `unreachable` (§3.7.3, §6.2: 7 days).
+/// Returns how many were replaced.
+pub async fn expire_resyncs(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    after: std::time::Duration,
+) -> Result<u64> {
+    let cutoff = now
+        - chrono::Duration::from_std(after)
+            .map_err(|e| crate::error::StorageError::Invariant(e.to_string()))?;
+    let stale: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT actor_id, since_witness FROM relist_debt WHERE reason = $1 AND created_at < $2",
+    )
+    .bind(DebtReason::Resync.code())
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+    for (actor, since) in &stale {
+        replace_resync_with_unreachable(pool, *actor, *since).await?;
+    }
+    Ok(stale.len() as u64)
+}

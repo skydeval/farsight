@@ -30,9 +30,12 @@ use crate::counters::{CounterSink, stat};
 use crate::error::{Result, StorageError};
 use crate::firehose::FirehoseProgress;
 use crate::keys::{self, CapKind, Limits};
+use crate::repo_events::{RepoEvent, unavailable_list_keys};
 use crate::tracking::FireArgs;
 use crate::transition::Event;
-use crate::txn::{ApplyReport, AuthorInfo, Cause, Gates, Refusal, Txn, lww_upsert_wins};
+use crate::txn::{
+    ApplyReport, AuthorInfo, Cause, Gates, Refusal, Txn, WriteOutcome, lww_upsert_wins,
+};
 
 /// Maximum attempts of one batch transaction when deadlocks abort it.
 pub const MAX_DEADLOCK_ATTEMPTS: u32 = 8;
@@ -116,6 +119,8 @@ pub struct Batch {
     pub writes: Vec<Write>,
     /// Reconciles, applied after the writes.
     pub reconciles: Vec<Reconcile>,
+    /// Non-commit firehose events, applied after the writes (§6.4).
+    pub events: Vec<RepoEvent>,
     /// Firehose progress to persist atomically with the writes.
     pub firehose: Option<FirehoseProgress>,
 }
@@ -127,6 +132,7 @@ impl Batch {
             origin,
             writes: Vec::new(),
             reconciles: Vec::new(),
+            events: Vec::new(),
             firehose: None,
         }
     }
@@ -213,6 +219,9 @@ async fn apply_once(
         for r in &batch.reconciles {
             authors.insert(&r.author);
         }
+        for e in &batch.events {
+            authors.insert(e.did());
+        }
         let author_keys: BTreeSet<i64> = authors
             .iter()
             .map(|d| keys::author_lock_key(d.as_str()))
@@ -277,6 +286,13 @@ async fn apply_once(
             candidates.push(c);
         }
 
+        // A reactivation fires OA on the DID's unavailable lists.
+        for e in batch.events.iter().filter(|e| e.may_reactivate()) {
+            for (_, lrkey) in unavailable_list_keys(&mut t, e.did()).await? {
+                locks.add(e.did().as_str(), &lrkey, true);
+            }
+        }
+
         // 3. List locks.
         t.lock_lists(&locks.0).await?;
 
@@ -306,10 +322,26 @@ async fn apply_once(
 
         // 4. Writes, then reconciles.
         for w in &batch.writes {
+            let before = (t.report.stale, t.report.refused, t.report.untracked_items);
             apply_write(&mut t, &batch.origin, w).await?;
+            let after = (t.report.stale, t.report.refused, t.report.untracked_items);
+            let outcome = if after.0 > before.0 {
+                WriteOutcome::Stale
+            } else if after.1 > before.1 {
+                WriteOutcome::Refused
+            } else if after.2 > before.2 {
+                WriteOutcome::Dropped
+            } else {
+                WriteOutcome::Applied
+            };
+            t.report.write_outcomes.push(outcome);
         }
         for (r, c) in batch.reconciles.iter().zip(candidates) {
             apply_reconcile(&mut t, r, &c).await?;
+        }
+        let cap = ctx.limits.system_queue_cap;
+        for e in &batch.events {
+            t.apply_repo_event(e, cap).await?;
         }
 
         // 5. Firehose progress and notify.

@@ -44,8 +44,14 @@ impl Txn<'_> {
              ON CONFLICT (id) DO UPDATE SET
                source_url = EXCLUDED.source_url,
                protocol = EXCLUDED.protocol,
-               cursor_seq = EXCLUDED.cursor_seq,
-               cursor_us = EXCLUDED.cursor_us,
+               -- Monotonic per instance (a v1 resume replays from cursor − 120 s);
+               -- a different instance (failover) restarts the cursor space.
+               cursor_seq = CASE WHEN firehose_state.source_url IS NOT DISTINCT FROM EXCLUDED.source_url
+                                 THEN GREATEST(firehose_state.cursor_seq, EXCLUDED.cursor_seq)
+                                 ELSE EXCLUDED.cursor_seq END,
+               cursor_us = CASE WHEN firehose_state.source_url IS NOT DISTINCT FROM EXCLUDED.source_url
+                                THEN GREATEST(firehose_state.cursor_us, EXCLUDED.cursor_us)
+                                ELSE EXCLUDED.cursor_us END,
                applied_through = GREATEST(firehose_state.applied_through, EXCLUDED.applied_through),
                first_applied_at = COALESCE(firehose_state.first_applied_at, clock_timestamp()),
                connected = true

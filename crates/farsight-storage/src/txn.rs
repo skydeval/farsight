@@ -106,6 +106,31 @@ pub struct TransitionRecord {
     pub effects: Vec<crate::transition::Effect>,
 }
 
+/// What happened to one write (`farsight_firehose_events_total` outcome).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WriteOutcome {
+    /// Changed stored state (deletes always record a tombstone).
+    Applied,
+    /// Lost to LWW (older or equal stamp).
+    Stale,
+    /// Refused by a cap, rate, gate or deletes-only mode.
+    Refused,
+    /// Not stored and not a refusal: a listitem whose list is untracked.
+    Dropped,
+}
+
+impl WriteOutcome {
+    /// Metric label.
+    pub fn label(self) -> &'static str {
+        match self {
+            WriteOutcome::Applied => "applied",
+            WriteOutcome::Stale => "stale",
+            WriteOutcome::Refused => "refused",
+            WriteOutcome::Dropped => "dropped",
+        }
+    }
+}
+
 /// One refused or uncounted write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusalRecord {
@@ -145,6 +170,15 @@ pub struct ApplyReport {
     pub transitions: Vec<TransitionRecord>,
     /// Deadlock aborts retried before success.
     pub deadlock_retries: u32,
+    /// Per write, in batch order: what happened to it.
+    pub write_outcomes: Vec<WriteOutcome>,
+    /// Non-commit events applied (identity, account, sync).
+    pub repo_events: u64,
+    /// `resync` debts raised by `#sync` / account events.
+    pub resyncs: u64,
+    /// Accounts that became `deleted`: the caller purges them after commit
+    /// (§7.4; multi-transaction, see `janitor::purge_account`).
+    pub deleted_accounts: Vec<Did>,
     /// Whether `NOTIFY farsight_coverage` was sent.
     pub notified: bool,
 }
