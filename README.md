@@ -42,12 +42,13 @@ depending on a third-party index.
 - A small server-rendered web UI with a first-run setup wizard,
   dashboard, lookups, operations and settings.
 - An optional **public UI** under `/public`, off by default: a lookup
-  site where anyone can see who blocks an account or a list, with
-  coverage stated per section. See [Public UI](#public-ui).
+  site where anyone can see who blocks an account or a list. Coverage
+  is stated per section in the admin UI; the public UI shows a single
+  "Last updated" line per page. See [Public UI](#public-ui).
 - A record of the blocks, listblocks and list memberships it stored
   and later removed, kept for a year by default
-  (`storage.block_history_retention`) and shown only on the public UI's
-  history pages. No API endpoint returns it.
+  (`storage.block_history_retention`) and shown only in the admin UI.
+  No API endpoint returns it.
 
 ## What Farsight is not
 
@@ -137,14 +138,32 @@ confirm. It needs `access.reads = "public"` and `access.ui =
 "public_read"`: a public site in front of a gated API is not a
 supported combination.
 
-- **Coverage is stated honestly.** Every section prints the coverage of
-  the data it was built from (`Complete`, `Best effort` or `Partial`,
-  with the reasons), and the page summary is the lowest of its sections.
-  Times are absolute UTC.
-- **Removed records** (`show_history`, on by default): blocks and list
-  memberships Farsight stored and later removed, with what the record
-  can and cannot show spelled out on the page. This data has no other
-  public source; turn it off if you do not want to publish it.
+- **A bar on every page** with search and a light / dark / system
+  theme toggle. Public pages link only to other public pages (and to
+  the record viewer, if you set one): no login link, no admin route.
+- **No coverage detail.** A public page prints no coverage level. It
+  says "None on record at this instance" for an empty section, says so
+  when a list is not indexed, and ends with one "Last updated" line.
+  The dashboard and the lookup pages state coverage in full.
+- **Profile cards.** Resting the pointer on an account in a row (or
+  focusing it with the keyboard) opens a card with its avatar, verified
+  handle, DID and the date the DID was created. Farsight fetches that
+  from the PLC directory and the account's own server when the card is
+  asked for, and stores none of it. Touch devices get no cards.
+- **Avatars come from the account's own server** (`show_avatars`, on by
+  default): the visitor's browser fetches the image there, so that
+  server's operator sees the visitor's address. Set it to `false` and
+  visitors' browsers talk only to your instance; cards keep everything
+  else.
+- **Record links** (`record_viewer_url`, empty by default): block and
+  listblock records are shown as `at://` text. Give a URL template with
+  `{authority}`, `{collection}` and `{rkey}` and each becomes a link to
+  that viewer.
+- **Times** are sent as absolute UTC and shown in the visitor's own
+  timezone by the page's script.
+- **Removed records are not public.** Blocks and list memberships
+  Farsight stored and later removed are on admin pages, reached from
+  the DID and list lookups after login.
 - **Outgoing blocks** (`show_outgoing_blocks`, off by default): the
   blocks an account has made.
 - **Accounts that are not shown.** Deactivated, suspended, taken-down
@@ -153,12 +172,12 @@ supported combination.
   neutral notice. Exclusion changes what the public pages show, nothing
   else: the API still returns the data.
 - **Search engines** are asked to stay out unless you set `crawlable`.
-  History, search and error pages are never offered.
+  Search, cards and error pages are never offered.
 - **Link previews** carry a title, a fixed description and one static
   image, never data: a count in a preview is a stale claim with no date.
 - Pages are safe to cache at the edge (they do not depend on the
-  visitor), carry a strict Content-Security-Policy, and need no
-  JavaScript to read.
+  visitor), carry a strict Content-Security-Policy with no inline
+  script, and need no JavaScript to read.
 
 Every `[public_ui]` key applies on save, without a restart:
 
@@ -170,7 +189,10 @@ public_ui = false                 # the toggle
 instance_description = ""         # plain text on the home page
 contact = ""                      # "" = server.contact
 show_outgoing_blocks = false
-show_history = true
+record_viewer_url = ""            # "" = records are not links
+show_avatars = true               # false = cards carry no image
+card_rps = 4                      # cards fetched per second, all visitors
+card_burst = 8
 show_opengraph_image = true
 dark_mode_default = "system"      # "light" | "dark" | "system"
 crawlable = false
@@ -181,8 +203,31 @@ handle_cache_ttl = "1h"
 excluded_dids = []                # at most 10,000
 ```
 
-Search and history pages share the lookup rate
-(`rate_limit.ui_lookup_rps`, 1 per second per address).
+Search shares the lookup rate (`rate_limit.ui_lookup_rps`, 1 per second
+per address). Cards have their own: 2 per second per address, and
+`card_rps` / `card_burst` for the whole instance. Each card makes
+Farsight send at most three requests (the PLC directory, the handle's
+host, the account's server); these are not counted in
+`backfill.plc_rps`, so lower one of the two if your PLC source has a
+tight limit. With the budget used up, cards show the DID only. A PLC
+mirror must serve `/{did}/log/audit` for cards to show a creation date.
+
+`show_history` is retired. A config that still has it loads, with a
+warning; the value does nothing, and the key is removed the next time
+you save the Public UI settings.
+
+### Upgrading from an earlier version
+
+- **The admin login is at `/enter`.** `/login` is a 404. Update
+  bookmarks, and any proxy or firewall rule that names `/login`.
+- **`/public/about` and the public history pages are gone** (404).
+  History is under `/admin/…/history`, after login.
+- With avatars on, the `Content-Security-Policy` of public pages allows
+  images from `https:` origins. A proxy that sets its own policy for
+  `/public/*` must allow that, or set `show_avatars = false`.
+- An older binary refuses a config that holds `record_viewer_url`,
+  `show_avatars`, `card_rps` or `card_burst`. Delete those lines before
+  rolling back.
 
 ## Storage and hardware
 
@@ -222,7 +267,7 @@ stops recording.
      `query.getBackfillStatus`.
    - If the public UI is on, make `/public/*` eligible for cache and
      respect origin headers.
-   - Bypass the cache for `/admin*`, `/setup*`,
+   - Bypass the cache for `/admin*`, `/enter`, `/setup*`,
      `/xrpc/app.nearhorizon.farsight.admin.*`, `/health` and `/livez`.
 4. Lock the origin with Cloudflare Tunnel or Authenticated Origin
    Pulls. Firewalling the origin to Cloudflare's IP ranges alone is not
