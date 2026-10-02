@@ -842,12 +842,12 @@ pub fn robots_body(cfg: &Config) -> &'static str {
     }
 }
 
-/// `GET /robots.txt`: served in normal mode unless `ui = disabled`,
-/// whatever the toggle.
+/// `GET /robots.txt`: served in normal mode whenever the public UI is on
+/// or the admin UI is not disabled.
 async fn robots(State(st): St) -> Response {
     let started = Instant::now();
     let cfg = st.api.config.current();
-    let resp = if cfg.config.access.ui == UiMode::Disabled {
+    let resp = if cfg.config.access.ui == UiMode::Disabled && !cfg.config.access.public_ui {
         crate::common::not_found()
     } else {
         (

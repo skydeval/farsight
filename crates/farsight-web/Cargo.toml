@@ -7,6 +7,11 @@ repository.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Phase B hooks (a shorter sign-in flow lifetime from the environment). Off
+# by default so release builds contain none.
+harness = []
+
 [dependencies]
 askama = "0.12"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "tokio"] }
@@ -19,6 +24,7 @@ farsight-ingest = { path = "../farsight-ingest" }
 farsight-storage = { path = "../farsight-storage" }
 ipnet.workspace = true
 metrics = "0.24"
+ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

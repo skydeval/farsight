@@ -154,12 +154,21 @@ complete as the sweep, and responses say so.</div>
 <option value="auth_all" {% if self.ui_is("auth_all") %}selected{% endif %}>Everything needs login</option>
 <option value="disabled" {% if self.ui_is("disabled") %}selected{% endif %}>Disabled (API only)</option>
 </select>
-<label for="password">Admin password</label>
-<input type="password" id="password" name="password" autocomplete="new-password">
-<label for="password2">Repeat password</label>
-<input type="password" id="password2" name="password2" autocomplete="new-password">
-<div class="hint">12 characters to 72 bytes. Not needed when the UI is disabled.
-{% if w.password_bcrypt.is_some() %}A password is already set; leave empty to keep it.{% endif %}</div>
+<label for="admin_did">Admin DID</label>
+<input type="text" id="admin_did" name="admin_did" value="{{ w.admin_did }}" spellcheck="false" autocomplete="off" placeholder="did:plc:…">
+<div class="hint">The ATProto account that administers this instance: you sign in to the web UI with it.
+<code>did:plc:…</code> or <code>did:web:…</code>, not a handle. Not needed when the UI is disabled.
+Farsight does not check that the account is yours; a wrong DID is corrected later with
+<code>farsight set-admin-did</code> in the container.</div>
+{% if let Some(found) = self.admin_found() %}
+<div class="banner ok" id="admin-found">{% if self.admin_confirmed() %}Confirmed: {% else %}This DID is {% endif %}<strong>{{ found }}</strong>.
+{% if !self.admin_confirmed() %}If that is the right account, press Next again.{% endif %}</div>
+{% endif %}
+{% if let Some(why) = self.admin_not_found() %}
+<div class="banner bad" id="admin-not-found">This DID could not be resolved ({{ why }}). Check it; or, if the directory is
+down and you are sure of the DID, tick the box and press Next.</div>
+<label><input type="checkbox" name="use_anyway"> Use this DID anyway</label>
+{% endif %}
 <h2>Admin token</h2>
 {% if show_token %}
 <p>The admin token authorizes every API call, including admin procedures. It is shown

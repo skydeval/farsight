@@ -88,8 +88,14 @@ pub struct Wizard {
     pub reads: ReadsMode,
     /// `access.ui`.
     pub ui: UiMode,
-    /// bcrypt of the admin password.
-    pub password_bcrypt: Option<String>,
+    /// `access.admin_did`, as entered.
+    pub admin_did: String,
+    /// The DID the access step last looked up, and what came back: the
+    /// identity, or why it did not resolve.
+    pub admin_seen: Option<(String, Result<crate::oauth::Identity, String>)>,
+    /// The admin DID the operator confirmed (after seeing what it
+    /// resolves to, or by "use anyway").
+    pub admin_confirmed: Option<String>,
     /// The admin token, generated once per session, shown until saved.
     pub admin_token: String,
     /// The operator confirmed saving the admin token.
@@ -136,7 +142,9 @@ impl Wizard {
             backlinks_url: String::new(),
             reads: ReadsMode::Public,
             ui: UiMode::PublicRead,
-            password_bcrypt: None,
+            admin_did: String::new(),
+            admin_seen: None,
+            admin_confirmed: None,
             admin_token: farsight_api::auth::generate(farsight_api::auth::ADMIN_PREFIX),
             admin_token_saved: false,
             proxy_choice: "none".into(),
@@ -181,10 +189,14 @@ impl Wizard {
             // The public UI is enabled from Settings, with its
             // confirmation step (§8.6); never by the wizard.
             public_ui: false,
+            admin_did: if self.ui == UiMode::Disabled {
+                String::new()
+            } else {
+                self.admin_did.clone()
+            },
         };
         c.auth.admin_token_sha256 =
             farsight_api::auth::hex(&farsight_api::auth::sha256(&self.admin_token));
-        c.auth.admin_password_bcrypt = self.password_bcrypt.clone().unwrap_or_default();
         c.proxy.mode = self.proxy_mode;
         c.proxy.trusted = self.trusted.clone();
         c
@@ -391,6 +403,35 @@ impl SetupPage {
     /// Whether `m` is the selected proxy mode.
     pub fn mode_is(&self, m: &str) -> bool {
         mode_name(self.w.proxy_mode) == m
+    }
+
+    /// What the entered admin DID resolved to, in words, when the access
+    /// step has looked it up and found it.
+    pub fn admin_found(&self) -> Option<String> {
+        match self.w.admin_seen.as_ref()? {
+            (did, Ok(i)) if *did == self.w.admin_did => Some(format!(
+                "{}, hosted at {}",
+                i.handle
+                    .as_ref()
+                    .map_or_else(|| "no handle".to_owned(), |h| format!("@{h}")),
+                i.pds.as_deref().unwrap_or("no PDS named in its document")
+            )),
+            _ => None,
+        }
+    }
+
+    /// Why the entered admin DID did not resolve, when it did not.
+    pub fn admin_not_found(&self) -> Option<&str> {
+        match self.w.admin_seen.as_ref()? {
+            (did, Err(e)) if *did == self.w.admin_did => Some(e.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether the entered admin DID is confirmed.
+    pub fn admin_confirmed(&self) -> bool {
+        !self.w.admin_did.is_empty()
+            && self.w.admin_confirmed.as_deref() == Some(self.w.admin_did.as_str())
     }
 }
 
@@ -906,27 +947,34 @@ fn apply_step(w: &mut Wizard, step: &str, f: &HashMap<String, String>) -> Result
                 "disabled" => UiMode::Disabled,
                 _ => UiMode::PublicRead,
             };
-            let pw = f.get("password").cloned().unwrap_or_default();
-            if w.ui != UiMode::Disabled {
-                if pw.is_empty() && w.password_bcrypt.is_some() {
-                    // Keep the password chosen earlier.
-                } else {
-                    if pw.chars().count() < 12 || pw.len() > 72 {
-                        return Err("The admin password must be at least 12 characters and at \
-                                    most 72 bytes."
-                            .into());
-                    }
-                    if f.get("password2") != Some(&pw) {
-                        return Err("The passwords do not match.".into());
-                    }
-                    // Hashing happens in `save_step` (blocking pool).
-                    w.password_bcrypt = Some(format!("__pending__{pw}"));
-                }
-            }
             if !w.admin_token_saved && !on("token_saved") {
                 return Err("Confirm that you saved the admin token.".into());
             }
             w.admin_token_saved = true;
+            if w.ui != UiMode::Disabled {
+                let did = get("admin_did");
+                if !farsight_core::config::valid_admin_did(&did) {
+                    return Err(
+                        "Enter the admin DID: did:plc: followed by 24 characters, or \
+                                did:web: followed by a hostname. A handle will not do."
+                            .into(),
+                    );
+                }
+                // Whether this DID is confirmed is decided in `save_step`,
+                // which may have to resolve it first.
+                if w.admin_confirmed.as_deref() != Some(did.as_str()) {
+                    w.admin_confirmed = None;
+                }
+                let seen = w.admin_seen.as_ref().filter(|(d, _)| *d == did);
+                match seen {
+                    Some((_, Ok(_))) => w.admin_confirmed = Some(did.clone()),
+                    Some((_, Err(_))) if on("use_anyway") => {
+                        w.admin_confirmed = Some(did.clone());
+                    }
+                    _ => {}
+                }
+                w.admin_did = did;
+            }
         }
         "proxy" => {
             let choice = get("proxy_choice");
@@ -1024,21 +1072,27 @@ async fn save_step(
     if let Err(e) = result {
         return render_step(&st, &id, slug, Some(e));
     }
-    // Hash a new admin password off the async workers (bcrypt cost 12).
-    let pending = st
-        .with_session(&id, |s| s.wizard.password_bcrypt.clone())
-        .flatten()
-        .and_then(|p| p.strip_prefix("__pending__").map(str::to_owned));
-    if let Some(pw) = pending {
-        let hashed = tokio::task::spawn_blocking(move || bcrypt::hash(pw, 12)).await;
-        let hashed = match hashed {
-            Ok(Ok(h)) => h,
-            _ => {
-                st.with_session(&id, |s| s.wizard.password_bcrypt = None);
-                return render_step(&st, &id, slug, Some("Hashing the password failed.".into()));
-            }
+    // The admin DID is shown resolved before the step advances (§8.4
+    // step 6): the first submit of a DID looks it up, the second confirms
+    // it. A DID that does not resolve advances only with "use anyway".
+    if slug == "access" {
+        let Some(w) = st.with_session(&id, |s| s.wizard.clone()) else {
+            return common::redirect("/setup");
         };
-        st.with_session(&id, |s| s.wizard.password_bcrypt = Some(hashed));
+        if w.ui != UiMode::Disabled && w.admin_confirmed.as_deref() != Some(w.admin_did.as_str()) {
+            let already_seen = w
+                .admin_seen
+                .as_ref()
+                .is_some_and(|(d, _)| *d == w.admin_did);
+            if !already_seen {
+                let result = resolve_admin_did(&st, &w).await;
+                st.with_session(&id, |s| {
+                    s.wizard.admin_seen = Some((w.admin_did.clone(), result));
+                });
+            }
+            st.with_session(&id, |s| s.wizard.done[i] = false);
+            return render_step(&st, &id, slug, None);
+        }
     }
     st.with_session(&id, |s| s.wizard.done[i] = true);
     let next = STEPS[i + 1].0;
@@ -1046,6 +1100,25 @@ async fn save_step(
         return common::redirect("/setup/review");
     }
     common::redirect(&format!("/setup/{next}"))
+}
+
+/// Looks the wizard's admin DID up through a safe client built from the
+/// wizard's own answers (the PLC directory is step 5's). Setup mode has
+/// no other outbound client; the caller holds a verified setup session.
+async fn resolve_admin_did(st: &SetupState, w: &Wizard) -> Result<crate::oauth::Identity, String> {
+    use farsight_core::net::{SafeClient, SafeClientConfig};
+    let did = farsight_core::Did::parse(&w.admin_did).map_err(|e| e.to_string())?;
+    let cfg = w.build_config();
+    let safe = SafeClient::new(SafeClientConfig::from_config(&cfg, st.version));
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        crate::oauth::identity(&safe, &cfg, &did),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err("the lookup timed out".into()),
+    }
 }
 
 /// Subscribes to `url` for at most `limit` and reports events, lag and v2
@@ -1315,6 +1388,11 @@ pub struct DonePage {
     pub ui: bool,
     /// Error, if the write failed.
     pub error: Option<String>,
+    /// The admin account: the DID, and its handle when it verified.
+    pub admin: String,
+    /// The hostname can be an OAuth client (a public HTTPS domain name);
+    /// otherwise the page explains loopback sign-in.
+    pub hosted: bool,
 }
 
 async fn finish(
@@ -1359,6 +1437,8 @@ async fn finish(
             return render_private(&DonePage {
                 ui: false,
                 error: Some("Another setup session already completed setup.".into()),
+                admin: String::new(),
+                hosted: true,
             });
         }
         Err(e) => {
@@ -1380,6 +1460,14 @@ async fn finish(
     let mut r = render_private(&DonePage {
         ui: config.access.ui != UiMode::Disabled,
         error: None,
+        admin: match w.admin_seen.as_ref() {
+            Some((did, Ok(i))) if *did == w.admin_did => match &i.handle {
+                Some(h) => format!("{did}, @{h}"),
+                None => did.clone(),
+            },
+            _ => w.admin_did.clone(),
+        },
+        hosted: crate::oauth::hosted_possible(&config.server.hostname.to_ascii_lowercase()),
     });
     r.headers_mut().append(
         header::SET_COOKIE,
@@ -1418,9 +1506,22 @@ mod tests {
         w.hostname = "farsight.example".into();
         w.contact = "mailto:ops@example".into();
         w.dsn = "postgres://u:p@db/farsight".into();
-        w.password_bcrypt = Some("$2b$12$abcdefghijklmnopqrstuv".into());
+        w.admin_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into();
         let text = farsight_core::config::to_toml(&w.build_config()).unwrap();
+        assert!(!text.contains("admin_password_bcrypt"));
         let l = farsight_core::config::load_from_parts(Some(&text), &[]).unwrap();
+        assert_eq!(
+            l.admin_auth(),
+            farsight_core::config::AdminAuth::Configured(w.admin_did.clone())
+        );
+        assert!(l.warnings.is_empty());
+        // With the UI disabled no admin DID is written.
+        w.ui = UiMode::Disabled;
+        assert!(
+            !farsight_core::config::to_toml(&w.build_config())
+                .unwrap()
+                .contains("admin_did")
+        );
         assert_eq!(l.config.storage.budget_bytes, 350_000_000_000);
         assert!(redacted_toml(&l.config).contains("<redacted>"));
         assert!(!redacted_toml(&l.config).contains("u:p@"));

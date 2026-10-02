@@ -18,7 +18,7 @@ use farsight_api::clientip::ClientIp;
 use farsight_api::params::Params;
 use farsight_api::ratelimit::Class;
 use farsight_api::{ApiState, admin as api_admin, handlers};
-use farsight_core::config::{ReadsMode, UiMode};
+use farsight_core::config::{AdminAuth, LoadedConfig, ReadsMode, UiMode};
 use farsight_core::net::{OutboundClient, SafeClient};
 use farsight_core::{AtUri, Collection, Did};
 use farsight_storage::backfill_api::{self, Request, RequestOutcome, Requester};
@@ -27,9 +27,7 @@ use farsight_storage::keys::Limits;
 use serde_json::Value;
 use tokio::sync::{Semaphore, watch};
 
-use crate::common::{
-    self, NO_STORE, cookie, ct_eq, random_id, read_cookie, render, render_private,
-};
+use crate::common::{self, NO_STORE, cookie, ct_eq, read_cookie, render, render_private};
 
 /// Admin session cookie (§8.6).
 pub const ADMIN_COOKIE: &str = "farsight_admin";
@@ -37,10 +35,8 @@ pub const ADMIN_COOKIE: &str = "farsight_admin";
 pub const SESSION_IDLE: Duration = Duration::from_secs(12 * 3600);
 /// Absolute expiry.
 pub const SESSION_ABSOLUTE: Duration = Duration::from_secs(7 * 24 * 3600);
-/// bcrypt cost for new passwords (§8.4 step 6).
-pub const BCRYPT_COST: u32 = 12;
-/// How long a login from an IP with a recent successful login may wait
-/// for a bcrypt slot; others wait [`LOGIN_WAIT`] (§3.6 residual).
+/// How long a migration submit from an IP with a recent successful
+/// sign-in may wait for a bcrypt slot; others wait [`LOGIN_WAIT`].
 pub const LOGIN_WAIT_KNOWN: Duration = Duration::from_secs(10);
 /// Bcrypt slot wait for other IPs.
 pub const LOGIN_WAIT: Duration = Duration::from_secs(2);
@@ -91,10 +87,14 @@ pub struct WebState {
     pub api: Arc<ApiState>,
     /// Safe outbound client (handle resolution, §11.3).
     pub safe: SafeClient,
-    /// Bound on concurrent bcrypt verifications (§3.6).
+    /// Bound on concurrent bcrypt verifications (§3.6; the migration
+    /// page only).
     pub bcrypt_permits: Arc<Semaphore>,
-    /// IPs with a successful login, for login queue priority.
+    /// IPs with a successful sign-in: exempt from the process-wide
+    /// sign-in bucket (§3.6).
     pub recent_logins: Mutex<HashMap<IpAddr, Instant>>,
+    /// The OAuth sign-in's state: flows in progress, discovery cache.
+    pub oauth: crate::oauth::OAuthState,
     /// Set to true to switch to setup mode (reset).
     pub reset: watch::Sender<bool>,
     /// `.setup-token` path.
@@ -117,9 +117,32 @@ fn hex(b: &[u8]) -> String {
     farsight_api::auth::hex(b)
 }
 
-async fn admin(st: &WebState, headers: &HeaderMap) -> Option<Admin> {
+/// The stored key of an OAuth session (§7.1): SHA-256 of the cookie
+/// value, a zero byte and the admin DID it was created for. A session is
+/// therefore found only while that DID is the configured one.
+pub fn oauth_session_key(cookie: &str, did: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(cookie.as_bytes());
+    h.update([0u8]);
+    h.update(did.as_bytes());
+    h.finalize().into()
+}
+
+/// The key a session cookie is looked up under with this config: bound
+/// to the admin DID when one is configured; the plain hash of a
+/// pre-OAuth password session in the migration state; none otherwise.
+pub fn session_key(cfg: &LoadedConfig, cookie: &str) -> Option<[u8; 32]> {
+    match cfg.admin_auth() {
+        AdminAuth::Configured(did) => Some(oauth_session_key(cookie, &did)),
+        AdminAuth::Migration => Some(common::sha256(cookie)),
+        AdminAuth::Unconfigured | AdminAuth::Disabled => None,
+    }
+}
+
+pub(crate) async fn admin(st: &WebState, headers: &HeaderMap) -> Option<Admin> {
     let raw = read_cookie(headers, ADMIN_COOKIE)?;
-    let id = common::sha256(&raw);
+    let id = session_key(&st.api.config.current(), &raw)?;
     let s =
         farsight_storage::auth::touch_session(&st.api.pool, &id, SESSION_IDLE, SESSION_ABSOLUTE)
             .await
@@ -151,7 +174,7 @@ pub(crate) async fn gate(
     let cfg = st.api.config.current();
     let access = &cfg.config.access;
     if access.ui == UiMode::Disabled {
-        return Err((StatusCode::NOT_FOUND, "not found").into_response());
+        return Err(common::not_found());
     }
     let session = admin(st, headers).await;
     let needs_login = match need {
@@ -161,7 +184,14 @@ pub(crate) async fn gate(
         Need::Dashboard => false,
     };
     if needs_login && session.is_none() {
-        return Err(login_redirect());
+        // `auth_all` hides the admin pages: without a session each is
+        // the same bare 404 as a path that does not exist. Elsewhere the
+        // dashboard is public anyway, and the redirect is how a visitor
+        // finds the sign-in.
+        return Err(match access.ui {
+            UiMode::AuthAll => common::not_found(),
+            _ => login_redirect(),
+        });
     }
     Ok(session)
 }
@@ -185,7 +215,12 @@ pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/dashboard/fragment", get(dashboard_fragment))
-        .route("/enter", get(login_page).post(login))
+        .route("/enter", get(crate::enter::page).post(crate::enter::submit))
+        .route("/enter/callback", get(crate::enter::callback))
+        .route(
+            crate::oauth::METADATA_PATH,
+            get(crate::enter::client_metadata),
+        )
         .route("/logout", post(logout))
         .route("/lookup/did", get(lookup_did))
         .route("/lookup/list", get(lookup_list))
@@ -202,7 +237,6 @@ pub fn router(state: Arc<WebState>) -> Router {
             "/settings/public-ui/confirm",
             post(crate::public_settings::confirm),
         )
-        .route("/settings/password", post(settings_password))
         .route("/settings/token", post(settings_token))
         .route("/reset", get(reset_page).post(reset_submit))
         .route(
@@ -654,10 +688,11 @@ async fn dashboard(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Respo
         Ok(s) => s,
         Err(r) => return r,
     };
-    let (d, error) = match dashboard_data(&st).await {
+    let (mut d, error) = match dashboard_data(&st).await {
         Ok(d) => (d, None),
         Err(e) => (DashboardData::default(), Some(e)),
     };
+    migration_warning(&st, &s, &mut d);
     let page = DashboardPage {
         nav: nav(&st, &s),
         d,
@@ -670,146 +705,48 @@ async fn dashboard(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Respo
     }
 }
 
-async fn dashboard_fragment(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
-    if let Err(r) = gate(&st, &headers, Need::Dashboard).await {
-        return r;
+/// Tells a signed-in admin that sign-in is changing (the migration
+/// state, §8.6).
+fn migration_warning(st: &WebState, s: &Option<Admin>, d: &mut DashboardData) {
+    if s.is_some() && st.api.config.current().admin_auth() == AdminAuth::Migration {
+        d.warnings.insert(
+            0,
+            Warning {
+                class: "bad",
+                text: "Admin sign-in is changing: open /enter to set the admin DID. The \
+                       password stops working once it is set."
+                    .into(),
+            },
+        );
     }
-    let (d, error) = match dashboard_data(&st).await {
+}
+
+async fn dashboard_fragment(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+    let s = match gate(&st, &headers, Need::Dashboard).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let (mut d, error) = match dashboard_data(&st).await {
         Ok(d) => (d, None),
         Err(e) => (DashboardData::default(), Some(e)),
     };
+    migration_warning(&st, &s, &mut d);
     render_private(&DashboardFragment { d, error })
 }
 
 // ---------------------------------------------------------------------------
-// Login
+// Logout (sign-in is in `crate::enter`)
 
-/// The login page.
-#[derive(Template)]
-#[template(path = "login.html")]
-pub struct LoginPage {
-    /// Navigation.
-    pub nav: Nav,
-    /// Error.
-    pub error: Option<String>,
-}
-
-async fn login_page(State(st): State<Arc<WebState>>) -> Response {
-    if st.api.config.current().config.access.ui == UiMode::Disabled {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
-    render_private(&LoginPage {
-        nav: Nav::default(),
-        error: None,
-    })
-}
-
-fn login_error(status: StatusCode, msg: &str) -> Response {
-    let mut r = render_private(&LoginPage {
-        nav: Nav::default(),
-        error: Some(msg.into()),
-    });
-    *r.status_mut() = status;
-    r
-}
-
-async fn login(
-    State(st): State<Arc<WebState>>,
-    headers: HeaderMap,
-    client: Option<axum::Extension<ClientIp>>,
-    Form(form): Form<HashMap<String, String>>,
-) -> Response {
-    let cfg = st.api.config.current();
-    if cfg.config.access.ui == UiMode::Disabled {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
-    if !common::same_origin(&headers) {
-        return common::forbidden("cross-origin request refused");
-    }
-    let client = client.map(|c| c.0);
-    let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
-    let limit = Class::UiLogin.limit(&cfg.config, None);
-    if let Err((_, retry)) =
-        st.api
-            .limiter
-            .check(Class::UiLogin, &farsight_api::ratelimit::ip_key(ip), limit)
-    {
-        metrics_rate_limited(Class::UiLogin);
-        let mut r = login_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many login attempts; wait a minute.",
-        );
-        r.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from(retry));
-        return r;
-    }
-    let known = st
-        .recent_logins
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&ip)
-        .is_some_and(|t| t.elapsed() < SESSION_ABSOLUTE);
-    let wait = if known { LOGIN_WAIT_KNOWN } else { LOGIN_WAIT };
-    let permit = match tokio::time::timeout(wait, st.bcrypt_permits.clone().acquire_owned()).await {
-        Ok(Ok(p)) => p,
-        _ => {
-            return login_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "The server is busy verifying logins; try again shortly.",
-            );
-        }
-    };
-    let password = form.get("password").cloned().unwrap_or_default();
-    let hash = cfg.config.auth.admin_password_bcrypt.clone();
-    let ok = tokio::task::spawn_blocking(move || {
-        !hash.is_empty() && bcrypt::verify(password, &hash).unwrap_or(false)
-    })
-    .await
-    .unwrap_or(false);
-    drop(permit);
-    if !ok {
-        return login_error(StatusCode::UNAUTHORIZED, "Wrong password.");
-    }
-    let raw = random_id();
-    let csrf = farsight_api::auth::random_bytes::<32>();
-    let ua = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.chars().take(300).collect::<String>());
-    if let Err(e) = farsight_storage::auth::create_session(
-        &st.api.pool,
-        &common::sha256(&raw),
-        &csrf,
-        Some(ip),
-        ua.as_deref(),
-    )
-    .await
-    {
-        tracing::error!(error = %e, "creating admin session failed");
-        return login_error(StatusCode::INTERNAL_SERVER_ERROR, "Login failed.");
-    }
-    st.recent_logins
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(ip, Instant::now());
-    let secure = client.is_some_and(|c| c.https);
-    let mut r = common::redirect("/");
-    r.headers_mut().append(
-        header::SET_COOKIE,
-        cookie(ADMIN_COOKIE, &raw, "/", secure, None),
-    );
-    r
-}
-
-fn metrics_rate_limited(c: Class) {
+pub(crate) fn metrics_rate_limited(c: Class) {
     farsight_api::metrics::rate_limited(c);
 }
 
 async fn logout(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     if let Some(raw) = read_cookie(&headers, ADMIN_COOKIE) {
         if common::same_origin(&headers) {
-            let _ =
-                farsight_storage::auth::delete_session(&st.api.pool, &common::sha256(&raw)).await;
+            if let Some(key) = session_key(&st.api.config.current(), &raw) {
+                let _ = farsight_storage::auth::delete_session(&st.api.pool, &key).await;
+            }
         }
     }
     let mut r = common::redirect("/enter");
@@ -1553,6 +1490,12 @@ pub struct SettingsPage {
     pub restart: Vec<String>,
     /// A new admin token, shown once.
     pub new_token: Option<String>,
+    /// `access.admin_did` (empty when not set).
+    pub admin_did: String,
+    /// Its verified handle, when known.
+    pub admin_handle: Option<String>,
+    /// The instance is in the migration state.
+    pub migration: bool,
     /// The Public UI subsection's values.
     pub p: crate::public_settings::View,
 }
@@ -1648,13 +1591,29 @@ pub(crate) fn settings_base(st: &WebState, s: &Admin) -> SettingsPage {
         error: None,
         restart: Vec::new(),
         new_token: None,
+        admin_did: cur.config.access.admin_did.clone(),
+        admin_handle: st
+            .oauth
+            .cached_handle(&cur.config.access.admin_did)
+            .flatten(),
+        migration: cur.admin_auth() == AdminAuth::Migration,
         p: crate::public_settings::View::of(&cur.config),
     }
 }
 
 async fn settings_page(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => render_private(&settings_base(&st, &s)),
+        Ok(Some(s)) => {
+            // Resolve the admin handle for display (cached; two-second
+            // budget), so that `settings_base` finds it.
+            let cur = st.api.config.current();
+            if !cur.config.access.admin_did.is_empty() {
+                st.oauth
+                    .handle(&st.safe, &cur.config, &cur.config.access.admin_did)
+                    .await;
+            }
+            render_private(&settings_base(&st, &s))
+        }
         Ok(None) => login_redirect(),
         Err(r) => r,
     }
@@ -1711,61 +1670,6 @@ async fn settings_save(
         }
     }
     render_private(&page)
-}
-
-async fn revoke_sessions_and_logout(st: &WebState) -> Response {
-    let _ = farsight_storage::auth::delete_all_sessions(&st.api.pool).await;
-    let mut r = common::redirect("/enter");
-    r.headers_mut().append(
-        header::SET_COOKIE,
-        cookie(ADMIN_COOKIE, "", "/", false, Some(0)),
-    );
-    r
-}
-
-async fn settings_password(
-    State(st): State<Arc<WebState>>,
-    headers: HeaderMap,
-    Form(form): Form<HashMap<String, String>>,
-) -> Response {
-    let s = match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return login_redirect(),
-        Err(r) => return r,
-    };
-    if let Err(r) = check_form(&s, &headers, &form) {
-        return r;
-    }
-    let pw = form.get("password").cloned().unwrap_or_default();
-    let mut page = settings_base(&st, &s);
-    if pw.chars().count() < 12 || pw.len() > 72 {
-        page.error =
-            Some("The password must be at least 12 characters and at most 72 bytes.".into());
-        return render_private(&page);
-    }
-    if form.get("password2") != Some(&pw) {
-        page.error = Some("The passwords do not match.".into());
-        return render_private(&page);
-    }
-    let hashed = match tokio::task::spawn_blocking(move || bcrypt::hash(pw, BCRYPT_COST)).await {
-        Ok(Ok(h)) => h,
-        _ => {
-            page.error = Some("Hashing failed.".into());
-            return render_private(&page);
-        }
-    };
-    let r = st
-        .api
-        .config
-        .edit(|t| set_auth(t, "admin_password_bcrypt", hashed))
-        .await;
-    if let Err(e) = r {
-        page.error = Some(e.to_string());
-        return render_private(&page);
-    }
-    let _ = farsight_api::config_store::notify_config(&st.api.pool).await;
-    // Password change revokes all sessions (§8.6).
-    revoke_sessions_and_logout(&st).await
 }
 
 fn set_auth(t: &mut toml::Table, key: &str, value: String) -> Result<(), String> {

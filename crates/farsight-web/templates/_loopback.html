@@ -1,0 +1,4 @@
+<p class="muted" id="loopback">{% if hosted_url.is_none() %}This instance's hostname cannot be used for ATProto sign-in (that needs a
+public HTTPS domain name without a port). {% endif %}Sign-in also works on the machine that runs Farsight, or through an
+SSH tunnel to it (<code>ssh -L PORT:127.0.0.1:PORT host</code>, with the port Farsight is published on): open
+<code>http://127.0.0.1:PORT/enter</code>. Use <code>127.0.0.1</code>, not <code>localhost</code>.</p>

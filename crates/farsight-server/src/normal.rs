@@ -196,6 +196,7 @@ pub async fn run(
             cfg.rate_limit.bcrypt_concurrency.max(1) as usize
         )),
         recent_logins: Mutex::new(Default::default()),
+        oauth: Default::default(),
         reset: reset_tx,
         token_path: farsight_web::setup_token::token_path(&config_path),
         status: status.clone(),
@@ -210,12 +211,18 @@ pub async fn run(
         let trust = trust.clone();
         let config = config.clone();
         let status = status.clone();
+        let web = web.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             let mut n: u64 = 0;
             loop {
                 tick.tick().await;
                 n += 1;
+                // Sign-in flows older than their lifetime (they are already
+                // refused at lookup; this frees the memory).
+                if n % 2 == 0 {
+                    web.oauth.flows.sweep(std::time::Instant::now());
+                }
                 if let Err(e) = keys.refresh(&pool).await {
                     tracing::warn!(error = %e, "API key refresh failed");
                 }

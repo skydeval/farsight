@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Farsight — sign in{% endblock %}
+{% block content %}
+<h1>Sign in</h1>
+{% if let Some(n) = notice %}<div class="banner ok">{{ n }}</div>{% endif %}
+{% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
+{% if kind == "signin" %}
+<form class="stack card" method="post" action="/enter">
+<p>Administration of <strong>{{ hostname }}</strong>. Sign-in is with the admin's ATProto account, at that
+account's own server.</p>
+<div class="row"><button type="submit">Sign in with ATProto</button></div>
+<p class="muted">Signing out here does not sign you out of your ATProto account's server.</p>
+</form>
+{% else if kind == "unconfigured" %}
+<div class="card" id="unconfigured">
+<p>Admin sign-in is not configured on this instance.</p>
+<p class="muted">The operator sets the admin account with <code>farsight set-admin-did &lt;did&gt;</code> in the
+container, or with the <code>FARSIGHT__ACCESS__ADMIN_DID</code> environment variable when the configuration is
+managed through the environment, and restarts farsight.</p>
+</div>
+{% else %}
+<div class="card" id="elsewhere">
+<p>Sign-in is not available at this address.</p>
+{% if let Some(u) = hosted_url %}<p>Sign in at <a href="{{ u }}">{{ u }}</a>.</p>{% endif %}
+{% include "_loopback.html" %}
+</div>
+{% endif %}
+{% endblock %}

@@ -5,7 +5,7 @@
 {% if let Some(n) = notice %}<div class="banner ok">{{ n }}</div>{% endif %}
 {% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if !restart.is_empty() %}<div class="banner">Restart required for: {% for k in restart %}<code>{{ k }}</code> {% endfor %}(restart the farsight container). Other changes apply immediately.</div>{% endif %}
-{% if let Some(t) = new_token %}<div class="card"><p>New admin token, shown <strong>once</strong>. All sessions were signed out; log in again afterwards.</p><div class="secret">{{ t }}</div><p><a href="/enter">Log in</a></p></div>{% endif %}
+{% if let Some(t) = new_token %}<div class="card"><p>New admin token, shown <strong>once</strong>. All sessions were signed out; sign in again afterwards.</p><div class="secret">{{ t }}</div><p><a href="/enter">Sign in</a></p></div>{% endif %}
 
 {% if env_managed %}
 <div class="banner">The configuration comes from the environment (FARSIGHT_SKIP_WIZARD); edit it there.</div>
@@ -106,14 +106,19 @@ and <code>/xrpc/*</code> and the lookup pages here still return it.</div>
 <div class="row"><button type="submit">Save public UI settings</button></div>
 </form>
 
-<form class="stack card" method="post" action="/settings/password">
-<h2>Admin password</h2>
-<input type="hidden" name="csrf" value="{{ csrf }}">
-<label for="password">New password</label><input type="password" id="password" name="password" autocomplete="new-password">
-<label for="password2">Repeat</label><input type="password" id="password2" name="password2" autocomplete="new-password">
-<div class="hint">Changing it signs out every session.</div>
-<div class="row"><button type="submit">Change password</button></div>
-</form>
+<div class="card" id="admin-did">
+<h2>Admin account</h2>
+{% if migration %}
+<p>Admin sign-in is changing from a password to an ATProto account. <a href="/enter">Set the admin DID</a>; the
+password stops working once it is set.</p>
+{% else if admin_did.is_empty() %}
+<p class="muted">No admin DID is set.</p>
+{% else %}
+<p>Sign-in is as <code>{{ admin_did }}</code>{% if let Some(h) = admin_handle %} (@{{ h }}){% endif %}.</p>
+{% endif %}
+<p class="muted">The admin DID cannot be changed here. Change it with <code>farsight set-admin-did &lt;did&gt;</code>
+in the container, then restart farsight; sessions of the previous DID end at that restart.</p>
+</div>
 
 <form class="card" method="post" action="/settings/token">
 <h2>Admin token</h2>

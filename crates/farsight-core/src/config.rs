@@ -34,14 +34,13 @@ pub const ENV_PREFIX: &str = "FARSIGHT__";
 /// exists, never entering setup mode.
 pub const SKIP_WIZARD_ENV: &str = "FARSIGHT_SKIP_WIZARD";
 
-/// Keys with no usable default. `auth.admin_password_bcrypt` is required
-/// only while `access.ui` is not `disabled` (design §8.4 step 6).
-pub const REQUIRED_KEYS: [&str; 5] = [
+/// Keys with no usable default. `access.admin_did` is not among them: a
+/// value used only at sign-in never stops the process (design §16).
+pub const REQUIRED_KEYS: [&str; 4] = [
     "server.hostname",
     "server.contact",
     "storage.database_url",
     "auth.admin_token_sha256",
-    "auth.admin_password_bcrypt",
 ];
 
 /// Configuration errors. Any of these makes the process exit non-zero
@@ -437,8 +436,11 @@ pub struct AccessConfig {
     /// Send `Access-Control-Allow-Origin: *` on reads.
     pub cors: bool,
     /// Serve the public UI under `/public` (§8.6). Requires `reads =
-    /// "public"` and `ui = "public_read"`.
+    /// "public"`; independent of `ui`.
     pub public_ui: bool,
+    /// The DID of the one account that may sign in to the admin UI
+    /// (§8.6). Empty = not set (see [`AdminAuth`]).
+    pub admin_did: String,
 }
 
 impl Default for AccessConfig {
@@ -448,6 +450,7 @@ impl Default for AccessConfig {
             ui: UiMode::PublicRead,
             cors: true,
             public_ui: false,
+            admin_did: String::new(),
         }
     }
 }
@@ -626,9 +629,50 @@ pub fn validate_record_viewer_url(v: &str) -> Result<(), String> {
 pub struct AuthConfig {
     /// SHA-256 of the admin token, hex. Required.
     pub admin_token_sha256: String,
-    /// bcrypt hash of the admin password. Required unless `access.ui =
-    /// "disabled"`.
+    /// bcrypt hash of the pre-OAuth admin password. Retired: read only
+    /// by the migration page (see [`AdminAuth::Migration`]); otherwise
+    /// accepted and ignored.
     pub admin_password_bcrypt: String,
+}
+
+/// Warning logged when `auth.admin_password_bcrypt` is present and unused.
+pub const RETIRED_PASSWORD_WARNING: &str = "auth.admin_password_bcrypt is set and ignored: admin sign-in uses access.admin_did; \
+     remove the key";
+/// Warning logged in the migration state.
+pub const MIGRATION_WARNING: &str = "admin sign-in needs migration: access.admin_did is not set; open /enter and set it \
+     with the existing admin password";
+/// Warning logged in the unconfigured state.
+pub const UNCONFIGURED_WARNING: &str = "admin sign-in is not configured: set access.admin_did (farsight set-admin-did, or \
+     FARSIGHT__ACCESS__ADMIN_DID) and restart";
+
+/// How (and whether) anyone can sign in to the admin UI (design §8.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAuth {
+    /// `access.ui = "disabled"`: no admin UI.
+    Disabled,
+    /// `access.admin_did` is set: OAuth sign-in as that DID.
+    Configured(String),
+    /// A file config from before OAuth sign-in: a password hash and no
+    /// admin DID. `/enter` serves the migration page.
+    Migration,
+    /// No admin DID and no migration path: nobody can sign in.
+    Unconfigured,
+}
+
+/// Whether `s` is an admin DID the config accepts: `did:plc:` followed by
+/// 24 characters of `[a-z2-7]`, or `did:web:` followed by a hostname (no
+/// port, no path segments).
+pub fn valid_admin_did(s: &str) -> bool {
+    if let Some(id) = s.strip_prefix("did:plc:") {
+        return id.len() == 24
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b));
+    }
+    match s.strip_prefix("did:web:") {
+        Some(host) => host == host.to_ascii_lowercase() && crate::did::is_valid_hostname(host),
+        None => false,
+    }
 }
 
 /// `proxy.mode` (§9.1).
@@ -873,6 +917,22 @@ pub struct LoadedConfig {
     pub from_env_only: bool,
 }
 
+impl LoadedConfig {
+    /// The admin sign-in state of this config.
+    pub fn admin_auth(&self) -> AdminAuth {
+        let c = &self.config;
+        if c.access.ui == UiMode::Disabled {
+            AdminAuth::Disabled
+        } else if !c.access.admin_did.is_empty() {
+            AdminAuth::Configured(c.access.admin_did.clone())
+        } else if !self.from_env_only && !c.auth.admin_password_bcrypt.trim().is_empty() {
+            AdminAuth::Migration
+        } else {
+            AdminAuth::Unconfigured
+        }
+    }
+}
+
 /// Where a config is coming from; determines which checks apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSource {
@@ -922,12 +982,22 @@ pub fn load_from_parts(
         ConfigSource::EnvOnly
     };
     let warnings = config.validate()?;
-    Ok(LoadedConfig {
+    let mut loaded = LoadedConfig {
         config,
         env_keys,
         warnings,
         from_env_only: source == ConfigSource::EnvOnly,
-    })
+    };
+    let has_password = !loaded.config.auth.admin_password_bcrypt.trim().is_empty();
+    match loaded.admin_auth() {
+        AdminAuth::Migration => loaded.warnings.push(MIGRATION_WARNING.to_owned()),
+        AdminAuth::Unconfigured => loaded.warnings.push(UNCONFIGURED_WARNING.to_owned()),
+        AdminAuth::Configured(_) | AdminAuth::Disabled if has_password => {
+            loaded.warnings.push(RETIRED_PASSWORD_WARNING.to_owned());
+        }
+        _ => {}
+    }
+    Ok(loaded)
 }
 
 fn defaults_value() -> toml::Value {
@@ -1096,14 +1166,15 @@ impl Config {
             "auth.admin_token_sha256",
             self.auth.admin_token_sha256.as_str(),
         );
-        if self.access.ui != UiMode::Disabled {
-            require(
-                "auth.admin_password_bcrypt",
-                self.auth.admin_password_bcrypt.as_str(),
-            );
-        }
         if !missing.is_empty() {
             return Err(ConfigError::MissingKeys(missing));
+        }
+        if !self.access.admin_did.is_empty() && !valid_admin_did(&self.access.admin_did) {
+            return Err(invalid(
+                "access.admin_did",
+                "expected did:plc: followed by 24 characters of a-z and 2-7, or did:web: followed \
+                 by a hostname (no port, no path)",
+            ));
         }
         if !is_hex_sha256(&self.auth.admin_token_sha256) {
             return Err(invalid(
@@ -1200,13 +1271,11 @@ impl Config {
     /// bounds of `[public_ui]`. The same check runs at load and at every
     /// settings save.
     fn validate_public_ui(&self) -> Result<(), ConfigError> {
-        if self.access.public_ui
-            && (self.access.reads != ReadsMode::Public || self.access.ui != UiMode::PublicRead)
-        {
+        if self.access.public_ui && self.access.reads != ReadsMode::Public {
             return Err(invalid(
                 "access.public_ui",
-                "the public UI needs access.reads = \"public\" and access.ui = \"public_read\"; \
-                 change access.reads / access.ui, or turn access.public_ui off",
+                "the public UI needs access.reads = \"public\"; change access.reads, or turn \
+                 access.public_ui off",
             ));
         }
         let p = &self.public_ui;
@@ -1274,9 +1343,79 @@ impl Config {
     }
 }
 
-/// Serializes a config as TOML for `config.toml`.
+/// Serializes a config as TOML for `config.toml`. An unset
+/// `access.admin_did` and an unset (retired) `auth.admin_password_bcrypt`
+/// are left out rather than written empty.
 pub fn to_toml(config: &Config) -> Result<String, ConfigError> {
-    toml::to_string_pretty(config).map_err(|e| ConfigError::Schema(e.to_string()))
+    let mut table =
+        toml::Table::try_from(config).map_err(|e| ConfigError::Schema(e.to_string()))?;
+    for (section, key) in [("access", "admin_did"), ("auth", "admin_password_bcrypt")] {
+        if let Some(t) = table.get_mut(section).and_then(toml::Value::as_table_mut) {
+            if t.get(key).and_then(toml::Value::as_str) == Some("") {
+                t.remove(key);
+            }
+        }
+    }
+    toml::to_string_pretty(&table).map_err(|e| ConfigError::Schema(e.to_string()))
+}
+
+/// Where the pre-OAuth copy of `config.toml` is kept for a rollback.
+pub fn pre_oauth_backup_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".pre-oauth");
+    path.with_file_name(name)
+}
+
+/// What [`set_admin_did`] did to a config file's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminDidEdit {
+    /// The new file text.
+    pub text: String,
+    /// The file held a password hash and no admin DID (the migration
+    /// state): the caller writes the backup before the new text.
+    pub was_migration: bool,
+    /// The retired password key was removed.
+    pub removed_password: bool,
+}
+
+/// Sets `access.admin_did` in a `config.toml` text and removes the retired
+/// `auth.admin_password_bcrypt` unless `keep_password` (the key is locked
+/// by the environment). The file need not load before the edit.
+pub fn set_admin_did(text: &str, did: &str, keep_password: bool) -> Result<AdminDidEdit, String> {
+    if !valid_admin_did(did) {
+        return Err(format!("{did} is not a did:plc or did:web DID"));
+    }
+    let mut table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
+    let had_did = table
+        .get("access")
+        .and_then(|a| a.get("admin_did"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(|d| !d.is_empty());
+    let has_password = table
+        .get("auth")
+        .and_then(|a| a.get("admin_password_bcrypt"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(|p| !p.trim().is_empty());
+    table
+        .entry("access")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or("`access` is not a table")?
+        .insert("admin_did".to_owned(), toml::Value::String(did.to_owned()));
+    let mut removed_password = false;
+    if !keep_password {
+        if let Some(auth) = table.get_mut("auth").and_then(toml::Value::as_table_mut) {
+            removed_password = auth.remove("admin_password_bcrypt").is_some();
+        }
+    }
+    Ok(AdminDidEdit {
+        text: toml::to_string_pretty(&table).map_err(|e| e.to_string())?,
+        was_migration: !had_did && has_password,
+        removed_password,
+    })
 }
 
 fn temp_path(path: &Path) -> std::path::PathBuf {
@@ -1350,6 +1489,7 @@ mod tests {
     }
 
     const TOKEN_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const ADMIN_DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn complete() -> Config {
         let mut c = Config::default();
@@ -1357,7 +1497,7 @@ mod tests {
         c.server.contact = "mailto:ops@farsight.test".to_owned();
         c.storage.database_url = "postgres://farsight:pw@postgres:5432/farsight".to_owned();
         c.auth.admin_token_sha256 = TOKEN_HASH.to_owned();
-        c.auth.admin_password_bcrypt = "$2b$12$abcdefghijklmnopqrstuv".to_owned();
+        c.access.admin_did = ADMIN_DID.to_owned();
         c
     }
 
@@ -1448,7 +1588,9 @@ source = "relay_collections"
 
 [auth]
 admin_token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-admin_password_bcrypt = "$2b$12$x"
+
+[access]
+admin_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
 
 [proxy]
 mode = "cloudflare"
@@ -1573,8 +1715,7 @@ gap_threshold = "300s"
             [
                 "server.contact",
                 "storage.database_url",
-                "auth.admin_token_sha256",
-                "auth.admin_password_bcrypt"
+                "auth.admin_token_sha256"
             ]
         );
         let ok = load_from_parts(
@@ -1643,25 +1784,20 @@ gap_threshold = "300s"
     }
 
     #[test]
-    fn public_ui_needs_public_reads_and_ui() {
-        let mut c = complete();
-        c.access.public_ui = true;
-        assert!(c.validate().is_ok());
-        for (reads, ui) in [
-            (ReadsMode::ApiKey, UiMode::PublicRead),
-            (ReadsMode::Disabled, UiMode::PublicRead),
-            (ReadsMode::Public, UiMode::AuthAll),
-            (ReadsMode::Public, UiMode::Disabled),
-        ] {
+    fn public_ui_needs_public_reads() {
+        // Every UI mode is fine with the public UI on.
+        for ui in [UiMode::PublicRead, UiMode::AuthAll, UiMode::Disabled] {
+            let mut c = complete();
+            c.access.public_ui = true;
+            c.access.ui = ui;
+            assert!(c.validate().is_ok(), "{ui:?}");
+        }
+        for reads in [ReadsMode::ApiKey, ReadsMode::Disabled] {
             let mut c = complete();
             c.access.public_ui = true;
             c.access.reads = reads;
-            c.access.ui = ui;
             let e = c.validate().unwrap_err().to_string();
-            assert!(
-                e.contains("access.reads") && e.contains("access.ui"),
-                "{reads:?}/{ui:?}: {e}"
-            );
+            assert!(e.contains("access.reads"), "{reads:?}: {e}");
             // The same combination is fine while the public UI is off.
             c.access.public_ui = false;
             assert!(c.validate().is_ok());
@@ -1803,5 +1939,137 @@ gap_threshold = "300s"
         assert!(!l.is_large_host("host.bsky.network"));
         assert!(!l.is_large_host("evilhost.bsky.network"));
         assert!(!l.is_large_host("pds.example.com"));
+    }
+
+    #[test]
+    fn admin_did_syntax() {
+        for ok in [
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            "did:plc:z72i7hdynmk6r22z27h6tvur",
+            "did:web:alice.example",
+            "did:web:pds.alice.example",
+        ] {
+            assert!(valid_admin_did(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "alice.example",
+            "did:plc:short",
+            "did:plc:AAAAAAAAAAAAAAAAAAAAAAAA",
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaa1",
+            "did:web:localhost",
+            "did:web:alice.example%3A8080",
+            "did:web:alice.example:path",
+            "did:web:Alice.Example",
+            "did:web:10.0.0.1",
+            "did:key:z6Mk",
+        ] {
+            assert!(!valid_admin_did(bad), "{bad}");
+        }
+        let mut c = complete();
+        c.access.admin_did = "did:plc:nope".into();
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("access.admin_did")
+        );
+    }
+
+    #[test]
+    fn admin_auth_states() {
+        let file = |c: &Config, envs: &[(&str, &str)]| {
+            load_from_parts(Some(&to_toml(c).unwrap()), &env(envs)).unwrap()
+        };
+        // Configured.
+        let l = file(&complete(), &[]);
+        assert_eq!(l.admin_auth(), AdminAuth::Configured(ADMIN_DID.into()));
+        assert!(l.warnings.is_empty());
+        // A file from before OAuth sign-in: migration, and it loads.
+        let mut old = complete();
+        old.access.admin_did.clear();
+        old.auth.admin_password_bcrypt = "$2b$12$abcdefghijklmnopqrstuv".into();
+        let l = file(&old, &[]);
+        assert_eq!(l.admin_auth(), AdminAuth::Migration);
+        assert_eq!(l.warnings, [MIGRATION_WARNING]);
+        // The DID from the environment configures it; the password is
+        // then ignored and warned about.
+        let l = file(&old, &[("FARSIGHT__ACCESS__ADMIN_DID", ADMIN_DID)]);
+        assert_eq!(l.admin_auth(), AdminAuth::Configured(ADMIN_DID.into()));
+        assert_eq!(l.warnings, [RETIRED_PASSWORD_WARNING]);
+        // Neither key: unconfigured, and it loads.
+        let mut none = complete();
+        none.access.admin_did.clear();
+        let l = file(&none, &[]);
+        assert_eq!(l.admin_auth(), AdminAuth::Unconfigured);
+        assert_eq!(l.warnings, [UNCONFIGURED_WARNING]);
+        // UI disabled: neither key matters.
+        none.access.ui = UiMode::Disabled;
+        let l = file(&none, &[]);
+        assert_eq!(l.admin_auth(), AdminAuth::Disabled);
+        assert!(l.warnings.is_empty());
+        // Env-only with a password hash and no DID: unconfigured, never
+        // migration (there is no file to write).
+        let l = load_from_parts(
+            None,
+            &env(&[
+                ("FARSIGHT__SERVER__HOSTNAME", "h.test"),
+                ("FARSIGHT__SERVER__CONTACT", "mailto:x@h.test"),
+                ("FARSIGHT__STORAGE__DATABASE_URL", "postgres://x"),
+                ("FARSIGHT__AUTH__ADMIN_TOKEN_SHA256", TOKEN_HASH),
+                ("FARSIGHT__AUTH__ADMIN_PASSWORD_BCRYPT", "$2b$12$x"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(l.admin_auth(), AdminAuth::Unconfigured);
+        // A malformed DID fails the load.
+        assert!(matches!(
+            load_from_parts(
+                Some(&to_toml(&none).unwrap()),
+                &env(&[("FARSIGHT__ACCESS__ADMIN_DID", "alice.example")])
+            ),
+            Err(ConfigError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn unset_admin_keys_are_not_written() {
+        let mut c = complete();
+        let text = to_toml(&c).unwrap();
+        assert!(text.contains("admin_did = \"did:plc:"));
+        assert!(!text.contains("admin_password_bcrypt"));
+        c.access.admin_did.clear();
+        c.access.ui = UiMode::Disabled;
+        assert!(!to_toml(&c).unwrap().contains("admin_did"));
+    }
+
+    #[test]
+    fn set_admin_did_edits_the_file_text() {
+        let old = "[access]\nui = \"auth_all\"\n\n[auth]\nadmin_token_sha256 = \"x\"\nadmin_password_bcrypt = \"$2b$12$x\"\n";
+        let e = set_admin_did(old, ADMIN_DID, false).unwrap();
+        assert!(e.was_migration && e.removed_password);
+        assert!(e.text.contains(&format!("admin_did = \"{ADMIN_DID}\"")));
+        assert!(!e.text.contains("admin_password_bcrypt"));
+        assert!(e.text.contains("admin_token_sha256") && e.text.contains("auth_all"));
+        // The password stays when the environment locks it.
+        let e = set_admin_did(old, ADMIN_DID, true).unwrap();
+        assert!(e.was_migration && !e.removed_password);
+        assert!(e.text.contains("admin_password_bcrypt"));
+        // Changing an existing DID is not a migration.
+        let e2 = set_admin_did(&e.text, "did:web:alice.example", false).unwrap();
+        assert!(!e2.was_migration);
+        assert!(e2.text.contains("did:web:alice.example") && !e2.text.contains(ADMIN_DID));
+        // A file with no [access] table gets one.
+        assert!(
+            set_admin_did("", ADMIN_DID, false)
+                .unwrap()
+                .text
+                .contains("[access]")
+        );
+        assert!(set_admin_did(old, "alice.example", false).is_err());
+        assert_eq!(
+            pre_oauth_backup_path(Path::new("/etc/farsight/config.toml")),
+            Path::new("/etc/farsight/config.toml.pre-oauth")
+        );
     }
 }

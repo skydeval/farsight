@@ -607,6 +607,7 @@ name = "farsight-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bcrypt",
  "chrono",
  "farsight-api",
@@ -619,10 +620,13 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "reqwest",
+ "ring",
  "serde_json",
+ "sha2",
  "sqlx",
  "subtle",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -657,6 +661,7 @@ dependencies = [
  "farsight-storage",
  "ipnet",
  "metrics",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

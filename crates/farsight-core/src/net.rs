@@ -242,13 +242,44 @@ impl SafeClient {
             .map_err(|e| OutboundError::Transport(e.to_string()))
     }
 
+    /// `POST url` with a form body and extra request headers, under the
+    /// same rules as [`OutboundClient::get`] (URL and address checks,
+    /// timeout, body cap). Redirects are **not** followed: a 3xx answer
+    /// is returned as it is, so a form is never re-sent to another host.
+    pub async fn post_form(
+        &self,
+        url: &Url,
+        headers: &[(&str, &str)],
+        body: String,
+    ) -> Result<OutboundResponse, OutboundError> {
+        check_url(url, &self.config)?;
+        let mut req = self
+            .http
+            .post(url.clone())
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("accept", "application/json")
+            .body(body);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        self.read(url, req.send().await.map_err(map_reqwest)?).await
+    }
+
     async fn get_once(&self, url: &Url) -> Result<OutboundResponse, OutboundError> {
-        let mut resp = self
+        let resp = self
             .http
             .get(url.clone())
             .send()
             .await
             .map_err(map_reqwest)?;
+        self.read(url, resp).await
+    }
+
+    async fn read(
+        &self,
+        url: &Url,
+        mut resp: reqwest::Response,
+    ) -> Result<OutboundResponse, OutboundError> {
         let status = resp.status().as_u16();
         let headers = resp
             .headers()

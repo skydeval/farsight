@@ -23,8 +23,12 @@ pub enum Class {
     KeyBackfill,
     /// UI handle/DID lookups by anonymous visitors, per IP.
     UiLookup,
-    /// UI login attempts, per IP.
+    /// UI sign-in attempts (starts, OAuth callbacks, migration submits),
+    /// per IP.
     UiLogin,
+    /// UI sign-in starts: one bucket for the whole process. An address
+    /// with a recent successful sign-in is not charged (§3.6).
+    UiLoginStart,
     /// Public UI page views, per IP (`public_ui.rate_limit_*`).
     PublicUi,
     /// Public UI handle resolutions: one bucket for the whole process.
@@ -35,6 +39,11 @@ pub enum Class {
     /// (`public_ui.card_rps`, `public_ui.card_burst`).
     PublicCardBudget,
 }
+
+/// Admin sign-in flows the whole process may start per second (§3.6).
+pub const UI_LOGIN_START_RPS: f64 = 1.0;
+/// Burst of the same budget.
+pub const UI_LOGIN_START_BURST: f64 = 10.0;
 
 /// Handle resolutions per second the public UI may start, process-wide
 /// (§3.6).
@@ -58,6 +67,7 @@ impl Class {
             Class::KeyBackfill => "key_backfill",
             Class::UiLookup => "ui_lookup",
             Class::UiLogin => "ui_login",
+            Class::UiLoginStart => "ui_login_start",
             Class::PublicUi => "public_ui",
             Class::PublicHandle => "public_ui_handle",
             Class::PublicCard => "public_ui_card",
@@ -88,6 +98,7 @@ impl Class {
             Class::KeyBackfill => Limit::new(f64::from(cfg.key_backfill_rps), 20.0),
             Class::UiLookup => Limit::new(f64::from(cfg.ui_lookup_rps), 5.0),
             Class::UiLogin => Limit::new(5.0 / 60.0, 5.0),
+            Class::UiLoginStart => Limit::new(UI_LOGIN_START_RPS, UI_LOGIN_START_BURST),
             Class::PublicUi => Limit::new(
                 f64::from(config.public_ui.rate_limit_rps),
                 f64::from(config.public_ui.rate_limit_burst),

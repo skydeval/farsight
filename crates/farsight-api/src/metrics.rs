@@ -35,6 +35,7 @@ pub fn register() {
         Class::KeyBackfill,
         Class::UiLookup,
         Class::UiLogin,
+        Class::UiLoginStart,
         Class::PublicUi,
         Class::PublicCard,
     ] {
