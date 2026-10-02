@@ -1,0 +1,36 @@
+{% extends "public_base.html" %}
+{% block content %}
+<h1 class="subject">{% if let Some(n) = name %}{{ n }} {% endif %}<code>{{ uri }}</code></h1>
+<dl class="facts">
+{% if let Some(p) = purpose %}<dt>Purpose</dt><dd>{{ p }}</dd>{% endif %}
+<dt>Owner</dt><dd>{% if let Some(h) = owner.handle %}<span class="handle">@{{ h }}</span> {% endif %}<a href="{{ owner.href }}"><code>{{ owner.did }}</code></a></dd>
+<dt>State</dt><dd>{{ state }}{% if capped %} This instance stores only part of this list.{% endif %}</dd>
+</dl>
+<nav class="sections">{% if members.is_some() %}<a href="#members">Members</a>{% endif %}<a href="#listblockers">Blocked by</a><a href="#coverage">Coverage</a>{% if let Some(h) = history %}<a href="{{ h }}">Removed records</a>{% endif %}</nav>
+
+{% if let Some(members) = members %}<section id="members">
+<h2>Members <span class="count">{{ stored_members }} stored members</span></h2>
+<p class="muted">The stored count is this instance's own counter; it does not apply this page's filters, so it can exceed the rows below.</p>
+{{ members.line|safe }}
+{% if !members.rows.is_empty() %}<table><thead><tr><th>Account</th><th>Added (as stated by the list's owner)</th></tr></thead><tbody>
+{% for r in members.rows %}<tr><td>{% if let Some(h) = r.who.handle %}<span class="handle">@{{ h }}</span> {% endif %}<a href="{{ r.who.href }}"><code>{{ r.who.did }}</code></a></td><td>{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
+{% endfor %}</tbody></table>{% endif %}
+{% if let Some(e) = members.empty %}<p class="empty">{{ e }}</p>{% endif %}
+{{ members.pager|safe }}
+</section>{% endif %}
+
+<section id="listblockers">
+<h2>Blocked by{% if let Some(n) = blockers.count %} <span class="count">{{ n }}</span>{% endif %}</h2>
+<p class="muted">Accounts with a listblock on this list.</p>
+{{ blockers.line|safe }}
+{% if !blockers.rows.is_empty() %}<table><thead><tr><th>Account</th><th>Created (as stated by the author)</th></tr></thead><tbody>
+{% for r in blockers.rows %}<tr><td>{% if let Some(h) = r.who.handle %}<span class="handle">@{{ h }}</span> {% endif %}<a href="{{ r.who.href }}"><code>{{ r.who.did }}</code></a></td><td>{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
+{% endfor %}</tbody></table>{% endif %}
+{% if let Some(e) = blockers.empty %}<p class="empty">{{ e }}</p>{% endif %}
+{{ blockers.pager|safe }}
+</section>
+
+{{ panel|safe }}
+
+{% if let Some(h) = history %}<p class="history-link"><a href="{{ h }}">Removed listblocks and members of this list</a></p>{% endif %}
+{% endblock %}

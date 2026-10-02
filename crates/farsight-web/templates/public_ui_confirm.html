@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Farsight — turn on the public UI{% endblock %}
+{% block content %}
+<h1>Turn on the public UI?</h1>
+<div class="banner">Nothing has been changed yet. Read what becomes reachable, then confirm.</div>
+<div class="card">
+<p>With the public UI on, anyone can open <code>https://{{ e.hostname }}/public</code> without logging in and see:</p>
+<ul>
+<li><strong>The instance hostname</strong>: {{ e.hostname }}.</li>
+<li><strong>The operator contact</strong>: {{ e.shown_contact }}. <code>server.contact</code> ({{ e.server_contact }}) is already public through <code>getStats</code> and the User-Agent of this instance's outbound requests.</li>
+<li><strong>Coverage status</strong>: how complete this instance's index is, with the reasons and the instance-wide exception counts.</li>
+<li><strong>Incoming blocks</strong> for any account: which accounts block it.</li>
+<li><strong>Lists naming any account</strong>: the listblocked lists it is on, each with its name, purpose, owner and number of listblocks.</li>
+<li><strong>List memberships</strong>: the members of any indexed list, and the accounts that block the list.</li>
+{% if e.show_history %}<li><strong>Historical data</strong>: blocks, listblocks and list memberships this instance stored and later removed{% if let Some(r) = e.retention %}, for {{ r }} after each removal{% else %}, kept indefinitely{% endif %}. This is not available from any other public source. Turn <code>show_history</code> off if you do not want to publish it.</li>
+{% else %}<li>Removed records are <strong>not</strong> shown (<code>show_history</code> is off).</li>{% endif %}
+{% if e.show_outgoing %}<li><strong>Outgoing blocks</strong>: the blocks each account has made (<code>show_outgoing_blocks</code> is on).</li>
+{% else %}<li>The blocks an account has made are <strong>not</strong> listed (<code>show_outgoing_blocks</code> is off).</li>{% endif %}
+</ul>
+<p>{% if e.crawlable %}Search engines <strong>will</strong> be allowed to index the account and list pages (<code>crawlable</code> is on).{% else %}Search engines are asked not to index the pages (<code>crawlable</code> is off).{% endif %}
+Accounts that are not active, and the accounts in <code>excluded_dids</code>, are not shown.</p>
+<p>You can turn the public UI off again at any time; caches in front of Farsight keep their copies for up to a minute.</p>
+<form method="post" action="/settings/public-ui/confirm">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="confirm" value="{{ token }}">
+<div class="row"><button type="submit">Turn on the public UI</button> <a class="button secondary" href="/settings">Cancel</a></div>
+</form>
+</div>
+{% endblock %}

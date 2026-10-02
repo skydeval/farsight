@@ -21,6 +21,70 @@ need a restart. Writes are atomic and notify the backfill process.</p>
 <div class="row"><button type="submit">Save</button></div>
 </form>
 
+<form class="stack card" method="post" action="/settings/public-ui" id="public-ui">
+<h2>Public UI</h2>
+<p class="muted">A public lookup site under <code>/public</code>: anyone can see who blocks an account,
+directly and through lists, with this instance's coverage. Every setting here applies on save, without
+a restart; a cache in front of Farsight keeps serving its copies for up to a minute.
+<a href="/public" target="_blank" rel="noopener">Open the public UI in a new tab</a>{% if !p.enabled %} (it answers 404 while switched off){% endif %}.</p>
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label><input type="checkbox" name="enabled"{% if p.enabled %} checked{% endif %}> Serve the public UI (<code>access.public_ui</code>)</label>
+<div class="hint">Needs <code>access.reads = "public"</code> and <code>access.ui = "public_read"</code>. Turning it on asks for confirmation on a page that lists what becomes reachable without login.</div>
+
+<label for="instance_description">Description</label>
+<textarea id="instance_description" name="instance_description" maxlength="2000">{{ p.instance_description }}</textarea>
+<div class="hint">Plain text shown on the public home page; blank lines separate paragraphs. Empty: the default text.</div>
+
+<label for="pu_contact">Contact</label>
+<input type="text" id="pu_contact" name="contact" maxlength="200" value="{{ p.contact }}">
+<div class="hint">Shown on public pages. Empty: <code>server.contact</code>.</div>
+
+<label><input type="checkbox" name="show_history"{% if p.show_history %} checked{% endif %}> Show removed records (<code>show_history</code>)</label>
+<div class="hint">Removed blocks and list memberships have no other public source. Off: the history pages answer 404.</div>
+
+<label><input type="checkbox" name="show_outgoing_blocks"{% if p.show_outgoing_blocks %} checked{% endif %}> Show the blocks an account has made (<code>show_outgoing_blocks</code>)</label>
+<div class="hint">Adds a "Blocks by this account" section to account pages, with its own coverage.</div>
+
+<label><input type="checkbox" name="show_opengraph_image"{% if p.show_opengraph_image %} checked{% endif %}> Offer the preview image (<code>show_opengraph_image</code>)</label>
+<div class="hint">Link previews carry a title, a fixed description and one static image; never data.</div>
+
+<label for="dark_mode_default">Default theme</label>
+<select id="dark_mode_default" name="dark_mode_default">
+<option value="system"{% if p.dark_mode_default == "system" %} selected{% endif %}>system (follow the visitor)</option>
+<option value="light"{% if p.dark_mode_default == "light" %} selected{% endif %}>light</option>
+<option value="dark"{% if p.dark_mode_default == "dark" %} selected{% endif %}>dark</option>
+</select>
+<div class="hint">What a visitor gets before choosing; the toggle on the pages overrides it for that visitor.</div>
+
+<label><input type="checkbox" name="crawlable"{% if p.crawlable %} checked{% endif %}> Let search engines index the public pages (<code>crawlable</code>)</label>
+<div class="hint">Changes <code>/robots.txt</code> and the <code>X-Robots-Tag</code> header. History, search and error pages are never offered.
+Turning this off later does not retract what was indexed: a crawler that may no longer fetch a page never sees its
+<code>noindex</code>, so entries can stay listed until removed with the search engines' own tools. <code>robots.txt</code> is
+advisory; scrapers that ignore it are bounded only by the rate limit. Some link-preview fetchers obey
+<code>robots.txt</code>: while this is off, previews do not appear on those platforms.</div>
+
+<label for="rate_limit_rps">Page views per second, per address</label>
+<input type="number" id="rate_limit_rps" name="rate_limit_rps" min="1" value="{{ p.rate_limit_rps }}">
+<label for="rate_limit_burst">Burst</label>
+<input type="number" id="rate_limit_burst" name="rate_limit_burst" min="1" value="{{ p.rate_limit_burst }}">
+<div class="hint">Home, about, account and list pages. Search and history pages use the lookup rate (<code>rate_limit.ui_lookup_rps</code>).</div>
+
+<label for="query_concurrency">Concurrent page renders</label>
+<input type="number" id="query_concurrency" name="query_concurrency" min="1" max="{{ p.max_concurrency }}" value="{{ p.query_concurrency }}">
+<div class="hint">At most <code>rate_limit.query_concurrency</code> ({{ p.max_concurrency }}), so public page views cannot take every slot the API's reads need.</div>
+
+<label for="handle_cache_ttl">Handle cache lifetime</label>
+<input type="text" id="handle_cache_ttl" name="handle_cache_ttl" value="{{ p.handle_cache_ttl }}">
+<div class="hint">How long a verified handle is shown before it is checked again, e.g. <code>1h</code>.</div>
+
+<label for="excluded_dids">Excluded accounts</label>
+<textarea id="excluded_dids" name="excluded_dids" spellcheck="false" placeholder="did:plc:…">{{ p.excluded_dids }}</textarea>
+<div class="hint">One DID per line, at most 10,000. An excluded account has no public page and appears in no row, with the same
+notice an inactive account gets. This changes what the public pages <strong>show</strong>, nothing else: the data stays stored,
+and <code>/xrpc/*</code> and the lookup pages here still return it.</div>
+<div class="row"><button type="submit">Save public UI settings</button></div>
+</form>
+
 <form class="stack card" method="post" action="/settings/password">
 <h2>Admin password</h2>
 <input type="hidden" name="csrf" value="{{ csrf }}">

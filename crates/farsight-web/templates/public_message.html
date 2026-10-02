@@ -1,0 +1,7 @@
+{% extends "public_base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<div class="card"><p>{{ message }}</p>
+{% if let Some(l) = link %}<p><a href="{{ l.0 }}">{{ l.1 }}</a></p>{% endif %}
+</div>
+{% endblock %}

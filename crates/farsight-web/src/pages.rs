@@ -101,6 +101,9 @@ pub struct WebState {
     pub token_path: PathBuf,
     /// Background status.
     pub status: Arc<ServerStatus>,
+    /// The public UI's state (handle cache, render bound, pending
+    /// confirmations).
+    pub public: crate::public::PublicState,
 }
 
 /// A logged-in admin.
@@ -135,12 +138,16 @@ pub enum Need {
     Admin,
 }
 
-fn login_redirect() -> Response {
+pub(crate) fn login_redirect() -> Response {
     common::redirect("/login")
 }
 
 /// Applies the UI access rules (§3.5, §8.6).
-async fn gate(st: &WebState, headers: &HeaderMap, need: Need) -> Result<Option<Admin>, Response> {
+pub(crate) async fn gate(
+    st: &WebState,
+    headers: &HeaderMap,
+    need: Need,
+) -> Result<Option<Admin>, Response> {
     let cfg = st.api.config.current();
     let access = &cfg.config.access;
     if access.ui == UiMode::Disabled {
@@ -159,7 +166,7 @@ async fn gate(st: &WebState, headers: &HeaderMap, need: Need) -> Result<Option<A
     Ok(session)
 }
 
-fn check_form(
+pub(crate) fn check_form(
     admin: &Admin,
     headers: &HeaderMap,
     form: &HashMap<String, String>,
@@ -185,6 +192,11 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/ops", get(ops_page))
         .route("/ops/{action}", post(ops_action))
         .route("/settings", get(settings_page).post(settings_save))
+        .route("/settings/public-ui", post(crate::public_settings::save))
+        .route(
+            "/settings/public-ui/confirm",
+            post(crate::public_settings::confirm),
+        )
         .route("/settings/password", post(settings_password))
         .route("/settings/token", post(settings_token))
         .route("/reset", get(reset_page).post(reset_submit))
@@ -198,6 +210,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         )
         .route("/static/farsight.css", get(common::css))
         .route("/static/htmx.min.js", get(common::htmx))
+        .merge(crate::public::router())
         .with_state(state)
 }
 
@@ -215,7 +228,7 @@ pub struct Nav {
     pub csrf: String,
 }
 
-fn nav(st: &WebState, session: &Option<Admin>) -> Nav {
+pub(crate) fn nav(st: &WebState, session: &Option<Admin>) -> Nav {
     let cfg = st.api.config.current();
     Nav {
         admin: session.is_some(),
@@ -1523,6 +1536,8 @@ pub struct SettingsPage {
     pub restart: Vec<String>,
     /// A new admin token, shown once.
     pub new_token: Option<String>,
+    /// The Public UI subsection's values.
+    pub p: crate::public_settings::View,
 }
 
 const REDACTED: &str = "<redacted>";
@@ -1599,7 +1614,7 @@ fn unredact(submitted: &str, current: &str) -> Result<String, String> {
     toml::to_string_pretty(&t).map_err(|e| e.to_string())
 }
 
-fn settings_base(st: &WebState, s: &Admin) -> SettingsPage {
+pub(crate) fn settings_base(st: &WebState, s: &Admin) -> SettingsPage {
     let cur = st.api.config.current();
     SettingsPage {
         nav: nav(st, &Some(s.clone())),
@@ -1616,6 +1631,7 @@ fn settings_base(st: &WebState, s: &Admin) -> SettingsPage {
         error: None,
         restart: Vec::new(),
         new_token: None,
+        p: crate::public_settings::View::of(&cur.config),
     }
 }
 
@@ -1643,12 +1659,22 @@ async fn settings_save(
     let submitted = form.get("config").cloned().unwrap_or_default();
     let current = st.api.config.file_text().unwrap_or_default();
     let result = match unredact(&submitted, &current) {
-        Ok(text) => st
-            .api
-            .config
-            .replace(&text)
-            .await
-            .map_err(|e| e.to_string()),
+        // Turning the public UI on needs the operator's confirmation,
+        // whichever editor asks for it (§8.6).
+        Ok(text) => match crate::public_settings::confirmation(
+            &st,
+            &s,
+            crate::public_settings::Change::File(text.clone()),
+        ) {
+            Ok(Some(confirm)) => return confirm,
+            Ok(None) => st
+                .api
+                .config
+                .replace(&text)
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        },
         Err(e) => Err(format!("Not valid TOML: {e}")),
     };
     let mut page = settings_base(&st, &s);

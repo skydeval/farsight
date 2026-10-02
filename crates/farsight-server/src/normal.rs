@@ -166,6 +166,7 @@ pub async fn run(
     let cf = Arc::new(CfTracker::default());
     farsight_api::metrics::register();
     farsight_storage::history::register_metrics();
+    farsight_web::public::metrics::register();
 
     let api = Arc::new(ApiState {
         pool: api_pool.clone(),
@@ -198,6 +199,7 @@ pub async fn run(
         reset: reset_tx,
         token_path: farsight_web::setup_token::token_path(&config_path),
         status: status.clone(),
+        public: Default::default(),
     });
 
     // Housekeeping of in-memory API state.
@@ -270,6 +272,9 @@ pub async fn run(
         .merge(farsight_web::pages::router(web.clone()))
         .route("/health", get(health::health).with_state(api_pool.clone()))
         .route("/livez", get(health::livez))
+        // One answer for every path that does not exist, and for the
+        // routes of a feature that is switched off (§8.6).
+        .fallback(farsight_web::common::fallback)
         .layer(axum::middleware::from_fn_with_state(
             layer,
             client_ip_middleware,

@@ -1,0 +1,1 @@
+{% if let Some(n) = next %}<p class="pager"><a href="{{ n }}#{{ section }}" hx-get="{{ n }}" hx-select="#{{ section }}" hx-target="#{{ section }}" hx-swap="outerHTML" hx-push-url="true" rel="nofollow">Next</a></p>{% endif %}

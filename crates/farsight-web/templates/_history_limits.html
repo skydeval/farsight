@@ -1,0 +1,22 @@
+<section id="limits">
+<h2>What this page covers</h2>
+<p>Every row is a record this instance stored and later removed. This is not a complete record of anything.</p>
+<h3>When removals were recorded</h3>
+{% if windows.is_empty() %}<p>No recording period falls inside the time this instance keeps removals for.</p>{% endif %}
+<ul>{% for w in windows %}<li>{% if let Some(to) = w.to %}This instance recorded removals from <time datetime="{{ w.from.iso }}">{{ w.from.text }}</time> to <time datetime="{{ to.iso }}">{{ to.text }}</time>.{% else %}This instance has recorded removals since <time datetime="{{ w.from.iso }}">{{ w.from.text }}</time>.{% endif %}</li>
+{% endfor %}</ul>
+{% if !recording %}<p>This instance is not recording removals at present.</p>{% endif %}
+<h3>How long they are kept</h3>
+<p>{{ retention }}</p>
+<h3>Limits</h3>
+<ul>
+<li>A block or membership that began and ended before this instance stored it is not here. This is most of what is missing.</li>
+<li>Only lists that someone blocks are indexed; membership of other lists is never recorded. When a list stops being blocked its members are dropped without a record.</li>
+<li>A removal this instance missed is recorded when it is noticed later, with the time it was noticed. Times stand still while the instance is disconnected from the network.</li>
+<li>"First seen" is when this instance stored the record. It restarts when a list is indexed again.</li>
+<li>Records of accounts that were deleted are removed, and accounts that are not active are not shown.</li>
+<li>An account or list that removes very many records in a day has the excess left out.</li>
+<li>A deleted list's members are recorded only up to that daily limit; a very large list is stored only in part.</li>
+<li>The two sections are separate records. They can show that an account stopped blocking a list, and that someone was removed from a list, not that a given block covered a given account at a given time.</li>
+</ul>
+</section>

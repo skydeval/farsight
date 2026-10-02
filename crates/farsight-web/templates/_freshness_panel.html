@@ -1,0 +1,10 @@
+<section id="coverage">
+<h2>Coverage</h2>
+{% if let Some(s) = summary %}<p class="lead">For this page as a whole, the lowest of its sections:</p>
+{{ s|safe }}{% endif %}
+{% if !exceptions.is_empty() %}<p>Across this instance, not counted in the above:</p>
+<ul class="exceptions">{% for e in exceptions %}<li><a href="/public/about#{{ e.anchor }}">{{ e.text }}</a></li>{% endfor %}</ul>{% endif %}
+<p class="notice">Accounts that are not active are not shown.{% if operator_excludes %} This instance's operator has chosen not to show some accounts on these pages.{% endif %}</p>
+{% for r in raw %}<details><summary>Raw freshness: {{ r.title }}</summary><pre>{{ r.json }}</pre></details>
+{% endfor %}<p class="muted"><a href="/public/about#coverage">How to read coverage</a></p>
+</section>

@@ -59,6 +59,22 @@ pub async fn htmx() -> Response {
     asset(HTMX, "text/javascript; charset=utf-8")
 }
 
+/// The answer for a route that does not exist — or does not exist for
+/// this configuration, which must look the same: a disabled feature's
+/// response does not say what the instance could serve if configured
+/// otherwise.
+pub fn not_found() -> Response {
+    let mut r = (StatusCode::NOT_FOUND, "not found").into_response();
+    r.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+/// The router fallback: [`not_found`] for every unmatched path.
+pub async fn fallback() -> Response {
+    not_found()
+}
+
 /// A relative redirect (§8.5: never absolute, never to another scheme).
 pub fn redirect(path: &str) -> Response {
     debug_assert!(path.starts_with('/') && !path.starts_with("//"));

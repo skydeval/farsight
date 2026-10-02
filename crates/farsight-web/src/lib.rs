@@ -1,7 +1,8 @@
 //! The Farsight web UI (design §8): server-rendered HTML (askama), one CSS
 //! file, vendored htmx, no build step, no CDN. Setup mode serves the
 //! first-run wizard; normal mode serves the dashboard, lookups, operations,
-//! settings and reset.
+//! settings and reset, and — when the operator turns it on — the public UI
+//! under `/public`.
 
 #![warn(missing_docs)]
 // Handlers return early with a ready `Response` as the error value; boxing
@@ -10,6 +11,8 @@
 
 pub mod common;
 pub mod pages;
+pub mod public;
+pub mod public_settings;
 pub mod setup;
 pub mod setup_token;
 

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"{% if c.theme != "system" %} data-theme="{{ c.theme }}"{% endif %} data-theme-default="{{ c.theme }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false}'>
+<title>{{ c.title }}</title>
+{{ c.og|safe }}
+<link rel="stylesheet" href="/public/static/public.css">
+<script src="/public/static/public.js"></script>
+<script src="/public/static/htmx.min.js" defer></script>
+</head>
+<body>
+<header class="top">
+<a class="brand" href="/public">Farsight</a>
+<span class="host">{{ c.hostname }}</span>
+<nav><a href="/public">Search</a><a href="/public/about">About</a></nav>
+<button type="button" id="theme-toggle" class="secondary" hidden>Dark mode</button>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+<footer>
+<p>An independent index of public block records, run by its operator and not affiliated with Bluesky. <a href="/public/about">About this instance</a>.{% if !c.contact.is_empty() %} Contact: {{ c.contact }}{% endif %}</p>
+</footer>
+</body>
+</html>
