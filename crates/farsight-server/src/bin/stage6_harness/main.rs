@@ -1796,8 +1796,8 @@ async fn check_coverage(
         let stamp = updated_of(&r.text).unwrap_or_default();
         let text_ok = r.text.contains(&format!(
             "<time datetime=\"{stamp}\">{} {} UTC</time>.</p>",
-            &stamp.get(..10).unwrap_or(""),
-            &stamp.get(11..19).unwrap_or("")
+            stamp.get(..10).unwrap_or(""),
+            stamp.get(11..19).unwrap_or("")
         ));
         if n != 1 || !is_utc_instant(&stamp) || !text_ok {
             bad.push(format!("{name}: {n} lines, {stamp:?}, text {text_ok}"));
