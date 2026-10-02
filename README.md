@@ -58,8 +58,8 @@ depending on a third-party index.
   types above.
 - It holds nothing private. Everything it stores comes from public
   records.
-- It has no user accounts. Auth is bearer tokens plus one admin
-  password.
+- It has no user accounts. The API uses bearer tokens; the web UI
+  admits one admin, who signs in with an ATProto account.
 - It does not decide block policy. For example, it reports each list's
   purpose, and the consumer decides how to treat it.
 
@@ -92,8 +92,8 @@ The wizard asks for:
   v1 only, so coverage stays `partial` until you point Farsight at a
   self-hosted v2 Jetstream;
 - backfill preferences and the disk space available to Postgres;
-- access modes and an admin password, after which it shows the admin
-  token once;
+- access modes and the DID of the ATProto account that will
+  administer the instance, after which it shows the admin token once;
 - reverse-proxy trust (it has a preset for Cloudflare);
 - the Postgres connection string.
 
@@ -125,6 +125,61 @@ answers within a second (compose uses it as a status check); `/livez`
 returns 200 while the process serves HTTP and is the right probe for
 orchestrators that restart unhealthy containers.
 
+## Admin sign-in
+
+The web UI's admin is one ATProto account, named by its DID in
+`access.admin_did`. Signing in at `/enter` sends you to that account's
+own server (its PDS or entryway) to authenticate, through ATProto
+OAuth; Farsight asks for the `atproto` scope only, which proves who you
+are and grants no access to the account. It keeps no token: once the
+account is confirmed, Farsight issues its own session (12 hours idle,
+7 days at most) and forgets the rest. There is no password.
+
+Farsight can be an OAuth client in two ways:
+
+- **On its hostname.** When `server.hostname` is a public domain name
+  without a port, reachable over HTTPS, open `https://<hostname>/enter`.
+  The account's server fetches Farsight's client description from
+  `/.well-known/atproto-oauth-client-metadata`. The reverse proxy must
+  pass the original `Host` header.
+- **On 127.0.0.1.** Anywhere else — an IP address, a port, a private
+  network — sign in on the machine that runs Farsight, or through an SSH
+  tunnel to it, at `http://127.0.0.1:<port>/enter`
+  (`ssh -L 8080:127.0.0.1:8080 your-host`). Use `127.0.0.1`, not
+  `localhost`. Browsers share cookies across ports of `127.0.0.1`, so two
+  instances tunnelled at once sign each other out.
+
+The account's server must be reachable from Farsight at a public
+address: like every request Farsight makes to an address it learned
+from the network, sign-in refuses private, loopback and link-local
+addresses.
+
+Things to know:
+
+- **Whoever controls the account controls the admin UI.** That
+  includes the account's server, its password there, and its PLC
+  rotation keys or `did:web` domain. An account on a server you run is
+  the safer choice.
+- **Signing out of Farsight does not sign you out of the account's
+  server.** If that server remembers you, signing in again may take one
+  click.
+- **Changing the admin account, or recovering from a lost one,** is done
+  in the container: `docker exec farsight farsight set-admin-did <did>`,
+  then `docker restart farsight`. The running server does not re-read
+  `config.toml`; the change applies at the restart, and every session of
+  the previous account ends then. `farsight admin-did` prints the
+  current value. With `FARSIGHT_SKIP_WIZARD=1`, set
+  `FARSIGHT__ACCESS__ADMIN_DID` instead. Settings shows the admin DID
+  but does not change it.
+- Neither the wizard nor the CLI can prove that the DID you enter is
+  yours; they show what it resolves to. A wrong DID is fixed with the
+  CLI.
+- **`access.ui = "auth_all"`** answers every admin page with a plain
+  404 to anyone not signed in. `/enter`, its callback and the client
+  description stay reachable — the sign-in is hidden from nobody, the
+  admin data is. After a session expires, go to `/enter`. Under
+  `"public_read"` (the default) the dashboard and lookups stay public.
+
 ## Public UI
 
 Farsight can serve a public lookup site from the same binary: search by
@@ -134,9 +189,10 @@ blocks it). It is an independent equivalent of Clearsky's lookup pages.
 
 It is **off by default**. Turn it on in Settings → Public UI; Farsight
 first shows what becomes reachable without login and asks you to
-confirm. It needs `access.reads = "public"` and `access.ui =
-"public_read"`: a public site in front of a gated API is not a
-supported combination.
+confirm. It needs `access.reads = "public"`: a public site in front of
+a gated API is not a supported combination. It works with every
+`access.ui` mode; with `"auth_all"` the public pages are up and the
+admin pages are hidden.
 
 - **A bar on every page** with search and a light / dark / system
   theme toggle. Public pages link only to other public pages (and to
@@ -218,6 +274,30 @@ you save the Public UI settings.
 
 ### Upgrading from an earlier version
 
+From a version with a password login:
+
+- **Admin sign-in uses an ATProto account instead of the password.**
+  After the upgrade, `/enter` shows a one-time page: enter the existing
+  admin password and the DID of the account that will administer the
+  instance. Farsight then writes `access.admin_did`, removes the
+  password hash, ends every password session, and you sign in with the
+  account. `farsight set-admin-did <did>` in the container does the same
+  (then restart). Until you do either, the instance runs as before and
+  the old password still opens that page — and only that page.
+- The config as it was is kept next to it as `config.toml.pre-oauth`
+  (0600). It holds the old password hash: delete it once sign-in works.
+  To roll back, stop Farsight, copy it over `config.toml` and start the
+  older image; an older binary refuses a config that has
+  `access.admin_did`.
+- With `FARSIGHT_SKIP_WIZARD=1` there is no file to write: set
+  `FARSIGHT__ACCESS__ADMIN_DID` and restart. Until then the UI has no
+  sign-in; ingest and the API run.
+- `access.public_ui` no longer requires `access.ui = "public_read"`.
+- Add `/enter/callback` to anything that names `/enter` (cache bypass,
+  firewall rules); see "Running behind Cloudflare".
+
+From earlier versions:
+
 - **The admin login is at `/enter`.** `/login` is a 404. Update
   bookmarks, and any proxy or firewall rule that names `/login`.
 - **`/public/about` and the public history pages are gone** (404).
@@ -267,8 +347,12 @@ stops recording.
      `query.getBackfillStatus`.
    - If the public UI is on, make `/public/*` eligible for cache and
      respect origin headers.
-   - Bypass the cache for `/admin*`, `/enter`, `/setup*`,
-     `/xrpc/app.nearhorizon.farsight.admin.*`, `/health` and `/livez`.
+   - Bypass the cache for `/admin*`, `/enter*` (the sign-in and its
+     callback), `/setup*`, `/xrpc/app.nearhorizon.farsight.admin.*`,
+     `/health` and `/livez`. The admin pages outside `/admin*` (`/`,
+     `/dashboard/fragment`, `/lookup/*`, `/ops`, `/settings`, `/reset`)
+     send `no-store` to a signed-in admin; bypass them too if the
+     dashboard is not public.
 4. Lock the origin with Cloudflare Tunnel or Authenticated Origin
    Pulls. Firewalling the origin to Cloudflare's IP ranges alone is not
    enough.
