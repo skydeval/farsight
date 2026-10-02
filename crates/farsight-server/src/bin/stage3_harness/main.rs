@@ -28,10 +28,11 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use crate::seed::did;
-use crate::support::{Checks, Http, Pg, Resp, Server, csrf_of, enc, free_port, set_cookie};
+use crate::support::{
+    ADMIN_DID, Checks, Http, Pg, Resp, Server, admin_session, csrf_of, enc, free_port, set_cookie,
+};
 
 const NS: &str = "app.nearhorizon.farsight";
-const PASSWORD: &str = "harness-password-123";
 const HOSTNAME: &str = "farsight.test";
 
 fn x(base: &str, method: &str, query: &str) -> String {
@@ -60,7 +61,6 @@ fn config_toml(
     metrics_bind: &str,
     extra: &str,
 ) -> String {
-    let bcrypt = bcrypt::hash(PASSWORD, 4).expect("bcrypt");
     format!(
         r#"[server]
 hostname = "{HOSTNAME}"
@@ -76,10 +76,10 @@ urls = ["{firehose}"]
 [access]
 reads = "{reads}"
 ui = "public_read"
+admin_did = "{ADMIN_DID}"
 
 [auth]
 admin_token_sha256 = "{}"
-admin_password_bcrypt = "{bcrypt}"
 
 [metrics]
 bind = "{metrics_bind}"
@@ -956,14 +956,16 @@ async fn check_rate_limits(
             .post_form(
                 &format!("{base}/enter"),
                 &[("cf-connecting-ip", &cf_ip(21))],
-                &[("password", "wrong-password-xx")],
+                &[],
             )
             .await?;
         statuses.push(r.status);
     }
+    // Each admitted start tries to reach the harness admin DID's server,
+    // which does not exist (502); what is checked here is the limit.
     c.check(
-        "UI login attempts: 5 per minute per IP, then 429",
-        statuses[..5].iter().all(|s| *s == 401) && statuses[5..].iter().all(|s| *s == 429),
+        "UI sign-in starts: 5 per minute per IP, then 429",
+        statuses[..5].iter().all(|s| *s != 429) && statuses[5..].iter().all(|s| *s == 429),
         format!("{statuses:?}"),
     );
     // Cache headers (§9.4).
@@ -1129,23 +1131,7 @@ async fn check_reset(
 ) -> Result<(), String> {
     c.section("8. reset");
     let base = &s.base;
-    let r = ctx
-        .http
-        .post_form(
-            &format!("{base}/enter"),
-            &[("cf-connecting-ip", "203.0.113.90")],
-            &[("password", PASSWORD)],
-        )
-        .await?;
-    let Some(cookie) = set_cookie(&r, "farsight_admin") else {
-        c.check("admin login", false, r.short());
-        return Ok(());
-    };
-    c.check(
-        "admin login creates a server-side session",
-        r.status == 303,
-        r.short(),
-    );
+    let cookie = admin_session(pool, ADMIN_DID).await?;
     let page = ctx
         .http
         .get(&format!("{base}/reset"), &[("cookie", &cookie)])

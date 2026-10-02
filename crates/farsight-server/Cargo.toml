@@ -40,6 +40,11 @@ name = "farsight-stage6-harness"
 path = "src/bin/stage6_harness/main.rs"
 required-features = ["harness"]
 
+[[bin]]
+name = "farsight-stage7-harness"
+path = "src/bin/stage7_harness/main.rs"
+required-features = ["harness"]
+
 [dependencies]
 base64 = { version = "0.22", optional = true }
 bcrypt = { version = "0.15", optional = true }

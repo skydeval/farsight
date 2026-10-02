@@ -44,9 +44,10 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::seed::did;
-use crate::support::{Checks, Http, Pg, Resp, Server, csrf_of, enc, free_port, set_cookie};
+use crate::support::{
+    ADMIN_DID, Checks, Http, Pg, Resp, Server, admin_session, csrf_of, enc, free_port, set_cookie,
+};
 
-const PASSWORD: &str = "harness-password-123";
 const HOSTNAME: &str = "farsight.test";
 const NS: &str = "app.nearhorizon.farsight";
 /// A real account with a stable handle, for the live checks.
@@ -93,7 +94,6 @@ fn config_toml(
     access: &str,
     public_ui: &str,
 ) -> String {
-    let bcrypt = bcrypt::hash(PASSWORD, 4).expect("bcrypt");
     format!(
         r#"[server]
 hostname = "{HOSTNAME}"
@@ -112,6 +112,7 @@ plc_url = "{plc}"
 [access]
 reads = "public"
 ui = "public_read"
+admin_did = "{ADMIN_DID}"
 {access}
 
 [public_ui]
@@ -119,7 +120,6 @@ ui = "public_read"
 
 [auth]
 admin_token_sha256 = "{}"
-admin_password_bcrypt = "{bcrypt}"
 
 [metrics]
 bind = "{metrics_bind}"
@@ -238,16 +238,7 @@ impl H {
     }
 
     async fn login(&mut self) -> Result<(), String> {
-        let r = self
-            .admin
-            .post_form(
-                &format!("{}/enter", self.base),
-                &[],
-                &[("password", PASSWORD)],
-            )
-            .await?;
-        self.cookie =
-            set_cookie(&r, "farsight_admin").ok_or_else(|| format!("login: {}", r.short()))?;
+        self.cookie = admin_session(&self.pool, ADMIN_DID).await?;
         let page = self
             .admin
             .get(
@@ -871,13 +862,14 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
             && robots.header("cache-control").as_deref() == Some("public, max-age=300"),
         robots.short(),
     );
-    // The loader refuses every other access combination.
+    // The loader refuses the public UI over gated reads, whatever the
+    // admin UI mode (the public UI no longer depends on it).
     let mut refused = Vec::new();
     for (reads, ui) in [
         ("api_key", "public_read"),
         ("disabled", "public_read"),
-        ("public", "auth_all"),
-        ("public", "disabled"),
+        ("api_key", "auth_all"),
+        ("disabled", "disabled"),
     ] {
         let text = minimal_config(&format!(
             "[access]\nreads = \"{reads}\"\nui = \"{ui}\"\npublic_ui = true\n"
@@ -892,16 +884,20 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
             .err()
             .map(ToString::to_string)
             .unwrap_or_default();
-        if !(on.is_err()
-            && off.is_ok()
-            && msg.contains("access.reads")
-            && msg.contains("access.ui"))
-        {
+        if !(on.is_err() && off.is_ok() && msg.contains("access.reads")) {
             refused.push(format!("{reads}/{ui}: {msg}"));
         }
     }
+    for ui in ["public_read", "auth_all", "disabled"] {
+        let text = minimal_config(&format!(
+            "[access]\nreads = \"public\"\nui = \"{ui}\"\npublic_ui = true\n"
+        ));
+        if let Err(e) = farsight_core::config::load_from_parts(Some(&text), &[]) {
+            refused.push(format!("public/{ui} refused: {e}"));
+        }
+    }
     c.check(
-        "config load refuses public_ui = true without reads = public and ui = public_read, naming both keys",
+        "config load refuses public_ui = true without reads = public, naming the key, and accepts it with every ui mode",
         refused.is_empty(),
         refused.join("; "),
     );
@@ -911,7 +907,7 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
 fn minimal_config(rest: &str) -> String {
     format!(
         "[server]\nhostname = \"h.test\"\ncontact = \"mailto:x@h.test\"\n[storage]\ndatabase_url = \"postgres://x\"\n\
-         [auth]\nadmin_token_sha256 = \"{}\"\nadmin_password_bcrypt = \"$2b$04$x\"\n{rest}",
+         [auth]\nadmin_token_sha256 = \"{}\"\n{rest}",
         "0".repeat(64)
     )
 }
@@ -1210,12 +1206,12 @@ async fn check_enable_flow(c: &mut Checks, h: &mut H, w: &World) -> Result<(), S
 // ------------------------------------------------------------ 2. routes
 
 async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
-    c.section("2a. the admin login is at /enter");
+    c.section("2a. the admin sign-in is at /enter");
     let unknown = h.get("/no-such-route").await?;
     let get = h.get("/login").await?;
     let post = h
         .fresh()
-        .post_form(&format!("{}/login", h.base), &[], &[("password", PASSWORD)])
+        .post_form(&format!("{}/login", h.base), &[], &[("password", "x")])
         .await?;
     let with_cookie = h.admin_get("/login").await?;
     let same = |r: &Resp| {
@@ -1232,31 +1228,25 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
     );
     let enter = h.get("/enter").await?;
     c.check(
-        "/enter serves the admin login form, posting to /enter, never cached",
+        "/enter serves the admin sign-in form, posting to /enter, with no password field, never cached",
         enter.status == 200
             && enter
                 .text
                 .contains("<form class=\"stack card\" method=\"post\" action=\"/enter\">")
-            && enter.text.contains("name=\"password\"")
+            && !enter.text.contains("type=\"password\"")
             && enter.header("cache-control").as_deref() == Some("no-store, private"),
         enter.short(),
     );
-    let wrong = h
+    // A password posted to /enter signs nobody in (the flow itself is the
+    // stage-7 harness's subject).
+    let posted = h
         .fresh()
         .post_form(&format!("{}/enter", h.base), &[], &[("password", "nope")])
         .await?;
-    let right = h
-        .fresh()
-        .post_form(&format!("{}/enter", h.base), &[], &[("password", PASSWORD)])
-        .await?;
     c.check(
-        "POST /enter verifies the password: wrong ⇒ 401 and no cookie, right ⇒ 303 to / with the session cookie",
-        wrong.status == 401
-            && set_cookie(&wrong, "farsight_admin").is_none()
-            && right.status == 303
-            && right.header("location").as_deref() == Some("/")
-            && set_cookie(&right, "farsight_admin").is_some(),
-        format!("{} / {}", wrong.status, right.status),
+        "POST /enter takes no password: whatever is posted, no session cookie comes back",
+        set_cookie(&posted, "farsight_admin").is_none() && posted.status != 200,
+        format!("{}", posted.status),
     );
     let gated = h.get("/settings").await?;
     let dash = h.get("/").await?;
@@ -1264,7 +1254,7 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
         "an admin page without a session redirects to /enter, and the admin header's link points there",
         gated.status == 303
             && gated.header("location").as_deref() == Some("/enter")
-            && dash.text.contains("<a href=\"/enter\">Log in</a>")
+            && dash.text.contains("<a href=\"/enter\">Sign in</a>")
             && !dash.text.contains("/login"),
         format!("{} → {:?}", gated.status, gated.header("location")),
     );
@@ -3475,7 +3465,6 @@ async fn check_settings_refusals(c: &mut Checks, h: &mut H) -> Result<(), String
     for (from, to) in [
         ("reads = \"public\"", "reads = \"api_key\""),
         ("reads = \"public\"", "reads = \"disabled\""),
-        ("ui = \"public_read\"", "ui = \"auth_all\""),
     ] {
         let text = before.replace(from, to);
         let r = h
@@ -3487,14 +3476,14 @@ async fn check_settings_refusals(c: &mut Checks, h: &mut H) -> Result<(), String
             )
             .await?;
         let b = banner(&r.text);
-        if !(b.contains("access.reads") && b.contains("access.ui"))
+        if !b.contains("access.reads")
             || std::fs::read_to_string(&path).map_err(|e| e.to_string())? != before
         {
             bad.push(format!("{to}: {b}"));
         }
     }
     c.check(
-        "changing reads or ui while the public UI is on is rejected with a message naming both keys; nothing is written",
+        "changing reads while the public UI is on is rejected with a message naming the key; nothing is written (the ui mode is free: stage 7)",
         bad.is_empty() && h.get("/public").await?.status == 200 && before.contains("public_ui = true"),
         bad.join("; "),
     );
@@ -3970,7 +3959,7 @@ async fn phase_ui(
     if hold {
         h.set(&[("show_outgoing_blocks", Some("on"))]).await?;
         println!(
-            "== holding: {} (admin password {PASSWORD}, login at /enter)",
+            "== holding: {} (admin DID {ADMIN_DID}; sessions are made by the harness)",
             h.base
         );
         println!("   account {}/public/did/{}", h.base, w.s);
