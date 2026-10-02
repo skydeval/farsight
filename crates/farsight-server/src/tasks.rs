@@ -15,7 +15,7 @@ use farsight_storage::gates::{self, Budget, GateState, SharedGates};
 use farsight_storage::keys::Limits;
 use farsight_storage::tracking::FireArgs;
 use farsight_storage::transition::Event;
-use farsight_storage::{debts, firehose, janitor, recount};
+use farsight_storage::{debts, firehose, history, janitor, recount};
 use farsight_web::ServerStatus;
 use sqlx::PgPool;
 use tokio::sync::watch;
@@ -31,7 +31,10 @@ pub const RECORDS: &str = "farsight_records";
 /// `farsight_abuse_capped_total{kind}` is counted where batches are
 /// applied (ingest writer, backfill jobs); the monitor only publishes
 /// gauges.
-const TABLES: [&str; 8] = [
+const TABLES: [&str; 11] = [
+    "blocks_history",
+    "list_blocks_history",
+    "list_items_history",
     "blocks",
     "list_items",
     "actors",
@@ -62,6 +65,9 @@ pub struct TaskCtx {
     pub gates: Arc<SharedGates>,
     /// Dashboard status.
     pub status: Arc<ServerStatus>,
+    /// `storage.block_history_enabled` as it was at start: the server
+    /// applies a change of the flag at restart (§7.7).
+    pub history_enabled: bool,
     gate_state: Mutex<GateState>,
     samples: Mutex<VecDeque<(DateTime<Utc>, u64)>>,
 }
@@ -75,19 +81,23 @@ impl TaskCtx {
         gates: Arc<SharedGates>,
         status: Arc<ServerStatus>,
     ) -> TaskCtx {
+        let history_enabled = config.current().config.storage.block_history_enabled;
         TaskCtx {
             pool,
             config,
             counters,
             gates,
             status,
+            history_enabled,
             gate_state: Mutex::new(GateState::default()),
             samples: Mutex::new(VecDeque::new()),
         }
     }
 
     fn limits(&self) -> Limits {
-        Limits::from_config(&self.config.current().config)
+        let mut l = Limits::from_config(&self.config.current().config);
+        l.history_enabled = self.history_enabled;
+        l
     }
 }
 
@@ -172,6 +182,12 @@ fn jobs() -> Vec<Job> {
             placeholder_lists
         ),
         job!("rate_tables", DAY, Duration::from_secs(960), rate_tables),
+        job!(
+            "history_retention",
+            DAY,
+            Duration::from_secs(1080),
+            history_retention
+        ),
         job!(
             "orphaned_cursors",
             DAY,
@@ -492,6 +508,7 @@ async fn admin_sessions(ctx: Arc<TaskCtx>) -> Result<String, String> {
 }
 
 async fn storage_metrics(ctx: Arc<TaskCtx>) -> Result<String, String> {
+    let mut history_bytes = 0u64;
     for t in TABLES {
         let n: Option<i64> = sqlx::query_scalar("SELECT pg_total_relation_size(to_regclass($1))")
             .bind(t)
@@ -499,7 +516,12 @@ async fn storage_metrics(ctx: Arc<TaskCtx>) -> Result<String, String> {
             .await
             .map_err(err)?;
         metrics::gauge!(STORAGE_TABLE_BYTES, "table" => t).set(n.unwrap_or(0) as f64);
+        if t.ends_with("_history") {
+            history_bytes += n.unwrap_or(0).max(0) as u64;
+        }
     }
+    // The dashboard shows history next to the budget (§11.2).
+    ctx.status.update(|s| s.history_bytes = Some(history_bytes));
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT name, COALESCE(sum(value), 0)::bigint FROM stats_counters GROUP BY name",
     )
@@ -545,6 +567,27 @@ async fn rate_tables(ctx: Arc<TaskCtx>) -> Result<String, String> {
         .await
         .map_err(err)?;
     Ok(format!("{n} rate rows older than 2 days deleted"))
+}
+
+/// The daily history retention pass (§7.7). With `"0s"` it does not run.
+async fn history_retention(ctx: Arc<TaskCtx>) -> Result<String, String> {
+    let retention = ctx
+        .config
+        .current()
+        .config
+        .storage
+        .block_history_retention
+        .get();
+    if retention.is_zero() {
+        return Ok(String::new());
+    }
+    let r = history::prune(&ctx.pool, Utc::now(), retention)
+        .await
+        .map_err(err)?;
+    Ok(format!(
+        "history past retention deleted: {} blocks, {} listblocks, {} listitems, {} windows",
+        r.rows[0], r.rows[1], r.rows[2], r.windows
+    ))
 }
 
 async fn orphaned_cursors(ctx: Arc<TaskCtx>) -> Result<String, String> {

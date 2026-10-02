@@ -68,6 +68,8 @@ pub struct StatusInner {
     pub growth_warning: Option<String>,
     /// When the Cloudflare ranges were last refreshed.
     pub cf_refreshed_at: Option<DateTime<Utc>>,
+    /// Size of the three history tables with their indexes (§7.7).
+    pub history_bytes: Option<u64>,
 }
 
 impl ServerStatus {
@@ -528,6 +530,10 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
             .push(stat("Of budget", format!("{:.1}%", ratio * 100.0)));
         d.storage
             .push(stat("Hard ceiling", common::human_bytes(s.ceiling_bytes)));
+        if let Some(h) = s.history_bytes {
+            d.storage
+                .push(stat("History (in the budget)", common::human_bytes(h)));
+        }
         if s.gate.critical {
             d.warnings.push(Warning {
                 class: "bad",

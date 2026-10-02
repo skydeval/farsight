@@ -16,6 +16,7 @@ pub mod debts;
 pub mod error;
 pub mod firehose;
 pub mod gates;
+pub mod history;
 pub mod janitor;
 pub mod keys;
 pub mod queries;
@@ -130,6 +131,7 @@ mod tests {
             ("counters.rs", include_str!("counters.rs")),
             ("coverage.rs", include_str!("coverage.rs")),
             ("queries.rs", include_str!("queries.rs")),
+            ("history.rs", include_str!("history.rs")),
             ("auth.rs", include_str!("auth.rs")),
             ("backfill_api.rs", include_str!("backfill_api.rs")),
         ] {

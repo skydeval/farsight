@@ -13,6 +13,7 @@ use crate::apply::{block_delete_row, item_delete_row, listblock_delete_row};
 use crate::codes::TrackState;
 use crate::counters::{CounterSink, stat};
 use crate::error::{Result, StorageError};
+use crate::history::{self, Cause, Removal};
 use crate::keys::{self, CapKind, Limits};
 use crate::tracking::FireArgs;
 use crate::transition::Event;
@@ -37,7 +38,7 @@ pub async fn purge_tombstones(
         .rows_affected())
 }
 
-/// Drops `admission_rate` and `intern_rate` rows older than 2 days
+/// Drops `admission_rate`, `intern_rate` and `history_rate` rows older than 2 days
 /// (§7.1; nightly).
 pub async fn drop_old_rates(pool: &PgPool, today: NaiveDate) -> Result<u64> {
     let cutoff = today - ChronoDuration::days(2);
@@ -51,7 +52,12 @@ pub async fn drop_old_rates(pool: &PgPool, today: NaiveDate) -> Result<u64> {
         .execute(pool)
         .await?
         .rows_affected();
-    Ok(a + i)
+    let h = sqlx::query("DELETE FROM history_rate WHERE utc_day < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(a + i + h)
 }
 
 /// Deletes cursor rows of runs that are no longer current (§5.2; nightly).
@@ -176,8 +182,12 @@ pub async fn process_purges(
                 .bind(PURGE_BATCH)
                 .fetch_all(&mut *t.conn)
                 .await?;
+                // Recorded only while the list's record is deleted and its
+                // owner is not (§4.4, §7.8); `item_delete_row` checks both.
+                // Every other drain is a change of tracking.
+                let drained = Removal::listing(Cause::ListDeleted);
                 for rk in &rkeys {
-                    if item_delete_row(&mut t, &author, rk).await? {
+                    if item_delete_row(&mut t, &author, rk, Some(&drained)).await? {
                         deleted += 1;
                     }
                 }
@@ -365,13 +375,13 @@ pub async fn purge_account_batch(
         }
         t.lock_lists(&locks).await?;
         for rk in &blocks {
-            block_delete_row(&mut t, &author, rk).await?;
+            block_delete_row(&mut t, &author, rk, None).await?;
         }
         for (rk, _, _) in &lbs {
-            listblock_delete_row(&mut t, &author, rk).await?;
+            listblock_delete_row(&mut t, &author, rk, None).await?;
         }
         for (rk, _) in &items {
-            item_delete_row(&mut t, &author, rk).await?;
+            item_delete_row(&mut t, &author, rk, None).await?;
         }
         for (list_id, _, record_state) in &own_lists {
             sqlx::query(
@@ -400,9 +410,15 @@ pub async fn purge_account_batch(
         .bind(author_id)
         .execute(&mut *t.conn)
         .await?;
-        let done = (blocks.len() as i64) < batch
+        let mut done = (blocks.len() as i64) < batch
             && (lbs.len() as i64) < batch
             && (items.len() as i64) < batch;
+        if done {
+            // The purge writes no history, and deletes the history the DID
+            // authored, in batches, after the live rows (§7.4).
+            let n = history::delete_authored(&mut *t.conn, author_id, batch).await?;
+            done = (n as i64) < batch;
+        }
         t.send_notify().await?;
         let (_, deltas) = t.finish();
         (done, deltas)
@@ -519,13 +535,13 @@ pub async fn purge_for_divergence_batch(
         }
         t.lock_lists(&locks).await?;
         for rk in &blocks {
-            block_delete_row(&mut t, &author, rk).await?;
+            block_delete_row(&mut t, &author, rk, None).await?;
         }
         for (rk, _, _) in &lbs {
-            listblock_delete_row(&mut t, &author, rk).await?;
+            listblock_delete_row(&mut t, &author, rk, None).await?;
         }
         for (rk, _) in &items {
-            item_delete_row(&mut t, &author, rk).await?;
+            item_delete_row(&mut t, &author, rk, None).await?;
         }
         let done = (blocks.len() as i64) < batch
             && (lbs.len() as i64) < batch
@@ -595,14 +611,18 @@ pub async fn purge_account(
     Ok(())
 }
 
-/// Accounts with status `deleted` that still author rows (a purge was
-/// interrupted, e.g. by a crash after the status commit). Ingest runs
-/// these at start-up.
+/// Accounts with status `deleted` that still author rows, live or in
+/// history (a purge was interrupted, e.g. by a crash after the status
+/// commit; or a replayed event wrote a history row later, §7.4). Ingest
+/// runs these at start-up.
 pub async fn accounts_pending_purge(pool: &PgPool, limit: i64) -> Result<Vec<Did>> {
     let dids: Vec<String> = sqlx::query_scalar(
         "SELECT did FROM actors a WHERE a.status = $1
            AND (a.authored_blocks > 0 OR a.authored_listblocks > 0 OR a.owned_items > 0
-                OR EXISTS (SELECT 1 FROM lists l WHERE l.owner_id = a.id AND l.record_state <> 2))
+                OR EXISTS (SELECT 1 FROM lists l WHERE l.owner_id = a.id AND l.record_state <> 2)
+                OR EXISTS (SELECT 1 FROM blocks_history h WHERE h.author_id = a.id)
+                OR EXISTS (SELECT 1 FROM list_blocks_history h WHERE h.author_id = a.id)
+                OR EXISTS (SELECT 1 FROM list_items_history h WHERE h.owner_id = a.id))
          ORDER BY id LIMIT $2",
     )
     .bind(crate::codes::actor_status::DELETED)

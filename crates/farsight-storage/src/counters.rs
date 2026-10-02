@@ -80,6 +80,9 @@ pub struct Deltas {
     pub stats: HashMap<&'static str, i64>,
     /// `host_usage` bucket → delta.
     pub hosts: HashMap<String, HostDelta>,
+    /// History rows written and skipped (§7.7); published as metrics when
+    /// the transaction's deltas reach the sink, never flushed to a table.
+    pub history: crate::history::Counts,
 }
 
 impl Deltas {
@@ -141,7 +144,8 @@ impl CounterSink {
     }
 
     /// Merges the deltas of a committed transaction.
-    pub fn add(&self, d: Deltas) {
+    pub fn add(&self, mut d: Deltas) {
+        std::mem::take(&mut d.history).publish();
         if d.is_empty() {
             return;
         }

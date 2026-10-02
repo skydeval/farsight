@@ -20,6 +20,7 @@ required-features = ["harness"]
 [dependencies]
 chrono.workspace = true
 farsight-core.workspace = true
+metrics = "0.24"
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true

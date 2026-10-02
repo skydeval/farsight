@@ -92,6 +92,13 @@ pub async fn run(
         schema = farsight_storage::SCHEMA_VERSION,
         "migrations applied"
     );
+    // The recording window (§7.7) opens or closes here and only here: the
+    // ingest writer takes `block_history_enabled` at start.
+    let recording =
+        farsight_storage::history::sync_window(&api_pool, cfg.storage.block_history_enabled)
+            .await
+            .map_err(|e| format!("history window: {e}"))?;
+    tracing::info!(recording, "block and list-membership history");
     let ingest_pool =
         farsight_storage::connect(&cfg.storage.database_url, farsight_ingest::POOL_SIZE)
             .await
@@ -158,6 +165,7 @@ pub async fn run(
     let trust = Arc::new(ProxyTrust::default());
     let cf = Arc::new(CfTracker::default());
     farsight_api::metrics::register();
+    farsight_storage::history::register_metrics();
 
     let api = Arc::new(ApiState {
         pool: api_pool.clone(),

@@ -77,6 +77,8 @@ pub fn install_metrics() -> Option<PrometheusHandle> {
     match b.install_recorder() {
         Ok(h) => {
             metrics::register();
+            // Reconciles write history rows in this process (§7.7).
+            farsight_storage::history::register_metrics();
             Some(h)
         }
         Err(e) => {

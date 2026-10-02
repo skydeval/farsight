@@ -45,6 +45,8 @@ pub struct Limits {
     pub tombstone_ttl: Duration,
     /// `backfill.system_queue_cap` (system requesters' waiting entries).
     pub system_queue_cap: i64,
+    /// `storage.block_history_enabled`: write history rows (§7.7, §7.8).
+    pub history_enabled: bool,
 }
 
 impl Limits {
@@ -55,6 +57,7 @@ impl Limits {
             synthetic_gap_lag: config.firehose.tuning.synthetic_gap_lag.get(),
             tombstone_ttl: config.storage.tombstone_ttl.get(),
             system_queue_cap: clamp(config.backfill.system_queue_cap),
+            history_enabled: config.storage.block_history_enabled,
         }
     }
 
@@ -78,6 +81,15 @@ impl Limits {
             clamp(self.cfg.intern_per_bucket_per_day)
         } else {
             clamp(self.cfg.intern_per_did_per_day)
+        }
+    }
+
+    /// Daily history-row limit for an admission key (§7.7).
+    pub fn history_limit(&self, key: &str) -> i64 {
+        if key.starts_with(BUCKET_KEY_PREFIX) {
+            clamp(self.cfg.history_per_bucket_per_day)
+        } else {
+            clamp(self.cfg.history_per_did_per_day)
         }
     }
 
@@ -319,6 +331,9 @@ mod tests {
         assert_eq!(l.admission_limit("bucket:example.com"), 20_000);
         assert_eq!(l.admission_limit("unresolved:did:plc:x"), 200);
         assert_eq!(l.intern_limit("token:3"), 1_000_000);
+        assert_eq!(l.history_limit("bucket:example.com"), 200_000);
+        assert_eq!(l.history_limit("did:did:plc:x"), 10_000);
+        assert!(l.history_enabled);
         assert_eq!(l.bucket_cap("unresolved", CapKind::Blocks), 1_000_000);
         assert_eq!(l.bucket_cap("d:example.com", CapKind::Blocks), 20_000_000);
         assert_eq!(l.bucket_cap("did:did:plc:x", CapKind::Listblocks), 100_000);

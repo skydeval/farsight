@@ -633,6 +633,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "farsight-core",
+ "metrics",
  "proptest",
  "serde_json",
  "sha2",
@@ -655,6 +656,7 @@ dependencies = [
  "farsight-ingest",
  "farsight-storage",
  "ipnet",
+ "metrics",
  "serde",
  "serde_json",
  "sha2",

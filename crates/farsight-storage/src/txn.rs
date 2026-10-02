@@ -77,6 +77,8 @@ pub struct AuthorInfo {
     pub large: bool,
     /// OR of the buckets' `capped_mask`.
     pub mask: i16,
+    /// `actors.status` (§7.4 codes), as read with the row.
+    pub status: i16,
 }
 
 impl AuthorInfo {
@@ -202,6 +204,11 @@ pub struct Txn<'c> {
     /// `firehose_state.applied_through` at transaction start: the witness
     /// stamped on debts caused by non-firehose work.
     pub clock_witness: Option<DateTime<Utc>>,
+    /// The database's `now()` at transaction start (§7.7: the witness of a
+    /// listing write while the clock is still undefined).
+    pub now: DateTime<Utc>,
+    /// The history row written last (see `history`).
+    pub(crate) last_history: Option<crate::history::Written>,
     authors: HashMap<Did, AuthorInfo>,
     /// Counter deltas, merged into the sink only after commit.
     pub deltas: Deltas,
@@ -222,18 +229,21 @@ impl<'c> Txn<'c> {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *conn)
             .await?;
-        let (today, clock_witness): (NaiveDate, Option<DateTime<Utc>>) = sqlx::query_as(
-            "SELECT (now() AT TIME ZONE 'UTC')::date,
-                    (SELECT applied_through FROM firehose_state WHERE id = 1)",
-        )
-        .fetch_one(&mut *conn)
-        .await?;
+        let (today, clock_witness, now): (NaiveDate, Option<DateTime<Utc>>, DateTime<Utc>) =
+            sqlx::query_as(
+                "SELECT (now() AT TIME ZONE 'UTC')::date,
+                    (SELECT applied_through FROM firehose_state WHERE id = 1), now()",
+            )
+            .fetch_one(&mut *conn)
+            .await?;
         Ok(Txn {
             conn,
             limits,
             gates,
             today,
             clock_witness,
+            now,
+            last_history: None,
             authors: HashMap::new(),
             deltas: Deltas::default(),
             notify: false,
@@ -317,15 +327,24 @@ impl<'c> Txn<'c> {
         }
         let row: Option<AuthorRow> = sqlx::query_as(
             "SELECT a.id, a.admission_key, a.resolve_failures, a.pds_host_id IS NOT NULL,
-                        h.cap_key, h.ip_bucket, COALESCE(h.large, false)
+                        h.cap_key, h.ip_bucket, COALESCE(h.large, false), a.status
                  FROM actors a LEFT JOIN pds_hosts h ON h.id = a.pds_host_id
                  WHERE a.did = $1",
         )
         .bind(did.as_str())
         .fetch_optional(&mut *self.conn)
         .await?;
-        let (id, facts) = match row {
-            Some((id, admission_key, resolve_failures, resolved, cap_key, ip_bucket, large)) => (
+        let (id, facts, status) = match row {
+            Some((
+                id,
+                admission_key,
+                resolve_failures,
+                resolved,
+                cap_key,
+                ip_bucket,
+                large,
+                status,
+            )) => (
                 id,
                 HostFacts {
                     admission_key,
@@ -335,6 +354,7 @@ impl<'c> Txn<'c> {
                     large,
                     resolved,
                 },
+                status,
             ),
             None => {
                 let facts = HostFacts::default();
@@ -345,7 +365,7 @@ impl<'c> Txn<'c> {
                 let id = self.insert_actor(did.as_str()).await?;
                 self.deltas.host(&buckets, CapKind::Interned, 1);
                 self.report.new_authors.push(id);
-                (id, facts)
+                (id, facts, crate::codes::actor_status::ACTIVE)
             }
         };
         let key = keys::admission_key(did, &facts);
@@ -359,6 +379,7 @@ impl<'c> Txn<'c> {
             buckets,
             large,
             mask,
+            status,
         };
         self.authors.insert(did.clone(), info.clone());
         Ok(info)
@@ -674,6 +695,7 @@ type AuthorRow = (
     Option<String>,
     Option<String>,
     bool,
+    i16,
 );
 
 /// The LWW upsert rule (§7.2): apply iff `w` beats the stored row's rev

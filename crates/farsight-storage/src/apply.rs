@@ -29,6 +29,7 @@ use crate::codes::{CapType, DebtReason, RecordState, TrackState};
 use crate::counters::{CounterSink, stat};
 use crate::error::{Result, StorageError};
 use crate::firehose::FirehoseProgress;
+use crate::history::{Cause as Removed, Gone, Removal};
 use crate::keys::{self, CapKind, Limits};
 use crate::repo_events::{RepoEvent, unavailable_list_keys};
 use crate::tracking::FireArgs;
@@ -421,6 +422,27 @@ async fn stored_list_targets(
         .await?)
 }
 
+/// The removal a write causes (§7.7): a firehose event names its commit
+/// rev and its witness; a listing or discovery write knows neither.
+fn removal_for(origin: &Origin, w: &Write, cause: Removed) -> Removal {
+    match origin {
+        Origin::Firehose => Removal {
+            cause,
+            rev: Some(w.stamp),
+            witness: w.witness,
+        },
+        _ => Removal::listing(cause),
+    }
+}
+
+/// The witness a write stamps on the row it stores (§7.7).
+fn seen_for(t: &Txn<'_>, origin: &Origin, w: &Write) -> DateTime<Utc> {
+    match origin {
+        Origin::Firehose => t.seen_at(w.witness),
+        _ => t.seen_at(None),
+    }
+}
+
 fn cause_for(author: &AuthorInfo, origin: &Origin) -> Cause {
     match origin {
         Origin::Discovery { requester } => Cause {
@@ -446,10 +468,10 @@ async fn apply_write(t: &mut Txn<'_>, origin: &Origin, w: &Write) -> Result<()> 
     }
     match &w.action {
         WriteAction::Delete => match w.collection {
-            Collection::Block => block_delete(t, &author, w).await,
-            Collection::ListBlock => listblock_delete(t, &author, w).await,
+            Collection::Block => block_delete(t, origin, &author, w).await,
+            Collection::ListBlock => listblock_delete(t, origin, &author, w).await,
             Collection::List => list_delete(t, &author, w).await,
-            Collection::ListItem => listitem_delete(t, &author, w).await,
+            Collection::ListItem => listitem_delete(t, origin, &author, w).await,
         },
         WriteAction::Upsert(record) => {
             if let Origin::Listing {
@@ -460,10 +482,10 @@ async fn apply_write(t: &mut Txn<'_>, origin: &Origin, w: &Write) -> Result<()> 
             }
             let cause = cause_for(&author, origin);
             match record {
-                Record::Block(r) => block_upsert(t, &author, &cause, w, r).await,
-                Record::ListBlock(r) => listblock_upsert(t, &author, &cause, w, r).await,
+                Record::Block(r) => block_upsert(t, origin, &author, &cause, w, r).await,
+                Record::ListBlock(r) => listblock_upsert(t, origin, &author, &cause, w, r).await,
                 Record::List(r) => list_upsert(t, &author, &cause, w, r).await,
-                Record::ListItem(r) => listitem_upsert(t, &author, &cause, w, r).await,
+                Record::ListItem(r) => listitem_upsert(t, origin, &author, &cause, w, r).await,
             }
         }
     }
@@ -515,28 +537,33 @@ async fn stored_rev(
 
 async fn block_upsert(
     t: &mut Txn<'_>,
+    origin: &Origin,
     author: &AuthorInfo,
     cause: &Cause,
     w: &Write,
     r: &BlockRecord,
 ) -> Result<()> {
     let rkey = w.rkey.as_str();
-    let row: Option<(i64, i64)> =
-        sqlx::query_as("SELECT subject_id, rev FROM blocks WHERE author_id = $1 AND rkey = $2")
-            .bind(author.id)
-            .bind(rkey)
-            .fetch_optional(&mut *t.conn)
-            .await?;
+    let row: Option<BlockRow> = sqlx::query_as(
+        "SELECT subject_id, rev, created_at, first_seen, last_seen FROM blocks
+         WHERE author_id = $1 AND rkey = $2",
+    )
+    .bind(author.id)
+    .bind(rkey)
+    .fetch_optional(&mut *t.conn)
+    .await?;
     let tomb = t.tombstone_rev(Collection::Block, author.id, rkey).await?;
     if !lww_upsert_wins(w.stamp, row.map(|x| x.1), tomb) {
         t.report.stale += 1;
         return Ok(());
     }
-    if let Some((old_subject, _)) = row {
+    let seen = seen_for(t, origin, w);
+    if let Some((old_subject, _, old_created, old_first, old_last)) = row {
         let same = t.actor_id(r.subject.as_str()).await? == Some(old_subject);
+        let refused = removal_for(origin, w, Removed::RefusedUpdate);
         if let Some(refusal) = t.gate(cause, CapKind::Blocks) {
             if !same {
-                block_delete_row(t, author, rkey).await?;
+                block_delete_row(t, author, rkey, Some(&refused)).await?;
                 t.put_refusal_tombstone(Collection::Block, author.id, rkey, w.stamp)
                     .await?;
             }
@@ -550,7 +577,7 @@ async fn block_upsert(
             match t.intern_actor(&r.subject, cause).await? {
                 Ok(id) => id,
                 Err(refusal) => {
-                    block_delete_row(t, author, rkey).await?;
+                    block_delete_row(t, author, rkey, Some(&refused)).await?;
                     t.put_refusal_tombstone(Collection::Block, author.id, rkey, w.stamp)
                         .await?;
                     return t
@@ -559,9 +586,24 @@ async fn block_upsert(
                 }
             }
         };
-        // Subject change = delete + insert: authored_blocks is unchanged.
+        if !same {
+            // Subject change = removal of the old target + a fresh insert,
+            // done in place: authored_blocks is unchanged, the old target
+            // goes to history and the witness bounds start again (§7.2).
+            let gone = Gone {
+                rkey,
+                created_at: old_created,
+                first_seen: old_first,
+                last_seen: old_last,
+            };
+            let removal = removal_for(origin, w, Removed::SubjectChange);
+            t.record_block_removal(author, &gone, old_subject, &removal)
+                .await?;
+        }
         sqlx::query(
-            "UPDATE blocks SET subject_id = $3, created_at = $4, rev = $5
+            "UPDATE blocks SET subject_id = $3, created_at = $4, rev = $5,
+               first_seen = CASE WHEN $6 THEN first_seen ELSE $7 END,
+               last_seen = CASE WHEN $6 THEN GREATEST(last_seen, $7) ELSE $7 END
              WHERE author_id = $1 AND rkey = $2",
         )
         .bind(author.id)
@@ -569,12 +611,14 @@ async fn block_upsert(
         .bind(subject_id)
         .bind(r.created_at)
         .bind(w.stamp)
+        .bind(same)
+        .bind(seen)
         .execute(&mut *t.conn)
         .await?;
         t.report.applied += 1;
         return Ok(());
     }
-    match block_insert(t, author, cause, w, r).await? {
+    match block_insert(t, author, cause, w, r, seen).await? {
         Ok(()) => {
             t.report.applied += 1;
             Ok(())
@@ -586,12 +630,22 @@ async fn block_upsert(
     }
 }
 
+/// `subject_id, rev, created_at, first_seen, last_seen` of a stored block.
+type BlockRow = (
+    i64,
+    i64,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+);
+
 async fn block_insert(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
     cause: &Cause,
     w: &Write,
     r: &BlockRecord,
+    seen: DateTime<Utc>,
 ) -> Result<Result<(), Refusal>> {
     if let Some(refusal) = t.gate(cause, CapKind::Blocks) {
         return Ok(Err(refusal));
@@ -612,14 +666,15 @@ async fn block_insert(
         return Ok(Err(Refusal::Capped(CapType::BlocksPerAuthor)));
     }
     sqlx::query(
-        "INSERT INTO blocks (author_id, rkey, subject_id, created_at, rev)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO blocks (author_id, rkey, subject_id, created_at, rev, first_seen, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6, $6)",
     )
     .bind(author.id)
     .bind(w.rkey.as_str())
     .bind(subject_id)
     .bind(r.created_at)
     .bind(w.stamp)
+    .bind(seen)
     .execute(&mut *t.conn)
     .await?;
     t.deltas.stat(stat::BLOCKS, 1);
@@ -627,30 +682,80 @@ async fn block_insert(
     Ok(Ok(()))
 }
 
+/// `subject_id, created_at, first_seen, last_seen` of a deleted block.
+type BlockGone = (
+    i64,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+);
+
+/// `list_id, counted, sched_key, created_at, first_seen, last_seen` of a
+/// deleted listblock.
+type ListBlockGone = (
+    i64,
+    bool,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+);
+
+/// `list_id, subject_id, created_at, first_seen, last_seen` of a deleted
+/// listitem.
+type ItemGone = (
+    i64,
+    i64,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+);
+
 /// Deletes one block row (with its counters). Returns whether a row went.
+/// Every path deleting `blocks` rows uses this function; it is also where
+/// `blocks_history` is written (§7.7): the caller names the removal, and
+/// the account and divergence purges name none.
 pub(crate) async fn block_delete_row(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
     rkey: &str,
+    removal: Option<&Removal>,
 ) -> Result<bool> {
-    let gone = sqlx::query("DELETE FROM blocks WHERE author_id = $1 AND rkey = $2")
+    let gone: Option<BlockGone> = sqlx::query_as(
+        "DELETE FROM blocks WHERE author_id = $1 AND rkey = $2
+             RETURNING subject_id, created_at, first_seen, last_seen",
+    )
+    .bind(author.id)
+    .bind(rkey)
+    .fetch_optional(&mut *t.conn)
+    .await?;
+    let Some((subject_id, created_at, first_seen, last_seen)) = gone else {
+        return Ok(false);
+    };
+    sqlx::query("UPDATE actors SET authored_blocks = authored_blocks - 1 WHERE id = $1")
         .bind(author.id)
-        .bind(rkey)
         .execute(&mut *t.conn)
-        .await?
-        .rows_affected();
-    if gone > 0 {
-        sqlx::query("UPDATE actors SET authored_blocks = authored_blocks - 1 WHERE id = $1")
-            .bind(author.id)
-            .execute(&mut *t.conn)
-            .await?;
-        t.deltas.stat(stat::BLOCKS, -1);
-        t.deltas.host(&author.buckets, CapKind::Blocks, -1);
+        .await?;
+    t.deltas.stat(stat::BLOCKS, -1);
+    t.deltas.host(&author.buckets, CapKind::Blocks, -1);
+    if let Some(r) = removal {
+        let gone = Gone {
+            rkey,
+            created_at,
+            first_seen,
+            last_seen,
+        };
+        t.record_block_removal(author, &gone, subject_id, r).await?;
     }
-    Ok(gone > 0)
+    Ok(true)
 }
 
-async fn block_delete(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<()> {
+async fn block_delete(
+    t: &mut Txn<'_>,
+    origin: &Origin,
+    author: &AuthorInfo,
+    w: &Write,
+) -> Result<()> {
     let rkey = w.rkey.as_str();
     let rev: Option<i64> =
         sqlx::query_scalar("SELECT rev FROM blocks WHERE author_id = $1 AND rkey = $2")
@@ -659,7 +764,8 @@ async fn block_delete(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result
             .fetch_optional(&mut *t.conn)
             .await?;
     if rev.is_some_and(|r| r < w.stamp) {
-        block_delete_row(t, author, rkey).await?;
+        let removal = removal_for(origin, w, Removed::Delete);
+        block_delete_row(t, author, rkey, Some(&removal)).await?;
     }
     t.put_tombstone(Collection::Block, author.id, rkey, w.stamp)
         .await?;
@@ -702,6 +808,7 @@ async fn find_list(t: &mut Txn<'_>, owner: &str, rkey: &str) -> Result<Option<i6
 
 async fn listblock_upsert(
     t: &mut Txn<'_>,
+    origin: &Origin,
     author: &AuthorInfo,
     cause: &Cause,
     w: &Write,
@@ -717,6 +824,7 @@ async fn listblock_upsert(
         return Ok(());
     }
     let target = find_list(t, r.subject.authority.as_str(), r.subject.rkey.as_str()).await?;
+    let seen = seen_for(t, origin, w);
     if let Some(old) = row {
         if Some(old.list_id) == target {
             // Same subject: counted, witnessed_at and sched_key are sticky.
@@ -726,26 +834,34 @@ async fn listblock_upsert(
                     .await;
             }
             sqlx::query(
-                "UPDATE list_blocks SET created_at = $3, rev = $4
+                "UPDATE list_blocks SET created_at = $3, rev = $4,
+                   last_seen = GREATEST(last_seen, $5)
                  WHERE author_id = $1 AND rkey = $2",
             )
             .bind(author.id)
             .bind(rkey)
             .bind(r.created_at)
             .bind(w.stamp)
+            .bind(seen)
             .execute(&mut *t.conn)
             .await?;
             t.report.applied += 1;
             return Ok(());
         }
         // Subject change: delete of the old row plus a new insert (§4.2).
-        listblock_delete_row(t, author, rkey).await?;
-        return match listblock_insert(t, author, cause, w, r).await? {
+        // The old target goes to history (§7.2); if the new version is
+        // then refused, the removal is a refused update.
+        let removal = removal_for(origin, w, Removed::SubjectChange);
+        t.clear_last_history();
+        listblock_delete_row(t, author, rkey, Some(&removal)).await?;
+        return match listblock_insert(t, author, cause, w, r, seen).await? {
             Ok(()) => {
+                t.clear_last_history();
                 t.report.applied += 1;
                 Ok(())
             }
             Err(refusal) => {
+                t.relabel_last_history(Removed::RefusedUpdate).await?;
                 t.put_refusal_tombstone(Collection::ListBlock, author.id, rkey, w.stamp)
                     .await?;
                 t.refuse(author, Collection::ListBlock, rkey, refusal, w.witness)
@@ -753,7 +869,7 @@ async fn listblock_upsert(
             }
         };
     }
-    match listblock_insert(t, author, cause, w, r).await? {
+    match listblock_insert(t, author, cause, w, r, seen).await? {
         Ok(()) => {
             t.report.applied += 1;
             Ok(())
@@ -820,6 +936,7 @@ async fn listblock_insert(
     cause: &Cause,
     w: &Write,
     r: &ListBlockRecord,
+    seen: DateTime<Utc>,
 ) -> Result<Result<(), Refusal>> {
     if let Some(refusal) = t.gate(cause, CapKind::Listblocks) {
         return Ok(Err(refusal));
@@ -845,8 +962,8 @@ async fn listblock_insert(
     let counted = decide_counted(t, author, list_id).await?;
     sqlx::query(
         "INSERT INTO list_blocks (author_id, rkey, list_id, counted, witnessed_at, sched_key,
-                                  created_at, rev)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                                  created_at, rev, first_seen, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)",
     )
     .bind(author.id)
     .bind(w.rkey.as_str())
@@ -856,6 +973,7 @@ async fn listblock_insert(
     .bind(author.key.as_str())
     .bind(r.created_at)
     .bind(w.stamp)
+    .bind(seen)
     .execute(&mut *t.conn)
     .await?;
     t.deltas.stat(stat::LIST_BLOCKS, 1);
@@ -879,23 +997,36 @@ async fn listblock_insert(
 /// counted, decrements `listblock_count`, `fetch_triggers` and the lane
 /// of its stored `sched_key`, firing **−** on 1 → 0. Every path deleting
 /// `list_blocks` rows uses this function. The caller holds author(A) and
-/// list(L) exclusive.
+/// list(L) exclusive. It is also where `list_blocks_history` is written
+/// (§4.2, §7.7): the caller names the removal, and the two purges name
+/// none. Counted and uncounted rows are recorded alike.
 pub(crate) async fn listblock_delete_row(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
     rkey: &str,
+    removal: Option<&Removal>,
 ) -> Result<bool> {
-    let gone: Option<(i64, bool, Option<String>)> = sqlx::query_as(
+    let gone: Option<ListBlockGone> = sqlx::query_as(
         "DELETE FROM list_blocks WHERE author_id = $1 AND rkey = $2
-         RETURNING list_id, counted, sched_key",
+         RETURNING list_id, counted, sched_key, created_at, first_seen, last_seen",
     )
     .bind(author.id)
     .bind(rkey)
     .fetch_optional(&mut *t.conn)
     .await?;
-    let Some((list_id, counted, sched_key)) = gone else {
+    let Some((list_id, counted, sched_key, created_at, first_seen, last_seen)) = gone else {
         return Ok(false);
     };
+    if let Some(r) = removal {
+        let gone = Gone {
+            rkey,
+            created_at,
+            first_seen,
+            last_seen,
+        };
+        t.record_listblock_removal(author, &gone, list_id, r)
+            .await?;
+    }
     sqlx::query("UPDATE actors SET authored_listblocks = authored_listblocks - 1 WHERE id = $1")
         .bind(author.id)
         .execute(&mut *t.conn)
@@ -913,11 +1044,17 @@ pub(crate) async fn listblock_delete_row(
     Ok(true)
 }
 
-async fn listblock_delete(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<()> {
+async fn listblock_delete(
+    t: &mut Txn<'_>,
+    origin: &Origin,
+    author: &AuthorInfo,
+    w: &Write,
+) -> Result<()> {
     let rkey = w.rkey.as_str();
     if let Some(row) = listblock_row(t, author.id, rkey).await? {
         if row.rev < w.stamp {
-            listblock_delete_row(t, author, rkey).await?;
+            let removal = removal_for(origin, w, Removed::Delete);
+            listblock_delete_row(t, author, rkey, Some(&removal)).await?;
         }
     }
     t.put_tombstone(Collection::ListBlock, author.id, rkey, w.stamp)
@@ -966,6 +1103,7 @@ async fn mark_list_capped(t: &mut Txn<'_>, list_id: i64, refresh: bool) -> Resul
 
 async fn listitem_upsert(
     t: &mut Txn<'_>,
+    origin: &Origin,
     author: &AuthorInfo,
     cause: &Cause,
     w: &Write,
@@ -991,6 +1129,7 @@ async fn listitem_upsert(
         .and_then(|(_, s)| TrackState::from_code(s))
         .is_some_and(TrackState::is_tracked);
     let target_id = target.map(|(id, _)| id);
+    let seen = seen_for(t, origin, w);
 
     if let Some(old) = &row {
         let same_list = Some(old.list_id) == target_id;
@@ -1002,31 +1141,41 @@ async fn listitem_upsert(
                     .await;
             }
             sqlx::query(
-                "UPDATE list_items SET created_at = $3, rev = $4 WHERE owner_id = $1 AND rkey = $2",
+                "UPDATE list_items SET created_at = $3, rev = $4,
+                   last_seen = GREATEST(last_seen, $5)
+                 WHERE owner_id = $1 AND rkey = $2",
             )
             .bind(author.id)
             .bind(rkey)
             .bind(r.created_at)
             .bind(w.stamp)
+            .bind(seen)
             .execute(&mut *t.conn)
             .await?;
             t.report.applied += 1;
             return Ok(());
         }
         // Changed (list or subject) or no longer tracked: delete the old
-        // version, then try the new one as an insert.
-        item_delete_row(t, author, rkey).await?;
+        // version, then try the new one as an insert. The removal goes to
+        // history under §7.8's condition: a subject change if the new
+        // version is stored, a refused update if it is not (which is also
+        // the case of an unchanged target whose new version is refused).
+        let removal = removal_for(origin, w, Removed::SubjectChange);
+        t.clear_last_history();
+        item_delete_row(t, author, rkey, Some(&removal)).await?;
         let result = if tracked {
-            item_insert(t, author, cause, w, r, target_id.unwrap_or_default()).await?
+            item_insert(t, author, cause, w, r, target_id.unwrap_or_default(), seen).await?
         } else {
             Err(ItemRefusal::Untracked)
         };
         return match result {
             Ok(()) => {
+                t.clear_last_history();
                 t.report.applied += 1;
                 Ok(())
             }
             Err(refusal) => {
+                t.relabel_last_history(Removed::RefusedUpdate).await?;
                 // §4.4 notes: refused new version with a stored row ⇒
                 // delete + refusal tombstone at E − 1.
                 t.put_refusal_tombstone(Collection::ListItem, author.id, rkey, w.stamp)
@@ -1039,7 +1188,7 @@ async fn listitem_upsert(
         t.report.untracked_items += 1;
         return Ok(());
     }
-    match item_insert(t, author, cause, w, r, target_id.unwrap_or_default()).await? {
+    match item_insert(t, author, cause, w, r, target_id.unwrap_or_default(), seen).await? {
         Ok(()) => {
             t.report.applied += 1;
             Ok(())
@@ -1088,6 +1237,7 @@ async fn item_insert(
     w: &Write,
     r: &ListItemRecord,
     list_id: i64,
+    seen: DateTime<Utc>,
 ) -> Result<Result<(), ItemRefusal>> {
     if let Some(refusal) = t.gate(cause, CapKind::Items) {
         mark_list_capped(t, list_id, false).await?;
@@ -1131,8 +1281,9 @@ async fn item_insert(
         return Ok(Err(ItemRefusal::ListCap));
     }
     sqlx::query(
-        "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev,
+                                 first_seen, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
     )
     .bind(author.id)
     .bind(w.rkey.as_str())
@@ -1140,6 +1291,7 @@ async fn item_insert(
     .bind(subject_id)
     .bind(r.created_at)
     .bind(w.stamp)
+    .bind(seen)
     .execute(&mut *t.conn)
     .await?;
     t.deltas.stat(stat::LIST_ITEMS, 1);
@@ -1149,25 +1301,49 @@ async fn item_insert(
 
 /// Deletes one listitem row and its counters. The caller holds author(O)
 /// and list(L) (shared suffices: all writers of L's items hold author(O)).
+/// Every path deleting `list_items` rows uses this function; it is also
+/// where `list_items_history` is written (§4.7, §7.8), when the caller
+/// names the removal **and** the owner is not `deleted` **and** the list
+/// is tracked or its record is deleted — so a change of tracking is never
+/// recorded as a change of membership.
 pub(crate) async fn item_delete_row(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
     rkey: &str,
+    removal: Option<&Removal>,
 ) -> Result<bool> {
-    let list_id: Option<i64> = sqlx::query_scalar(
-        "DELETE FROM list_items WHERE owner_id = $1 AND rkey = $2 RETURNING list_id",
+    let gone: Option<ItemGone> = sqlx::query_as(
+        "DELETE FROM list_items WHERE owner_id = $1 AND rkey = $2
+             RETURNING list_id, subject_id, created_at, first_seen, last_seen",
     )
     .bind(author.id)
     .bind(rkey)
     .fetch_optional(&mut *t.conn)
     .await?;
-    let Some(list_id) = list_id else {
+    let Some((list_id, subject_id, created_at, first_seen, last_seen)) = gone else {
         return Ok(false);
     };
-    sqlx::query("UPDATE lists SET item_count = item_count - 1 WHERE id = $1")
-        .bind(list_id)
-        .execute(&mut *t.conn)
-        .await?;
+    let list: Option<(i16, i16, String)> = sqlx::query_as(
+        "UPDATE lists SET item_count = item_count - 1 WHERE id = $1
+         RETURNING track_state, record_state, rkey",
+    )
+    .bind(list_id)
+    .fetch_optional(&mut *t.conn)
+    .await?;
+    if let (Some(r), Some((track_state, record_state, list_rkey))) = (removal, &list) {
+        let tracked = TrackState::from_code(*track_state).is_some_and(TrackState::is_tracked);
+        let record_deleted = *record_state == RecordState::Deleted.code();
+        if author.status != crate::codes::actor_status::DELETED && (tracked || record_deleted) {
+            let gone = Gone {
+                rkey,
+                created_at,
+                first_seen,
+                last_seen,
+            };
+            t.record_item_removal(author, &gone, list_rkey, subject_id, r)
+                .await?;
+        }
+    }
     sqlx::query("UPDATE actors SET owned_items = owned_items - 1 WHERE id = $1")
         .bind(author.id)
         .execute(&mut *t.conn)
@@ -1177,11 +1353,17 @@ pub(crate) async fn item_delete_row(
     Ok(true)
 }
 
-async fn listitem_delete(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<()> {
+async fn listitem_delete(
+    t: &mut Txn<'_>,
+    origin: &Origin,
+    author: &AuthorInfo,
+    w: &Write,
+) -> Result<()> {
     let rkey = w.rkey.as_str();
     if let Some(row) = item_row(t, author.id, rkey).await? {
         if row.rev < w.stamp {
-            item_delete_row(t, author, rkey).await?;
+            let removal = removal_for(origin, w, Removed::Delete);
+            item_delete_row(t, author, rkey, Some(&removal)).await?;
         }
     }
     t.put_tombstone(Collection::ListItem, author.id, rkey, w.stamp)
@@ -1358,15 +1540,24 @@ async fn reconcile_candidates(
 
 async fn apply_reconcile(t: &mut Txn<'_>, r: &Reconcile, candidates: &[String]) -> Result<()> {
     let author = t.author(&r.author).await?;
+    // A listing knows only its stamp, which is neither the removing
+    // commit's rev nor a bound on it: no rev, the listing clock (§7.7).
+    let found = Removal::listing(Removed::Reconcile);
     for rkey in candidates {
         // Re-check `rev < R` (a write earlier in this batch may have
         // re-stamped the row).
         let rev = stored_rev(t, r.collection, author.id, rkey).await?;
         let gone = match (r.collection, rev) {
             (_, Some(rev)) if rev >= r.stamp => false,
-            (Collection::Block, Some(_)) => block_delete_row(t, &author, rkey).await?,
-            (Collection::ListBlock, Some(_)) => listblock_delete_row(t, &author, rkey).await?,
-            (Collection::ListItem, Some(_)) => item_delete_row(t, &author, rkey).await?,
+            (Collection::Block, Some(_)) => {
+                block_delete_row(t, &author, rkey, Some(&found)).await?
+            }
+            (Collection::ListBlock, Some(_)) => {
+                listblock_delete_row(t, &author, rkey, Some(&found)).await?
+            }
+            (Collection::ListItem, Some(_)) => {
+                item_delete_row(t, &author, rkey, Some(&found)).await?
+            }
             (Collection::List, _) => {
                 let row: Option<(i64, i16)> = sqlx::query_as(
                     "SELECT id, record_state FROM lists WHERE owner_id = $1 AND rkey = $2",
