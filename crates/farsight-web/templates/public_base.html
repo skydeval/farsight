@@ -11,17 +11,12 @@
 <script src="/public/static/htmx.min.js" defer></script>
 </head>
 <body>
-<header class="top">
-<a class="brand" href="/public">Farsight</a>
-<span class="host">{{ c.hostname }}</span>
-<nav><a href="/public">Search</a><a href="/public/about">About</a></nav>
-<button type="button" id="theme-toggle" class="secondary" hidden>Dark mode</button>
-</header>
+{% include "_public_nav.html" %}
 <main>
 {% block content %}{% endblock %}
 </main>
 <footer>
-<p>An independent index of public block records, run by its operator and not affiliated with Bluesky. <a href="/public/about">About this instance</a>.{% if !c.contact.is_empty() %} Contact: {{ c.contact }}{% endif %}</p>
+<p>An independent index of public block records, run by its operator and not affiliated with Bluesky.</p>
 </footer>
 </body>
 </html>

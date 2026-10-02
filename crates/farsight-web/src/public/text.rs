@@ -84,6 +84,104 @@ pub fn list_href(owner: &str, rkey: &str) -> String {
     format!("/public/list/{}/{}", seg(owner), seg(rkey))
 }
 
+/// `/public/card/{did}`: the profile-card fragment of an account.
+pub fn card_href(did: &str) -> String {
+    format!("/public/card/{}", seg(did))
+}
+
+/// `/admin/did/{did}/history`.
+pub fn admin_did_history_href(did: &str) -> String {
+    format!("/admin/did/{}/history", seg(did))
+}
+
+/// `/admin/list/{did}/{rkey}/history`.
+pub fn admin_list_history_href(owner: &str, rkey: &str) -> String {
+    format!("/admin/list/{}/{}/history", seg(owner), seg(rkey))
+}
+
+/// The collection of a block record.
+pub const BLOCK: &str = "app.bsky.graph.block";
+/// The collection of a listblock record.
+pub const LISTBLOCK: &str = "app.bsky.graph.listblock";
+
+/// A record as a table cell shows it: its at-uri, and a link to the
+/// operator's record viewer when one is configured.
+#[derive(Debug, Clone, PartialEq, Eq, askama::Template)]
+#[template(path = "_record.html")]
+pub struct Record {
+    /// `at://{authority}/{collection}/{rkey}`.
+    pub uri: String,
+    /// The viewer's page for it.
+    pub href: Option<String>,
+}
+
+impl Record {
+    /// A record named by its parts. `collection` is one of Farsight's own
+    /// constants, never text from a record.
+    pub fn of(viewer: &str, authority: &str, collection: &'static str, rkey: &str) -> Record {
+        Record {
+            uri: format!("at://{authority}/{collection}/{rkey}"),
+            href: record_href(viewer, authority, collection, rkey),
+        }
+    }
+
+    /// A record named by an at-uri the API returned. One that does not
+    /// parse to a block or a listblock is shown as plain text.
+    pub fn of_uri(viewer: &str, uri: &str) -> Record {
+        match farsight_core::AtUri::parse(uri) {
+            Ok(u) => {
+                let collection = match u.collection.as_str() {
+                    BLOCK => Some(BLOCK),
+                    LISTBLOCK => Some(LISTBLOCK),
+                    _ => None,
+                };
+                match collection {
+                    Some(c) => Record::of(viewer, u.authority.as_str(), c, u.rkey.as_str()),
+                    None => Record {
+                        uri: clean(uri),
+                        href: None,
+                    },
+                }
+            }
+            Err(_) => Record {
+                uri: clean(uri),
+                href: None,
+            },
+        }
+    }
+}
+
+/// The record viewer's URL for a record: `public_ui.record_viewer_url`
+/// with each placeholder replaced, everywhere it occurs, by the
+/// percent-encoded value. `None` while no viewer is configured.
+pub fn record_href(viewer: &str, authority: &str, collection: &str, rkey: &str) -> Option<String> {
+    if viewer.is_empty() {
+        return None;
+    }
+    // One pass over the template, so a value can never be read as a
+    // placeholder.
+    let mut out = String::with_capacity(viewer.len() + 64);
+    let mut rest = viewer;
+    while let Some(i) = rest.find('{') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let (value, len) = if tail.starts_with("{authority}") {
+            (authority, "{authority}".len())
+        } else if tail.starts_with("{collection}") {
+            (collection, "{collection}".len())
+        } else if tail.starts_with("{rkey}") {
+            (rkey, "{rkey}".len())
+        } else {
+            // The loader refuses any other brace.
+            return None;
+        };
+        out.push_str(&seg(value));
+        rest = &tail[len..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// The at-uri of a list.
 pub fn list_uri(owner: &str, rkey: &str) -> String {
     format!("at://{owner}/app.bsky.graph.list/{rkey}")
@@ -169,6 +267,52 @@ mod tests {
         assert_eq!(
             list_href("did:plc:abc", "a/b c"),
             "/public/list/did:plc:abc/a%2Fb%20c"
+        );
+    }
+
+    #[test]
+    fn record_links() {
+        let v = "https://viewer.example/at/{authority}/{collection}/{rkey}?again={rkey}";
+        assert_eq!(record_href("", "did:plc:abc", BLOCK, "3k"), None);
+        assert_eq!(
+            record_href(v, "did:plc:abc", BLOCK, "3k").as_deref(),
+            Some("https://viewer.example/at/did:plc:abc/app.bsky.graph.block/3k?again=3k")
+        );
+        // Values are percent-encoded and never re-read as placeholders.
+        assert_eq!(
+            record_href(v, "did:web:example.com%3A8080", LISTBLOCK, "{rkey}/x").as_deref(),
+            Some(
+                "https://viewer.example/at/did:web:example.com%253A8080/app.bsky.graph.listblock/\
+                 %7Brkey%7D%2Fx?again=%7Brkey%7D%2Fx"
+            )
+        );
+        let d = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let r = Record::of_uri(v, &format!("at://{d}/app.bsky.graph.block/3k"));
+        assert_eq!(r.uri, format!("at://{d}/app.bsky.graph.block/3k"));
+        assert_eq!(
+            r.href,
+            Some(format!(
+                "https://viewer.example/at/{d}/app.bsky.graph.block/3k?again=3k"
+            ))
+        );
+        // No viewer: the same text, no link.
+        assert_eq!(
+            Record::of_uri("", &format!("at://{d}/app.bsky.graph.block/3k")).href,
+            None
+        );
+        // Another collection, or something that is not an at-uri: text.
+        assert_eq!(
+            Record::of_uri(v, &format!("at://{d}/app.bsky.feed.post/3k")).href,
+            None
+        );
+        assert_eq!(Record::of_uri(v, "https://x.example/").href, None);
+        assert_eq!(
+            card_href("did:web:example.com%3A8080"),
+            "/public/card/did:web:example.com%253A8080"
+        );
+        assert_eq!(
+            admin_list_history_href("did:plc:abc", "a b"),
+            "/admin/list/did:plc:abc/a%20b/history"
         );
     }
 

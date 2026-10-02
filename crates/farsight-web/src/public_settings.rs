@@ -11,6 +11,10 @@
 //! Every save goes through the same loader as start-up, so a combination
 //! the loader refuses (the public UI without `reads = "public"` and `ui =
 //! "public_read"`) is refused here too and nothing is written.
+//!
+//! The retired `show_history` key has no control. A save of this form
+//! deletes it from the file: the save edits the file's existing table, and
+//! a key the form does not name would otherwise stay there for ever.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,13 +27,13 @@ use axum::response::Response;
 use farsight_api::config_store::EditReport;
 use farsight_core::config::{
     self, Config, MAX_EXCLUDED_DIDS, MAX_INSTANCE_DESCRIPTION, MAX_PUBLIC_CONTACT,
+    validate_record_viewer_url,
 };
 use farsight_core::{ConfigDuration, Did};
 
 use crate::common::{random_id, render_private};
 use crate::pages::{Admin, Nav, Need, WebState, check_form, gate, login_redirect, nav};
 use crate::public::PendingEnable;
-use crate::public::text::duration_words;
 
 /// How long a confirmation page stays valid.
 pub const CONFIRM_TTL: Duration = Duration::from_secs(600);
@@ -45,10 +49,18 @@ pub struct Settings {
     pub contact: String,
     /// `show_outgoing_blocks`.
     pub show_outgoing_blocks: bool,
-    /// `show_history`.
-    pub show_history: bool,
     /// `show_opengraph_image`.
     pub show_opengraph_image: bool,
+    /// `record_viewer_url`.
+    pub record_viewer_url: String,
+    /// `show_avatars`.
+    pub show_avatars: bool,
+    /// `card_rps`.
+    pub card_rps: u32,
+    /// `card_burst`; never below `card_rps`.
+    pub card_burst: u32,
+    /// The burst as typed was below the rate and was raised to it.
+    pub burst_raised: bool,
     /// `dark_mode_default`: `light`, `dark` or `system`.
     pub dark_mode_default: String,
     /// `crawlable`.
@@ -77,10 +89,16 @@ pub struct View {
     pub contact: String,
     /// Outgoing section.
     pub show_outgoing_blocks: bool,
-    /// History pages.
-    pub show_history: bool,
     /// Preview image tag.
     pub show_opengraph_image: bool,
+    /// Record viewer URL template.
+    pub record_viewer_url: String,
+    /// Avatars in profile cards.
+    pub show_avatars: bool,
+    /// Profile cards per second, process-wide.
+    pub card_rps: String,
+    /// Burst of the same budget.
+    pub card_burst: String,
     /// Theme default.
     pub dark_mode_default: String,
     /// Crawlers.
@@ -108,8 +126,11 @@ impl View {
             instance_description: p.instance_description.clone(),
             contact: p.contact.clone(),
             show_outgoing_blocks: p.show_outgoing_blocks,
-            show_history: p.show_history,
             show_opengraph_image: p.show_opengraph_image,
+            record_viewer_url: p.record_viewer_url.clone(),
+            show_avatars: p.show_avatars,
+            card_rps: p.card_rps.to_string(),
+            card_burst: p.effective_card_burst().to_string(),
             dark_mode_default: p.dark_mode_default.as_str().to_owned(),
             crawlable: p.crawlable,
             rate_limit_rps: p.rate_limit_rps.to_string(),
@@ -130,8 +151,11 @@ impl View {
             instance_description: s("instance_description"),
             contact: s("contact"),
             show_outgoing_blocks: b("show_outgoing_blocks"),
-            show_history: b("show_history"),
             show_opengraph_image: b("show_opengraph_image"),
+            record_viewer_url: s("record_viewer_url"),
+            show_avatars: b("show_avatars"),
+            card_rps: s("card_rps"),
+            card_burst: s("card_burst"),
             dark_mode_default: s("dark_mode_default"),
             crawlable: b("crawlable"),
             rate_limit_rps: s("rate_limit_rps"),
@@ -206,12 +230,24 @@ impl Settings {
                 "The handle cache lifetime must be a duration such as 30m, 1h or 1d.".into(),
             );
         }
+        let viewer = v.record_viewer_url.trim();
+        if !viewer.is_empty() {
+            validate_record_viewer_url(viewer).map_err(|r| format!("Record viewer URL: {r}"))?;
+        }
+        let card_rps = number("Profile cards per second", &v.card_rps, 1, 1_000)?;
+        let card_burst = number("Profile card burst", &v.card_burst, 1, 10_000)?;
         Ok(Settings {
+            record_viewer_url: viewer.to_owned(),
+            show_avatars: v.show_avatars,
+            card_rps,
+            // A burst below the rate is raised to it, as the loader does
+            // for a hand-edited file; the save says so.
+            card_burst: card_burst.max(card_rps),
+            burst_raised: card_burst < card_rps,
             enabled: v.enabled,
             instance_description: v.instance_description.replace("\r\n", "\n"),
             contact: v.contact.trim().to_owned(),
             show_outgoing_blocks: v.show_outgoing_blocks,
-            show_history: v.show_history,
             show_opengraph_image: v.show_opengraph_image,
             dark_mode_default: v.dark_mode_default.clone(),
             crawlable: v.crawlable,
@@ -247,7 +283,15 @@ impl Settings {
             "show_outgoing_blocks".into(),
             self.show_outgoing_blocks.into(),
         );
-        p.insert("show_history".into(), self.show_history.into());
+        // Retired: accepted by the loader, never written back.
+        p.remove("show_history");
+        p.insert(
+            "record_viewer_url".into(),
+            self.record_viewer_url.clone().into(),
+        );
+        p.insert("show_avatars".into(), self.show_avatars.into());
+        p.insert("card_rps".into(), i64::from(self.card_rps).into());
+        p.insert("card_burst".into(), i64::from(self.card_burst).into());
         p.insert(
             "show_opengraph_image".into(),
             self.show_opengraph_image.into(),
@@ -304,10 +348,11 @@ pub struct Exposure {
     pub server_contact: String,
     /// The contact the pages will show.
     pub shown_contact: String,
-    /// History pages will be reachable.
-    pub show_history: bool,
-    /// The retention in force, in words; `None` = kept indefinitely.
-    pub retention: Option<String>,
+    /// Profile cards will carry avatars, fetched by visitors' browsers
+    /// from the accounts' own servers.
+    pub show_avatars: bool,
+    /// Records will link to this viewer (its origin), if one is set.
+    pub record_viewer: Option<String>,
     /// The outgoing section will be shown.
     pub show_outgoing: bool,
     /// Crawlers will be allowed.
@@ -317,13 +362,14 @@ pub struct Exposure {
 impl Exposure {
     /// From the config the change would produce.
     pub fn of(c: &Config) -> Exposure {
-        let d = c.storage.block_history_retention.get();
         Exposure {
             hostname: c.server.hostname.clone(),
             server_contact: c.server.contact.clone(),
             shown_contact: crate::public::contact(c),
-            show_history: c.public_ui.show_history,
-            retention: (!d.is_zero()).then(|| duration_words(d)),
+            show_avatars: c.public_ui.show_avatars,
+            record_viewer: url::Url::parse(&c.public_ui.record_viewer_url.replace(['{', '}'], ""))
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned)),
             show_outgoing: c.public_ui.show_outgoing_blocks,
             crawlable: c.public_ui.crawlable,
         }
@@ -426,15 +472,21 @@ fn outcome(
     admin: &Admin,
     result: Result<EditReport, String>,
     typed: Option<View>,
+    note: Option<String>,
 ) -> Response {
     let mut page = crate::pages::settings_base(st, admin);
     match result {
         Ok(report) => {
-            page.notice = Some(if report.changed.is_empty() {
-                "No changes.".into()
+            let mut notice = if report.changed.is_empty() {
+                "No changes.".to_owned()
             } else {
                 format!("Saved. Changed: {}.", report.changed.join(", "))
-            });
+            };
+            if let Some(n) = note {
+                notice.push(' ');
+                notice.push_str(&n);
+            }
+            page.notice = Some(notice);
             page.restart = report.restart_required;
         }
         Err(e) => {
@@ -466,15 +518,21 @@ pub async fn save(
     let typed = View::submitted(&form, &st.api.config.current().config);
     let settings = match Settings::parse(&typed) {
         Ok(s) => s,
-        Err(e) => return outcome(&st, &admin, Err(e), Some(typed)),
+        Err(e) => return outcome(&st, &admin, Err(e), Some(typed), None),
     };
+    let note = settings.burst_raised.then(|| {
+        format!(
+            "The profile card burst was below the rate and was raised to {}.",
+            settings.card_burst
+        )
+    });
     let change = Change::Form(Box::new(settings));
     match confirmation(&st, &admin, change.clone()) {
-        Err(e) => outcome(&st, &admin, Err(e), Some(typed)),
+        Err(e) => outcome(&st, &admin, Err(e), Some(typed), None),
         Ok(Some(confirm)) => confirm,
         Ok(None) => {
             let r = commit(&st, &change).await;
-            outcome(&st, &admin, r, Some(typed))
+            outcome(&st, &admin, r, Some(typed), note)
         }
     }
 }
@@ -520,7 +578,7 @@ pub async fn confirm(
         }
     };
     let r = commit(&st, &change).await;
-    outcome(&st, &admin, r, None)
+    outcome(&st, &admin, r, None, None)
 }
 
 #[cfg(test)]
@@ -558,6 +616,65 @@ mod tests {
         let back: Config = toml::Value::Table(t).try_into().unwrap();
         assert_eq!(back.public_ui, c.public_ui);
         assert_eq!(back.access.public_ui, c.access.public_ui);
+    }
+
+    #[test]
+    fn a_save_drops_the_retired_key_and_writes_the_new_ones() {
+        // A file as the previous version's Settings page left it.
+        let mut t: toml::Table =
+            "[public_ui]\nshow_history = true\ncrawlable = true\n[server]\nbind = \"x\"\n"
+                .parse()
+                .unwrap();
+        let mut c = Config::default();
+        c.public_ui.record_viewer_url =
+            "https://viewer.example/at/{authority}/{collection}/{rkey}".into();
+        c.public_ui.show_avatars = false;
+        c.public_ui.card_rps = 2;
+        c.public_ui.card_burst = 5;
+        let s = Settings::parse(&View::of(&c)).unwrap();
+        assert!(!s.burst_raised);
+        s.apply(&mut t).unwrap();
+        let p = t["public_ui"].as_table().unwrap();
+        assert!(!p.contains_key("show_history"));
+        assert_eq!(
+            p["record_viewer_url"].as_str(),
+            Some("https://viewer.example/at/{authority}/{collection}/{rkey}")
+        );
+        assert_eq!(p["show_avatars"].as_bool(), Some(false));
+        assert_eq!(p["card_rps"].as_integer(), Some(2));
+        assert_eq!(p["card_burst"].as_integer(), Some(5));
+        // Keys of other sections are left alone.
+        assert_eq!(t["server"]["bind"].as_str(), Some("x"));
+    }
+
+    #[test]
+    fn new_keys_are_validated_on_save() {
+        let c = Config::default();
+        let ok = View::of(&c);
+        let e = Settings::parse(&View {
+            record_viewer_url: "https://viewer.example/{authority}/{collection}".into(),
+            ..ok.clone()
+        })
+        .unwrap_err();
+        assert_eq!(e, "Record viewer URL: `{rkey}` is missing.");
+        assert!(
+            Settings::parse(&View {
+                card_rps: "0".into(),
+                ..ok.clone()
+            })
+            .is_err()
+        );
+        // A burst below the rate is raised, not refused.
+        let s = Settings::parse(&View {
+            card_rps: "6".into(),
+            card_burst: "2".into(),
+            ..ok.clone()
+        })
+        .unwrap();
+        assert!(s.burst_raised);
+        assert_eq!((s.card_rps, s.card_burst), (6, 6));
+        // Empty: no viewer, records are plain text.
+        assert_eq!(Settings::parse(&ok).unwrap().record_viewer_url, "");
     }
 
     #[test]
@@ -603,8 +720,10 @@ mod tests {
     fn unchecked_boxes_are_false() {
         let c = Config::default();
         let mut form = HashMap::new();
-        form.insert("show_history".to_owned(), "on".to_owned());
+        form.insert("show_outgoing_blocks".to_owned(), "on".to_owned());
         let v = View::submitted(&form, &c);
-        assert!(v.show_history && !v.enabled && !v.crawlable && !v.show_opengraph_image);
+        assert!(v.show_outgoing_blocks && !v.enabled && !v.crawlable && !v.show_opengraph_image);
+        // Avatars default to on in the config; an unchecked box is still off.
+        assert!(!v.show_avatars);
     }
 }

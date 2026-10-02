@@ -16,24 +16,22 @@ pub const DURATION: &str = "farsight_public_ui_duration_seconds";
 pub const HANDLE_RESOLUTIONS: &str = "farsight_public_ui_handle_resolutions_total";
 /// `farsight_public_ui_withheld_total{reason}`.
 pub const WITHHELD: &str = "farsight_public_ui_withheld_total";
+/// `farsight_public_ui_cards_total{outcome}`.
+pub const CARDS: &str = "farsight_public_ui_cards_total";
 
 /// The matched route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     /// `/public`.
     Home,
-    /// `/public/about`.
-    About,
     /// `/public/search`.
     Search,
     /// `/public/did/{did}`.
     Did,
-    /// `/public/did/{did}/history`.
-    DidHistory,
     /// `/public/list/{did}/{rkey}`.
     List,
-    /// `/public/list/{did}/{rkey}/history`.
-    ListHistory,
+    /// `/public/card/{did}`.
+    Card,
     /// `/robots.txt`.
     Robots,
     /// Anything else under `/public/`.
@@ -42,14 +40,12 @@ pub enum Page {
 
 impl Page {
     /// Every page.
-    pub const ALL: [Page; 9] = [
+    pub const ALL: [Page; 7] = [
         Page::Home,
-        Page::About,
         Page::Search,
         Page::Did,
-        Page::DidHistory,
         Page::List,
-        Page::ListHistory,
+        Page::Card,
         Page::Robots,
         Page::Other,
     ];
@@ -58,12 +54,10 @@ impl Page {
     pub fn label(self) -> &'static str {
         match self {
             Page::Home => "home",
-            Page::About => "about",
             Page::Search => "search",
             Page::Did => "did",
-            Page::DidHistory => "did_history",
             Page::List => "list",
-            Page::ListHistory => "list_history",
+            Page::Card => "card",
             Page::Robots => "robots",
             Page::Other => "other",
         }
@@ -92,6 +86,11 @@ pub fn handle_resolution(o: Outcome) {
     ::metrics::counter!(HANDLE_RESOLUTIONS, "outcome" => o.label()).increment(1);
 }
 
+/// Counts one profile-card request.
+pub fn card(o: super::card::Outcome) {
+    ::metrics::counter!(CARDS, "outcome" => o.label()).increment(1);
+}
+
 /// Counts one withheld page: a request for an account's or a list's page
 /// that got the notice instead.
 pub fn withheld(r: WithheldReason) {
@@ -105,6 +104,9 @@ pub fn register() {
     }
     for o in Outcome::ALL {
         ::metrics::counter!(HANDLE_RESOLUTIONS, "outcome" => o.label()).increment(0);
+    }
+    for o in super::card::Outcome::ALL {
+        ::metrics::counter!(CARDS, "outcome" => o.label()).increment(0);
     }
     for r in [
         WithheldReason::HiddenStatus,
@@ -132,17 +134,7 @@ mod tests {
         let labels: Vec<&str> = Page::ALL.iter().map(|p| p.label()).collect();
         assert_eq!(
             labels,
-            [
-                "home",
-                "about",
-                "search",
-                "did",
-                "did_history",
-                "list",
-                "list_history",
-                "robots",
-                "other"
-            ]
+            ["home", "search", "did", "list", "card", "robots", "other"]
         );
     }
 }

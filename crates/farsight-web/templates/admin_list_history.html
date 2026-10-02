@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Farsight — removed records{% endblock %}
+{% block content %}
+<h1>Removed records of <code>{{ uri }}</code></h1>
+<p><a href="{{ back }}">Current records</a> · <a href="#removed-listblocks">Removed listblocks</a> · <a href="#removed-members">Removed members</a> · <a href="#limits">What this page covers</a></p>
+<p class="muted">Admin only. Removed records are not shown on the public pages.</p>
+
+<div class="card" id="removed-listblocks">
+<h2>Removed listblocks</h2>
+<p class="muted">Listblocks on this list that this instance stored and later removed, newest removal first.</p>
+{% if !listblocks.rows.is_empty() %}<table class="history"><tr><th>Blocker</th><th>Created (as stated by the author)</th><th>First seen</th><th>Last seen</th><th>Removed</th><th>How it ended</th></tr>
+{% for r in listblocks.rows %}<tr><td>{% if let Some(w) = r.who %}{% if let Some(h) = w.handle %}<span class="handle">@{{ h }}</span> {% endif %}<a href="{{ w.href }}"><code>{{ w.did }}</code></a>{% endif %}</td><td>{% if let Some(t) = r.created %}{{ t }}{% endif %}</td><td>{% if let Some(t) = r.first_seen %}{{ t }}{% else %}before this instance kept dates{% endif %}</td><td>{% if let Some(t) = r.last_seen %}{{ t }}{% endif %}</td><td>{{ r.removed }}</td><td>{{ r.cause }}{% if let Some(m) = r.mark %} <span class="pill">{{ m }}</span>{% endif %}</td></tr>
+{% endfor %}</table>{% endif %}
+{% if listblocks.empty %}<p class="muted">No removals recorded. <a href="#limits">What this page covers</a>.</p>{% endif %}
+{{ listblocks.pager|safe }}
+</div>
+
+<div class="card" id="removed-members">
+<h2>Removed members</h2>
+<p class="muted">Entries of this list that this instance stored and later removed, newest removal first.</p>
+{% if !members.rows.is_empty() %}<table class="history"><tr><th>Member</th><th>Created (as stated by the list's owner)</th><th>First seen</th><th>Last seen</th><th>Removed</th><th>How it ended</th></tr>
+{% for r in members.rows %}<tr><td>{% if let Some(w) = r.who %}{% if let Some(h) = w.handle %}<span class="handle">@{{ h }}</span> {% endif %}<a href="{{ w.href }}"><code>{{ w.did }}</code></a>{% endif %}</td><td>{% if let Some(t) = r.created %}{{ t }}{% endif %}</td><td>{% if let Some(t) = r.first_seen %}{{ t }}{% else %}before this instance kept dates{% endif %}</td><td>{% if let Some(t) = r.last_seen %}{{ t }}{% endif %}</td><td>{{ r.removed }}</td><td>{{ r.cause }}{% if let Some(m) = r.mark %} <span class="pill">{{ m }}</span>{% endif %}</td></tr>
+{% endfor %}</table>{% endif %}
+{% if members.empty %}<p class="muted">No removals recorded. <a href="#limits">What this page covers</a>.</p>{% endif %}
+{{ members.pager|safe }}
+</div>
+
+{{ limits|safe }}
+{% endblock %}

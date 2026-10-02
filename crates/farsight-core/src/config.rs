@@ -493,8 +493,11 @@ pub struct PublicUiConfig {
     pub contact: String,
     /// The DID page shows the subject's own blocks.
     pub show_outgoing_blocks: bool,
-    /// History pages are reachable.
-    pub show_history: bool,
+    /// Retired (§16): history pages are admin-only. Accepted so that a
+    /// file written by an earlier version still loads; the value has no
+    /// effect, a warning is logged, and the key is never written back.
+    #[serde(skip_serializing)]
+    pub show_history: Option<bool>,
     /// Emit the `og:image` tag for the static card.
     pub show_opengraph_image: bool,
     /// Theme a visitor gets before choosing one.
@@ -512,6 +515,26 @@ pub struct PublicUiConfig {
     pub handle_cache_ttl: ConfigDuration,
     /// DIDs the public pages withhold; at most [`MAX_EXCLUDED_DIDS`].
     pub excluded_dids: Vec<String>,
+    /// URL template of a record viewer; empty = records are not links.
+    /// Placeholders: `{authority}`, `{collection}`, `{rkey}`.
+    pub record_viewer_url: String,
+    /// Profile cards carry the account's avatar, which the visitor's
+    /// browser fetches from the account's own server.
+    pub show_avatars: bool,
+    /// Profile cards the process fetches per second, for all visitors
+    /// together.
+    pub card_rps: u32,
+    /// Burst of the same budget; at least `card_rps` (see
+    /// [`PublicUiConfig::effective_card_burst`]).
+    pub card_burst: u32,
+}
+
+impl PublicUiConfig {
+    /// `card_burst`, raised to `card_rps` when it was set lower (the
+    /// loader warns).
+    pub fn effective_card_burst(&self) -> u32 {
+        self.card_burst.max(self.card_rps)
+    }
 }
 
 impl Default for PublicUiConfig {
@@ -520,7 +543,7 @@ impl Default for PublicUiConfig {
             instance_description: String::new(),
             contact: String::new(),
             show_outgoing_blocks: false,
-            show_history: true,
+            show_history: None,
             show_opengraph_image: true,
             dark_mode_default: ThemeDefault::System,
             crawlable: false,
@@ -529,7 +552,71 @@ impl Default for PublicUiConfig {
             query_concurrency: 8,
             handle_cache_ttl: ConfigDuration::hours(1),
             excluded_dids: Vec::new(),
+            record_viewer_url: String::new(),
+            show_avatars: true,
+            card_rps: 4,
+            card_burst: 8,
         }
+    }
+}
+
+/// The retired `public_ui.show_history` key.
+pub const RETIRED_SHOW_HISTORY: &str = "public_ui.show_history";
+/// What the loader says when the retired key is present.
+pub const RETIRED_SHOW_HISTORY_WARNING: &str =
+    "`public_ui.show_history` no longer has any effect; history pages are admin-only.";
+
+/// Longest `public_ui.record_viewer_url`, in characters.
+pub const MAX_RECORD_VIEWER_URL: usize = 500;
+/// The placeholders of `public_ui.record_viewer_url`.
+pub const RECORD_VIEWER_PLACEHOLDERS: [&str; 3] = ["{authority}", "{collection}", "{rkey}"];
+
+/// Checks a non-empty `public_ui.record_viewer_url`. The message names
+/// the rule that failed; the same check runs at load and on a Settings
+/// save.
+pub fn validate_record_viewer_url(v: &str) -> Result<(), String> {
+    if v.chars().count() > MAX_RECORD_VIEWER_URL {
+        return Err(format!("longer than {MAX_RECORD_VIEWER_URL} characters."));
+    }
+    if v.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("must not contain spaces or control characters.".into());
+    }
+    for p in RECORD_VIEWER_PLACEHOLDERS {
+        if !v.contains(p) {
+            return Err(format!("`{p}` is missing."));
+        }
+    }
+    let mut bare = v.to_owned();
+    for p in RECORD_VIEWER_PLACEHOLDERS {
+        bare = bare.replace(p, "x");
+    }
+    if bare.contains('{') || bare.contains('}') {
+        return Err(
+            "`{` and `}` may only be used for {authority}, {collection} and {rkey}.".into(),
+        );
+    }
+    let origin_end = v
+        .find("://")
+        .and_then(|i| v[i + 3..].find('/').map(|j| i + 3 + j))
+        .unwrap_or(v.len());
+    if v[..origin_end].contains('{') {
+        return Err(
+            "the scheme, host and port must be fixed text; placeholders belong after the \
+             first `/` of the path (a query needs a path before it: \
+             https://viewer.example/?u=…)."
+                .into(),
+        );
+    }
+    match url::Url::parse(&bare) {
+        Ok(u)
+            if matches!(u.scheme(), "https" | "http")
+                && u.host_str().is_some_and(|h| !h.is_empty())
+                && u.username().is_empty()
+                && u.password().is_none() =>
+        {
+            Ok(())
+        }
+        _ => Err("must be an absolute http or https URL with a host and no credentials.".into()),
     }
 }
 
@@ -919,6 +1006,21 @@ pub fn apply_env_overrides(
         if path.iter().any(String::is_empty) {
             return Err(ConfigError::UnknownEnvKey(var.clone()));
         }
+        if path.join(".") == RETIRED_SHOW_HISTORY {
+            // Retired: still typed and accepted, never locked, so that a
+            // Settings save may drop the key from the file.
+            let value = coerce(var, raw, &toml::Value::Boolean(false))?;
+            table
+                .entry("public_ui")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| ConfigError::Invalid {
+                    key: RETIRED_SHOW_HISTORY.to_owned(),
+                    reason: "`public_ui` in config.toml is not a table".to_owned(),
+                })?
+                .insert("show_history".to_owned(), value);
+            continue;
+        }
         let mut hint = &defaults;
         for seg in &path {
             hint = hint
@@ -1066,6 +1168,15 @@ impl Config {
         }
         self.validate_public_ui()?;
         let mut warnings = Vec::new();
+        if self.public_ui.show_history.is_some() {
+            warnings.push(RETIRED_SHOW_HISTORY_WARNING.to_owned());
+        }
+        if self.public_ui.card_burst < self.public_ui.card_rps {
+            warnings.push(format!(
+                "public_ui.card_burst ({}) is below public_ui.card_rps ({}); using {} as the burst",
+                self.public_ui.card_burst, self.public_ui.card_rps, self.public_ui.card_rps
+            ));
+        }
         for net in &self.proxy.trusted {
             validate_trusted_proxy(net).map_err(|r| invalid("proxy.trusted", r))?;
             if is_public_net(net) && !crate::cloudflare::contains_net(net) {
@@ -1136,6 +1247,16 @@ impl Config {
         }
         if p.query_concurrency == 0 {
             return Err(invalid("public_ui.query_concurrency", "must be positive"));
+        }
+        if p.card_rps == 0 {
+            return Err(invalid("public_ui.card_rps", "must be positive"));
+        }
+        if p.card_burst == 0 {
+            return Err(invalid("public_ui.card_burst", "must be positive"));
+        }
+        if !p.record_viewer_url.is_empty() {
+            validate_record_viewer_url(&p.record_viewer_url)
+                .map_err(|r| invalid("public_ui.record_viewer_url", r))?;
         }
         // Checked only while the public UI is on: a config written before
         // `[public_ui]` existed, with a lowered `rate_limit.query_concurrency`,
@@ -1253,7 +1374,9 @@ mod tests {
         assert_eq!(c.limits.history_per_bucket_per_day, 200_000);
         assert!(!c.access.public_ui);
         let p = &c.public_ui;
-        assert!(!p.show_outgoing_blocks && p.show_history && p.show_opengraph_image);
+        assert!(!p.show_outgoing_blocks && p.show_opengraph_image && p.show_avatars);
+        assert!(p.show_history.is_none() && p.record_viewer_url.is_empty());
+        assert_eq!((p.card_rps, p.card_burst), (4, 8));
         assert!(!p.crawlable && p.excluded_dids.is_empty());
         assert_eq!(p.dark_mode_default, ThemeDefault::System);
         assert_eq!((p.rate_limit_rps, p.rate_limit_burst), (5, 20));
@@ -1592,6 +1715,84 @@ gap_threshold = "300s"
             load_from_parts(Some(text), &[]),
             Err(ConfigError::Schema(_))
         ));
+    }
+
+    #[test]
+    fn retired_show_history_loads_with_a_warning() {
+        // A file as the previous version's Settings page wrote it.
+        let mut c = complete();
+        c.public_ui.show_history = None;
+        let mut text = to_toml(&c).unwrap();
+        assert!(!text.contains("show_history"), "never written back");
+        text = text.replace("[public_ui]\n", "[public_ui]\nshow_history = true\n");
+        assert!(text.contains("show_history = true"));
+        let l = load_from_parts(Some(&text), &[]).unwrap();
+        assert_eq!(l.config.public_ui.show_history, Some(true));
+        assert_eq!(l.warnings, [RETIRED_SHOW_HISTORY_WARNING]);
+        // Without the key there is no warning.
+        let l = load_from_parts(Some(&to_toml(&c).unwrap()), &[]).unwrap();
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        // The environment form is accepted, typed and not locked.
+        let env = vec![(
+            "FARSIGHT__PUBLIC_UI__SHOW_HISTORY".to_owned(),
+            "false".to_owned(),
+        )];
+        let l = load_from_parts(Some(&to_toml(&c).unwrap()), &env).unwrap();
+        assert_eq!(l.config.public_ui.show_history, Some(false));
+        assert!(l.env_keys.is_empty());
+        assert_eq!(l.warnings, [RETIRED_SHOW_HISTORY_WARNING]);
+        let env = vec![(
+            "FARSIGHT__PUBLIC_UI__SHOW_HISTORY".to_owned(),
+            "perhaps".to_owned(),
+        )];
+        assert!(load_from_parts(Some(&to_toml(&c).unwrap()), &env).is_err());
+    }
+
+    #[test]
+    fn record_viewer_url_rules() {
+        let ok = validate_record_viewer_url;
+        assert!(ok("https://viewer.example/at/{authority}/{collection}/{rkey}").is_ok());
+        assert!(ok("http://viewer.example:8080/?u=at://{authority}/{collection}/{rkey}").is_ok());
+        assert!(ok("https://viewer.example/{authority}/{collection}/{rkey}?again={rkey}").is_ok());
+        let e = ok("https://viewer.example/at/{authority}/{collection}").unwrap_err();
+        assert!(e.contains("`{rkey}` is missing"), "{e}");
+        assert!(ok("https://viewer.example/{authority}/{collection}/{rkey}/{did}").is_err());
+        assert!(ok("https://{authority}.example/{collection}/{rkey}").is_err());
+        assert!(ok("https://viewer.example?u={authority}/{collection}/{rkey}").is_err());
+        assert!(ok("{authority}/{collection}/{rkey}").is_err());
+        assert!(ok("javascript:alert('{authority}{collection}{rkey}')").is_err());
+        assert!(ok("ftp://viewer.example/{authority}/{collection}/{rkey}").is_err());
+        assert!(ok("https://u:p@viewer.example/{authority}/{collection}/{rkey}").is_err());
+        assert!(ok("https://viewer.example/ {authority}/{collection}/{rkey}").is_err());
+        let long = format!(
+            "https://viewer.example/{}/{{authority}}/{{collection}}/{{rkey}}",
+            "x".repeat(MAX_RECORD_VIEWER_URL)
+        );
+        assert!(ok(&long).is_err());
+        // An invalid value in the file is an invalid config.
+        let mut c = complete();
+        c.public_ui.record_viewer_url = "https://viewer.example/".into();
+        assert!(matches!(c.validate(), Err(ConfigError::Invalid { .. })));
+        c.public_ui.record_viewer_url =
+            "https://viewer.example/at/{authority}/{collection}/{rkey}".into();
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn card_budget_bounds() {
+        let mut c = complete();
+        assert!(c.validate().unwrap().is_empty());
+        assert_eq!(c.public_ui.effective_card_burst(), 8);
+        c.public_ui.card_rps = 10;
+        c.public_ui.card_burst = 3;
+        let w = c.validate().unwrap();
+        assert!(w.len() == 1 && w[0].contains("card_burst"), "{w:?}");
+        assert_eq!(c.public_ui.effective_card_burst(), 10);
+        c.public_ui.card_rps = 0;
+        assert!(c.validate().is_err());
+        c.public_ui.card_rps = 1;
+        c.public_ui.card_burst = 0;
+        assert!(c.validate().is_err());
     }
 
     #[test]

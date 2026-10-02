@@ -1,9 +1,9 @@
-<section id="limits">
+<div class="card" id="limits">
 <h2>What this page covers</h2>
 <p>Every row is a record this instance stored and later removed. This is not a complete record of anything.</p>
 <h3>When removals were recorded</h3>
 {% if windows.is_empty() %}<p>No recording period falls inside the time this instance keeps removals for.</p>{% endif %}
-<ul>{% for w in windows %}<li>{% if let Some(to) = w.to %}This instance recorded removals from <time datetime="{{ w.from.iso }}">{{ w.from.text }}</time> to <time datetime="{{ to.iso }}">{{ to.text }}</time>.{% else %}This instance has recorded removals since <time datetime="{{ w.from.iso }}">{{ w.from.text }}</time>.{% endif %}</li>
+<ul>{% for w in windows %}<li>{% if let Some(to) = w.to %}This instance recorded removals from {{ w.from }} to {{ to }}.{% else %}This instance has recorded removals since {{ w.from }}.{% endif %}</li>
 {% endfor %}</ul>
 {% if !recording %}<p>This instance is not recording removals at present.</p>{% endif %}
 <h3>How long they are kept</h3>
@@ -19,4 +19,4 @@
 <li>A deleted list's members are recorded only up to that daily limit; a very large list is stored only in part.</li>
 <li>The two sections are separate records. They can show that an account stopped blocking a list, and that someone was removed from a list, not that a given block covered a given account at a given time.</li>
 </ul>
-</section>
+</div>

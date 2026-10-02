@@ -1,107 +1,335 @@
-// Farsight public UI: the theme toggle and a relative reading next to
-// absolute times. Nothing here is needed to read a page.
+// Farsight public UI: the theme toggle, times in the visitor's timezone,
+// and profile cards. Nothing here is needed to read a page: without it
+// the times stay in UTC, the links work and there are no cards.
 (function () {
   "use strict";
   var root = document.documentElement;
   var KEY = "farsight-theme";
 
+  // ---- Theme: light, dark or system ------------------------------------
+
   function stored() {
     try {
-      return window.localStorage.getItem(KEY);
+      var v = window.localStorage.getItem(KEY);
+      return v === "light" || v === "dark" || v === "system" ? v : null;
     } catch (e) {
       return null;
     }
   }
 
-  // Runs before the page paints: a visitor's own choice overrides the
-  // default the server wrote into <html data-theme>.
-  var chosen = stored();
-  if (chosen === "light" || chosen === "dark") {
-    root.setAttribute("data-theme", chosen);
-  }
-
-  function effective() {
-    var t = root.getAttribute("data-theme");
-    if (t === "light" || t === "dark") {
-      return t;
+  // What <html data-theme> must say for a choice: an explicit theme, or
+  // nothing, which follows prefers-color-scheme.
+  function apply(choice) {
+    if (choice === "light" || choice === "dark") {
+      root.setAttribute("data-theme", choice);
+    } else {
+      root.removeAttribute("data-theme");
     }
-    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
-      ? "dark"
-      : "light";
   }
 
-  function label(button) {
-    button.textContent = effective() === "dark" ? "Light mode" : "Dark mode";
+  // The visitor's choice, or the operator's default the server wrote.
+  function current() {
+    var s = stored();
+    if (s) {
+      return s;
+    }
+    var d = root.getAttribute("data-theme-default");
+    return d === "light" || d === "dark" ? d : "system";
   }
+
+  // Runs before the page paints: a stored choice overrides the default
+  // in <html data-theme>, and a stored "system" removes it.
+  var chosen = stored();
+  if (chosen) {
+    apply(chosen);
+  }
+
+  function mark(buttons, choice) {
+    for (var i = 0; i < buttons.length; i++) {
+      var on = buttons[i].getAttribute("data-theme-choice") === choice;
+      buttons[i].setAttribute("aria-pressed", on ? "true" : "false");
+    }
+  }
+
+  function themeToggle() {
+    var box = document.querySelector(".theme-toggle");
+    if (!box) {
+      return;
+    }
+    var buttons = box.querySelectorAll("button[data-theme-choice]");
+    var shown = current();
+    mark(buttons, shown);
+    box.hidden = false;
+    box.addEventListener("click", function (event) {
+      var b = event.target.closest ? event.target.closest("button[data-theme-choice]") : null;
+      if (!b) {
+        return;
+      }
+      var choice = b.getAttribute("data-theme-choice");
+      apply(choice);
+      try {
+        window.localStorage.setItem(KEY, choice);
+      } catch (e) {
+        // No storage: the choice lasts for this page only.
+      }
+      mark(buttons, choice);
+    });
+  }
+
+  // ---- Times -----------------------------------------------------------
 
   function unit(n, word) {
     return n + " " + word + (n === 1 ? "" : "s");
   }
 
-  // The server renders absolute UTC times only; a cached page would keep
-  // saying "3 seconds ago". The browser can say it truthfully.
-  function relative(then, now) {
+  // Seconds, minutes, hours or days; null for an instant in the future
+  // (author-stated times can be).
+  function span(then, now) {
     var s = Math.round((now - then) / 1000);
     if (s < 0) {
       return null;
     }
     if (s < 90) {
-      return unit(s, "second") + " ago";
+      return unit(s, "second");
     }
     if (s < 5400) {
-      return unit(Math.round(s / 60), "minute") + " ago";
+      return unit(Math.round(s / 60), "minute");
     }
     if (s < 129600) {
-      return unit(Math.round(s / 3600), "hour") + " ago";
+      return unit(Math.round(s / 3600), "hour");
     }
-    return unit(Math.round(s / 86400), "day") + " ago";
+    return unit(Math.round(s / 86400), "day");
   }
 
-  function annotate(scope) {
+  function two(n) {
+    return (n < 10 ? "0" : "") + n;
+  }
+
+  // The short zone name the browser gives for that instant: "EDT" in some
+  // locales, "GMT-4" in others. Whatever it returns is used.
+  function zone(date) {
+    var parts = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" }).formatToParts(date);
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].type === "timeZoneName") {
+        return parts[i].value;
+      }
+    }
+    return "";
+  }
+
+  // YYYY-MM-DD HH:MM:SS TZ, in the visitor's timezone, 24-hour.
+  function local(date) {
+    var text =
+      date.getFullYear() + "-" + two(date.getMonth() + 1) + "-" + two(date.getDate()) + " " +
+      two(date.getHours()) + ":" + two(date.getMinutes()) + ":" + two(date.getSeconds());
+    var tz = zone(date);
+    return tz ? text + " " + tz : text;
+  }
+
+  // Rewrites every <time datetime> not yet processed. The server's text
+  // is absolute UTC and stays in `title`. Each element changes in one
+  // assignment or not at all: a failure leaves the server's text.
+  function times(scope) {
     var now = Date.now();
-    var times = scope.querySelectorAll("time[datetime]");
-    for (var i = 0; i < times.length; i++) {
-      var el = times[i];
-      if (el.getAttribute("data-rel")) {
+    var list = scope.querySelectorAll("time[datetime]");
+    for (var i = 0; i < list.length; i++) {
+      var el = list[i];
+      if (el.getAttribute("data-local")) {
         continue;
       }
-      var then = Date.parse(el.getAttribute("datetime"));
-      if (isNaN(then)) {
-        continue;
+      try {
+        var then = Date.parse(el.getAttribute("datetime"));
+        if (isNaN(then)) {
+          continue;
+        }
+        var ago = span(then, now);
+        var text;
+        if (el.closest(".updated")) {
+          // "Last updated": the relative reading alone.
+          text = ago ? ago + " ago" : local(new Date(then));
+        } else if (el.closest(".pc")) {
+          // A card states the age on its own line.
+          text = local(new Date(then));
+        } else {
+          text = local(new Date(then)) + (ago ? " (" + ago + " ago)" : "");
+        }
+        var utc = el.textContent;
+        el.setAttribute("title", utc);
+        el.textContent = text;
+        el.setAttribute("data-local", "1");
+      } catch (e) {
+        // Left as the server wrote it.
       }
-      var words = relative(then, now);
-      if (!words) {
-        continue;
-      }
-      el.setAttribute("data-rel", "1");
-      var span = document.createElement("span");
-      span.className = "rel";
-      span.textContent = " (" + words + ")";
-      el.parentNode.insertBefore(span, el.nextSibling);
     }
   }
+
+  // ---- Profile cards ---------------------------------------------------
+
+  var OPEN_AFTER = 300;
+  var canHover = !!(window.matchMedia && window.matchMedia("(hover: hover)").matches);
+  var serial = 0;
+  var timer = null;
+
+  function linkOf(node) {
+    return node && node.closest ? node.closest("a.who[data-card]") : null;
+  }
+
+  function wrapOf(node) {
+    return node && node.closest ? node.closest(".who-wrap") : null;
+  }
+
+  function line(text, className) {
+    var p = document.createElement("p");
+    if (className) {
+      p.className = className;
+    }
+    p.textContent = text;
+    return p;
+  }
+
+  // The DID and one line: while loading, and when no card can be shown.
+  function placeholder(card, did, words) {
+    while (card.firstChild) {
+      card.removeChild(card.firstChild);
+    }
+    var code = document.createElement("code");
+    code.className = "pc-did";
+    code.textContent = did;
+    var p = document.createElement("p");
+    p.appendChild(code);
+    card.appendChild(p);
+    card.appendChild(line(words, "muted"));
+  }
+
+  function age(card) {
+    var t = card.querySelector(".pc time[datetime]");
+    var slots = card.querySelectorAll(".pc-age");
+    if (!t || slots.length !== 2) {
+      return;
+    }
+    var then = Date.parse(t.getAttribute("datetime"));
+    var words = isNaN(then) ? null : span(then, Date.now());
+    if (!words) {
+      return;
+    }
+    slots[1].textContent = words;
+    slots[0].hidden = false;
+    slots[1].hidden = false;
+  }
+
+  // Requests the fragment once per link per page load.
+  function load(link, card) {
+    var did = link.getAttribute("title") || "";
+    placeholder(card, did, "Loading…");
+    var failed = function () {
+      placeholder(card, did, "Profile not available.");
+    };
+    fetch(link.getAttribute("data-card"), { credentials: "omit" })
+      .then(function (r) {
+        if (r.status !== 200) {
+          throw new Error("card " + r.status);
+        }
+        return r.text();
+      })
+      .then(function (html) {
+        // The fragment is this origin's own markup, escaped by the server.
+        card.innerHTML = html;
+        times(card);
+        age(card);
+        link.setAttribute("aria-describedby", card.id);
+      })
+      .catch(failed);
+  }
+
+  function open(link) {
+    var wrap = wrapOf(link);
+    if (!wrap) {
+      return;
+    }
+    var card = wrap.querySelector(".profile-card");
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "profile-card";
+      card.id = "profile-card-" + ++serial;
+      card.setAttribute("role", "tooltip");
+      wrap.appendChild(card);
+      load(link, card);
+    }
+    wrap.classList.add("open");
+  }
+
+  function close(wrap) {
+    if (wrap) {
+      wrap.classList.remove("open");
+    }
+  }
+
+  function closeAll() {
+    var shown = document.querySelectorAll(".who-wrap.open");
+    for (var i = 0; i < shown.length; i++) {
+      close(shown[i]);
+    }
+  }
+
+  // Delegated, so rows swapped in by htmx need no binding of their own.
+  function cards() {
+    if (!canHover || !window.fetch) {
+      return;
+    }
+    document.addEventListener("mouseover", function (event) {
+      var link = linkOf(event.target);
+      if (!link || (event.relatedTarget && link.contains(event.relatedTarget))) {
+        return;
+      }
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        open(link);
+      }, OPEN_AFTER);
+    });
+    document.addEventListener("mouseout", function (event) {
+      var wrap = wrapOf(event.target);
+      if (!wrap) {
+        return;
+      }
+      // Still on the link or on its card: stays open.
+      if (event.relatedTarget && wrap.contains(event.relatedTarget)) {
+        return;
+      }
+      clearTimeout(timer);
+      var link = wrap.querySelector("a.who");
+      if (document.activeElement !== link) {
+        close(wrap);
+      }
+    });
+    document.addEventListener("focusin", function (event) {
+      var link = linkOf(event.target);
+      if (link) {
+        open(link);
+      }
+    });
+    document.addEventListener("focusout", function (event) {
+      if (linkOf(event.target)) {
+        close(wrapOf(event.target));
+      }
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" || event.key === "Esc") {
+        clearTimeout(timer);
+        closeAll();
+      }
+    });
+  }
+
+  // ----------------------------------------------------------------------
 
   document.addEventListener("DOMContentLoaded", function () {
-    var button = document.getElementById("theme-toggle");
-    if (button) {
-      button.hidden = false;
-      label(button);
-      button.addEventListener("click", function () {
-        var next = effective() === "dark" ? "light" : "dark";
-        root.setAttribute("data-theme", next);
-        try {
-          window.localStorage.setItem(KEY, next);
-        } catch (e) {
-          // Private mode: the choice lasts for this page only.
-        }
-        label(button);
-      });
-    }
-    annotate(document);
+    themeToggle();
+    times(document);
+    cards();
   });
 
   // A section swapped in by htmx carries new times.
   document.addEventListener("htmx:afterSwap", function (event) {
-    annotate(event.target && event.target.parentNode ? event.target.parentNode : document);
+    times(event.target && event.target.parentNode ? event.target.parentNode : document);
   });
 })();

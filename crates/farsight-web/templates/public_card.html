@@ -1,0 +1,9 @@
+<div class="pc">
+{% if let Some(a) = avatar %}<img class="pc-avatar" src="{{ a }}" alt="" width="64" height="64" loading="lazy" referrerpolicy="no-referrer">{% else if placeholder %}<span class="pc-avatar pc-none" aria-hidden="true"></span>{% endif %}
+<div class="pc-body">
+{% if let Some(h) = handle %}<p class="handle">@{{ h }}</p>{% endif %}
+<p><code class="pc-did">{{ did }}</code></p>
+{% if created_line %}<dl class="pc-facts"><dt>DID created</dt><dd>{% if let Some(t) = created %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% else %}{{ created_words }}{% endif %}</dd>{% if created.is_some() %}<dt class="pc-age" hidden>Age</dt><dd class="pc-age" hidden></dd>{% endif %}</dl>{% endif %}
+{% if let Some(n) = note %}<p class="muted">{{ n }}</p>{% endif %}
+</div>
+</div>

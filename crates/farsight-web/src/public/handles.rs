@@ -9,7 +9,10 @@
 //!
 //! At most one resolution per page view (the page's subject or list
 //! owner), under a process-wide budget. Rows never trigger a resolution;
-//! they show a handle only if one is already cached.
+//! they show a handle only if one is already cached. A profile card
+//! ([`super::card`]) verifies the handle of its account under the card
+//! budget and writes the same cache, so rows fill in as cards are opened
+//! and as pages are visited.
 
 use std::time::Duration;
 

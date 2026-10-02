@@ -8,7 +8,7 @@
 </form>
 {% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if let Some(d) = did %}
-<p><strong>{{ d }}</strong></p>
+<p><strong>{{ d }}</strong>{% if let Some(h) = history %} · <a href="{{ h }}">View history</a>{% endif %}</p>
 {% if !backfill.is_empty() %}<div class="card"><h2>Backfill</h2>{% for l in backfill %}<div>{{ l }}</div>{% endfor %}</div>{% endif %}
 {% for s in sections %}
 <div class="card">

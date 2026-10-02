@@ -1,16 +1,18 @@
 //! The public UI (design §8.6): `/public/*` and `/robots.txt`.
 //!
-//! Anyone may look up the block relationships of a DID or a list, with
-//! coverage stated honestly per section, and — when the operator allows —
-//! the records this instance stored and later removed. The surface is
-//! toggled by `access.public_ui` and shaped by `[public_ui]`, both read
-//! per request.
+//! Anyone may look up the block relationships of a DID or a list. The
+//! surface is toggled by `access.public_ui` and shaped by `[public_ui]`,
+//! both read per request.
 //!
 //! Rules every handler here keeps:
 //!
 //! - **Off means absent.** With the toggle off, `/public/*` answers like
-//!   any unknown route. So does a history route while `show_history` is
-//!   off.
+//!   any unknown route.
+//! - **No way out.** A public page links only to `/public/*` paths and,
+//!   when the operator configures one, to the record viewer. It carries no
+//!   login link and names no admin route. Removed records are an admin
+//!   page ([`crate::history`]); the paths that once served them here
+//!   answer like any unknown `/public/…` path.
 //! - **Responses do not depend on the caller.** A response is a function
 //!   of the path, the query string and the instance's state: no cookie is
 //!   read or set, and no request header changes the body. That is what
@@ -20,7 +22,10 @@
 //!   notice is the same for both.
 //! - **No writes.** The public UI never interns a row and never enqueues
 //!   work.
+//! - **No inline script.** Everything the pages run is the static script
+//!   and the vendored htmx; the CSP allows nothing else.
 
+pub mod card;
 pub mod coverage;
 pub mod handles;
 pub mod metrics;
@@ -69,10 +74,25 @@ pub const MAX_DID_SEGMENT: usize = 512;
 pub const CSP: &str = "default-src 'none'; style-src 'self'; script-src 'self'; \
                        img-src 'self'; connect-src 'self'; base-uri 'none'; \
                        form-action 'self'; frame-ancestors 'none'";
+/// The same with images from any `https` origin: profile cards show an
+/// avatar that the visitor's browser fetches from the account's own
+/// server. In force while `public_ui.show_avatars` is on.
+pub const CSP_AVATARS: &str = "default-src 'none'; style-src 'self'; script-src 'self'; \
+                               img-src 'self' https:; connect-src 'self'; base-uri 'none'; \
+                               form-action 'self'; frame-ancestors 'none'";
+
+/// The policy in force for `cfg`.
+pub fn csp(cfg: &Config) -> &'static str {
+    if cfg.public_ui.show_avatars {
+        CSP_AVATARS
+    } else {
+        CSP
+    }
+}
 
 /// The public stylesheet.
 pub const PUBLIC_CSS: &str = include_str!("../../static/public.css");
-/// The theme toggle and relative-time script.
+/// The script: theme toggle, local times, profile cards.
 pub const PUBLIC_JS: &str = include_str!("../../static/public.js");
 /// The one preview image, the same for every page (1200×630).
 pub const OG_IMAGE: &[u8] = include_bytes!("../../static/og-default.png");
@@ -174,11 +194,6 @@ impl Withheld {
     /// Whether the operator excludes `did`.
     pub fn excluded(&self, did: &str) -> bool {
         self.dids.contains(did)
-    }
-
-    /// Whether the operator excludes anyone (the coverage-panel line).
-    pub fn any(&self) -> bool {
-        !self.dids.is_empty()
     }
 
     /// Why `did` with stored `status` (`None`: no `actors` row) is
@@ -289,30 +304,26 @@ pub struct OpenGraph {
 
 /// Fixed preview text of an account page.
 pub const OG_ACCOUNT: &str = "Block records for this account as indexed by this Farsight \
-                              instance. Open the page for current data and coverage.";
+                              instance. Open the page for current data.";
 /// Fixed preview text of a list page.
 pub const OG_LIST: &str = "Block records for this list as indexed by this Farsight instance. \
-                           Open the page for current data and coverage.";
+                           Open the page for current data.";
 /// Fixed preview text of the other pages.
 pub const OG_INSTANCE: &str = "An independent index of public block records on the AT Protocol \
-                               network. Open the page for current data and coverage.";
+                               network. Open the page for current data.";
 
 /// What the shared layout needs.
 #[derive(Debug, Clone)]
 pub struct Chrome {
     /// `<title>`.
     pub title: String,
-    /// `server.hostname`.
-    pub hostname: String,
-    /// `public_ui.contact`, or `server.contact`.
-    pub contact: String,
     /// `public_ui.dark_mode_default`: `light`, `dark` or `system`.
     pub theme: &'static str,
     /// Preview tags.
     pub og: OpenGraph,
 }
 
-/// The contact shown on public pages.
+/// The contact shown on the public home page.
 pub fn contact(cfg: &Config) -> String {
     let c = cfg.public_ui.contact.trim();
     text::clean(if c.is_empty() {
@@ -333,8 +344,6 @@ pub fn chrome(
     let host = &cfg.server.hostname;
     Chrome {
         title: format!("{title} — Farsight at {host}"),
-        hostname: host.clone(),
-        contact: contact(cfg),
         theme: cfg.public_ui.dark_mode_default.as_str(),
         og: OpenGraph {
             title: og_title.to_owned(),
@@ -451,7 +460,7 @@ pub fn finish(mut r: Response, cfg: &Config, cache: Cache, indexable: bool) -> R
     robots_tag(h, cfg, indexable);
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CSP),
+        HeaderValue::from_static(csp(cfg)),
     );
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -588,7 +597,7 @@ pub struct Req<'a> {
     pub cfg: Arc<LoadedConfig>,
 }
 
-fn client_key(client: Option<ClientIp>) -> String {
+pub(crate) fn client_key(client: Option<ClientIp>) -> String {
     let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
     farsight_api::ratelimit::ip_key(ip)
 }
@@ -655,7 +664,7 @@ impl Req<'_> {
     }
 }
 
-fn parse_did(p: Result<Path<String>, PathRejection>) -> Result<Did, Fail> {
+pub(crate) fn parse_did(p: Result<Path<String>, PathRejection>) -> Result<Did, Fail> {
     let bad = || Fail::Bad {
         message: "The address does not name a DID. Handles go through search.".into(),
         link: None,
@@ -723,13 +732,6 @@ async fn home(State(st): St, client: Client) -> Response {
     .await
 }
 
-async fn about(State(st): St, client: Client) -> Response {
-    serve(&st, Page::About, client, Class::PublicUi, |r| async move {
-        pages::about(&r).await
-    })
-    .await
-}
-
 async fn search_route(State(st): St, client: Client, RawQuery(q): RawQuery) -> Response {
     serve(&st, Page::Search, client, Class::UiLookup, |r| async move {
         pages::search(&r, &Params::parse(q.as_deref().unwrap_or(""))).await
@@ -747,28 +749,6 @@ async fn did_route(
         let did = parse_did(path)?;
         pages::did(&r, &did, &Params::parse(q.as_deref().unwrap_or(""))).await
     })
-    .await
-}
-
-async fn did_history_route(
-    State(st): St,
-    client: Client,
-    path: Result<Path<String>, PathRejection>,
-    RawQuery(q): RawQuery,
-) -> Response {
-    serve(
-        &st,
-        Page::DidHistory,
-        client,
-        Class::UiLookup,
-        |r| async move {
-            if !r.config().public_ui.show_history {
-                return Err(Fail::Absent);
-            }
-            let did = parse_did(path)?;
-            pages::did_history(&r, &did, &Params::parse(q.as_deref().unwrap_or(""))).await
-        },
-    )
     .await
 }
 
@@ -791,35 +771,10 @@ async fn list_route(
     .await
 }
 
-async fn list_history_route(
-    State(st): St,
-    client: Client,
-    path: Result<Path<(String, String)>, PathRejection>,
-    RawQuery(q): RawQuery,
-) -> Response {
-    serve(
-        &st,
-        Page::ListHistory,
-        client,
-        Class::UiLookup,
-        |r| async move {
-            if !r.config().public_ui.show_history {
-                return Err(Fail::Absent);
-            }
-            let (owner, rkey) = parse_list(path)?;
-            pages::list_history(
-                &r,
-                &owner,
-                &rkey,
-                &Params::parse(q.as_deref().unwrap_or("")),
-            )
-            .await
-        },
-    )
-    .await
-}
-
-/// Anything else under `/public/`.
+/// Anything else under `/public/`, the withdrawn paths included
+/// (`/public/about` and the two history pages): the same 404, `no-store`,
+/// and no redirect — the history pages' new home is behind login, and a
+/// redirect would name it.
 async fn other(State(st): St) -> Response {
     let started = Instant::now();
     let cfg = st.api.config.current();
@@ -880,7 +835,8 @@ async fn og_image(State(st): St) -> Response {
 /// the longest.
 pub fn robots_body(cfg: &Config) -> &'static str {
     if cfg.access.public_ui && cfg.public_ui.crawlable {
-        "User-agent: *\nDisallow: /public/search\nAllow: /public\nDisallow: /\n"
+        "User-agent: *\nDisallow: /public/search\nDisallow: /public/card\nAllow: /public\n\
+         Disallow: /\n"
     } else {
         "User-agent: *\nDisallow: /\n"
     }
@@ -911,12 +867,10 @@ async fn robots(State(st): St) -> Response {
 pub fn router() -> Router<Arc<WebState>> {
     Router::new()
         .route("/public", get(home))
-        .route("/public/about", get(about))
         .route("/public/search", get(search_route))
         .route("/public/did/{did}", get(did_route))
-        .route("/public/did/{did}/history", get(did_history_route))
         .route("/public/list/{did}/{rkey}", get(list_route))
-        .route("/public/list/{did}/{rkey}/history", get(list_history_route))
+        .route("/public/card/{did}", get(card::route))
         .route("/public/static/public.css", get(css))
         .route("/public/static/public.js", get(js))
         .route("/public/static/htmx.min.js", get(htmx))
@@ -939,6 +893,9 @@ mod tests {
         c.access.public_ui = true;
         let b = robots_body(&c);
         assert!(b.contains("Allow: /public\n") && b.contains("Disallow: /public/search\n"));
+        assert!(b.contains("Disallow: /public/card\n"));
+        // The narrower rules come before `Allow`, for first-match parsers.
+        assert!(b.find("Disallow: /public/card").unwrap() < b.find("Allow: /public").unwrap());
         assert!(b.ends_with("Disallow: /\n"));
     }
 
@@ -973,7 +930,6 @@ mod tests {
         }
         // No row: shown (sections render empty with their coverage).
         assert_eq!(w.reason("did:plc:other", None), None);
-        assert!(w.any() && !Withheld::default().any());
     }
 
     #[test]
@@ -982,13 +938,20 @@ mod tests {
         let r = finish(StatusCode::OK.into_response(), &c, Cache::Public(30), true);
         assert_eq!(r.headers()[header::CACHE_CONTROL], "public, max-age=30");
         assert_eq!(r.headers()["x-robots-tag"], "noindex, nofollow");
+        // Avatars are on by default: images may come from https origins.
+        assert_eq!(r.headers()[header::CONTENT_SECURITY_POLICY], CSP_AVATARS);
+        assert!(CSP_AVATARS.contains("img-src 'self' https:;"));
+        assert!(CSP_AVATARS.contains("script-src 'self';") && !CSP_AVATARS.contains("unsafe"));
+        c.public_ui.show_avatars = false;
+        let r = finish(StatusCode::OK.into_response(), &c, Cache::Public(30), true);
         assert_eq!(r.headers()[header::CONTENT_SECURITY_POLICY], CSP);
+        assert!(CSP.contains("img-src 'self';"));
         assert_eq!(r.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
         assert_eq!(r.headers()[header::REFERRER_POLICY], "same-origin");
         c.public_ui.crawlable = true;
         let r = finish(StatusCode::OK.into_response(), &c, Cache::Public(30), true);
         assert!(r.headers().get("x-robots-tag").is_none());
-        // History, search and errors are never offered, on any setting.
+        // Search, cards and errors are never offered, on any setting.
         let r = finish(StatusCode::OK.into_response(), &c, Cache::NoStore, false);
         assert_eq!(r.headers()["x-robots-tag"], "noindex, nofollow");
         assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");

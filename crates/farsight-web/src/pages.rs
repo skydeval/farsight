@@ -139,7 +139,7 @@ pub enum Need {
 }
 
 pub(crate) fn login_redirect() -> Response {
-    common::redirect("/login")
+    common::redirect("/enter")
 }
 
 /// Applies the UI access rules (§3.5, §8.6).
@@ -185,10 +185,15 @@ pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/dashboard/fragment", get(dashboard_fragment))
-        .route("/login", get(login_page).post(login))
+        .route("/enter", get(login_page).post(login))
         .route("/logout", post(logout))
         .route("/lookup/did", get(lookup_did))
         .route("/lookup/list", get(lookup_list))
+        .route("/admin/did/{did}/history", get(crate::history::did_history))
+        .route(
+            "/admin/list/{did}/{rkey}/history",
+            get(crate::history::list_history),
+        )
         .route("/ops", get(ops_page))
         .route("/ops/{action}", post(ops_action))
         .route("/settings", get(settings_page).post(settings_save))
@@ -251,7 +256,7 @@ pub struct MessagePage {
     pub link: Option<(String, String)>,
 }
 
-fn message(
+pub(crate) fn message(
     st: &WebState,
     s: &Option<Admin>,
     status: StatusCode,
@@ -807,7 +812,7 @@ async fn logout(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response
                 farsight_storage::auth::delete_session(&st.api.pool, &common::sha256(&raw)).await;
         }
     }
-    let mut r = common::redirect("/login");
+    let mut r = common::redirect("/enter");
     r.headers_mut().append(
         header::SET_COOKIE,
         cookie(ADMIN_COOKIE, "", "/", false, Some(0)),
@@ -912,6 +917,8 @@ pub struct DidPage {
     pub sections: Vec<Section>,
     /// Backfill state lines.
     pub backfill: Vec<String>,
+    /// The account's history page; offered to a logged-in admin only.
+    pub history: Option<String>,
 }
 
 fn link_with(base: &str, pairs: &[(&str, &str)]) -> String {
@@ -921,7 +928,7 @@ fn link_with(base: &str, pairs: &[(&str, &str)]) -> String {
     format!("{base}?{q}")
 }
 
-async fn permit(st: &WebState) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+pub(crate) async fn permit(st: &WebState) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
     match tokio::time::timeout(
         farsight_api::PERMIT_WAIT,
         st.api.query_permits.clone().acquire_owned(),
@@ -951,6 +958,7 @@ async fn lookup_did(
         error: None,
         sections: Vec::new(),
         backfill: Vec::new(),
+        history: None,
     };
     if query.is_empty() {
         return render_private(&page);
@@ -968,6 +976,9 @@ async fn lookup_did(
         }
     };
     page.did = Some(did.as_str().to_owned());
+    page.history = s
+        .is_some()
+        .then(|| crate::public::text::admin_did_history_href(did.as_str()));
     let _permit = match permit(&st).await {
         Ok(p) => p,
         Err(e) => {
@@ -1119,6 +1130,8 @@ pub struct ListPage {
     pub facts: Vec<Stat>,
     /// Members, inbound listblocks.
     pub sections: Vec<Section>,
+    /// The list's history page; offered to a logged-in admin only.
+    pub history: Option<String>,
 }
 
 /// Parses an AT-URI or a `https://bsky.app/profile/<actor>/lists/<rkey>`
@@ -1155,6 +1168,7 @@ async fn lookup_list(
         error: None,
         facts: Vec::new(),
         sections: Vec::new(),
+        history: None,
     };
     if query.is_empty() {
         return render_private(&page);
@@ -1178,6 +1192,9 @@ async fn lookup_list(
     };
     let uri = format!("at://{}/app.bsky.graph.list/{rkey}", owner.as_str());
     page.uri = Some(uri.clone());
+    page.history = s
+        .is_some()
+        .then(|| crate::public::text::admin_list_history_href(owner.as_str(), &rkey));
     let _permit = match permit(&st).await {
         Ok(p) => p,
         Err(e) => {
@@ -1698,7 +1715,7 @@ async fn settings_save(
 
 async fn revoke_sessions_and_logout(st: &WebState) -> Response {
     let _ = farsight_storage::auth::delete_all_sessions(&st.api.pool).await;
-    let mut r = common::redirect("/login");
+    let mut r = common::redirect("/enter");
     r.headers_mut().append(
         header::SET_COOKIE,
         cookie(ADMIN_COOKIE, "", "/", false, Some(0)),

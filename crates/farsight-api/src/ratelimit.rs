@@ -29,6 +29,11 @@ pub enum Class {
     PublicUi,
     /// Public UI handle resolutions: one bucket for the whole process.
     PublicHandle,
+    /// Public UI profile-card requests, per IP.
+    PublicCard,
+    /// Public UI profile-card fetches: one bucket for the whole process
+    /// (`public_ui.card_rps`, `public_ui.card_burst`).
+    PublicCardBudget,
 }
 
 /// Handle resolutions per second the public UI may start, process-wide
@@ -36,6 +41,12 @@ pub enum Class {
 pub const PUBLIC_HANDLE_RPS: f64 = 2.0;
 /// Burst of the same budget.
 pub const PUBLIC_HANDLE_BURST: f64 = 10.0;
+/// Profile-card requests per second per client address (§3.6). Cards have
+/// their own class so that moving the pointer down a table does not spend
+/// the visitor's page budget.
+pub const PUBLIC_CARD_RPS: f64 = 2.0;
+/// Burst of the same class.
+pub const PUBLIC_CARD_BURST: f64 = 20.0;
 
 impl Class {
     /// Metric label and policy name.
@@ -49,6 +60,8 @@ impl Class {
             Class::UiLogin => "ui_login",
             Class::PublicUi => "public_ui",
             Class::PublicHandle => "public_ui_handle",
+            Class::PublicCard => "public_ui_card",
+            Class::PublicCardBudget => "public_ui_card_budget",
         }
     }
 
@@ -80,6 +93,11 @@ impl Class {
                 f64::from(config.public_ui.rate_limit_burst),
             ),
             Class::PublicHandle => Limit::new(PUBLIC_HANDLE_RPS, PUBLIC_HANDLE_BURST),
+            Class::PublicCard => Limit::new(PUBLIC_CARD_RPS, PUBLIC_CARD_BURST),
+            Class::PublicCardBudget => Limit::new(
+                f64::from(config.public_ui.card_rps),
+                f64::from(config.public_ui.effective_card_burst()),
+            ),
         }
     }
 }
@@ -259,6 +277,18 @@ mod tests {
         assert_eq!(Class::PublicHandle.limit(&c, None), Limit::new(2.0, 10.0));
         assert_eq!(Class::UiLookup.limit(&c, None), Limit::new(1.0, 5.0));
         assert_eq!(Class::PublicUi.label(), "public_ui");
+        assert_eq!(Class::PublicCard.limit(&c, None), Limit::new(2.0, 20.0));
+        assert_eq!(
+            Class::PublicCardBudget.limit(&c, None),
+            Limit::new(4.0, 8.0)
+        );
+        c.public_ui.card_rps = 6;
+        c.public_ui.card_burst = 2;
+        // A burst below the rate is raised to it.
+        assert_eq!(
+            Class::PublicCardBudget.limit(&c, None),
+            Limit::new(6.0, 6.0)
+        );
     }
 
     #[test]

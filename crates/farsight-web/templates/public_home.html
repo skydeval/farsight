@@ -1,17 +1,13 @@
 {% extends "public_base.html" %}
 {% block content %}
-<h1>Farsight at {{ c.hostname }}</h1>
+<h1>Farsight at {{ hostname }}</h1>
 {% for p in description %}<p>{{ p }}</p>
 {% endfor %}
-<form class="search" method="get" action="/public/search" role="search">
+{% if !contact.is_empty() %}<p class="contact">Contact: {{ contact }}</p>{% endif %}
+<form class="search home-search" method="get" action="/public/search" role="search">
 <label for="q">Look up an account or a list</label>
-<div class="row"><input type="text" id="q" name="q" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="handle, DID, at:// URI or bsky.app link" required>
+<div class="row"><input type="search" id="q" name="q" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="handle, DID, at:// URI or bsky.app link" required>
 <button type="submit">Look up</button></div>
 </form>
-<section id="coverage">
-<h2>Instance-wide</h2>
-{{ line|safe }}
-<p>Each account and list page states its own coverage, which can be lower.</p>
-</section>
-<p><a href="/public/about">What this instance is and how to read its pages</a></p>
+{% if let Some(t) = updated %}<p class="updated">Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</p>{% endif %}
 {% endblock %}

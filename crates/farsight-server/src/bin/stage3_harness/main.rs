@@ -954,7 +954,7 @@ async fn check_rate_limits(
         let r = ctx
             .http
             .post_form(
-                &format!("{base}/login"),
+                &format!("{base}/enter"),
                 &[("cf-connecting-ip", &cf_ip(21))],
                 &[("password", "wrong-password-xx")],
             )
@@ -1023,8 +1023,8 @@ async fn check_rate_limits(
     );
     let r = ctx.http.get(&format!("{base}/ops"), &[]).await?;
     c.check(
-        "UI admin page without a session ⇒ redirect to /login",
-        r.status == 303 && r.header("location").as_deref() == Some("/login"),
+        "UI admin page without a session ⇒ redirect to /enter",
+        r.status == 303 && r.header("location").as_deref() == Some("/enter"),
         r.short(),
     );
     Ok(())
@@ -1132,7 +1132,7 @@ async fn check_reset(
     let r = ctx
         .http
         .post_form(
-            &format!("{base}/login"),
+            &format!("{base}/enter"),
             &[("cf-connecting-ip", "203.0.113.90")],
             &[("password", PASSWORD)],
         )

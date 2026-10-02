@@ -36,6 +36,7 @@ pub fn register() {
         Class::UiLookup,
         Class::UiLogin,
         Class::PublicUi,
+        Class::PublicCard,
     ] {
         metrics::counter!(RATE_LIMITED, "class" => c.label()).increment(0);
     }
