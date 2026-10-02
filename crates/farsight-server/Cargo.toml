@@ -8,10 +8,18 @@ license.workspace = true
 publish = false
 
 [features]
-# Builds the stage-3, stage-5 and stage-6 Phase B harness binaries and the API's
+# Builds the stage-3, stage-5, stage-6 and stage-7 Phase B harness binaries and the API's
 # harness hooks.
 # Off by default so release builds contain neither.
-harness = ["farsight-api/harness", "farsight-storage/harness", "dep:bcrypt"]
+harness = [
+    "farsight-api/harness",
+    "farsight-storage/harness",
+    "farsight-web/harness",
+    "dep:bcrypt",
+    "dep:ring",
+    "dep:sha2",
+    "dep:base64",
+]
 
 [[bin]]
 name = "farsight"
@@ -33,6 +41,7 @@ path = "src/bin/stage6_harness/main.rs"
 required-features = ["harness"]
 
 [dependencies]
+base64 = { version = "0.22", optional = true }
 bcrypt = { version = "0.15", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 chrono.workspace = true
@@ -45,11 +54,14 @@ getrandom = "0.2"
 ipnet.workspace = true
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
+ring = { version = "0.17", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
 sqlx.workspace = true
 subtle = "2.6"
 tokio = { workspace = true, features = ["signal", "net"] }
+toml.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json", "ansi"] }
 

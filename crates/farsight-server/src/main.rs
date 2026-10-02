@@ -5,6 +5,8 @@
 //! container's restart policy.
 //!
 //! `farsight setup-token [--rotate]` prints (or replaces) the setup token.
+//! `farsight set-admin-did <did> [--force]` sets the admin account in
+//! `config.toml`; `farsight admin-did` prints it.
 
 #![warn(missing_docs)]
 
@@ -89,6 +91,186 @@ fn setup_token_command(args: &[String]) -> ExitCode {
     }
 }
 
+/// The environment variable that sets `access.admin_did`.
+const ADMIN_DID_ENV: &str = "FARSIGHT__ACCESS__ADMIN_DID";
+
+fn env_admin_did() -> Option<String> {
+    std::env::var(ADMIN_DID_ENV).ok().filter(|v| !v.is_empty())
+}
+
+/// `farsight admin-did`: the effective admin DID and where it comes from.
+/// No network.
+fn admin_did_command() -> ExitCode {
+    if let Some(did) = env_admin_did() {
+        println!("{did}");
+        println!("(from the environment: {ADMIN_DID_ENV})");
+        return ExitCode::SUCCESS;
+    }
+    let path = config_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("(not set: there is no {})", path.display());
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("reading {}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let did = text.parse::<toml::Table>().ok().and_then(|t| {
+        t.get("access")
+            .and_then(|a| a.get("admin_did"))
+            .and_then(toml::Value::as_str)
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned)
+    });
+    match did {
+        Some(did) => {
+            println!("{did}");
+            println!("(from {})", path.display());
+        }
+        None => println!("(not set)"),
+    }
+    ExitCode::SUCCESS
+}
+
+/// `farsight set-admin-did <did> [--force]` (design §8.6): the way to
+/// change the admin account, and the recovery when the account is lost or
+/// was mistyped. Edits `config.toml` only; the running server does not
+/// re-read the file, so the change applies at its next start.
+fn set_admin_did_command(args: &[String]) -> ExitCode {
+    let force = args.iter().any(|a| a == "--force");
+    let dids: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let [did] = dids.as_slice() else {
+        eprintln!("usage: farsight set-admin-did <did> [--force]");
+        return ExitCode::from(2);
+    };
+    let path = config_path();
+    if !path.exists() {
+        eprintln!(
+            "There is no {}: the configuration comes from the environment, or setup has not \
+             run. Set {ADMIN_DID_ENV} and restart farsight.",
+            path.display()
+        );
+        return ExitCode::from(1);
+    }
+    if env_admin_did().is_some() {
+        eprintln!(
+            "{ADMIN_DID_ENV} is set in the environment and overrides the file. Change it there \
+             and restart farsight."
+        );
+        return ExitCode::from(1);
+    }
+    if !config::valid_admin_did(did) {
+        eprintln!(
+            "{did} is not an admin DID: expected did:plc: followed by 24 characters of a-z and \
+             2-7, or did:web: followed by a hostname. A handle will not do."
+        );
+        return ExitCode::from(1);
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("reading {}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let keep_password = env
+        .iter()
+        .any(|(k, v)| k == "FARSIGHT__AUTH__ADMIN_PASSWORD_BCRYPT" && !v.is_empty());
+    let edit = match config::set_admin_did(&text, did, keep_password) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    // The file need not load before the edit; the result must.
+    let loaded = match config::load_from_parts(Some(&edit.text), &env) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "{} would not load with the admin DID set: {e}. Nothing was changed.",
+                path.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    // Look the DID up before writing: a typo is cheaper to catch here.
+    // `--force` skips the refusal, for a recovery while a directory is
+    // down.
+    let identity = resolve_for_cli(&loaded.config, did);
+    if let Err(e) = &identity {
+        if !force {
+            eprintln!(
+                "{did} could not be resolved ({e}). Nothing was changed. Use --force to set it \
+                 anyway."
+            );
+            return ExitCode::from(1);
+        }
+        eprintln!("warning: {did} could not be resolved ({e}); setting it anyway (--force)");
+    }
+    if edit.was_migration {
+        let backup = config::pre_oauth_backup_path(&path);
+        if let Err(e) = config::write_replace(&backup, &text) {
+            eprintln!(
+                "writing {} failed: {e}. Nothing was changed.",
+                backup.display()
+            );
+            return ExitCode::from(1);
+        }
+        println!(
+            "The previous configuration was kept as {} (it holds the old password hash; delete \
+             it once sign-in works).",
+            backup.display()
+        );
+    }
+    if let Err(e) = config::write_replace(&path, &edit.text) {
+        eprintln!(
+            "writing {} failed: {e}. Nothing was changed.",
+            path.display()
+        );
+        return ExitCode::from(1);
+    }
+    println!("Admin DID set to {did}");
+    match identity.ok().and_then(|i| i.handle) {
+        Some(h) => println!("Handle: @{h}"),
+        None => println!("Handle: none verified"),
+    }
+    if edit.removed_password {
+        println!("The retired admin password was removed from the file.");
+    }
+    println!();
+    println!("Restart farsight to apply (`docker restart farsight`).");
+    ExitCode::SUCCESS
+}
+
+fn resolve_for_cli(
+    cfg: &config::Config,
+    did: &str,
+) -> Result<farsight_web::oauth::Identity, String> {
+    use farsight_core::net::{SafeClient, SafeClientConfig};
+    let parsed = farsight_core::Did::parse(did).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(async {
+        let safe = SafeClient::new(SafeClientConfig::from_config(cfg, VERSION));
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            farsight_web::oauth::identity(&safe, cfg, &parsed),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err("the lookup timed out".into()),
+        }
+    })
+}
+
 fn shutdown_signal() -> watch::Receiver<bool> {
     let (tx, rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -165,12 +347,20 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("setup-token") {
         return setup_token_command(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("set-admin-did") {
+        return set_admin_did_command(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("admin-did") {
+        return admin_did_command();
+    }
     if let Some(a) = args.first() {
         if a == "--version" || a == "-V" {
             println!("farsight {VERSION}");
             return ExitCode::SUCCESS;
         }
-        eprintln!("usage: farsight [setup-token [--rotate]]");
+        eprintln!(
+            "usage: farsight [setup-token [--rotate] | set-admin-did <did> [--force] | admin-did]"
+        );
         return ExitCode::from(2);
     }
     init_logging();
