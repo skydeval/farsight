@@ -110,6 +110,8 @@ pub struct Config {
     pub backfill: BackfillConfig,
     /// `[access]`.
     pub access: AccessConfig,
+    /// `[public_ui]`.
+    pub public_ui: PublicUiConfig,
     /// `[auth]`.
     pub auth: AuthConfig,
     /// `[proxy]`.
@@ -159,6 +161,10 @@ pub struct StorageConfig {
     pub hard_ceiling_bytes: u64,
     /// Tombstone TTL (§7.3).
     pub tombstone_ttl: ConfigDuration,
+    /// Record removed blocks, listblocks and list memberships (§7.7, §7.8).
+    pub block_history_enabled: bool,
+    /// How long history rows are kept; `"0s"` keeps them forever (§7.7).
+    pub block_history_retention: ConfigDuration,
 }
 
 impl Default for StorageConfig {
@@ -168,6 +174,8 @@ impl Default for StorageConfig {
             budget_bytes: 70_000_000_000,
             hard_ceiling_bytes: 0,
             tombstone_ttl: ConfigDuration::days(7),
+            block_history_enabled: true,
+            block_history_retention: ConfigDuration::days(365),
         }
     }
 }
@@ -428,6 +436,9 @@ pub struct AccessConfig {
     pub ui: UiMode,
     /// Send `Access-Control-Allow-Origin: *` on reads.
     pub cors: bool,
+    /// Serve the public UI under `/public` (§8.6). Requires `reads =
+    /// "public"` and `ui = "public_read"`.
+    pub public_ui: bool,
 }
 
 impl Default for AccessConfig {
@@ -436,6 +447,88 @@ impl Default for AccessConfig {
             reads: ReadsMode::Public,
             ui: UiMode::PublicRead,
             cors: true,
+            public_ui: false,
+        }
+    }
+}
+
+/// `public_ui.dark_mode_default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeDefault {
+    /// Light unless the visitor chooses otherwise.
+    Light,
+    /// Dark unless the visitor chooses otherwise.
+    Dark,
+    /// Follow the visitor's system preference.
+    System,
+}
+
+impl ThemeDefault {
+    /// The config value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeDefault::Light => "light",
+            ThemeDefault::Dark => "dark",
+            ThemeDefault::System => "system",
+        }
+    }
+}
+
+/// Most entries `public_ui.excluded_dids` may hold.
+pub const MAX_EXCLUDED_DIDS: usize = 10_000;
+/// Longest `public_ui.instance_description`, in characters.
+pub const MAX_INSTANCE_DESCRIPTION: usize = 2_000;
+/// Longest `public_ui.contact`, in characters.
+pub const MAX_PUBLIC_CONTACT: usize = 200;
+
+/// `[public_ui]` (§16): what the public UI shows. Every key applies
+/// without a restart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PublicUiConfig {
+    /// Plain text shown on `/public`; empty = the default text.
+    pub instance_description: String,
+    /// Contact shown on public pages; empty = `server.contact`.
+    pub contact: String,
+    /// The DID page shows the subject's own blocks.
+    pub show_outgoing_blocks: bool,
+    /// History pages are reachable.
+    pub show_history: bool,
+    /// Emit the `og:image` tag for the static card.
+    pub show_opengraph_image: bool,
+    /// Theme a visitor gets before choosing one.
+    pub dark_mode_default: ThemeDefault,
+    /// Let crawlers index the public pages.
+    pub crawlable: bool,
+    /// Public page views per second per client address.
+    pub rate_limit_rps: u32,
+    /// Burst of the same class.
+    pub rate_limit_burst: u32,
+    /// Concurrent public page renders; at most
+    /// `rate_limit.query_concurrency`.
+    pub query_concurrency: u32,
+    /// How long a verified handle is cached.
+    pub handle_cache_ttl: ConfigDuration,
+    /// DIDs the public pages withhold; at most [`MAX_EXCLUDED_DIDS`].
+    pub excluded_dids: Vec<String>,
+}
+
+impl Default for PublicUiConfig {
+    fn default() -> Self {
+        PublicUiConfig {
+            instance_description: String::new(),
+            contact: String::new(),
+            show_outgoing_blocks: false,
+            show_history: true,
+            show_opengraph_image: true,
+            dark_mode_default: ThemeDefault::System,
+            crawlable: false,
+            rate_limit_rps: 5,
+            rate_limit_burst: 20,
+            query_concurrency: 8,
+            handle_cache_ttl: ConfigDuration::hours(1),
+            excluded_dids: Vec::new(),
         }
     }
 }
@@ -539,6 +632,11 @@ pub struct LimitsConfig {
     pub host_interned_lifetime: u64,
     /// `unresolved` bucket list cap.
     pub unresolved_lists: u64,
+    /// Daily history rows per DID admission key, all three history tables
+    /// together (§7.7).
+    pub history_per_did_per_day: u64,
+    /// Daily history rows per bucket admission key (§7.7).
+    pub history_per_bucket_per_day: u64,
 }
 
 impl Default for LimitsConfig {
@@ -569,6 +667,8 @@ impl Default for LimitsConfig {
             intern_per_bucket_per_day: 5_000_000,
             host_interned_lifetime: 5_000_000,
             unresolved_lists: 20_000,
+            history_per_did_per_day: 10_000,
+            history_per_bucket_per_day: 200_000,
         }
     }
 }
@@ -964,6 +1064,7 @@ impl Config {
         if self.backfill.concurrency == 0 {
             return Err(invalid("backfill.concurrency", "must be positive"));
         }
+        self.validate_public_ui()?;
         let mut warnings = Vec::new();
         for net in &self.proxy.trusted {
             validate_trusted_proxy(net).map_err(|r| invalid("proxy.trusted", r))?;
@@ -980,6 +1081,75 @@ impl Config {
             );
         }
         Ok(warnings)
+    }
+}
+
+impl Config {
+    /// The public UI rules (§3.5, §16): the access combination, and the
+    /// bounds of `[public_ui]`. The same check runs at load and at every
+    /// settings save.
+    fn validate_public_ui(&self) -> Result<(), ConfigError> {
+        if self.access.public_ui
+            && (self.access.reads != ReadsMode::Public || self.access.ui != UiMode::PublicRead)
+        {
+            return Err(invalid(
+                "access.public_ui",
+                "the public UI needs access.reads = \"public\" and access.ui = \"public_read\"; \
+                 change access.reads / access.ui, or turn access.public_ui off",
+            ));
+        }
+        let p = &self.public_ui;
+        if p.excluded_dids.len() > MAX_EXCLUDED_DIDS {
+            return Err(invalid(
+                "public_ui.excluded_dids",
+                format!(
+                    "{} entries; at most {MAX_EXCLUDED_DIDS} are allowed",
+                    p.excluded_dids.len()
+                ),
+            ));
+        }
+        for d in &p.excluded_dids {
+            if let Err(e) = crate::Did::parse(d) {
+                return Err(invalid(
+                    "public_ui.excluded_dids",
+                    format!("{d:?} is not a DID: {e}"),
+                ));
+            }
+        }
+        if p.instance_description.chars().count() > MAX_INSTANCE_DESCRIPTION {
+            return Err(invalid(
+                "public_ui.instance_description",
+                format!("at most {MAX_INSTANCE_DESCRIPTION} characters"),
+            ));
+        }
+        if p.contact.chars().count() > MAX_PUBLIC_CONTACT {
+            return Err(invalid(
+                "public_ui.contact",
+                format!("at most {MAX_PUBLIC_CONTACT} characters"),
+            ));
+        }
+        if p.rate_limit_rps == 0 {
+            return Err(invalid("public_ui.rate_limit_rps", "must be positive"));
+        }
+        if p.rate_limit_burst == 0 {
+            return Err(invalid("public_ui.rate_limit_burst", "must be positive"));
+        }
+        if p.query_concurrency == 0 {
+            return Err(invalid("public_ui.query_concurrency", "must be positive"));
+        }
+        // Checked only while the public UI is on: a config written before
+        // `[public_ui]` existed, with a lowered `rate_limit.query_concurrency`,
+        // must keep loading with the defaults of a feature it does not use.
+        if self.access.public_ui && p.query_concurrency > self.rate_limit.query_concurrency {
+            return Err(invalid(
+                "public_ui.query_concurrency",
+                format!(
+                    "must be at most rate_limit.query_concurrency ({})",
+                    self.rate_limit.query_concurrency
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1077,6 +1247,18 @@ mod tests {
         assert_eq!(c.storage.budget_bytes, 70_000_000_000);
         assert_eq!(c.storage.effective_hard_ceiling(), 80_500_000_000);
         assert_eq!(c.storage.tombstone_ttl, ConfigDuration::days(7));
+        assert!(c.storage.block_history_enabled);
+        assert_eq!(c.storage.block_history_retention, ConfigDuration::days(365));
+        assert_eq!(c.limits.history_per_did_per_day, 10_000);
+        assert_eq!(c.limits.history_per_bucket_per_day, 200_000);
+        assert!(!c.access.public_ui);
+        let p = &c.public_ui;
+        assert!(!p.show_outgoing_blocks && p.show_history && p.show_opengraph_image);
+        assert!(!p.crawlable && p.excluded_dids.is_empty());
+        assert_eq!(p.dark_mode_default, ThemeDefault::System);
+        assert_eq!((p.rate_limit_rps, p.rate_limit_burst), (5, 20));
+        assert_eq!(p.query_concurrency, 8);
+        assert_eq!(p.handle_cache_ttl, ConfigDuration::hours(1));
         assert_eq!(c.firehose.urls, ["wss://jetstream2.us-east.bsky.network"]);
         assert_eq!(c.backfill.tier_shares, [60, 25, 15]);
         assert_eq!(c.backfill.retry_schedule.len(), 4);
@@ -1335,6 +1517,81 @@ gap_threshold = "300s"
         let mut c = complete();
         c.proxy.trusted = vec!["10.0.0.0/8".parse().unwrap()];
         assert!(c.validate().unwrap().is_empty());
+    }
+
+    #[test]
+    fn public_ui_needs_public_reads_and_ui() {
+        let mut c = complete();
+        c.access.public_ui = true;
+        assert!(c.validate().is_ok());
+        for (reads, ui) in [
+            (ReadsMode::ApiKey, UiMode::PublicRead),
+            (ReadsMode::Disabled, UiMode::PublicRead),
+            (ReadsMode::Public, UiMode::AuthAll),
+            (ReadsMode::Public, UiMode::Disabled),
+        ] {
+            let mut c = complete();
+            c.access.public_ui = true;
+            c.access.reads = reads;
+            c.access.ui = ui;
+            let e = c.validate().unwrap_err().to_string();
+            assert!(
+                e.contains("access.reads") && e.contains("access.ui"),
+                "{reads:?}/{ui:?}: {e}"
+            );
+            // The same combination is fine while the public UI is off.
+            c.access.public_ui = false;
+            assert!(c.validate().is_ok());
+        }
+        let text = toml::to_string(&complete()).unwrap();
+        assert!(matches!(
+            load_from_parts(
+                Some(&text),
+                &env(&[
+                    ("FARSIGHT__ACCESS__PUBLIC_UI", "true"),
+                    ("FARSIGHT__ACCESS__READS", "api_key")
+                ])
+            ),
+            Err(ConfigError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn public_ui_bounds() {
+        let mut c = complete();
+        c.public_ui.excluded_dids = vec!["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned()];
+        assert!(c.validate().is_ok());
+        c.public_ui.excluded_dids.push("alice.example".to_owned());
+        assert!(c.validate().is_err());
+        let mut c = complete();
+        c.public_ui.excluded_dids =
+            vec!["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(); MAX_EXCLUDED_DIDS + 1];
+        assert!(c.validate().is_err());
+        c.public_ui.excluded_dids.truncate(MAX_EXCLUDED_DIDS);
+        assert!(c.validate().is_ok());
+        let mut c = complete();
+        c.public_ui.query_concurrency = c.rate_limit.query_concurrency + 1;
+        // Not a load failure while the public UI is off: an older config
+        // with a lowered global bound keeps loading.
+        assert!(c.validate().is_ok());
+        c.access.public_ui = true;
+        assert!(c.validate().is_err());
+        let mut c = complete();
+        c.rate_limit.query_concurrency = 4;
+        assert!(c.validate().is_ok());
+        c.public_ui.query_concurrency = 0;
+        assert!(c.validate().is_err());
+        let mut c = complete();
+        c.public_ui.instance_description = "x".repeat(MAX_INSTANCE_DESCRIPTION + 1);
+        assert!(c.validate().is_err());
+        let mut c = complete();
+        c.public_ui.rate_limit_rps = 0;
+        assert!(c.validate().is_err());
+        let text = "[public_ui]\ndark_mode_default = \"sepia\"\n";
+        assert!(matches!(
+            load_from_parts(Some(text), &[]),
+            Err(ConfigError::Schema(_))
+        ));
     }
 
     #[test]

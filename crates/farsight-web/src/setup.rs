@@ -178,6 +178,9 @@ impl Wizard {
             reads: self.reads,
             ui: self.ui,
             cors: c.access.cors,
+            // The public UI is enabled from Settings, with its
+            // confirmation step (§8.6); never by the wizard.
+            public_ui: false,
         };
         c.auth.admin_token_sha256 =
             farsight_api::auth::hex(&farsight_api::auth::sha256(&self.admin_token));
