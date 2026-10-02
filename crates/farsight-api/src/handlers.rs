@@ -23,7 +23,7 @@ pub fn snapshot(st: &ApiState) -> Result<Arc<GlobalSnapshot>, XrpcError> {
         .ok_or_else(|| XrpcError::overloaded("coverage snapshot not ready yet"))
 }
 
-fn view<'a>(st: &ApiState, snap: &'a GlobalSnapshot) -> View<'a> {
+pub(crate) fn view<'a>(st: &ApiState, snap: &'a GlobalSnapshot) -> View<'a> {
     View {
         snap,
         lag: st
@@ -453,6 +453,59 @@ pub async fn get_list_members(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
     Ok(Reply::ok(Value::Object(body)))
 }
 
+/// Whether a listblocked list of a party bears on coverage: its record
+/// is not deleted and its owner is shown.
+fn list_relevant(l: &queries::PartyList, inc: bool) -> bool {
+    l.record_state != 2 && (inc || !actor_status::is_hidden(l.owner_status))
+}
+
+/// The X side of `checkBlocks` at response level (§3.7.5 item 5): network
+/// or subject scope for blocks and the list chain, X's last clean listing
+/// while the network is not complete, X's debts, and the state of every
+/// list X listblocks. `rows` must hold X's listblocks (`check_rows`).
+/// The public UI reads the same value for an account's outgoing blocks.
+pub(crate) fn actor_side_coverage(
+    v: &View<'_>,
+    ac: Option<&ActorCoverage>,
+    x_id: i64,
+    x_debt: bool,
+    rows: &queries::CheckRows,
+    inc: bool,
+) -> Cov {
+    let (cb, _) = v.network_or_subject(BLOCK, ac, SubjectKind::Block);
+    let (cl, _) = v.network_or_subject(LISTBLOCK, ac, SubjectKind::ListChain);
+    let net_complete =
+        v.network(BLOCK).level == Level::Complete && v.network(LISTBLOCK).level == Level::Complete;
+    let mut c = cb.combine(cl);
+    if !net_complete && !v.covered(ac.and_then(|a| a.clean_witness)) {
+        c.partial("sweep_incomplete");
+    }
+    if x_debt {
+        c.partial("party_debt");
+    }
+    for l in rows
+        .listblocks
+        .get(&x_id)
+        .into_iter()
+        .flatten()
+        .filter_map(|l| rows.lists.get(l))
+        .filter(|l| list_relevant(l, inc))
+    {
+        if l.capped && l.track_state.is_tracked() {
+            c.partial("list_capped");
+        }
+        if let Some(r) = list_state_reason(l.track_state, l.readmits()) {
+            c.partial(r);
+        }
+        if matches!(l.track_state, TrackState::Ready | TrackState::Retained)
+            && !v.covered(l.fetched_witness)
+        {
+            c.partial(v.uncovered_reason());
+        }
+    }
+    c
+}
+
 /// Maximum `others` per `checkBlocks` call.
 pub const MAX_OTHERS: usize = 100;
 
@@ -535,38 +588,9 @@ pub async fn check_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcE
     }
 
     // Response-level coverage: what is common to every pair.
-    let (cb, _) = v.network_or_subject(BLOCK, ac.as_ref(), SubjectKind::Block);
-    let (cl, _) = v.network_or_subject(LISTBLOCK, ac.as_ref(), SubjectKind::ListChain);
-    let net_complete =
-        v.network(BLOCK).level == Level::Complete && v.network(LISTBLOCK).level == Level::Complete;
-    let mut c = cb.combine(cl);
-    // X side.
-    if !net_complete && !v.covered(ac.as_ref().and_then(|a| a.clean_witness)) {
-        c.partial("sweep_incomplete");
-    }
-    if x_id >= 0 && debts.get(&x_id).is_some_and(|d| !d.is_empty()) {
-        c.partial("party_debt");
-    }
-    let relevant = |l: &queries::PartyList| {
-        l.record_state != 2 && (inc || !actor_status::is_hidden(l.owner_status))
-    };
-    for l in lists_of(x_id)
-        .iter()
-        .filter_map(|l| rows.lists.get(l))
-        .filter(|l| relevant(l))
-    {
-        if l.capped && l.track_state.is_tracked() {
-            c.partial("list_capped");
-        }
-        if let Some(r) = list_state_reason(l.track_state, l.readmits()) {
-            c.partial(r);
-        }
-        if matches!(l.track_state, TrackState::Ready | TrackState::Retained)
-            && !v.covered(l.fetched_witness)
-        {
-            c.partial(v.uncovered_reason());
-        }
-    }
+    let x_debt = x_id >= 0 && debts.get(&x_id).is_some_and(|d| !d.is_empty());
+    let c = actor_side_coverage(&v, ac.as_ref(), x_id, x_debt, &rows, inc);
+    let relevant = |l: &queries::PartyList| list_relevant(l, inc);
     // Per pair.
     let mut partial_for = Vec::new();
     for d in &others {

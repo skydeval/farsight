@@ -60,6 +60,25 @@ pub fn id(cursor: Option<&str>) -> Result<Option<i64>, XrpcError> {
     }
 }
 
+/// Decodes an `(rkey)` cursor.
+pub fn rkey(cursor: Option<&str>) -> Result<Option<String>, XrpcError> {
+    let Some(c) = cursor else { return Ok(None) };
+    match decode_raw(c)?.as_slice() {
+        [r] => Ok(Some(text(r)?)),
+        _ => Err(XrpcError::invalid("invalid cursor")),
+    }
+}
+
+/// Decodes a `(microseconds, id)` cursor (history pages: `removed_at` in
+/// microseconds since the epoch, then the row id).
+pub fn micros_id(cursor: Option<&str>) -> Result<Option<(i64, i64)>, XrpcError> {
+    let Some(c) = cursor else { return Ok(None) };
+    match decode_raw(c)?.as_slice() {
+        [t, i] => Ok(Some((int(t)?, int(i)?))),
+        _ => Err(XrpcError::invalid("invalid cursor")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +92,16 @@ mod tests {
         assert_eq!(id_id_rkey(Some(&c)).unwrap(), Some((1, 2, "r".to_owned())));
         assert_eq!(id(Some(&encode(&[json!(7)]))).unwrap(), Some(7));
         assert_eq!(id(None).unwrap(), None);
+        assert_eq!(
+            rkey(Some(&encode(&[json!("3k")]))).unwrap().as_deref(),
+            Some("3k")
+        );
+        assert_eq!(
+            micros_id(Some(&encode(&[json!(1_700_000_000_000_001_i64), json!(9)]))).unwrap(),
+            Some((1_700_000_000_000_001, 9))
+        );
+        assert!(micros_id(Some(&encode(&[json!("x"), json!(9)]))).is_err());
+        assert!(rkey(Some(&encode(&[json!(1)]))).is_err());
     }
 
     #[test]

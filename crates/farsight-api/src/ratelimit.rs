@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use farsight_core::config::RateLimitConfig;
+use farsight_core::config::Config;
 
 /// Rate-limit classes of §3.6 (also the `class` label of
 /// `farsight_rate_limited_total`).
@@ -25,7 +25,17 @@ pub enum Class {
     UiLookup,
     /// UI login attempts, per IP.
     UiLogin,
+    /// Public UI page views, per IP (`public_ui.rate_limit_*`).
+    PublicUi,
+    /// Public UI handle resolutions: one bucket for the whole process.
+    PublicHandle,
 }
+
+/// Handle resolutions per second the public UI may start, process-wide
+/// (§3.6).
+pub const PUBLIC_HANDLE_RPS: f64 = 2.0;
+/// Burst of the same budget.
+pub const PUBLIC_HANDLE_BURST: f64 = 10.0;
 
 impl Class {
     /// Metric label and policy name.
@@ -37,12 +47,15 @@ impl Class {
             Class::KeyBackfill => "key_backfill",
             Class::UiLookup => "ui_lookup",
             Class::UiLogin => "ui_login",
+            Class::PublicUi => "public_ui",
+            Class::PublicHandle => "public_ui_handle",
         }
     }
 
-    /// The class's limit from `[rate_limit]` (`key_rps_override` for a key
-    /// with its own `read_rps`).
-    pub fn limit(self, cfg: &RateLimitConfig, key_rps_override: Option<f32>) -> Limit {
+    /// The class's limit from `[rate_limit]` and `[public_ui]`
+    /// (`key_rps_override` for a key with its own `read_rps`).
+    pub fn limit(self, config: &Config, key_rps_override: Option<f32>) -> Limit {
+        let cfg = &config.rate_limit;
         match self {
             Class::AnonRead => Limit::new(f64::from(cfg.anon_rps), f64::from(cfg.anon_burst)),
             Class::KeyRead => {
@@ -62,6 +75,11 @@ impl Class {
             Class::KeyBackfill => Limit::new(f64::from(cfg.key_backfill_rps), 20.0),
             Class::UiLookup => Limit::new(f64::from(cfg.ui_lookup_rps), 5.0),
             Class::UiLogin => Limit::new(5.0 / 60.0, 5.0),
+            Class::PublicUi => Limit::new(
+                f64::from(config.public_ui.rate_limit_rps),
+                f64::from(config.public_ui.rate_limit_burst),
+            ),
+            Class::PublicHandle => Limit::new(PUBLIC_HANDLE_RPS, PUBLIC_HANDLE_BURST),
         }
     }
 }
@@ -229,6 +247,18 @@ mod tests {
         let t1 = t0 + Duration::from_millis(100);
         assert!(l.check_at(Class::AnonRead, "1.2.3.4", lim, t1).is_ok());
         assert!(l.check_at(Class::AnonRead, "1.2.3.4", lim, t1).is_err());
+    }
+
+    #[test]
+    fn public_ui_limits_come_from_config() {
+        let mut c = Config::default();
+        assert_eq!(Class::PublicUi.limit(&c, None), Limit::new(5.0, 20.0));
+        c.public_ui.rate_limit_rps = 2;
+        c.public_ui.rate_limit_burst = 3;
+        assert_eq!(Class::PublicUi.limit(&c, None), Limit::new(2.0, 3.0));
+        assert_eq!(Class::PublicHandle.limit(&c, None), Limit::new(2.0, 10.0));
+        assert_eq!(Class::UiLookup.limit(&c, None), Limit::new(1.0, 5.0));
+        assert_eq!(Class::PublicUi.label(), "public_ui");
     }
 
     #[test]

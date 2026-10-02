@@ -17,6 +17,7 @@ pub mod handlers;
 pub mod lexicon;
 pub mod metrics;
 pub mod params;
+pub mod public_ui;
 pub mod ratelimit;
 pub mod snapshot;
 
@@ -495,7 +496,7 @@ async fn run(
     let caller = auth::authenticate(headers, &cfg.config, &st.keys)?;
     authorize(ep.kind(), &caller, cfg.config.access.reads)?;
     if let Some((class, key, rps)) = caller_limit(st, ep, &caller, client) {
-        let limit = class.limit(&cfg.config.rate_limit, rps);
+        let limit = class.limit(&cfg.config, rps);
         match st.limiter.check(class, &key, limit) {
             Ok(h) => *rate = Some(h),
             Err((h, retry)) => {

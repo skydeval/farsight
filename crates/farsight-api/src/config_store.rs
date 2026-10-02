@@ -16,13 +16,15 @@ use farsight_core::config::{self, LoadedConfig};
 pub const CONFIG_CHANNEL: &str = "farsight_config";
 
 /// Keys (or key prefixes ending in `.`) that apply without a restart:
-/// everything the API and UI read per request. Anything else — bind
-/// addresses, the database, firehose and storage settings, `[limits]`
-/// used by the running ingest — needs a restart of `farsight`.
+/// everything the API and UI read per request, `[public_ui]` included.
+/// Anything else — bind addresses, the database, firehose and storage
+/// settings (`block_history_enabled` among them, §7.7), `[limits]` used
+/// by the running ingest — needs a restart of `farsight`.
 /// `farsight-backfill` reloads `[backfill]` itself on `NOTIFY
 /// farsight_config` (§5.1).
 pub const HOT_KEYS: &[&str] = &[
     "access.",
+    "public_ui.",
     "auth.",
     "proxy.",
     "server.contact",
@@ -241,6 +243,9 @@ mod tests {
     #[test]
     fn hot_keys() {
         assert!(is_hot("access.reads"));
+        assert!(is_hot("access.public_ui"));
+        assert!(is_hot("public_ui.excluded_dids"));
+        assert!(!is_hot("storage.block_history_enabled"));
         assert!(is_hot("backfill.sweep.enabled"));
         assert!(is_hot("rate_limit.anon_rps"));
         assert!(!is_hot("rate_limit.query_concurrency"));

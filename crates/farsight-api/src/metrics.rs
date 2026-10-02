@@ -35,6 +35,7 @@ pub fn register() {
         Class::KeyBackfill,
         Class::UiLookup,
         Class::UiLogin,
+        Class::PublicUi,
     ] {
         metrics::counter!(RATE_LIMITED, "class" => c.label()).increment(0);
     }

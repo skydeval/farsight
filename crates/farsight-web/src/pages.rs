@@ -710,7 +710,7 @@ async fn login(
     }
     let client = client.map(|c| c.0);
     let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
-    let limit = Class::UiLogin.limit(&cfg.config.rate_limit, None);
+    let limit = Class::UiLogin.limit(&cfg.config, None);
     if let Err((_, retry)) =
         st.api
             .limiter
@@ -844,7 +844,7 @@ async fn lookup_gate(
     if s.is_none() {
         let cfg = st.api.config.current();
         let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
-        let limit = Class::UiLookup.limit(&cfg.config.rate_limit, None);
+        let limit = Class::UiLookup.limit(&cfg.config, None);
         if let Err((_, retry)) =
             st.api
                 .limiter
