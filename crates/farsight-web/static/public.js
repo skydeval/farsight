@@ -126,6 +126,20 @@
     return tz ? text + " " + tz : text;
   }
 
+  // What a processed element reads at `now`. `abs` is the local instant,
+  // written once; only the relative part changes between readings.
+  function reading(t, now) {
+    var ago = span(t.then, now);
+    if (t.updated) {
+      // "Last updated": the relative reading alone.
+      return ago ? ago + " ago" : t.abs;
+    }
+    return t.abs + (ago ? " (" + ago + " ago)" : "");
+  }
+
+  // The processed elements whose text carries a relative reading.
+  var shown = [];
+
   // Rewrites every <time datetime> not yet processed. The server's text
   // is absolute UTC and stays in `title`. Each element changes in one
   // assignment or not at all: a failure leaves the server's text.
@@ -142,24 +156,54 @@
         if (isNaN(then)) {
           continue;
         }
-        var ago = span(then, now);
-        var text;
-        if (el.closest(".updated")) {
-          // "Last updated": the relative reading alone.
-          text = ago ? ago + " ago" : local(new Date(then));
-        } else if (el.closest(".pc")) {
-          // A card states the age on its own line.
-          text = local(new Date(then));
-        } else {
-          text = local(new Date(then)) + (ago ? " (" + ago + " ago)" : "");
-        }
+        var t = { el: el, then: then, abs: local(new Date(then)), updated: !!el.closest(".updated") };
+        // A card states the age on its own line.
+        var inCard = !!el.closest(".pc");
+        var text = inCard ? t.abs : reading(t, now);
         var utc = el.textContent;
         el.setAttribute("title", utc);
         el.textContent = text;
         el.setAttribute("data-local", "1");
+        if (!inCard) {
+          shown.push(t);
+        }
       } catch (e) {
         // Left as the server wrote it.
       }
+    }
+  }
+
+  // Once a minute the relative readings are brought up to date; elements
+  // that left the page (an htmx swap) are dropped.
+  var REFRESH_EVERY = 60000;
+  var ticking = null;
+
+  function refresh() {
+    var now = Date.now();
+    var kept = [];
+    for (var i = 0; i < shown.length; i++) {
+      var t = shown[i];
+      if (!document.contains(t.el)) {
+        continue;
+      }
+      kept.push(t);
+      var text = reading(t, now);
+      if (t.el.textContent !== text) {
+        t.el.textContent = text;
+      }
+    }
+    shown = kept;
+  }
+
+  // Runs while the page is visible; a page shown again is refreshed at
+  // once.
+  function keepTimes() {
+    if (document.hidden) {
+      clearInterval(ticking);
+      ticking = null;
+    } else if (!ticking) {
+      refresh();
+      ticking = setInterval(refresh, REFRESH_EVERY);
     }
   }
 
@@ -325,6 +369,8 @@
   document.addEventListener("DOMContentLoaded", function () {
     themeToggle();
     times(document);
+    keepTimes();
+    document.addEventListener("visibilitychange", keepTimes);
     cards();
   });
 
