@@ -200,6 +200,36 @@ await probe("every <time> is rewritten once, in the visitor's timezone, with the
   };
 });
 
+// Slow (over a minute), so it waits on a page of its own while the probes
+// below run. A <time> of ten seconds ago is added and announced the way an
+// htmx swap is, so the outcome does not depend on the age of the seeded rows.
+const refreshed = (async () => {
+  const p = await ctx.newPage();
+  watch(p);
+  await p.goto(base + accountPath);
+  const read = () =>
+    p.evaluate(() => {
+      const t = document.querySelector("#refresh-probe time");
+      const f = document.querySelector(".updated time");
+      return { text: t.textContent, title: t.getAttribute("title"), footer: f.textContent, footerIso: f.getAttribute("datetime") };
+    });
+  await p.evaluate(() => {
+    const box = document.createElement("p");
+    box.id = "refresh-probe";
+    const t = document.createElement("time");
+    t.setAttribute("datetime", new Date(Date.now() - 10000).toISOString());
+    t.textContent = "probe UTC";
+    box.appendChild(t);
+    document.body.appendChild(box);
+    t.dispatchEvent(new CustomEvent("htmx:afterSwap", { bubbles: true }));
+  });
+  const before = await read();
+  await p.waitForTimeout(65000);
+  const after = await read();
+  await p.close();
+  return { before, after };
+})();
+
 // ---- Profile cards -------------------------------------------------------
 await probe("a card opens after the pointer rests on a row's link, is requested once, and closes on leave and on Escape", async () => {
   await page.goto(base + accountPath);
@@ -294,6 +324,22 @@ if (livePath) {
     };
   });
 }
+await probe("after 65 seconds on an open page the relative part of a <time> has moved on; the absolute part and title have not", async () => {
+  const { before, after } = await refreshed;
+  const row = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \S+) \((\d+) seconds ago\)$/;
+  const a = row.exec(before.text);
+  const b = row.exec(after.text);
+  const moved = a && b ? Number(b[2]) - Number(a[2]) : null;
+  // The footer reads in minutes up to 90 minutes, and must have moved too.
+  const footerAge = Date.now() - Date.parse(after.footerIso);
+  const footerOk =
+    /^\d+ (second|minute|hour|day)s? ago$/.test(after.footer) &&
+    (footerAge > 5400000 || after.footer !== before.footer);
+  return {
+    ok: !!a && !!b && a[1] === b[1] && moved >= 60 && moved <= 70 && before.title === "probe UTC" && after.title === "probe UTC" && footerOk,
+    detail: JSON.stringify({ before, after }),
+  };
+});
 await ctx.close();
 
 // ---- Without script ------------------------------------------------------
