@@ -195,8 +195,19 @@ a gated API is not a supported combination. It works with every
 admin pages are hidden.
 
 - **A bar on every page** with search and a light / dark / system
-  theme toggle. Public pages link only to other public pages (and to
-  the record viewer, if you set one): no login link, no admin route.
+  theme toggle. Public pages link only to other public pages: no login
+  link, no admin route.
+- **Newest first.** Tables that show a creation time are sorted by it.
+  The time is the author's own claim, so the order uses the earlier of
+  that and the moment Farsight first stored the record: a record dated
+  in the future sits where it arrived, not at the top of the page.
+- **Handles.** A row shows `@handle` once Farsight has verified it in
+  both directions, the DID until then. A background worker verifies
+  the accounts that pages had to show as DIDs (`handle_warming_enabled`,
+  on by default), at no more than the two lookups per second the
+  instance already allowed itself: the first view of a page nobody has
+  opened shows DIDs, a later one shows handles. Handles are kept in
+  memory only; after a restart they fill in again.
 - **No coverage detail.** A public page prints no coverage level. It
   says "None on record at this instance" for an empty section, says so
   when a list is not indexed, and ends with one "Last updated" line.
@@ -211,10 +222,10 @@ admin pages are hidden.
   server's operator sees the visitor's address. Set it to `false` and
   visitors' browsers talk only to your instance; cards keep everything
   else.
-- **Record links** (`record_viewer_url`, empty by default): block and
-  listblock records are shown as `at://` text. Give a URL template with
-  `{authority}`, `{collection}` and `{rkey}` and each becomes a link to
-  that viewer.
+- **No record addresses.** Public tables do not show `at://` record
+  URIs. They are on the admin lookup pages, as links if you set
+  `record_viewer_url` (a URL template with `{authority}`,
+  `{collection}` and `{rkey}`).
 - **Times** are sent as absolute UTC and shown in the visitor's own
   timezone by the page's script.
 - **Removed records are not public.** Blocks and list memberships
@@ -245,7 +256,7 @@ public_ui = false                 # the toggle
 instance_description = ""         # plain text on the home page
 contact = ""                      # "" = server.contact
 show_outgoing_blocks = false
-record_viewer_url = ""            # "" = records are not links
+record_viewer_url = ""            # admin lookup pages; "" = records are not links
 show_avatars = true               # false = cards carry no image
 card_rps = 4                      # cards fetched per second, all visitors
 card_burst = 8
@@ -256,8 +267,14 @@ rate_limit_rps = 5                # page views per second per address
 rate_limit_burst = 20
 query_concurrency = 8             # concurrent page renders
 handle_cache_ttl = "1h"
+handle_warming_enabled = true     # verify handles of shown accounts in the background
 excluded_dids = []                # at most 10,000
 ```
+
+`handle_warming_enabled` and `record_viewer_url` also apply to the admin
+lookup and history pages, whether or not the public UI is on. There a
+signed-in admin additionally gets profile cards on account links and a
+"First seen" column (when Farsight first stored the record).
 
 Search shares the lookup rate (`rate_limit.ui_lookup_rps`, 1 per second
 per address). Cards have their own: 2 per second per address, and
@@ -273,6 +290,28 @@ warning; the value does nothing, and the key is removed the next time
 you save the Public UI settings.
 
 ### Upgrading from an earlier version
+
+From a version whose tables were not sorted by creation time:
+
+- **Disk.** Four new indexes, roughly a third on top of the current
+  database size. Check the headroom under `storage.budget_bytes` first:
+  an index that does not fit is not built, the dashboard says so, and
+  its table keeps its previous order until you raise the budget.
+- **Time.** The indexes are built in the background after the new
+  version starts; the instance serves and ingests meanwhile. Each table
+  switches to the new order when its index is ready.
+- **Paging links** into those tables stop working once, when a table
+  switches; they lead to a page that links to the first page.
+- **Public pages no longer show record URIs.** `record_viewer_url` now
+  affects the admin lookup pages only.
+- **New key** `public_ui.handle_warming_enabled` (on by default). An
+  older binary refuses a config that holds it: delete the line before
+  rolling back.
+- **Rolling back.** An older version ignores the four indexes; they
+  cost disk and write time until you drop them
+  (`DROP INDEX CONCURRENTLY blocks_by_subject_created,
+  blocks_by_author_created, list_blocks_by_list_created,
+  list_items_by_list_created`, one per statement).
 
 From a version with a password login:
 
@@ -321,8 +360,11 @@ most of the storage.
 | First full backfill sweep complete | 28–52 GB |
 | Growth afterwards | 17–19 GB per year |
 
-Removed records are extra: about 0.2 GB per million kept, inside the
-same storage budget. `storage.block_history_retention` bounds them
+On top of these come the four indexes that sort the UI's tables by
+creation time: 9–20 GB for a complete index, roughly a third more. They
+are built in the background, and only while the storage budget has room
+for them. Removed records are extra: about 0.2 GB per million kept,
+inside the same storage budget. `storage.block_history_retention` bounds them
 (`"0s"` keeps them forever); `storage.block_history_enabled = false`
 stops recording.
 
