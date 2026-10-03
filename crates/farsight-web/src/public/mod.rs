@@ -21,7 +21,8 @@
 //!   `public_ui.excluded_dids` has no page and appears in no row, and the
 //!   notice is the same for both.
 //! - **No writes.** The public UI never interns a row and never enqueues
-//!   work.
+//!   backfill work. (A row shown as a bare DID asks the in-memory warming
+//!   worker for that account's handle; nothing is stored.)
 //! - **No inline script.** Everything the pages run is the static script
 //!   and the vendored htmx; the CSP allows nothing else.
 
@@ -32,6 +33,7 @@ pub mod metrics;
 pub mod pages;
 pub mod search;
 pub mod text;
+pub mod warming;
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -234,6 +236,8 @@ pub struct PendingEnable {
 pub struct PublicState {
     /// Verified handles.
     pub handles: HandleCache,
+    /// Accounts whose handles the warming worker is asked to verify.
+    pub warm: warming::WarmQueue,
     /// Render concurrency bound.
     pub render: RenderGate,
     excluded: Mutex<Option<ExcludedCache>>,
@@ -368,6 +372,8 @@ pub enum Cache {
     Public(u32),
     /// `no-store`.
     NoStore,
+    /// `no-store, private`: an answer made for a signed-in admin.
+    Private,
 }
 
 /// A response that is not the page asked for.
@@ -452,6 +458,7 @@ pub fn finish(mut r: Response, cfg: &Config, cache: Cache, indexable: bool) -> R
     let cc = match cache {
         Cache::Public(age) => format!("public, max-age={age}"),
         Cache::NoStore => "no-store".to_owned(),
+        Cache::Private => crate::common::NO_STORE.to_owned(),
     };
     h.insert(
         header::CACHE_CONTROL,

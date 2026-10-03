@@ -83,7 +83,6 @@ p.updated { margin: 2rem 0 0; color: var(--muted); font-size: .9rem; }
 p.contact { color: var(--muted); }
 a.who { text-decoration: none; }
 a.who:hover, a.who:focus-visible { text-decoration: underline; }
-a.record { text-decoration: none; }
 /* Profile cards: positioned inside the row's wrapper, opened by the script.
    On a device without hover there are none; a tap follows the link. */
 .who-wrap { position: relative; display: inline-block; }

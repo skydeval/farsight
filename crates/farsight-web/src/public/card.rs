@@ -24,6 +24,15 @@
 //! `public_ui.show_avatars` is on.
 //!
 //! Nothing but the handle cache is stored.
+//!
+//! `GET /admin/card/{did}` serves the same fragment to a signed-in admin
+//! from the admin tables ([`admin_route`]). It differs in three ways:
+//! without a valid session it is the bare 404 of an unknown path in every
+//! `ui` mode — never a redirect, because the caller is a script and a
+//! redirect would put the sign-in page into the card; the withheld rule
+//! is not applied (the operator's tables show those accounts); and every
+//! answer is `no-store, private`. It draws on the same per-address class
+//! and the same process-wide budget as the public cards.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,12 +40,12 @@ use std::time::{Duration, Instant};
 use askama::Template;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use farsight_api::clientip::ClientIp;
 use farsight_api::ratelimit::Class;
-use farsight_core::config::Config;
+use farsight_core::config::{Config, UiMode};
 use farsight_core::net::{OutboundClient, SafeClient};
 use farsight_core::{Did, DidMethod};
 use farsight_storage::handles::Cached;
@@ -352,13 +361,38 @@ async fn identity(
     }
 }
 
-fn plain(cfg: &Config, status: StatusCode, text: &'static str) -> Response {
-    finish((status, text).into_response(), cfg, Cache::NoStore, false)
+/// Who a card is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum For {
+    /// Anyone: `/public/card/{did}`.
+    Public,
+    /// A signed-in admin: `/admin/card/{did}`.
+    Admin,
 }
 
-fn fragment(cfg: &Config, view: &CardView, cache: Cache) -> Response {
+impl For {
+    /// The cache class of an answer that would be `cache` on the public
+    /// route: nothing made for an admin is ever stored.
+    fn cache(self, cache: Cache) -> Cache {
+        match self {
+            For::Public => cache,
+            For::Admin => Cache::Private,
+        }
+    }
+}
+
+fn plain(cfg: &Config, who: For, status: StatusCode, text: &'static str) -> Response {
+    finish(
+        (status, text).into_response(),
+        cfg,
+        who.cache(Cache::NoStore),
+        false,
+    )
+}
+
+fn fragment(cfg: &Config, who: For, view: &CardView, cache: Cache) -> Response {
     // A card is a fragment, not a page: never offered to search engines.
-    super::page(view, StatusCode::OK, cfg, cache, false)
+    super::page(view, StatusCode::OK, cfg, who.cache(cache), false)
 }
 
 /// The short card: the DID, the cached handle if any, and one line.
@@ -380,6 +414,7 @@ async fn card(
     st: &WebState,
     cfg: &Config,
     loaded: &Arc<farsight_core::config::LoadedConfig>,
+    who: For,
     client: Option<ClientIp>,
     path: Result<Path<String>, PathRejection>,
 ) -> Response {
@@ -392,17 +427,17 @@ async fn card(
     {
         farsight_api::metrics::rate_limited(Class::PublicCard);
         m::card(Outcome::RateLimited);
-        let mut r = plain(cfg, StatusCode::TOO_MANY_REQUESTS, "too many requests");
+        let mut r = plain(cfg, who, StatusCode::TOO_MANY_REQUESTS, "too many requests");
         r.headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from(retry.max(1)));
         return r;
     }
     let Ok(did) = parse_did(path) else {
-        return plain(cfg, StatusCode::BAD_REQUEST, "not a DID");
+        return plain(cfg, who, StatusCode::BAD_REQUEST, "not a DID");
     };
     // 2. Is this account shown here? One lookup, in a slot of the global
     // read semaphore like any query; no render slot.
-    let busy = || plain(cfg, StatusCode::SERVICE_UNAVAILABLE, "busy");
+    let busy = || plain(cfg, who, StatusCode::SERVICE_UNAVAILABLE, "busy");
     let shown = {
         let Ok(Ok(_permit)) = tokio::time::timeout(
             farsight_api::PERMIT_WAIT,
@@ -412,21 +447,30 @@ async fn card(
         else {
             return busy();
         };
-        let Ok(withheld) = st.public.withheld(&st.api.pool, loaded).await else {
-            return busy();
+        // The operator's tables show withheld accounts and the operator
+        // may look at them; an account this instance does not hold gets
+        // nothing fetched for it on either route.
+        let withheld = match who {
+            For::Public => match st.public.withheld(&st.api.pool, loaded).await {
+                Ok(w) => Some(w),
+                Err(_) => return busy(),
+            },
+            For::Admin => None,
         };
         let Ok(mut conn) = st.api.pool.acquire().await else {
             return busy();
         };
         match queries::actor(&mut conn, did.as_str()).await {
-            Ok(Some(a)) => withheld.reason(did.as_str(), Some(a.status)).is_none(),
+            Ok(Some(a)) => withheld
+                .as_ref()
+                .is_none_or(|w| w.reason(did.as_str(), Some(a.status)).is_none()),
             Ok(None) => false,
             Err(_) => return busy(),
         }
     };
     if !shown {
         // Unknown and withheld accounts answer alike.
-        return plain(cfg, StatusCode::NOT_FOUND, "not found");
+        return plain(cfg, who, StatusCode::NOT_FOUND, "not found");
     }
     // 3. The process-wide budget.
     let budget = Class::PublicCardBudget.limit(cfg, None);
@@ -437,7 +481,7 @@ async fn card(
         .is_err()
     {
         m::card(Outcome::RateLimited);
-        return fragment(cfg, &short_card(st, &did, false), Cache::NoStore);
+        return fragment(cfg, who, &short_card(st, &did, false), Cache::NoStore);
     }
     // 4. The fetches, under one deadline.
     let deadline = tokio::time::Instant::now() + CARD_DEADLINE;
@@ -445,14 +489,14 @@ async fn card(
     let Some(ident) = identity(&st.safe, cfg, &did, deadline).await else {
         if is_plc {
             m::card(Outcome::PlcTimeout);
-            return fragment(cfg, &short_card(st, &did, true), Cache::NoStore);
+            return fragment(cfg, who, &short_card(st, &did, true), Cache::NoStore);
         }
         // did:web has no creation time to lose; without its document the
         // card has the DID and whatever handle is cached.
         m::card(Outcome::PdsFailed);
         let mut view = short_card(st, &did, true);
         view.created_words = "unknown";
-        return fragment(cfg, &view, Cache::NoStore);
+        return fragment(cfg, who, &view, Cache::NoStore);
     };
     let show_avatars = cfg.public_ui.show_avatars;
     let (handle, avatar) = tokio::join!(
@@ -479,14 +523,14 @@ async fn card(
     };
     if failed {
         m::card(Outcome::PdsFailed);
-        return fragment(cfg, &view, Cache::NoStore);
+        return fragment(cfg, who, &view, Cache::NoStore);
     }
     m::card(if show_avatars {
         Outcome::Served
     } else {
         Outcome::AvatarsDisabled
     });
-    fragment(cfg, &view, Cache::Public(FULL_CARD_MAX_AGE))
+    fragment(cfg, who, &view, Cache::Public(FULL_CARD_MAX_AGE))
 }
 
 /// `GET /public/card/{did}`.
@@ -498,12 +542,46 @@ pub async fn route(
     let started = Instant::now();
     let loaded = st.api.config.current();
     let resp = if loaded.config.access.public_ui {
-        card(&st, &loaded.config, &loaded, client.map(|c| c.0), path).await
+        card(
+            &st,
+            &loaded.config,
+            &loaded,
+            For::Public,
+            client.map(|c| c.0),
+            path,
+        )
+        .await
     } else {
         crate::common::not_found()
     };
     m::observe(Page::Card, resp.status(), started.elapsed());
     resp
+}
+
+/// `GET /admin/card/{did}`: the card for a signed-in admin. It does not go
+/// through the admin pages' gate, whose answer without a session is a
+/// redirect to the sign-in page under `ui = public_read`.
+pub async fn admin_route(
+    State(st): State<Arc<WebState>>,
+    headers: HeaderMap,
+    client: Option<axum::Extension<ClientIp>>,
+    path: Result<Path<String>, PathRejection>,
+) -> Response {
+    let loaded = st.api.config.current();
+    if loaded.config.access.ui == UiMode::Disabled
+        || crate::pages::admin(&st, &headers).await.is_none()
+    {
+        return crate::common::not_found();
+    }
+    card(
+        &st,
+        &loaded.config,
+        &loaded,
+        For::Admin,
+        client.map(|c| c.0),
+        path,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -642,6 +720,19 @@ mod tests {
                 "https://pds.example/xrpc/com.atproto.sync.getBlob?did=did%3Aweb%3Aa.example%253A8080&cid={cid}"
             )
         );
+    }
+
+    #[test]
+    fn nothing_made_for_an_admin_is_stored() {
+        for c in [Cache::Public(FULL_CARD_MAX_AGE), Cache::NoStore] {
+            assert_eq!(For::Admin.cache(c), Cache::Private);
+            assert_eq!(For::Public.cache(c), c);
+        }
+        let cfg = Config::default();
+        let r = plain(&cfg, For::Admin, StatusCode::NOT_FOUND, "not found");
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store, private");
+        let r = plain(&cfg, For::Public, StatusCode::NOT_FOUND, "not found");
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]

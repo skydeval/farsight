@@ -21,8 +21,8 @@
 <section id="listblockers">
 <h2>Blocked by{% if let Some(n) = blockers.count %} <span class="count">{{ n }}</span>{% endif %}</h2>
 <p class="muted">Accounts with a listblock on this list.</p>
-{% if !blockers.rows.is_empty() %}<table><thead><tr><th>Account</th><th>Record</th><th>Created (as stated by the author)</th></tr></thead><tbody>
-{% for r in blockers.rows %}<tr><td>{{ r.who|safe }}</td><td>{% if let Some(x) = r.record %}{{ x|safe }}{% endif %}</td><td>{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
+{% if !blockers.rows.is_empty() %}<table><thead><tr><th>Account</th><th>Created (as stated by the author)</th></tr></thead><tbody>
+{% for r in blockers.rows %}<tr><td>{{ r.who|safe }}</td><td>{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
 {% endfor %}</tbody></table>{% endif %}
 {% if let Some(e) = blockers.empty %}<p class="empty">{{ e }}</p>{% endif %}
 {{ blockers.pager|safe }}

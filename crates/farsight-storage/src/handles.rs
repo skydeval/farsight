@@ -61,10 +61,17 @@ impl HandleCache {
 
     /// The live entry for `did`, if any; marks it used.
     pub fn lookup(&self, did: &str) -> Option<Cached> {
+        self.lookup_at(did, Instant::now()).map(|(c, _)| c)
+    }
+
+    /// The live entry for `did` and how long it still lives; marks it
+    /// used. A handle about to expire can be refreshed before a page that
+    /// keeps being viewed loses it.
+    pub fn lookup_remaining(&self, did: &str) -> Option<(Cached, Duration)> {
         self.lookup_at(did, Instant::now())
     }
 
-    fn lookup_at(&self, did: &str, now: Instant) -> Option<Cached> {
+    fn lookup_at(&self, did: &str, now: Instant) -> Option<(Cached, Duration)> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let inner = &mut *g;
         let e = inner.entries.get_mut(did)?;
@@ -78,10 +85,11 @@ impl HandleCache {
         inner.tick += 1;
         e.tick = inner.tick;
         inner.order.insert(e.tick, did.to_owned());
-        Some(match &e.handle {
+        let cached = match &e.handle {
             Some(h) => Cached::Handle(h.clone()),
             None => Cached::None,
-        })
+        };
+        Some((cached, e.expires.saturating_duration_since(now)))
     }
 
     /// The verified handle of `did`, if one is cached.
@@ -154,9 +162,14 @@ mod tests {
         c.insert_at("did:plc:b", None, TTL, t0);
         assert_eq!(
             c.lookup_at("did:plc:a", t0),
-            Some(Cached::Handle("a.example".into()))
+            Some((Cached::Handle("a.example".into()), TTL))
         );
-        assert_eq!(c.lookup_at("did:plc:b", t0), Some(Cached::None));
+        assert_eq!(c.lookup_at("did:plc:b", t0), Some((Cached::None, TTL)));
+        // The remaining lifetime shrinks with the clock.
+        assert_eq!(
+            c.lookup_at("did:plc:b", t0 + TTL / 4).map(|(_, left)| left),
+            Some(TTL - TTL / 4)
+        );
         assert_eq!(c.get("did:plc:b"), None);
         // Expired entries are gone, not returned.
         assert_eq!(c.lookup_at("did:plc:a", t0 + TTL), None);
@@ -179,6 +192,6 @@ mod tests {
         // Re-inserting a key replaces it without growing.
         c.insert_at("a", None, TTL, t0);
         assert_eq!(c.len(), 2);
-        assert_eq!(c.lookup_at("a", t0), Some(Cached::None));
+        assert_eq!(c.lookup_at("a", t0).map(|(c, _)| c), Some(Cached::None));
     }
 }

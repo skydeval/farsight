@@ -24,10 +24,15 @@ use farsight_core::{AtUri, Collection, Did};
 use farsight_storage::backfill_api::{self, Request, RequestOutcome, Requester};
 use farsight_storage::gates::GateState;
 use farsight_storage::keys::Limits;
+use farsight_storage::ui_rows::{Filter, Section as Rows, SortIndexes};
 use serde_json::Value;
 use tokio::sync::{Semaphore, watch};
 
+use crate::cells::{self, Cell};
 use crate::common::{self, NO_STORE, cookie, ct_eq, read_cookie, render, render_private};
+use crate::public::text::{BLOCK, LISTBLOCK, LISTITEM, Record};
+use crate::public::warming::Asked;
+use crate::rows;
 
 /// Admin session cookie (§8.6).
 pub const ADMIN_COOKIE: &str = "farsight_admin";
@@ -66,6 +71,9 @@ pub struct StatusInner {
     pub cf_refreshed_at: Option<DateTime<Utc>>,
     /// Size of the three history tables with their indexes (§7.7).
     pub history_bytes: Option<u64>,
+    /// The UI sort indexes are not being built because the storage budget
+    /// has no room: the bytes the next one is estimated to need (§7.6).
+    pub sort_held_bytes: Option<u64>,
 }
 
 impl ServerStatus {
@@ -101,9 +109,12 @@ pub struct WebState {
     pub token_path: PathBuf,
     /// Background status.
     pub status: Arc<ServerStatus>,
-    /// The public UI's state (handle cache, render bound, pending
-    /// confirmations).
+    /// The public UI's state (handle cache, warming queue, render bound,
+    /// pending confirmations).
     pub public: crate::public::PublicState,
+    /// Which UI sections sort by shown time: one flag per sort index
+    /// (§7.6).
+    pub sort: Arc<SortIndexes>,
 }
 
 /// A logged-in admin.
@@ -247,7 +258,9 @@ pub fn router(state: Arc<WebState>) -> Router {
             "/setup/{*rest}",
             get(|| async { (StatusCode::NOT_FOUND, "not found") }),
         )
+        .route("/admin/card/{did}", get(crate::public::card::admin_route))
         .route("/static/farsight.css", get(common::css))
+        .route("/static/farsight.js", get(common::js))
         .route("/static/htmx.min.js", get(common::htmx))
         .merge(crate::public::router())
         .with_state(state)
@@ -693,6 +706,7 @@ async fn dashboard(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Respo
         Err(e) => (DashboardData::default(), Some(e)),
     };
     migration_warning(&st, &s, &mut d);
+    sort_warning(&st, &s, &mut d);
     let page = DashboardPage {
         nav: nav(&st, &s),
         d,
@@ -721,6 +735,29 @@ fn migration_warning(st: &WebState, s: &Option<Admin>, d: &mut DashboardData) {
     }
 }
 
+/// Tells a signed-in admin that the tables do not all sort by creation
+/// time yet: the sort indexes are still being built, or are held because
+/// the storage budget has no room for them (§7.6).
+fn sort_warning(st: &WebState, s: &Option<Admin>, d: &mut DashboardData) {
+    let ready = st.sort.count();
+    if s.is_none() || ready == 4 {
+        return;
+    }
+    let text = match st.status.get().sort_held_bytes {
+        Some(need) => format!(
+            "Sorting by creation time: {ready} of 4 indexes ready; the rest are not built, the \
+             storage budget has no room (needs ~{}). Tables without their index keep their \
+             previous order. Raise storage.budget_bytes after adding disk.",
+            common::human_bytes(need)
+        ),
+        None => format!(
+            "Sorting by creation time: {ready} of 4 indexes ready. They build in the \
+             background; a table keeps its previous order until its index is ready."
+        ),
+    };
+    d.warnings.push(Warning { class: "", text });
+}
+
 async fn dashboard_fragment(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     let s = match gate(&st, &headers, Need::Dashboard).await {
         Ok(s) => s,
@@ -731,6 +768,7 @@ async fn dashboard_fragment(State(st): State<Arc<WebState>>, headers: HeaderMap)
         Err(e) => (DashboardData::default(), Some(e)),
     };
     migration_warning(&st, &s, &mut d);
+    sort_warning(&st, &s, &mut d);
     render_private(&DashboardFragment { d, error })
 }
 
@@ -829,7 +867,7 @@ pub struct Section {
     /// Column headers.
     pub columns: Vec<String>,
     /// Rows.
-    pub rows: Vec<Vec<String>>,
+    pub rows: Vec<Vec<Cell>>,
     /// Coverage in words.
     pub coverage: String,
     /// Next-page link (relative).
@@ -877,6 +915,66 @@ pub(crate) async fn permit(st: &WebState) -> Result<tokio::sync::OwnedSemaphoreP
     }
 }
 
+/// What a section says when its page link carries a cursor it cannot
+/// read: a link made before the table changed its order.
+const STALE_LINK: &str = "This link carries a position that can no longer be read (the table's \
+                          order may have changed). Open the lookup again for the first page.";
+
+fn section_error(e: farsight_api::error::XrpcError) -> String {
+    if e.status == StatusCode::BAD_REQUEST {
+        STALE_LINK.to_owned()
+    } else {
+        e.message
+    }
+}
+
+/// The column headers of a section that sorts by shown time. "First seen"
+/// is for a signed-in admin only: nothing public serves that date, and an
+/// anonymous viewer of a lookup page is the public.
+fn time_columns(who: &str, record: &str, time: &str, signed_in: bool) -> Vec<String> {
+    let mut c = vec![who.to_owned(), record.to_owned(), time.to_owned()];
+    if signed_in {
+        c.push("First seen".to_owned());
+    }
+    c
+}
+
+/// The rows of such a section. `authority` is the account whose repo
+/// holds the records; `None`: the row's own account.
+#[allow(clippy::too_many_arguments)]
+fn time_rows(
+    st: &WebState,
+    asked: &mut Asked,
+    signed_in: bool,
+    viewer: &str,
+    collection: &'static str,
+    authority: Option<&str>,
+    rows: &[farsight_storage::ui_rows::Row],
+) -> Vec<Vec<Cell>> {
+    rows.iter()
+        .map(|b| {
+            let mut cells = vec![
+                Cell::account(&cells::account(st, asked, signed_in, &b.did)),
+                Cell::record(&Record::of(
+                    viewer,
+                    authority.unwrap_or(&b.did),
+                    collection,
+                    &b.rkey,
+                )),
+                Cell::time(b.created_at),
+            ];
+            if signed_in {
+                cells.push(Cell::first_seen(b.first_seen));
+            }
+            cells
+        })
+        .collect()
+}
+
+fn text_cell(v: &Value) -> Cell {
+    Cell::text(v.as_str().unwrap_or(""))
+}
+
 async fn lookup_did(
     State(st): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -887,6 +985,7 @@ async fn lookup_did(
         Ok(s) => s,
         Err(r) => return r,
     };
+    let signed_in = s.is_some();
     let query = q.get("q").map(|s| s.trim().to_owned()).unwrap_or_default();
     let mut page = DidPage {
         nav: nav(&st, &s),
@@ -913,9 +1012,7 @@ async fn lookup_did(
         }
     };
     page.did = Some(did.as_str().to_owned());
-    page.history = s
-        .is_some()
-        .then(|| crate::public::text::admin_did_history_href(did.as_str()));
+    page.history = signed_in.then(|| crate::public::text::admin_did_history_href(did.as_str()));
     let _permit = match permit(&st).await {
         Ok(p) => p,
         Err(e) => {
@@ -923,6 +1020,9 @@ async fn lookup_did(
             return render_private(&page);
         }
     };
+    let cfg = st.api.config.current();
+    let viewer = cfg.config.public_ui.record_viewer_url.as_str();
+    let mut asked = Asked::new(&cfg.config);
     let actor = did.as_str().to_owned();
     let base_pairs = |extra: (&str, &str)| -> String {
         let mut v: Vec<(&str, &str)> = vec![("q", actor.as_str())];
@@ -936,35 +1036,59 @@ async fn lookup_did(
         v.push(extra);
         link_with("/lookup/did", &v)
     };
-    let params = |cursor_key: &str| {
-        let mut p = vec![
-            ("actor".to_owned(), actor.clone()),
-            ("limit".to_owned(), "50".to_owned()),
-        ];
-        if let Some(c) = q.get(cursor_key) {
-            p.push(("cursor".to_owned(), c.clone()));
+    let params = |cursor_key: Option<&str>| {
+        let mut p = vec![("actor".to_owned(), actor.clone())];
+        match cursor_key {
+            Some(k) => {
+                p.push(("limit".to_owned(), "50".to_owned()));
+                if let Some(c) = q.get(k) {
+                    p.push(("cursor".to_owned(), c.clone()));
+                }
+            }
+            // Called for its freshness only.
+            None => p.push(("limit".to_owned(), "1".to_owned())),
         }
         Params::from_pairs(p)
     };
-    // Incoming blocks.
+    // Incoming blocks: coverage from the API's computation, rows from the
+    // section's own query, hidden accounts left out as the API does.
     let mut sec = Section {
         title: "Incoming blocks".into(),
-        columns: vec!["Blocker".into(), "Record".into(), "Created".into()],
+        columns: time_columns("Blocker", "Record", "Created", signed_in),
         ..Section::default()
     };
-    match handlers::get_incoming_blocks(&st.api, &params("bc")).await {
-        Ok(r) => {
-            for b in r.body["blocks"].as_array().cloned().unwrap_or_default() {
-                sec.rows.push(vec![
-                    b["did"].as_str().unwrap_or("").into(),
-                    b["uri"].as_str().unwrap_or("").into(),
-                    b["createdAt"].as_str().map(short_ts).unwrap_or_default(),
-                ]);
-            }
-            sec.coverage = coverage_words(&r.body["freshness"]);
-            sec.next = r.body["cursor"].as_str().map(|c| base_pairs(("bc", c)));
-        }
+    match handlers::get_incoming_blocks(&st.api, &params(None)).await {
+        Ok(r) => sec.coverage = coverage_words(&r.body["freshness"]),
         Err(e) => sec.error = Some(e.message),
+    }
+    let subject = match st.api.pool.acquire().await {
+        Ok(mut conn) => farsight_storage::queries::actor(&mut conn, did.as_str())
+            .await
+            .ok()
+            .flatten(),
+        Err(_) => None,
+    };
+    if let Some(a) = subject {
+        let filter = Filter {
+            hide_inactive: true,
+            excluded: &[],
+        };
+        match rows::page(
+            &st,
+            Rows::IncomingBlocks,
+            a.id,
+            filter,
+            q.get("bc").map(String::as_str),
+            50,
+        )
+        .await
+        {
+            Ok(p) => {
+                sec.rows = time_rows(&st, &mut asked, signed_in, viewer, BLOCK, None, &p.rows);
+                sec.next = p.next.as_deref().map(|c| base_pairs(("bc", c)));
+            }
+            Err(e) => sec.error = Some(section_error(e)),
+        }
     }
     page.sections.push(sec);
     // Incoming listblocks.
@@ -978,14 +1102,17 @@ async fn lookup_did(
         ],
         ..Section::default()
     };
-    match handlers::get_incoming_list_blocks(&st.api, &params("lc")).await {
+    match handlers::get_incoming_list_blocks(&st.api, &params(Some("lc"))).await {
         Ok(r) => {
             for i in r.body["items"].as_array().cloned().unwrap_or_default() {
                 sec.rows.push(vec![
-                    i["list"].as_str().unwrap_or("").into(),
-                    i["listPurpose"].as_str().unwrap_or("").into(),
-                    i["listName"].as_str().unwrap_or("").into(),
-                    i["blocker"].as_str().unwrap_or("").into(),
+                    text_cell(&i["list"]),
+                    text_cell(&i["listPurpose"]),
+                    text_cell(&i["listName"]),
+                    match i["blocker"].as_str() {
+                        Some(d) => Cell::account(&cells::account(&st, &mut asked, signed_in, d)),
+                        None => Cell::default(),
+                    },
                 ]);
             }
             sec.coverage = coverage_words(&r.body["freshness"]);
@@ -1005,14 +1132,14 @@ async fn lookup_did(
         ],
         ..Section::default()
     };
-    match handlers::get_lists_naming(&st.api, &params("nc")).await {
+    match handlers::get_lists_naming(&st.api, &params(Some("nc"))).await {
         Ok(r) => {
             for l in r.body["lists"].as_array().cloned().unwrap_or_default() {
                 sec.rows.push(vec![
-                    l["uri"].as_str().unwrap_or("").into(),
-                    l["purpose"].as_str().unwrap_or("").into(),
-                    l["name"].as_str().unwrap_or("").into(),
-                    l["listblockCount"].to_string(),
+                    text_cell(&l["uri"]),
+                    text_cell(&l["purpose"]),
+                    text_cell(&l["name"]),
+                    Cell::text(&l["listblockCount"].to_string()),
                 ]);
             }
             sec.coverage = coverage_words(&r.body["freshness"]);
@@ -1021,17 +1148,10 @@ async fn lookup_did(
         Err(e) => sec.error = Some(e.message),
     }
     page.sections.push(sec);
+    asked.submit(&st);
     // Backfill state.
     if let Ok(mut conn) = st.api.pool.acquire().await {
-        let discovery = !st
-            .api
-            .config
-            .current()
-            .config
-            .backfill
-            .backlinks
-            .url
-            .is_empty();
+        let discovery = !cfg.config.backfill.backlinks.url.is_empty();
         if let Ok(b) = backfill_api::status(&mut conn, did.as_str(), discovery).await {
             page.backfill
                 .push(format!("Repo: {}", b.repo.state.api_name()));
@@ -1097,6 +1217,7 @@ async fn lookup_list(
         Ok(s) => s,
         Err(r) => return r,
     };
+    let signed_in = s.is_some();
     let query = q.get("q").map(|s| s.trim().to_owned()).unwrap_or_default();
     let mut page = ListPage {
         nav: nav(&st, &s),
@@ -1129,9 +1250,8 @@ async fn lookup_list(
     };
     let uri = format!("at://{}/app.bsky.graph.list/{rkey}", owner.as_str());
     page.uri = Some(uri.clone());
-    page.history = s
-        .is_some()
-        .then(|| crate::public::text::admin_list_history_href(owner.as_str(), &rkey));
+    page.history =
+        signed_in.then(|| crate::public::text::admin_list_history_href(owner.as_str(), &rkey));
     let _permit = match permit(&st).await {
         Ok(p) => p,
         Err(e) => {
@@ -1139,18 +1259,28 @@ async fn lookup_list(
             return render_private(&page);
         }
     };
-    let mut p = vec![
+    let cfg = st.api.config.current();
+    let viewer = cfg.config.public_ui.record_viewer_url.as_str();
+    let mut asked = Asked::new(&cfg.config);
+    let info = match st.api.pool.acquire().await {
+        Ok(mut conn) => farsight_storage::queries::list_info(&mut conn, owner.as_str(), &rkey)
+            .await
+            .ok()
+            .flatten(),
+        Err(_) => None,
+    };
+    // Called for the list's facts and its freshness; the rows are read
+    // below.
+    let p = vec![
         ("list".to_owned(), uri.clone()),
-        ("limit".to_owned(), "50".to_owned()),
+        ("limit".to_owned(), "1".to_owned()),
     ];
-    if let Some(c) = q.get("mc") {
-        p.push(("cursor".to_owned(), c.clone()));
-    }
     let mut members = Section {
         title: "Members".into(),
-        columns: vec!["Member".into(), "Listitem".into(), "Added".into()],
+        columns: time_columns("Member", "Listitem", "Added", signed_in),
         ..Section::default()
     };
+    let mut serves = false;
     match handlers::get_list_members(&st.api, &Params::from_pairs(p)).await {
         Ok(r) => {
             let b = &r.body;
@@ -1171,66 +1301,74 @@ async fn lookup_list(
                     "no"
                 },
             ));
-            for m in b["members"].as_array().cloned().unwrap_or_default() {
-                members.rows.push(vec![
-                    m["did"].as_str().unwrap_or("").into(),
-                    m["itemUri"].as_str().unwrap_or("").into(),
-                    m["addedAt"].as_str().map(short_ts).unwrap_or_default(),
-                ]);
-            }
+            // Members are served as the API serves them: for a list that
+            // is indexed, whose owner is shown.
+            serves = matches!(b["state"].as_str(), Some("ready" | "retained"))
+                && info.as_ref().is_some_and(|i| {
+                    !farsight_storage::codes::actor_status::is_hidden(i.owner_status)
+                });
             members.coverage = coverage_words(&b["freshness"]);
-            members.next = b["cursor"]
-                .as_str()
-                .map(|c| link_with("/lookup/list", &[("q", uri.as_str()), ("mc", c)]));
         }
         Err(e) => members.error = Some(e.message),
     }
     let mut blockers = Section {
         title: "Inbound listblocks".into(),
-        columns: vec!["Blocker".into(), "Listblock".into(), "Created".into()],
+        columns: time_columns("Blocker", "Listblock", "Created", signed_in),
         ..Section::default()
     };
-    if let Ok(mut conn) = st.api.pool.acquire().await {
-        let info = farsight_storage::queries::list_info(&mut conn, owner.as_str(), &rkey).await;
-        if let Ok(Some(info)) = info {
-            page.facts.push(stat("Stored items", info.item_count));
-            let after = q
-                .get("bc")
-                .and_then(|c| farsight_api::cursor::id_rkey(Some(c)).ok().flatten());
-            match farsight_storage::queries::list_blockers(
-                &mut conn,
+    if let Some(info) = &info {
+        page.facts.push(stat("Stored items", info.item_count));
+        if serves {
+            match rows::page(
+                &st,
+                Rows::ListMembers,
                 info.id,
-                after.as_ref().map(|(a, r)| (*a, r.as_str())),
+                Filter::default(),
+                q.get("mc").map(String::as_str),
                 50,
             )
             .await
             {
-                Ok(rows) => {
-                    for b in &rows {
-                        blockers.rows.push(vec![
-                            b.did.clone(),
-                            format!("at://{}/app.bsky.graph.listblock/{}", b.did, b.rkey),
-                            b.created_at
-                                .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
-                                .unwrap_or_default(),
-                        ]);
-                    }
-                    if rows.len() == 50 {
-                        let last = rows.last().expect("non-empty");
-                        let c = farsight_api::cursor::encode(&[
-                            serde_json::json!(last.author_id),
-                            serde_json::json!(last.rkey),
-                        ]);
-                        blockers.next = Some(link_with(
-                            "/lookup/list",
-                            &[("q", uri.as_str()), ("bc", c.as_str())],
-                        ));
-                    }
+                Ok(p) => {
+                    members.rows = time_rows(
+                        &st,
+                        &mut asked,
+                        signed_in,
+                        viewer,
+                        LISTITEM,
+                        Some(owner.as_str()),
+                        &p.rows,
+                    );
+                    members.next = p
+                        .next
+                        .as_deref()
+                        .map(|c| link_with("/lookup/list", &[("q", uri.as_str()), ("mc", c)]));
                 }
-                Err(e) => blockers.error = Some(e.to_string()),
+                Err(e) => members.error = Some(section_error(e)),
             }
         }
+        match rows::page(
+            &st,
+            Rows::ListBlockers,
+            info.id,
+            Filter::default(),
+            q.get("bc").map(String::as_str),
+            50,
+        )
+        .await
+        {
+            Ok(p) => {
+                blockers.rows =
+                    time_rows(&st, &mut asked, signed_in, viewer, LISTBLOCK, None, &p.rows);
+                blockers.next = p
+                    .next
+                    .as_deref()
+                    .map(|c| link_with("/lookup/list", &[("q", uri.as_str()), ("bc", c)]));
+            }
+            Err(e) => blockers.error = Some(section_error(e)),
+        }
     }
+    asked.submit(&st);
     page.sections.push(members);
     page.sections.push(blockers);
     render_private(&page)

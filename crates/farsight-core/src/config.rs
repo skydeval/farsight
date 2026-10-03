@@ -530,6 +530,10 @@ pub struct PublicUiConfig {
     /// Burst of the same budget; at least `card_rps` (see
     /// [`PublicUiConfig::effective_card_burst`]).
     pub card_burst: u32,
+    /// A background worker verifies the handles of accounts that pages
+    /// had to show as bare DIDs, so that a later view shows the handle.
+    /// Governs the admin pages too, and works with the public UI off.
+    pub handle_warming_enabled: bool,
 }
 
 impl PublicUiConfig {
@@ -559,6 +563,7 @@ impl Default for PublicUiConfig {
             show_avatars: true,
             card_rps: 4,
             card_burst: 8,
+            handle_warming_enabled: true,
         }
     }
 }
@@ -1517,6 +1522,7 @@ mod tests {
         assert!(!p.show_outgoing_blocks && p.show_opengraph_image && p.show_avatars);
         assert!(p.show_history.is_none() && p.record_viewer_url.is_empty());
         assert_eq!((p.card_rps, p.card_burst), (4, 8));
+        assert!(p.handle_warming_enabled);
         assert!(!p.crawlable && p.excluded_dids.is_empty());
         assert_eq!(p.dark_mode_default, ThemeDefault::System);
         assert_eq!((p.rate_limit_rps, p.rate_limit_burst), (5, 20));

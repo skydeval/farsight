@@ -28,6 +28,7 @@ pub mod repo_events;
 pub mod tracking;
 pub mod transition;
 pub mod txn;
+pub mod ui_rows;
 
 use std::time::Duration;
 
@@ -134,6 +135,7 @@ mod tests {
             ("coverage.rs", include_str!("coverage.rs")),
             ("queries.rs", include_str!("queries.rs")),
             ("public.rs", include_str!("public.rs")),
+            ("ui_rows.rs", include_str!("ui_rows.rs")),
             ("history.rs", include_str!("history.rs")),
             ("auth.rs", include_str!("auth.rs")),
             ("backfill_api.rs", include_str!("backfill_api.rs")),

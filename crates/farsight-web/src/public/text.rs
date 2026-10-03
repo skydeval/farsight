@@ -103,9 +103,12 @@ pub fn admin_list_history_href(owner: &str, rkey: &str) -> String {
 pub const BLOCK: &str = "app.bsky.graph.block";
 /// The collection of a listblock record.
 pub const LISTBLOCK: &str = "app.bsky.graph.listblock";
+/// The collection of a listitem record.
+pub const LISTITEM: &str = "app.bsky.graph.listitem";
 
-/// A record as a table cell shows it: its at-uri, and a link to the
-/// operator's record viewer when one is configured.
+/// A record as a table cell of the admin lookup pages shows it: its
+/// at-uri, and a link to the operator's record viewer when one is
+/// configured. The public pages have no record cells.
 #[derive(Debug, Clone, PartialEq, Eq, askama::Template)]
 #[template(path = "_record.html")]
 pub struct Record {

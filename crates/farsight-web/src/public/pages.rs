@@ -1,11 +1,14 @@
 //! The public pages: home, search, an account and a list.
 //!
-//! Sections are built from the handlers behind the stable read queries,
-//! called in-process with default filtering (the UI never passes
-//! `includeInactive`), plus read-only storage queries for the two sections
-//! without an NSID. Handler output is filtered afterwards with one batched
-//! status lookup for the page's DIDs, so a page can hold fewer than 50
-//! rows while more follow; the cursor is still offered.
+//! The four sections that show a creation time — blockers, outgoing
+//! blocks, a list's members and its listblockers — read their rows through
+//! [`crate::rows`], newest first by shown time once the section's index is
+//! ready, with the withheld rule applied in the query. The handlers behind
+//! the stable read queries are still called in-process, with default
+//! filtering, for the lists section and for every section's freshness.
+//! Rows are filtered once more with one batched status lookup for the
+//! page's DIDs, so a page can hold fewer than 50 rows while more follow;
+//! the cursor is still offered.
 //!
 //! A page prints no coverage level. It ends with one "Last updated" line
 //! (see [`super::coverage`]); removed records are an admin page
@@ -18,20 +21,19 @@ use askama::Template;
 use axum::http::StatusCode;
 use axum::response::Response;
 use farsight_api::params::Params;
-use farsight_api::{cursor, handlers, public_ui};
+use farsight_api::{handlers, public_ui};
 use farsight_core::{AtUri, Did, RecordKey};
 use farsight_storage::codes::actor_status;
 use farsight_storage::public::{self as store, Counted};
 use farsight_storage::queries::{self, ActorRef};
-use serde_json::{Value, json};
+use farsight_storage::ui_rows::{Filter, Row, Section as Rows};
+use serde_json::Value;
 
 use super::coverage::{EMPTY, last_updated};
-use super::handles::{page_handle, row_handle, take_budget};
+use super::handles::{page_handle, take_budget};
 use super::search::{self, Authority, Target};
-use super::text::{
-    BLOCK, LISTBLOCK, Record, Stamp, card_href, clean, did_href, list_href, list_uri, paragraphs,
-    thousands,
-};
+use super::text::{Stamp, card_href, clean, did_href, list_href, list_uri, paragraphs, thousands};
+use super::warming::Asked;
 use super::{
     COUNT_CAP, Cache, Chrome, Fail, OG_ACCOUNT, OG_INSTANCE, OG_LIST, PAGE_ROWS, Req, Withheld,
     chrome, metrics as m, page, redirect,
@@ -53,7 +55,8 @@ pub const DEFAULT_DESCRIPTION: &str = "Farsight is an independent index of publi
 /// An account as a row names it: `@handle` when a verified handle is
 /// already cached, the DID otherwise. Either way a link to the account's
 /// page whose `title` is the DID, and on which the script opens the
-/// profile card. Rendering a row never makes an outbound request.
+/// profile card. Rendering a row never waits for an outbound request: an
+/// account shown as a DID is handed to the warming worker.
 #[derive(Debug, Clone, Template)]
 #[template(path = "_who.html")]
 pub struct Who {
@@ -67,12 +70,12 @@ pub struct Who {
     pub handle: Option<String>,
 }
 
-fn who(r: &Req<'_>, did: &str) -> Who {
+fn who(r: &Req<'_>, asked: &mut Asked, did: &str) -> Who {
     Who {
         did: did.to_owned(),
         href: did_href(did),
         card: card_href(did),
-        handle: row_handle(r.st, did).map(|h| clean(&h)),
+        handle: asked.handle(r.st, did).map(|h| clean(&h)),
     }
 }
 
@@ -92,9 +95,6 @@ pub struct Pager {
 pub struct PartyRow {
     /// The account.
     pub who: Who,
-    /// The block or listblock record. Member rows have none: the API's
-    /// member rows do not carry the listitem record.
-    pub record: Option<Record>,
     /// `createdAt` / `addedAt`, as stated by the record's author.
     pub when: Option<Stamp>,
 }
@@ -218,12 +218,6 @@ fn stamp_of(v: &Value) -> Option<Stamp> {
     v.as_str().and_then(Stamp::parse)
 }
 
-fn dids_of<'a>(rows: &'a [Value], key: &str) -> impl Iterator<Item = String> + 'a {
-    let key = key.to_owned();
-    rows.iter()
-        .filter_map(move |v| v[key.as_str()].as_str().map(str::to_owned))
-}
-
 fn handler_params(pairs: &[(&str, &str)], cursor: Option<&str>) -> Params {
     let mut p: Vec<(String, String)> = pairs
         .iter()
@@ -234,6 +228,36 @@ fn handler_params(pairs: &[(&str, &str)], cursor: Option<&str>) -> Params {
         p.push(("cursor".to_owned(), c.to_owned()));
     }
     Params::from_pairs(p)
+}
+
+/// Parameters for a handler that is called for its freshness only: the
+/// section's rows and cursor come from [`crate::rows`].
+fn freshness_params(pairs: &[(&str, &str)]) -> Params {
+    let mut p: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    p.push(("limit".to_owned(), "1".to_owned()));
+    Params::from_pairs(p)
+}
+
+/// The withheld rule as the row queries apply it.
+fn row_filter(w: &Withheld) -> Filter<'_> {
+    Filter {
+        hide_inactive: true,
+        excluded: &w.ids,
+    }
+}
+
+/// The rows of a section that may be shown, as the tables render them.
+fn party_rows(r: &Req<'_>, asked: &mut Asked, shown: &Shown<'_>, rows: &[Row]) -> Vec<PartyRow> {
+    rows.iter()
+        .filter(|b| shown.ok(&b.did))
+        .map(|b| PartyRow {
+            who: who(r, asked, &b.did),
+            when: b.created_at.map(Stamp::of),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -441,13 +465,23 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let (_slot, _permit) = r.render_slots().await?;
     let api = &r.st.api;
 
-    let blocks = handlers::get_incoming_blocks(
-        api,
-        &handler_params(&[("actor", did.as_str())], q.get("bc")),
-    )
-    .await
-    .map_err(|e| or_first_page(e.into(), &base))?
-    .body;
+    // Called for its freshness; the rows are read below.
+    let blocks = handlers::get_incoming_blocks(api, &freshness_params(&[("actor", did.as_str())]))
+        .await?
+        .body;
+    let block_page = match actor {
+        Some(a) => crate::rows::page(
+            r.st,
+            Rows::IncomingBlocks,
+            a.id,
+            row_filter(&withheld),
+            q.get("bc"),
+            PAGE_ROWS,
+        )
+        .await
+        .map_err(|e| or_first_page(e.into(), &base))?,
+        None => crate::rows::Page::default(),
+    };
     let naming = handlers::get_lists_naming(
         api,
         &handler_params(&[("actor", did.as_str())], q.get("nc")),
@@ -456,55 +490,41 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     .map_err(|e| or_first_page(e.into(), &base))?
     .body;
     let show_outgoing = cfg.public_ui.show_outgoing_blocks;
-    let out_after = cursor::rkey(q.get("oc")).map_err(|e| or_first_page(e.into(), &base))?;
-    let (out_rows, out_fresh) = if show_outgoing {
-        let rows = match actor {
-            Some(a) => {
-                let mut tx = api.read_tx().await?;
-                let rows = store::outgoing_blocks(
-                    &mut tx,
-                    a.id,
-                    &withheld.ids,
-                    out_after.as_deref(),
-                    PAGE_ROWS,
-                )
-                .await?;
-                tx.rollback().await?;
-                rows
-            }
-            None => Vec::new(),
+    let (out_page, out_fresh) = if show_outgoing {
+        let page = match actor {
+            Some(a) => crate::rows::page(
+                r.st,
+                Rows::OutgoingBlocks,
+                a.id,
+                row_filter(&withheld),
+                q.get("oc"),
+                PAGE_ROWS,
+            )
+            .await
+            .map_err(|e| or_first_page(e.into(), &base))?,
+            None => crate::rows::Page::default(),
         };
-        (rows, Some(public_ui::outgoing_freshness(api, did).await?))
+        (page, Some(public_ui::outgoing_freshness(api, did).await?))
     } else {
-        (Vec::new(), None)
+        (crate::rows::Page::default(), None)
     };
 
-    let block_rows = blocks["blocks"].as_array().cloned().unwrap_or_default();
     let list_rows = naming["lists"].as_array().cloned().unwrap_or_default();
     let lists: Vec<(AtUri, &Value)> = list_rows
         .iter()
         .filter_map(|l| Some((AtUri::parse(l["uri"].as_str()?).ok()?, l)))
         .collect();
-    let mut dids: Vec<String> = dids_of(&block_rows, "did").collect();
+    let mut dids: Vec<String> = block_page.rows.iter().map(|b| b.did.clone()).collect();
     dids.extend(lists.iter().map(|(u, _)| u.authority.as_str().to_owned()));
-    dids.extend(out_rows.iter().map(|o| o.did.clone()));
+    dids.extend(out_page.rows.iter().map(|o| o.did.clone()));
     let shown = Shown::load(r, &withheld, dids).await?;
+    let mut asked = Asked::new(cfg);
 
-    let viewer = cfg.public_ui.record_viewer_url.as_str();
-    let b_next = blocks["cursor"]
-        .as_str()
+    let b_next = block_page
+        .next
+        .as_deref()
         .map(|c| next_link(&base, q, &DID_CURSORS, "bc", c));
-    let b_rows: Vec<PartyRow> = block_rows
-        .iter()
-        .filter_map(|b| {
-            let d = b["did"].as_str()?;
-            shown.ok(d).then(|| PartyRow {
-                who: who(r, d),
-                record: b["uri"].as_str().map(|u| Record::of_uri(viewer, u)),
-                when: stamp_of(&b["createdAt"]),
-            })
-        })
-        .collect();
+    let b_rows = party_rows(r, &mut asked, &shown, &block_page.rows);
     let blockers = Section {
         count: match actor {
             Some(a) => count(r, Counted::IncomingBlocks, a.id, &withheld).await,
@@ -528,7 +548,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
             uri: u.to_string(),
             href: list_href(u.authority.as_str(), u.rkey.as_str()),
             name: l["name"].as_str().map(clean).filter(|n| !n.is_empty()),
-            owner: who(r, u.authority.as_str()),
+            owner: who(r, &mut asked, u.authority.as_str()),
             listblocks: l["listblockCount"].as_i64().unwrap_or(0).to_string(),
             added: stamp_of(&l["addedAt"]),
         })
@@ -547,27 +567,11 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let mut fresh: Vec<&Value> = vec![&blocks["freshness"], &naming["freshness"]];
     let outgoing = match &out_fresh {
         Some(f) => {
-            let next = (out_rows.len() as i64 == PAGE_ROWS)
-                .then(|| out_rows.last())
-                .flatten()
-                .map(|o| {
-                    next_link(
-                        &base,
-                        q,
-                        &DID_CURSORS,
-                        "oc",
-                        &cursor::encode(&[json!(o.rkey)]),
-                    )
-                });
-            let rows: Vec<PartyRow> = out_rows
-                .iter()
-                .filter(|o| shown.ok(&o.did))
-                .map(|o| PartyRow {
-                    who: who(r, &o.did),
-                    record: Some(Record::of(viewer, did.as_str(), BLOCK, &o.rkey)),
-                    when: o.created_at.map(Stamp::of),
-                })
-                .collect();
+            let next = out_page
+                .next
+                .as_deref()
+                .map(|c| next_link(&base, q, &DID_CURSORS, "oc", c));
+            let rows = party_rows(r, &mut asked, &shown, &out_page.rows);
             fresh.push(f);
             Some(Section {
                 count: match actor {
@@ -585,6 +589,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         None => None,
     };
 
+    asked.submit(r.st);
     let og_title = match &handle {
         Some(h) => format!("@{h} ({did})"),
         None => did.to_string(),
@@ -685,50 +690,50 @@ pub async fn list(
     let (_slot, _permit) = r.render_slots().await?;
     let api = &r.st.api;
 
-    let listing =
-        handlers::get_list_members(api, &handler_params(&[("list", uri.as_str())], q.get("mc")))
-            .await
-            .map_err(|e| or_first_page(e.into(), &base))?
-            .body;
+    // Called for the list's state and its freshness; the rows are read
+    // below.
+    let listing = handlers::get_list_members(api, &freshness_params(&[("list", uri.as_str())]))
+        .await?
+        .body;
     let (state, show_members) = state_words(listing["state"].as_str().unwrap_or(""));
-    let after = cursor::id_rkey(q.get("lc")).map_err(|e| or_first_page(e.into(), &base))?;
-    let blocker_rows = {
-        let mut tx = api.read_tx().await?;
-        let rows = store::list_blockers(
-            &mut tx,
+    let member_page = if show_members {
+        crate::rows::page(
+            r.st,
+            Rows::ListMembers,
             info.id,
-            &withheld.ids,
-            after.as_ref().map(|(a, k)| (*a, k.as_str())),
+            row_filter(&withheld),
+            q.get("mc"),
             PAGE_ROWS,
         )
-        .await?;
-        tx.rollback().await?;
-        rows
+        .await
+        .map_err(|e| or_first_page(e.into(), &base))?
+    } else {
+        crate::rows::Page::default()
     };
+    let blocker_page = crate::rows::page(
+        r.st,
+        Rows::ListBlockers,
+        info.id,
+        row_filter(&withheld),
+        q.get("lc"),
+        PAGE_ROWS,
+    )
+    .await
+    .map_err(|e| or_first_page(e.into(), &base))?;
     let blockers_fresh = public_ui::listblock_freshness(api)?;
 
-    let member_rows = listing["members"].as_array().cloned().unwrap_or_default();
-    let mut dids: Vec<String> = dids_of(&member_rows, "did").collect();
-    dids.extend(blocker_rows.iter().map(|b| b.did.clone()));
+    let mut dids: Vec<String> = member_page.rows.iter().map(|m| m.did.clone()).collect();
+    dids.extend(blocker_page.rows.iter().map(|b| b.did.clone()));
     let shown = Shown::load(r, &withheld, dids).await?;
+    let mut asked = Asked::new(cfg);
 
-    let viewer = cfg.public_ui.record_viewer_url.as_str();
     let mut fresh: Vec<&Value> = Vec::new();
     let members = if show_members {
-        let next = listing["cursor"]
-            .as_str()
+        let next = member_page
+            .next
+            .as_deref()
             .map(|c| next_link(&base, q, &LIST_CURSORS, "mc", c));
-        let rows: Vec<PartyRow> = member_rows
-            .iter()
-            .filter_map(|m| {
-                let d = m["did"].as_str()?;
-                shown.ok(d).then(|| PartyRow {
-                    who: who(r, d),
-                    record: None,
-                    when: stamp_of(&m["addedAt"]),
-                })
-            })
-            .collect();
+        let rows = party_rows(r, &mut asked, &shown, &member_page.rows);
         fresh.push(&listing["freshness"]);
         Some(Section {
             count: None,
@@ -743,27 +748,12 @@ pub async fn list(
         None
     };
 
-    let next = (blocker_rows.len() as i64 == PAGE_ROWS)
-        .then(|| blocker_rows.last())
-        .flatten()
-        .map(|b| {
-            next_link(
-                &base,
-                q,
-                &LIST_CURSORS,
-                "lc",
-                &cursor::encode(&[json!(b.author_id), json!(b.rkey)]),
-            )
-        });
-    let rows: Vec<PartyRow> = blocker_rows
-        .iter()
-        .filter(|b| shown.ok(&b.did))
-        .map(|b| PartyRow {
-            who: who(r, &b.did),
-            record: Some(Record::of(viewer, &b.did, LISTBLOCK, &b.rkey)),
-            when: b.created_at.map(Stamp::of),
-        })
-        .collect();
+    let next = blocker_page
+        .next
+        .as_deref()
+        .map(|c| next_link(&base, q, &LIST_CURSORS, "lc", c));
+    let rows = party_rows(r, &mut asked, &shown, &blocker_page.rows);
+    asked.submit(r.st);
     fresh.push(&blockers_fresh);
     let blockers = Section {
         count: count(r, Counted::ListBlockers, info.id, &withheld).await,

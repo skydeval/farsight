@@ -1,8 +1,9 @@
 //! Normal mode (design §2, §8.2): migrations, the API pool (separate from
 //! ingest's 4 connections), the ingest task, the coverage snapshot and its
 //! NOTIFY listener, the API and UI routers, `/health` and `/livez`, the
-//! metrics listener and the periodic tasks. Ends on shutdown or on a
-//! config reset (then the caller enters setup mode in-process).
+//! metrics listener, the periodic tasks, the UI sort-index builder and
+//! the handle-warming worker. Ends on shutdown or on a config reset (then
+//! the caller enters setup mode in-process).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,7 +27,7 @@ use sqlx::PgPool;
 use tokio::sync::{Semaphore, watch};
 
 use crate::tasks::{self, TaskCtx};
-use crate::{ModeEnd, VERSION, health, metrics_http};
+use crate::{ModeEnd, VERSION, health, metrics_http, sort_indexes};
 
 /// Extra API-pool connections beyond the query semaphore (writes,
 /// lookups, health).
@@ -167,6 +168,13 @@ pub async fn run(
     farsight_api::metrics::register();
     farsight_storage::history::register_metrics();
     farsight_web::public::metrics::register();
+    farsight_web::public::warming::register();
+    // Which UI sections sort by shown time: read once before serving, then
+    // kept by the index builder (§7.6).
+    let sort = Arc::new(farsight_storage::ui_rows::SortIndexes::default());
+    sort_indexes::load(&api_pool, &sort)
+        .await
+        .map_err(|e| format!("reading the sort indexes: {e}"))?;
 
     let api = Arc::new(ApiState {
         pool: api_pool.clone(),
@@ -201,6 +209,7 @@ pub async fn run(
         token_path: farsight_web::setup_token::token_path(&config_path),
         status: status.clone(),
         public: Default::default(),
+        sort: sort.clone(),
     });
 
     // Housekeeping of in-memory API state.
@@ -259,7 +268,6 @@ pub async fn run(
         status.clone(),
     ));
     let scheduler = tokio::spawn(tasks::run_scheduler(task_ctx, stop_rx.clone()));
-
     let metrics_task = metrics_handle.map(|h| {
         tokio::spawn(metrics_http::serve(
             h,
@@ -293,6 +301,25 @@ pub async fn run(
         .map_err(|e| format!("binding {bind}: {e}"))?;
     tracing::info!(bind, hostname = %cfg.server.hostname, "normal mode: serving");
 
+    // Not periodic jobs: the warming worker waits on its queue, and the
+    // index builder runs until the four indexes are valid. Both start
+    // once normal mode is serving (after a wizard run too): a long index
+    // build never stands between a start and a healthy instance.
+    let warming = tokio::spawn(farsight_web::public::warming::run(
+        web.clone(),
+        stop_rx.clone(),
+    ));
+    let index_builder = tokio::spawn(
+        sort_indexes::Builder {
+            pool: tasks_pool.clone(),
+            database_url: cfg.storage.database_url.clone(),
+            config: config.clone(),
+            sort,
+            status: status.clone(),
+        }
+        .run(stop_rx.clone()),
+    );
+
     let shutdown_wait = shutdown.clone();
     let mut reset_wait = reset_rx.clone();
     let served = axum::serve(
@@ -318,6 +345,10 @@ pub async fn run(
         let _ = tokio::time::timeout(Duration::from_secs(5), m).await;
     }
     housekeeping.abort();
+    warming.abort();
+    // An interrupted build leaves an invalid index; the next start drops
+    // it and builds again.
+    index_builder.abort();
     ingest.shutdown().await;
     flusher.abort();
     let limits = Limits::from_config(&config.current().config);

@@ -9,6 +9,7 @@
 // it would only add noise at every call site.
 #![allow(clippy::result_large_err)]
 
+pub mod cells;
 pub mod common;
 pub mod enter;
 pub mod history;
@@ -16,6 +17,7 @@ pub mod oauth;
 pub mod pages;
 pub mod public;
 pub mod public_settings;
+pub mod rows;
 pub mod setup;
 pub mod setup_token;
 

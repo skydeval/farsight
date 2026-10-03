@@ -8,11 +8,11 @@
 //! 3. resolve that handle forward and require the result to equal the DID.
 //!
 //! At most one resolution per page view (the page's subject or list
-//! owner), under a process-wide budget. Rows never trigger a resolution;
-//! they show a handle only if one is already cached. A profile card
-//! ([`super::card`]) verifies the handle of its account under the card
-//! budget and writes the same cache, so rows fill in as cards are opened
-//! and as pages are visited.
+//! owner), under a process-wide budget. Rendering a row never waits for a
+//! resolution: it shows a handle only if one is already cached, and asks
+//! the warming worker ([`super::warming`]) for the accounts it had to show
+//! as DIDs. A profile card ([`super::card`]) verifies the handle of its
+//! account under the card budget and writes the same cache.
 
 use std::time::Duration;
 
@@ -105,7 +105,12 @@ pub fn claimed_handle(doc: &serde_json::Value) -> Option<String> {
     farsight_core::did::is_valid_hostname(&h).then_some(h)
 }
 
-async fn verify(safe: &SafeClient, cfg: &Config, did: &Did) -> (Outcome, Option<String>) {
+/// Verifies the handle of `did` in both directions (steps 1–3 above).
+pub(crate) async fn verify(
+    safe: &SafeClient,
+    cfg: &Config,
+    did: &Did,
+) -> (Outcome, Option<String>) {
     let Some(url) = document_url(cfg, did) else {
         return (Outcome::Failed, None);
     };
@@ -157,11 +162,6 @@ pub async fn page_handle(st: &WebState, cfg: &Config, did: &Did) -> Option<Strin
             None
         }
     }
-}
-
-/// The cached handle of a DID named in a row, if there is one.
-pub fn row_handle(st: &WebState, did: &str) -> Option<String> {
-    st.public.handles.get(did)
 }
 
 #[cfg(test)]

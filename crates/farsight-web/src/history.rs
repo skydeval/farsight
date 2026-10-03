@@ -12,8 +12,11 @@
 //!   That, not the purge, is what keeps a deleted account's history from
 //!   being shown; an admin session does not lift it.
 //!   `public_ui.excluded_dids` is not applied: it governs `/public/*`.
-//! - **Nothing is resolved.** A handle is shown when the public UI's cache
-//!   already holds one.
+//! - **Nothing is resolved while rendering.** An account cell shows a
+//!   handle when the cache holds a verified one and opens a profile card;
+//!   accounts shown as DIDs are handed to the warming worker.
+//! - **Record cells are text.** The records were removed; a viewer link
+//!   would open "not found".
 //! - History is outside the coverage contract (§3.7): the pages print no
 //!   coverage and state their own limits.
 
@@ -35,12 +38,15 @@ use farsight_storage::public::{self as store, HistoryArgs, HistoryCursor, Remove
 use farsight_storage::queries::{self, ActorRef};
 use serde_json::json;
 
+use crate::cells::{self, Account, lookup_did_href};
 use crate::common::render_private;
 use crate::pages::{Nav, Need, WebState, gate, login_redirect, message, nav, permit};
 use crate::public::pages::{Pager, next_link, purpose_words, state_words};
 use crate::public::text::{
-    admin_did_history_href, admin_list_history_href, clean, duration_words, list_uri,
+    BLOCK, LISTBLOCK, LISTITEM, admin_did_history_href, admin_list_history_href, clean,
+    duration_words, list_uri,
 };
+use crate::public::warming::Asked;
 use crate::public::{MAX_DID_SEGMENT, PAGE_ROWS};
 
 /// The cursor parameters of the two pages. Cursors are opaque and
@@ -53,31 +59,12 @@ fn when(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }
 
-/// `/lookup/did?q=…`.
-fn lookup_did_href(did: &str) -> String {
-    let q: String = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("q", did)
-        .finish();
-    format!("/lookup/did?{q}")
-}
-
 /// `/lookup/list?q=at://…`.
 fn lookup_list_href(owner: &str, rkey: &str) -> String {
     let q: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("q", &list_uri(owner, rkey))
         .finish();
     format!("/lookup/list?{q}")
-}
-
-/// An account in a history row.
-#[derive(Debug, Clone)]
-pub struct Party {
-    /// The DID.
-    pub did: String,
-    /// Its lookup page.
-    pub href: String,
-    /// A verified handle, if the public UI's cache holds one.
-    pub handle: Option<String>,
 }
 
 /// The list a removed membership or listblock pointed at.
@@ -99,9 +86,11 @@ pub struct ListCell {
 #[derive(Debug, Clone)]
 pub struct RemovedRow {
     /// The other account, for rows that name one.
-    pub who: Option<Party>,
+    pub who: Option<Account>,
     /// The list, for rows that point at one.
     pub list: Option<ListCell>,
+    /// The removed record's at-uri. Always text: the record is gone.
+    pub record: String,
     /// Created, as stated by the author.
     pub created: Option<String>,
     /// First seen; `None`: before this instance kept dates.
@@ -187,13 +176,37 @@ fn purpose_of_code(c: Option<i16>) -> Option<&'static str> {
     c.map(|c| purpose_words(farsight_core::ListPurpose::from_code(c).api_name()))
 }
 
-fn removed_row(st: &WebState, kind: Kind, h: &Removed) -> RemovedRow {
+/// The at-uri of a removed record. A block or a listblock is in its
+/// author's repo — the row's account. A listitem is in the repo of the
+/// list's owner: the row's list on an account's page, `owner` on a list's
+/// page.
+fn record_uri(kind: Kind, h: &Removed, owner: Option<&str>) -> String {
+    let (authority, collection) = match kind {
+        Kind::Block => (h.party.as_str(), BLOCK),
+        Kind::ListBlock => (h.party.as_str(), LISTBLOCK),
+        Kind::Membership => (
+            h.list
+                .as_ref()
+                .map(|l| l.owner_did.as_str())
+                .or(owner)
+                .unwrap_or(""),
+            LISTITEM,
+        ),
+    };
+    format!("at://{authority}/{collection}/{}", h.rkey)
+}
+
+fn removed_row(
+    st: &WebState,
+    asked: &mut Asked,
+    kind: Kind,
+    h: &Removed,
+    owner: Option<&str>,
+) -> RemovedRow {
     RemovedRow {
-        who: (!h.party.is_empty()).then(|| Party {
-            did: h.party.clone(),
-            href: lookup_did_href(&h.party),
-            handle: st.public.handles.get(&h.party).map(|x| clean(&x)),
-        }),
+        // These pages are served to a signed-in admin only.
+        who: (!h.party.is_empty()).then(|| cells::account(st, asked, true, &h.party)),
+        record: record_uri(kind, h, owner),
         list: h.list.as_ref().map(|l| ListCell {
             uri: list_uri(&l.owner_did, &l.rkey),
             href: lookup_list_href(&l.owner_did, &l.rkey),
@@ -331,6 +344,8 @@ fn limits(
 #[allow(clippy::too_many_arguments)]
 fn history_section(
     st: &WebState,
+    asked: &mut Asked,
+    owner: Option<&str>,
     data: &HistoryData,
     kind: Kind,
     rows: &[Removed],
@@ -350,7 +365,7 @@ fn history_section(
             (h.party.is_empty() || data.ok(&h.party))
                 && h.list.as_ref().is_none_or(|l| data.ok(&l.owner_did))
         })
-        .map(|h| removed_row(st, kind, h))
+        .map(|h| removed_row(st, asked, kind, h, owner))
         .collect();
     HistorySection {
         empty: out.is_empty() && next.is_none() && q.get(key).is_none(),
@@ -526,7 +541,8 @@ async fn serve(
         }
     };
     let nav = nav(st, &admin);
-    match subject {
+    let mut asked = Asked::new(cfg);
+    let page = match subject {
         Subject::Did(did) => {
             let base = admin_did_history_href(did.as_str());
             render_private(&DidHistoryPage {
@@ -535,6 +551,8 @@ async fn serve(
                 back: lookup_did_href(did.as_str()),
                 blocks: history_section(
                     st,
+                    &mut asked,
+                    None,
                     &data,
                     Kind::Block,
                     &data.first,
@@ -546,6 +564,8 @@ async fn serve(
                 ),
                 memberships: history_section(
                     st,
+                    &mut asked,
+                    None,
                     &data,
                     Kind::Membership,
                     &data.second,
@@ -566,6 +586,8 @@ async fn serve(
                 back: lookup_list_href(owner.as_str(), rkey.as_str()),
                 listblocks: history_section(
                     st,
+                    &mut asked,
+                    Some(owner.as_str()),
                     &data,
                     Kind::ListBlock,
                     &data.first,
@@ -577,6 +599,8 @@ async fn serve(
                 ),
                 members: history_section(
                     st,
+                    &mut asked,
+                    Some(owner.as_str()),
                     &data,
                     Kind::Membership,
                     &data.second,
@@ -589,7 +613,9 @@ async fn serve(
                 limits: limits(cfg, &data, hz),
             })
         }
-    }
+    };
+    asked.submit(st);
+    page
 }
 
 /// `GET /admin/did/{did}/history`.
@@ -661,6 +687,53 @@ mod tests {
             [(t(7), Some(t(9))), (t(12), None)]
         );
         assert_eq!(clip_windows(&w, Some(t(20))), [(t(20), None)]);
+    }
+
+    #[test]
+    fn removed_records_are_named_by_their_repo() {
+        let h = |party: &str, list: Option<&str>| Removed {
+            id: 1,
+            removed_at: DateTime::<Utc>::UNIX_EPOCH,
+            party: party.to_owned(),
+            list: list.map(|o| store::RemovedList {
+                owner_did: o.to_owned(),
+                rkey: "l".into(),
+                name: None,
+                purpose: None,
+                state: None,
+            }),
+            rkey: "3k".into(),
+            created_at: None,
+            first_seen: None,
+            last_seen: None,
+            cause: 1,
+            live: false,
+        };
+        assert_eq!(
+            record_uri(Kind::Block, &h("did:plc:blocker", None), None),
+            "at://did:plc:blocker/app.bsky.graph.block/3k"
+        );
+        assert_eq!(
+            record_uri(
+                Kind::ListBlock,
+                &h("did:plc:blocker", None),
+                Some("did:plc:owner")
+            ),
+            "at://did:plc:blocker/app.bsky.graph.listblock/3k"
+        );
+        // A listitem is in the list owner's repo, whichever page shows it.
+        assert_eq!(
+            record_uri(Kind::Membership, &h("", Some("did:plc:owner")), None),
+            "at://did:plc:owner/app.bsky.graph.listitem/3k"
+        );
+        assert_eq!(
+            record_uri(
+                Kind::Membership,
+                &h("did:plc:member", None),
+                Some("did:plc:owner")
+            ),
+            "at://did:plc:owner/app.bsky.graph.listitem/3k"
+        );
     }
 
     #[test]

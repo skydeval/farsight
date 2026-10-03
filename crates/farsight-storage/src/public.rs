@@ -1,6 +1,7 @@
-//! Read-only queries behind the public UI (design §7.7, §7.8, §8.6):
-//! removed blocks, listblocks and list memberships, an account's outgoing
-//! blocks, the listblocks on a list, bounded counts and recording windows.
+//! Read-only queries behind the public UI and the admin history pages
+//! (design §7.7, §7.8, §8.6): removed blocks, listblocks and list
+//! memberships, bounded counts and recording windows. The rows of the live
+//! sections are read in [`crate::ui_rows`].
 //!
 //! Two filters are part of every query here and run at query time, so a
 //! status change or a settings change shows on the next page view:
@@ -26,7 +27,6 @@ use sqlx::PgConnection;
 
 use crate::codes::TrackState;
 use crate::error::Result;
-use crate::queries::IncomingBlock;
 
 /// SQL fragment: status codes hidden by default (§3.1, §7.4).
 const HIDDEN: &str = "(1, 2, 3, 4)";
@@ -419,93 +419,6 @@ pub async fn list_items_history_by_list(
         .fetch_all(conn)
         .await?;
     Ok(party_rows(rows))
-}
-
-/// One block authored by the page's subject.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutgoingBlock {
-    /// Block record key (the sort key).
-    pub rkey: String,
-    /// The blocked account.
-    pub did: String,
-    /// Author-claimed `createdAt`.
-    pub created_at: Option<DateTime<Utc>>,
-}
-
-/// Blocks authored by `author_id`, ordered by record key (the `blocks`
-/// primary key), after `after`. Rows whose blocked account is hidden or
-/// excluded are left out.
-pub async fn outgoing_blocks(
-    conn: &mut PgConnection,
-    author_id: i64,
-    excluded: &[i64],
-    after: Option<&str>,
-    limit: i64,
-) -> Result<Vec<OutgoingBlock>> {
-    let keyset = if after.is_some() {
-        "AND b.rkey > $3"
-    } else {
-        "AND $3::text IS NULL"
-    };
-    let rows: Vec<(String, String, Option<DateTime<Utc>>)> = sqlx::query_as(&format!(
-        "SELECT b.rkey, s.did, b.created_at
-         FROM blocks b JOIN actors s ON s.id = b.subject_id
-         WHERE b.author_id = $1 AND s.status NOT IN {HIDDEN} AND NOT (s.id = ANY($2)) {keyset}
-         ORDER BY b.rkey LIMIT $4"
-    ))
-    .bind(author_id)
-    .bind(excluded)
-    .bind(after)
-    .bind(limit)
-    .fetch_all(conn)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(rkey, did, created_at)| OutgoingBlock {
-            rkey,
-            did,
-            created_at,
-        })
-        .collect())
-}
-
-/// Listblocks on `list_id`, ordered by listblocker actor id then record
-/// key (`list_blocks_by_list`). Rows whose listblocker is hidden or
-/// excluded are left out.
-pub async fn list_blockers(
-    conn: &mut PgConnection,
-    list_id: i64,
-    excluded: &[i64],
-    after: Option<(i64, &str)>,
-    limit: i64,
-) -> Result<Vec<IncomingBlock>> {
-    let keyset = if after.is_some() {
-        "AND (b.author_id, b.rkey) > ($3, $4)"
-    } else {
-        "AND $3::bigint IS NULL AND $4::text IS NULL"
-    };
-    let rows: Vec<(i64, String, String, Option<DateTime<Utc>>)> = sqlx::query_as(&format!(
-        "SELECT b.author_id, a.did, b.rkey, b.created_at
-         FROM list_blocks b JOIN actors a ON a.id = b.author_id
-         WHERE b.list_id = $1 AND a.status NOT IN {HIDDEN} AND NOT (a.id = ANY($2)) {keyset}
-         ORDER BY b.author_id, b.rkey LIMIT $5"
-    ))
-    .bind(list_id)
-    .bind(excluded)
-    .bind(after.map(|a| a.0))
-    .bind(after.map(|a| a.1))
-    .bind(limit)
-    .fetch_all(conn)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(author_id, did, rkey, created_at)| IncomingBlock {
-            author_id,
-            did,
-            rkey,
-            created_at,
-        })
-        .collect())
 }
 
 /// Which section a bounded count is for.

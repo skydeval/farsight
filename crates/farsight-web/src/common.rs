@@ -54,6 +54,15 @@ pub async fn css() -> Response {
     asset(CSS, "text/css; charset=utf-8")
 }
 
+/// `GET /static/farsight.js`: the script of the public pages, served a
+/// second time next to the admin stylesheet (`/public/static/*` does not
+/// exist while the public UI is off). It does nothing where its elements
+/// are absent, names no admin path, and is ungated like the other admin
+/// assets.
+pub async fn js() -> Response {
+    asset(crate::public::PUBLIC_JS, "text/javascript; charset=utf-8")
+}
+
 /// `GET /static/htmx.min.js`.
 pub async fn htmx() -> Response {
     asset(HTMX, "text/javascript; charset=utf-8")

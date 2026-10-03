@@ -6,8 +6,8 @@
 <section id="blockers">
 <h2>Blocked by{% if let Some(n) = blockers.count %} <span class="count">{{ n }}</span>{% endif %}</h2>
 <p class="muted">Direct blocks naming this account. One account can hold several block records; each is listed.</p>
-{% if !blockers.rows.is_empty() %}<table><thead><tr><th>Account</th><th>Record</th><th>Created (as stated by the author)</th></tr></thead><tbody>
-{% for r in blockers.rows %}<tr><td>{{ r.who|safe }}</td><td>{% if let Some(x) = r.record %}{{ x|safe }}{% endif %}</td><td>{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
+{% if !blockers.rows.is_empty() %}<table><thead><tr><th>Account</th><th>Created (as stated by the author)</th></tr></thead><tbody>
+{% for r in blockers.rows %}<tr><td>{{ r.who|safe }}</td><td>{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
 {% endfor %}</tbody></table>{% endif %}
 {% if let Some(e) = blockers.empty %}<p class="empty">{{ e }}</p>{% endif %}
 {{ blockers.pager|safe }}
@@ -27,8 +27,8 @@
 {% if let Some(outgoing) = outgoing %}<section id="outgoing">
 <h2>Blocks by this account{% if let Some(n) = outgoing.count %} <span class="count">{{ n }}</span>{% endif %}</h2>
 <p class="muted">Blocks this account has made.</p>
-{% if !outgoing.rows.is_empty() %}<table><thead><tr><th>Account</th><th>Record</th><th>Created (as stated by the author)</th></tr></thead><tbody>
-{% for r in outgoing.rows %}<tr><td>{{ r.who|safe }}</td><td>{% if let Some(x) = r.record %}{{ x|safe }}{% endif %}</td><td>{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
+{% if !outgoing.rows.is_empty() %}<table><thead><tr><th>Account</th><th>Created (as stated by the author)</th></tr></thead><tbody>
+{% for r in outgoing.rows %}<tr><td>{{ r.who|safe }}</td><td>{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
 {% endfor %}</tbody></table>{% endif %}
 {% if let Some(e) = outgoing.empty %}<p class="empty">{{ e }}</p>{% endif %}
 {{ outgoing.pager|safe }}

@@ -14,6 +14,7 @@ mod health;
 mod metrics_http;
 mod normal;
 mod setup_mode;
+mod sort_indexes;
 mod tasks;
 
 use std::path::PathBuf;

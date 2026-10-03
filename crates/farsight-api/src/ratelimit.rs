@@ -246,6 +246,37 @@ impl RateLimiter {
         }
     }
 
+    /// Takes one token from `(class, key)` only if the bucket holds at
+    /// least `reserve + 1`: a background user of a budget leaves `reserve`
+    /// tokens for requests (§3.6, handle warming).
+    pub fn take_above(&self, class: Class, key: &str, limit: Limit, reserve: f64) -> bool {
+        self.take_above_at(class, key, limit, reserve, Instant::now())
+    }
+
+    fn take_above_at(
+        &self,
+        class: Class,
+        key: &str,
+        limit: Limit,
+        reserve: f64,
+        now: Instant,
+    ) -> bool {
+        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let b = map.entry((class, key.to_owned())).or_insert(Bucket {
+            tokens: limit.burst,
+            last: now,
+        });
+        let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
+        b.tokens = (b.tokens + elapsed * limit.rate).min(limit.burst);
+        b.last = now;
+        if b.tokens >= reserve + 1.0 {
+            b.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Drops buckets idle for longer than `idle` (a full bucket carries no
     /// state worth keeping).
     pub fn sweep(&self, idle: Duration) {
@@ -276,6 +307,27 @@ mod tests {
         let t1 = t0 + Duration::from_millis(100);
         assert!(l.check_at(Class::AnonRead, "1.2.3.4", lim, t1).is_ok());
         assert!(l.check_at(Class::AnonRead, "1.2.3.4", lim, t1).is_err());
+    }
+
+    #[test]
+    fn a_background_taker_leaves_the_reserve() {
+        let l = RateLimiter::default();
+        let lim = Limit::new(2.0, 10.0);
+        let t0 = Instant::now();
+        // From a full bucket of 10 with a reserve of 5: five, then none.
+        for _ in 0..5 {
+            assert!(l.take_above_at(Class::PublicHandle, "p", lim, 5.0, t0));
+        }
+        assert!(!l.take_above_at(Class::PublicHandle, "p", lim, 5.0, t0));
+        // The five left are there for requests.
+        for _ in 0..5 {
+            assert!(l.check_at(Class::PublicHandle, "p", lim, t0).is_ok());
+        }
+        assert!(l.check_at(Class::PublicHandle, "p", lim, t0).is_err());
+        // Refilled to 6 after three seconds: one more for the taker.
+        let t1 = t0 + Duration::from_secs(3);
+        assert!(l.take_above_at(Class::PublicHandle, "p", lim, 5.0, t1));
+        assert!(!l.take_above_at(Class::PublicHandle, "p", lim, 5.0, t1));
     }
 
     #[test]

@@ -61,6 +61,8 @@ pub struct Settings {
     pub card_burst: u32,
     /// The burst as typed was below the rate and was raised to it.
     pub burst_raised: bool,
+    /// `handle_warming_enabled`.
+    pub handle_warming_enabled: bool,
     /// `dark_mode_default`: `light`, `dark` or `system`.
     pub dark_mode_default: String,
     /// `crawlable`.
@@ -99,6 +101,8 @@ pub struct View {
     pub card_rps: String,
     /// Burst of the same budget.
     pub card_burst: String,
+    /// Handles verified in the background.
+    pub handle_warming_enabled: bool,
     /// Theme default.
     pub dark_mode_default: String,
     /// Crawlers.
@@ -131,6 +135,7 @@ impl View {
             show_avatars: p.show_avatars,
             card_rps: p.card_rps.to_string(),
             card_burst: p.effective_card_burst().to_string(),
+            handle_warming_enabled: p.handle_warming_enabled,
             dark_mode_default: p.dark_mode_default.as_str().to_owned(),
             crawlable: p.crawlable,
             rate_limit_rps: p.rate_limit_rps.to_string(),
@@ -156,6 +161,7 @@ impl View {
             show_avatars: b("show_avatars"),
             card_rps: s("card_rps"),
             card_burst: s("card_burst"),
+            handle_warming_enabled: b("handle_warming_enabled"),
             dark_mode_default: s("dark_mode_default"),
             crawlable: b("crawlable"),
             rate_limit_rps: s("rate_limit_rps"),
@@ -244,6 +250,7 @@ impl Settings {
             // for a hand-edited file; the save says so.
             card_burst: card_burst.max(card_rps),
             burst_raised: card_burst < card_rps,
+            handle_warming_enabled: v.handle_warming_enabled,
             enabled: v.enabled,
             instance_description: v.instance_description.replace("\r\n", "\n"),
             contact: v.contact.trim().to_owned(),
@@ -292,6 +299,10 @@ impl Settings {
         p.insert("show_avatars".into(), self.show_avatars.into());
         p.insert("card_rps".into(), i64::from(self.card_rps).into());
         p.insert("card_burst".into(), i64::from(self.card_burst).into());
+        p.insert(
+            "handle_warming_enabled".into(),
+            self.handle_warming_enabled.into(),
+        );
         p.insert(
             "show_opengraph_image".into(),
             self.show_opengraph_image.into(),
@@ -631,6 +642,7 @@ mod tests {
         c.public_ui.show_avatars = false;
         c.public_ui.card_rps = 2;
         c.public_ui.card_burst = 5;
+        c.public_ui.handle_warming_enabled = false;
         let s = Settings::parse(&View::of(&c)).unwrap();
         assert!(!s.burst_raised);
         s.apply(&mut t).unwrap();
@@ -643,6 +655,7 @@ mod tests {
         assert_eq!(p["show_avatars"].as_bool(), Some(false));
         assert_eq!(p["card_rps"].as_integer(), Some(2));
         assert_eq!(p["card_burst"].as_integer(), Some(5));
+        assert_eq!(p["handle_warming_enabled"].as_bool(), Some(false));
         // Keys of other sections are left alone.
         assert_eq!(t["server"]["bind"].as_str(), Some("x"));
     }

@@ -17,7 +17,7 @@
 <p class="muted">{{ s.coverage }}</p>
 {% if s.rows.is_empty() %}<p class="muted">None known.</p>{% else %}
 <table><tr>{% for c in s.columns %}<th>{{ c }}</th>{% endfor %}</tr>
-{% for r in s.rows %}<tr>{% for v in r %}<td>{{ v }}</td>{% endfor %}</tr>{% endfor %}</table>{% endif %}
+{% for r in s.rows %}<tr>{% for v in r %}<td>{{ v.html|safe }}</td>{% endfor %}</tr>{% endfor %}</table>{% endif %}
 {% if let Some(n) = s.next %}<p><a href="{{ n }}">Next page</a></p>{% endif %}
 </div>
 {% endfor %}

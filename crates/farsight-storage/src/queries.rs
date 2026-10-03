@@ -504,42 +504,6 @@ pub async fn list_members(
         .collect())
 }
 
-/// Inbound listblocks on one list (list lookup page), ordered by blocker
-/// actor id then rkey.
-pub async fn list_blockers(
-    conn: &mut PgConnection,
-    list_id: i64,
-    after: Option<(i64, &str)>,
-    limit: i64,
-) -> Result<Vec<IncomingBlock>> {
-    let keyset = if after.is_some() {
-        "AND (b.author_id, b.rkey) > ($2, $3)"
-    } else {
-        "AND $2::bigint IS NULL AND $3::text IS NULL"
-    };
-    let rows: Vec<(i64, String, String, Option<DateTime<Utc>>)> = sqlx::query_as(&format!(
-        "SELECT b.author_id, a.did, b.rkey, b.created_at
-         FROM list_blocks b JOIN actors a ON a.id = b.author_id
-         WHERE b.list_id = $1 {keyset}
-         ORDER BY b.author_id, b.rkey LIMIT $4"
-    ))
-    .bind(list_id)
-    .bind(after.map(|a| a.0))
-    .bind(after.map(|a| a.1))
-    .bind(limit)
-    .fetch_all(conn)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(author_id, did, rkey, created_at)| IncomingBlock {
-            author_id,
-            did,
-            rkey,
-            created_at,
-        })
-        .collect())
-}
-
 /// A list some party of a `checkBlocks` call holds a listblock on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartyList {

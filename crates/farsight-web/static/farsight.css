@@ -11,8 +11,13 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg); }
+/* The header stays at the top; headings leave room for it when a fragment
+   link lands on them. */
 header.top { display: flex; gap: 1.5rem; align-items: center; padding: .75rem 1.25rem;
-  border-bottom: 1px solid var(--line); background: var(--card); flex-wrap: wrap; }
+  border-bottom: 1px solid var(--line); background: var(--card); flex-wrap: wrap;
+  position: sticky; top: 0; z-index: 10; }
+h1, h2, h3, [id] { scroll-margin-top: 4.5rem; }
+[hidden] { display: none !important; }
 header.top .brand { font-weight: 700; letter-spacing: .02em; }
 header.top nav { display: flex; gap: 1rem; flex-wrap: wrap; }
 header.top nav a { color: var(--fg); text-decoration: none; }
@@ -62,3 +67,27 @@ ol.steps li.done { color: var(--ok); }
   border: 1px dashed var(--warn); border-radius: 4px; overflow-wrap: anywhere; }
 .pill { display: inline-block; padding: 0 .5rem; border-radius: 999px; font-size: .8rem;
   border: 1px solid var(--line); }
+/* Accounts in table cells, and their profile cards: positioned inside the
+   cell's wrapper, opened by the script, below the header. Only links a
+   page rendered for a signed-in admin carry a card. */
+a.who { text-decoration: none; }
+a.who:hover, a.who:focus-visible { text-decoration: underline; }
+a.record { text-decoration: none; }
+.who-wrap { position: relative; display: inline-block; }
+.profile-card { display: none; }
+@media (hover: hover) {
+  .who-wrap.open .profile-card { display: block; position: absolute; left: 0; top: 100%;
+    z-index: 5; width: 20rem; max-width: 80vw; min-height: 5.5rem; padding: .75rem .9rem;
+    background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .25); font-size: .9rem; overflow-wrap: anywhere; }
+}
+.pc { display: flex; gap: .75rem; align-items: flex-start; }
+.pc-avatar { flex: 0 0 64px; width: 64px; height: 64px; border-radius: 50%; object-fit: cover;
+  background: var(--bg); border: 1px solid var(--line); }
+.pc-body { min-width: 0; }
+.pc-body p { margin: 0 0 .25rem; }
+.pc-did { user-select: all; }
+.handle { font-weight: 600; }
+dl.pc-facts { display: grid; grid-template-columns: max-content 1fr; gap: .1rem .6rem; margin: .25rem 0 0; }
+dl.pc-facts dt { color: var(--muted); font-weight: 400; margin: 0; }
+dl.pc-facts dd { margin: 0; }

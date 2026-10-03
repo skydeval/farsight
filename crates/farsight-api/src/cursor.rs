@@ -79,10 +79,97 @@ pub fn micros_id(cursor: Option<&str>) -> Result<Option<(i64, i64)>, XrpcError> 
     }
 }
 
+/// First element of a cursor of a UI section's shown-time order (design
+/// §8.6). Without the tag such a cursor, `[time, rkey]`, and one of the
+/// order the section had before, `[id, rkey]`, are both an integer and a
+/// text, and the old one would be read as a time.
+pub const SHOWN_TAG: &str = "t";
+
+fn shown_time(v: &Value) -> Result<Option<i64>, XrpcError> {
+    if v.is_null() {
+        Ok(None)
+    } else {
+        int(v).map(Some)
+    }
+}
+
+fn tagged(v: &Value) -> Result<(), XrpcError> {
+    if v.as_str() == Some(SHOWN_TAG) {
+        Ok(())
+    } else {
+        Err(XrpcError::invalid("invalid cursor"))
+    }
+}
+
+/// Encodes a shown-time position: the shown time in microseconds since
+/// the epoch (`None` = the row has none and sorts last), the listed
+/// account's id where the section breaks ties by it, and the record key.
+pub fn encode_shown(time: Option<i64>, id: Option<i64>, rkey: &str) -> String {
+    let mut key = vec![Value::from(SHOWN_TAG), Value::from(time)];
+    if let Some(id) = id {
+        key.push(Value::from(id));
+    }
+    key.push(Value::from(rkey));
+    encode(&key)
+}
+
+/// Decodes a `("t", microseconds | null, id, rkey)` cursor.
+pub fn shown_id_rkey(
+    cursor: Option<&str>,
+) -> Result<Option<(Option<i64>, i64, String)>, XrpcError> {
+    let Some(c) = cursor else { return Ok(None) };
+    match decode_raw(c)?.as_slice() {
+        [tag, t, i, r] => {
+            tagged(tag)?;
+            Ok(Some((shown_time(t)?, int(i)?, text(r)?)))
+        }
+        _ => Err(XrpcError::invalid("invalid cursor")),
+    }
+}
+
+/// Decodes a `("t", microseconds | null, rkey)` cursor.
+pub fn shown_rkey(cursor: Option<&str>) -> Result<Option<(Option<i64>, String)>, XrpcError> {
+    let Some(c) = cursor else { return Ok(None) };
+    match decode_raw(c)?.as_slice() {
+        [tag, t, r] => {
+            tagged(tag)?;
+            Ok(Some((shown_time(t)?, text(r)?)))
+        }
+        _ => Err(XrpcError::invalid("invalid cursor")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shown_cursors_are_tagged() {
+        let c = encode_shown(Some(1_700_000_000_000_001), Some(42), "3l2x");
+        assert_eq!(
+            shown_id_rkey(Some(&c)).unwrap(),
+            Some((Some(1_700_000_000_000_001), 42, "3l2x".to_owned()))
+        );
+        let last = encode_shown(None, None, "3l2x");
+        assert_eq!(
+            shown_rkey(Some(&last)).unwrap(),
+            Some((None, "3l2x".to_owned()))
+        );
+        assert_eq!(shown_rkey(None).unwrap(), None);
+        // A cursor of the other order never parses, in either direction:
+        // nothing is silently read as a time.
+        let old = encode(&[json!(42), json!("3l2x")]);
+        assert!(shown_rkey(Some(&old)).is_err());
+        assert!(shown_id_rkey(Some(&old)).is_err());
+        assert!(shown_rkey(Some(&encode(&[json!("3l2x")]))).is_err());
+        assert!(id_rkey(Some(&c)).is_err());
+        assert!(id_rkey(Some(&last)).is_err());
+        assert!(rkey(Some(&last)).is_err());
+        // The tag is required even when the shape matches.
+        assert!(shown_rkey(Some(&encode(&[json!("x"), json!(1), json!("r")]))).is_err());
+        assert!(shown_id_rkey(Some(&encode(&[json!(1), json!(2), json!(3), json!("r")]))).is_err());
+    }
 
     #[test]
     fn round_trips() {

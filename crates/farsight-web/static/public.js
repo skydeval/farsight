@@ -1,6 +1,7 @@
-// Farsight public UI: the theme toggle, times in the visitor's timezone,
-// and profile cards. Nothing here is needed to read a page: without it
-// the times stay in UTC, the links work and there are no cards.
+// Farsight UI: the theme toggle, times in the visitor's timezone, and
+// profile cards. Nothing here is needed to read a page: without it the
+// times stay in UTC, the links work and there are no cards. The admin
+// pages load the same file; it does nothing where its elements are absent.
 (function () {
   "use strict";
   var root = document.documentElement;
@@ -268,9 +269,16 @@
     var failed = function () {
       placeholder(card, did, "Profile not available.");
     };
-    fetch(link.getAttribute("data-card"), { credentials: "omit" })
+    // A public card is the same for every caller and is requested without
+    // cookies. A link that says so asks with the session cookie: the page
+    // that carries it was rendered for a signed-in admin.
+    var session = link.hasAttribute("data-card-session");
+    fetch(link.getAttribute("data-card"), { credentials: session ? "same-origin" : "omit" })
       .then(function (r) {
-        if (r.status !== 200) {
+        // Only the card itself is shown. Anything else — a refusal, or an
+        // answer reached through a redirect, which would be some other
+        // page — leaves the placeholder.
+        if (r.status !== 200 || r.redirected) {
           throw new Error("card " + r.status);
         }
         return r.text();

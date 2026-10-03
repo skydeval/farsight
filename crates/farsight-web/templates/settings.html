@@ -47,9 +47,10 @@ how long, or how to reach you about their data, say it here.</div>
 
 <label for="record_viewer_url">Record viewer URL (<code>record_viewer_url</code>)</label>
 <input type="text" id="record_viewer_url" name="record_viewer_url" maxlength="500" spellcheck="false" placeholder="https://viewer.example/at/{authority}/{collection}/{rkey}" value="{{ p.record_viewer_url }}">
-<div class="hint">Empty: block and listblock records are shown as plain <code>at://</code> text. Set: each is a link that opens
-in a new tab. The address must contain <code>{authority}</code>, <code>{collection}</code> and <code>{rkey}</code>, after the
-host. Viewers of your public pages are sent to this site when they follow a record link.</div>
+<div class="hint">Used on the admin lookup pages; the public pages show no record addresses. Empty: block, listblock and
+listitem records are shown as plain <code>at://</code> text. Set: each is a link that opens in a new tab. The address must
+contain <code>{authority}</code>, <code>{collection}</code> and <code>{rkey}</code>, after the host. The lookup pages are
+open to anyone while <code>access.ui = "public_read"</code>; whoever follows a record link there is sent to this site.</div>
 
 <label><input type="checkbox" name="show_avatars"{% if p.show_avatars %} checked{% endif %}> Show avatars in profile cards (<code>show_avatars</code>)</label>
 <div class="hint">Resting the pointer on an account opens a card with its handle, DID and creation date. With this on, the card
@@ -64,7 +65,14 @@ cached keep or lack the image for up to five minutes.</div>
 <input type="number" id="card_burst" name="card_burst" min="1" value="{{ p.card_burst }}">
 <div class="hint">Each card makes this instance fetch from the PLC directory and from the account's server (at most three
 requests). These requests are not counted in <code>backfill.plc_rps</code>; lower either if your PLC source has a tight
-limit. With the budget used up, cards show the DID only. A burst below the rate is raised to it.</div>
+limit. With the budget used up, cards show the DID only. A burst below the rate is raised to it. Cards on the admin
+pages draw on the same budget.</div>
+
+<label><input type="checkbox" name="handle_warming_enabled"{% if p.handle_warming_enabled %} checked{% endif %}> Look up handles in the background (<code>handle_warming_enabled</code>)</label>
+<div class="hint">When a page has to show an account as a bare DID, a background worker verifies its handle so that the next
+view shows it. It uses what the handle budget (2 lookups per second) has to spare and never slows a page down; the first
+view of a page nobody has opened still shows DIDs. Applies to the admin pages too, also with the public UI off. Off:
+handles appear only as cards are opened and account pages are visited.</div>
 
 <label><input type="checkbox" name="show_opengraph_image"{% if p.show_opengraph_image %} checked{% endif %}> Offer the preview image (<code>show_opengraph_image</code>)</label>
 <div class="hint">Link previews carry a title, a fixed description and one static image; never data.</div>
