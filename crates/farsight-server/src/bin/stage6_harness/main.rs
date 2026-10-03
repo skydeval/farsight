@@ -973,7 +973,9 @@ fn check_validation(c: &mut Checks, dsn: &str) -> Result<(), String> {
     );
     let load = |pu: &str| {
         farsight_core::config::load_from_parts(
-            Some(&minimal_config(&format!("[public_ui]\n{pu}\n"))),
+            Some(&minimal_config(&format!(
+                "[access]\nadmin_did = \"{ADMIN_DID}\"\n[public_ui]\n{pu}\n"
+            ))),
             &[],
         )
     };
