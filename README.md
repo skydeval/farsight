@@ -39,10 +39,12 @@ depending on a third-party index.
     on-demand backfill hook. Both need a token.
 - A freshness watermark on every response. It reports how current the
   answer is and whether Farsight can claim it is complete.
-- A small server-rendered web UI with a first-run setup wizard,
-  dashboard, lookups, operations and settings.
-- An optional **public UI** under `/public`, off by default: a lookup
-  site where anyone can see who blocks an account or a list. Coverage
+- A first-run setup wizard, and an optional server-rendered **admin
+  UI** under `/admin`: dashboard, lookups, operations and settings,
+  after sign-in.
+- An optional **public UI** at the root of the hostname, off by
+  default: a lookup site where anyone can see who blocks an account or
+  a list. Coverage
   is stated per section in the admin UI; the public UI shows a single
   "Last updated" line per page. See [Public UI](#public-ui).
 - A record of the blocks, listblocks and list memberships it stored
@@ -92,8 +94,11 @@ The wizard asks for:
   v1 only, so coverage stays `partial` until you point Farsight at a
   self-hosted v2 Jetstream;
 - backfill preferences and the disk space available to Postgres;
-- access modes and the DID of the ATProto account that will
-  administer the instance, after which it shows the admin token once;
+- who may read the API, and which web interfaces to serve. Both are
+  off unless ticked: the **public UI** (the wizard shows what it makes
+  public and asks you to confirm) and the **admin UI**, with the DID of
+  the ATProto account that will administer the instance. With neither,
+  the instance is API-only. The step shows the admin token once;
 - reverse-proxy trust (it has a preset for Cloudflare);
 - the Postgres connection string.
 
@@ -125,9 +130,25 @@ answers within a second (compose uses it as a status check); `/livez`
 returns 200 while the process serves HTTP and is the right probe for
 orchestrators that restart unhealthy containers.
 
-## Admin sign-in
+## Admin UI and sign-in
 
-The web UI's admin is one ATProto account, named by its DID in
+The admin UI lives under `/admin` and is served while
+`access.admin_ui = true` (the default for a config that does not say).
+Every page of it needs a session: without one, a browser is sent to
+`/enter`. With `access.admin_ui = false` neither `/admin` nor `/enter`
+exists, and the instance is administered with the admin token over the
+API and by editing its config. The switch is read at start only: change
+it in `config.toml` (or `FARSIGHT__ACCESS__ADMIN_UI`) and restart.
+Settings refuses a save that would change it, and while `config.toml`
+holds a value that differs from the running one, no setting can be
+saved from the running server (pausing the sweep over the API
+included) until the restart.
+
+`/` is the public UI's home page when the public UI is on. Otherwise it
+redirects to `/admin`, or, on an instance with neither interface, shows
+a few lines of text.
+
+The admin is one ATProto account, named by its DID in
 `access.admin_did`. Signing in at `/enter` sends you to that account's
 own server (its PDS or entryway) to authenticate, through ATProto
 OAuth; Farsight asks for the `atproto` scope only, which proves who you
@@ -165,8 +186,8 @@ Things to know:
   click.
 - **Changing the admin account, or recovering from a lost one,** is done
   in the container: `docker exec farsight farsight set-admin-did <did>`,
-  then `docker restart farsight`. The running server does not re-read
-  `config.toml`; the change applies at the restart, and every session of
+  then `docker restart farsight`. The change applies at the restart
+  (the running server refuses to pick it up in between), and every session of
   the previous account ends then. `farsight admin-did` prints the
   current value. With `FARSIGHT_SKIP_WIZARD=1`, set
   `FARSIGHT__ACCESS__ADMIN_DID` instead. Settings shows the admin DID
@@ -174,11 +195,14 @@ Things to know:
 - Neither the wizard nor the CLI can prove that the DID you enter is
   yours; they show what it resolves to. A wrong DID is fixed with the
   CLI.
-- **`access.ui = "auth_all"`** answers every admin page with a plain
-  404 to anyone not signed in. `/enter`, its callback and the client
-  description stay reachable — the sign-in is hidden from nobody, the
-  admin data is. After a session expires, go to `/enter`. Under
-  `"public_read"` (the default) the dashboard and lookups stay public.
+- **A reverse proxy may restrict who reaches `/admin*` and `/enter*`**
+  (an address allowlist, its own authentication). It cannot rename
+  them: every link and redirect is an absolute path, and the sign-in
+  returns to `https://<hostname>/enter/callback`. For sign-in on the
+  hostname, the account's server must be able to fetch
+  `/.well-known/atproto-oauth-client-metadata` from the internet; an
+  instance whose `/enter` is closed to the outside signs in on
+  `127.0.0.1`.
 
 ## Public UI
 
@@ -187,12 +211,14 @@ handle, DID, `at://` URI or bsky.app link, then a page per account (who
 blocks it, which listblocked lists name it) and per list (members, who
 blocks it). It is an independent equivalent of Clearsky's lookup pages.
 
-It is **off by default**. Turn it on in Settings → Public UI; Farsight
-first shows what becomes reachable without login and asks you to
-confirm. It needs `access.reads = "public"`: a public site in front of
-a gated API is not a supported combination. It works with every
-`access.ui` mode; with `"auth_all"` the public pages are up and the
-admin pages are hidden.
+It is **off by default**, and served at the root of the hostname: `/`,
+`/did/<did>`, `/list/<did>/<rkey>`, `/search`. Turn it on in the wizard
+or in Settings → Public UI; either way Farsight first shows what
+becomes reachable without login and asks you to confirm. It needs
+`access.reads = "public"`: a public site in front of a gated API is not
+a supported combination. It does not depend on the admin UI: with
+`access.admin_ui = false` the instance serves the public site and
+nothing else in a browser.
 
 - **A bar on every page** with search and a light / dark / system
   theme toggle. Public pages link only to other public pages: no login
@@ -285,11 +311,57 @@ host, the account's server); these are not counted in
 tight limit. With the budget used up, cards show the DID only. A PLC
 mirror must serve `/{did}/log/audit` for cards to show a creation date.
 
+`access.ui` is retired too: see the upgrade notes.
+
 `show_history` is retired. A config that still has it loads, with a
 warning; the value does nothing, and the key is removed the next time
 you save the Public UI settings.
 
 ### Upgrading from an earlier version
+
+From a version with `access.ui` and the public UI under `/public`:
+
+- **Nothing has to be edited before the upgrade.** Every existing
+  config loads, and a warning at start says what changed.
+- **`access.ui` is retired, replaced by `access.admin_ui`.** The old
+  key is accepted for good and ignored, with one exception:
+  `ui = "disabled"` in a config without `admin_ui` still means no admin
+  UI. Replace the line with `admin_ui = true` or `false` when
+  convenient; Farsight never rewrites it for you.
+- **Every admin page now needs sign-in.** Under `ui = "public_read"`
+  the dashboard and the lookup pages were open to anyone; they are not
+  any more. Anonymous lookups are what the public UI is for, and the
+  numbers are in `query.getStats`. Under `ui = "auth_all"` the admin
+  pages answered 404 without a session; they now redirect to `/enter`.
+- **Paths moved.** For one release the old addresses redirect; update
+  bookmarks, and proxy, firewall and cache rules that name them:
+
+  | Old | New |
+  |---|---|
+  | `/` (dashboard) | `/admin` (`/` redirects there while the public UI is off) |
+  | `/lookup/did`, `/lookup/list` | `/admin/lookup/did`, `/admin/lookup/list` |
+  | `/ops`, `/settings`, `/reset` | `/admin/ops`, `/admin/settings`, `/admin/reset` |
+  | `/logout`, `/dashboard/fragment` | `/admin/logout`, `/admin/dashboard/fragment` (no redirect) |
+  | `/public` | `/` |
+  | `/public/did/…`, `/public/list/…`, `/public/search` | `/did/…`, `/list/…`, `/search` |
+  | `/public/card/…` | `/card/…` (no redirect) |
+  | `/public/static/*`, `/static/farsight.js` | `/static/*`; the script is `/static/public.js` |
+
+  `/enter`, `/enter/callback`, the history pages under `/admin/`,
+  `/xrpc/*`, `/health`, `/livez` and `/robots.txt` have not moved. A
+  dashboard or a form left open across the upgrade stops working until
+  the page is reloaded.
+- **`robots.txt`.** With the public UI on and `crawlable`, the root is
+  now open to crawlers, and the admin UI, the sign-in, the API, search
+  and the health endpoints are closed by name. Otherwise it still
+  closes everything.
+- **Rolling back.** An older binary refuses a config that has
+  `access.admin_ui`, and the `FARSIGHT__ACCESS__ADMIN_UI` variable:
+  remove both. Make sure `access.ui` says what the instance ran with —
+  **a config without `ui` means `"public_read"` to an older binary,
+  which opens the dashboard to anyone**. That is the case for a config
+  written by the new wizard. A browser may follow a cached redirect for
+  up to an hour.
 
 From a version whose tables were not sorted by creation time:
 
@@ -343,7 +415,7 @@ From earlier versions:
   History is under `/admin/…/history`, after login.
 - With avatars on, the `Content-Security-Policy` of public pages allows
   images from `https:` origins. A proxy that sets its own policy for
-  `/public/*` must allow that, or set `show_avatars = false`.
+  the public pages must allow that, or set `show_avatars = false`.
 - An older binary refuses a config that holds `record_viewer_url`,
   `show_avatars`, `card_rps` or `card_burst`. Delete those lines before
   rolling back.
@@ -387,14 +459,12 @@ stops recording.
    - Make `/xrpc/app.nearhorizon.farsight.query.*` eligible for cache
      and respect origin headers, except
      `query.getBackfillStatus`.
-   - If the public UI is on, make `/public/*` eligible for cache and
-     respect origin headers.
+   - If the public UI is on, everything else may be cached per the
+     origin's headers: the public pages are at the root.
    - Bypass the cache for `/admin*`, `/enter*` (the sign-in and its
      callback), `/setup*`, `/xrpc/app.nearhorizon.farsight.admin.*`,
-     `/health` and `/livez`. The admin pages outside `/admin*` (`/`,
-     `/dashboard/fragment`, `/lookup/*`, `/ops`, `/settings`, `/reset`)
-     send `no-store` to a signed-in admin; bypass them too if the
-     dashboard is not public.
+     `/health` and `/livez`. That list is complete: no admin page lives
+     outside `/admin*`.
 4. Lock the origin with Cloudflare Tunnel or Authenticated Origin
    Pulls. Firewalling the origin to Cloudflare's IP ranges alone is not
    enough.
