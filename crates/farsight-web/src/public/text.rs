@@ -74,19 +74,19 @@ pub fn seg(s: &str) -> String {
     out
 }
 
-/// `/public/did/{did}`.
+/// `/did/{did}`.
 pub fn did_href(did: &str) -> String {
-    format!("/public/did/{}", seg(did))
+    format!("/did/{}", seg(did))
 }
 
-/// `/public/list/{did}/{rkey}`.
+/// `/list/{did}/{rkey}`.
 pub fn list_href(owner: &str, rkey: &str) -> String {
-    format!("/public/list/{}/{}", seg(owner), seg(rkey))
+    format!("/list/{}/{}", seg(owner), seg(rkey))
 }
 
-/// `/public/card/{did}`: the profile-card fragment of an account.
+/// `/card/{did}`: the profile-card fragment of an account.
 pub fn card_href(did: &str) -> String {
-    format!("/public/card/{}", seg(did))
+    format!("/card/{}", seg(did))
 }
 
 /// `/admin/did/{did}/history`.
@@ -265,11 +265,11 @@ mod tests {
     fn segments() {
         assert_eq!(
             did_href("did:web:example.com%3A8080"),
-            "/public/did/did:web:example.com%253A8080"
+            "/did/did:web:example.com%253A8080"
         );
         assert_eq!(
             list_href("did:plc:abc", "a/b c"),
-            "/public/list/did:plc:abc/a%2Fb%20c"
+            "/list/did:plc:abc/a%2Fb%20c"
         );
     }
 
@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(Record::of_uri(v, "https://x.example/").href, None);
         assert_eq!(
             card_href("did:web:example.com%3A8080"),
-            "/public/card/did:web:example.com%253A8080"
+            "/card/did:web:example.com%253A8080"
         );
         assert_eq!(
             admin_list_history_href("did:plc:abc", "a b"),

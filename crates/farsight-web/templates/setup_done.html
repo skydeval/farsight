@@ -12,20 +12,26 @@
 {% if let Some(e) = error %}
 <h1>Setup not completed</h1>
 <div class="banner bad">{{ e }}</div>
-<p><a href="/enter">Go to sign-in</a></p>
+<p><a href="/">Open this instance</a></p>
 {% else %}
 <h1>Done</h1>
 <div class="card">
 <p>The configuration is written and the setup token is deleted. Farsight is switching to
 normal mode: it runs migrations, connects to the firehose and starts serving the API.</p>
-{% if ui %}<p>Setup complete. Sign in at <code>/enter</code> with the admin account (<code>{{ admin }}</code>).</p>
+{% if ui %}<p>Setup complete. The admin UI is at <code>/admin</code>: sign in at <code>/enter</code> with the admin account (<code>{{ admin }}</code>).</p>
+{% if public %}<p>The public UI is at <code>/</code>.</p>{% endif %}
 <p><a class="button" href="/enter">Sign in</a></p>
 <p class="muted">If the page does not load yet, wait a few seconds and reload.</p>
 {% if !hosted %}<p class="muted" id="loopback">This instance's hostname cannot be used for ATProto sign-in (that needs a
 public HTTPS domain name without a port). Sign in on the machine that runs Farsight, or through an SSH tunnel to it
 (<code>ssh -L PORT:127.0.0.1:PORT host</code>, with the port Farsight is published on): open
 <code>http://127.0.0.1:PORT/enter</code>. Use <code>127.0.0.1</code>, not <code>localhost</code>.</p>{% endif %}
-{% else %}<p>The web UI is disabled; use the API with the admin token.</p>{% endif %}
+{% else if public %}<p>Setup complete. The public UI is at <code>/</code>. There is no admin UI: manage this instance with the
+admin token over the API (<code>/xrpc/…</code>) and by editing its config.</p>
+<p><a class="button" href="/">Open the public UI</a></p>
+<p class="muted">If the page does not load yet, wait a few seconds and reload.</p>
+{% else %}<p>Setup complete. This instance is API-only: its endpoints are under <code>/xrpc/…</code>, with the admin token for
+admin calls. <code>/livez</code> answers when it is up.</p>{% endif %}
 </div>
 {% endif %}
 </main>

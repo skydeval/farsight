@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use chrono::Utc;
 use farsight_api::clientip::{self, ClientIp, OriginalForwarding};
 use farsight_core::config::{
-    AccessConfig, Config, ProxyMode, ReadsMode, SweepSource, UiMode, validate_trusted_proxy,
+    AccessConfig, Config, ProxyMode, ReadsMode, SweepSource, validate_trusted_proxy,
 };
 use ipnet::IpNet;
 use tokio::sync::{Semaphore, watch};
@@ -86,8 +86,13 @@ pub struct Wizard {
     pub backlinks_url: String,
     /// `access.reads`.
     pub reads: ReadsMode,
-    /// `access.ui`.
-    pub ui: UiMode,
+    /// `access.public_ui`.
+    pub public_ui: bool,
+    /// The operator confirmed, on the page that lists what becomes
+    /// public, that the public UI is to be on.
+    pub public_confirmed: bool,
+    /// `access.admin_ui`.
+    pub admin_ui: bool,
     /// `access.admin_did`, as entered.
     pub admin_did: String,
     /// The DID the access step last looked up, and what came back: the
@@ -141,7 +146,10 @@ impl Wizard {
             disk_gb: 500,
             backlinks_url: String::new(),
             reads: ReadsMode::Public,
-            ui: UiMode::PublicRead,
+            // Both web interfaces are off until the operator ticks them.
+            public_ui: false,
+            public_confirmed: false,
+            admin_ui: false,
             admin_did: String::new(),
             admin_seen: None,
             admin_confirmed: None,
@@ -184,15 +192,15 @@ impl Wizard {
         c.backfill.backlinks.url = self.backlinks_url.clone();
         c.access = AccessConfig {
             reads: self.reads,
-            ui: self.ui,
+            ui: None,
             cors: c.access.cors,
-            // The public UI is enabled from Settings, with its
-            // confirmation step (§8.6); never by the wizard.
-            public_ui: false,
-            admin_did: if self.ui == UiMode::Disabled {
-                String::new()
-            } else {
+            // Only with the operator's confirmation (§8.4 step 6).
+            public_ui: self.public_ui && self.public_confirmed,
+            admin_ui: self.admin_ui,
+            admin_did: if self.admin_ui {
                 self.admin_did.clone()
+            } else {
+                String::new()
             },
         };
         c.auth.admin_token_sha256 =
@@ -378,6 +386,9 @@ pub struct SetupPage {
     pub urls_text: String,
     /// Review TOML (secrets redacted).
     pub review: String,
+    /// Show, in place of the access step's form, the page that lists
+    /// what the public UI makes public and asks for confirmation.
+    pub confirm_public: bool,
     /// Version.
     pub version: &'static str,
     /// The bundled Cloudflare set's date.
@@ -393,11 +404,6 @@ impl SetupPage {
     /// Whether `r` is the selected reads mode.
     pub fn reads_is(&self, r: &str) -> bool {
         reads_name(self.w.reads) == r
-    }
-
-    /// Whether `u` is the selected UI mode.
-    pub fn ui_is(&self, u: &str) -> bool {
-        ui_name(self.w.ui) == u
     }
 
     /// Whether `m` is the selected proxy mode.
@@ -441,15 +447,6 @@ pub fn reads_name(r: ReadsMode) -> &'static str {
         ReadsMode::Public => "public",
         ReadsMode::ApiKey => "api_key",
         ReadsMode::Disabled => "disabled",
-    }
-}
-
-/// Wire name of a UI mode.
-pub fn ui_name(u: UiMode) -> &'static str {
-    match u {
-        UiMode::PublicRead => "public_read",
-        UiMode::AuthAll => "auth_all",
-        UiMode::Disabled => "disabled",
     }
 }
 
@@ -596,6 +593,7 @@ fn page(
             .join("\n"),
         urls_text: w.urls.join("\n"),
         review,
+        confirm_public: false,
         version: state.version,
         cf_as_of: farsight_core::cloudflare::BUNDLED_AS_OF,
         w,
@@ -942,16 +940,30 @@ fn apply_step(w: &mut Wizard, step: &str, f: &HashMap<String, String>) -> Result
                 "disabled" => ReadsMode::Disabled,
                 _ => ReadsMode::Public,
             };
-            w.ui = match get("ui").as_str() {
-                "auth_all" => UiMode::AuthAll,
-                "disabled" => UiMode::Disabled,
-                _ => UiMode::PublicRead,
-            };
+            // A checkbox that is not ticked is not in the post.
+            let public_ui = on("public_ui");
+            if public_ui && w.reads != ReadsMode::Public {
+                return Err(
+                    "The public UI needs public read queries: choose \"Public\" above, or \
+                     leave the public UI off."
+                        .into(),
+                );
+            }
+            if !public_ui {
+                w.public_confirmed = false;
+            }
+            w.public_ui = public_ui;
+            w.admin_ui = on("admin_ui");
             if !w.admin_token_saved && !on("token_saved") {
                 return Err("Confirm that you saved the admin token.".into());
             }
             w.admin_token_saved = true;
-            if w.ui != UiMode::Disabled {
+            if !w.admin_ui {
+                // The field is in the form either way; without the admin
+                // UI what it holds is not used and not kept.
+                w.admin_did.clear();
+                w.admin_confirmed = None;
+            } else {
                 let did = get("admin_did");
                 if !farsight_core::config::valid_admin_did(&did) {
                     return Err(
@@ -1059,6 +1071,30 @@ async fn save_step(
         return (StatusCode::NOT_FOUND, "no such step").into_response();
     };
     let slug = STEPS[i].0;
+    // The second request of the access step when the public UI was
+    // ticked: the confirmation page's own form. It carries no fields of
+    // the step; it confirms what the session holds, and only once the
+    // rest of the step stands.
+    if slug == "access" && form.contains_key("confirm_public") {
+        let confirmed = st
+            .with_session(&id, |s| {
+                let w = &mut s.wizard;
+                let ready = w.public_ui
+                    && w.admin_token_saved
+                    && (!w.admin_ui || w.admin_confirmed.as_deref() == Some(w.admin_did.as_str()));
+                if ready {
+                    w.public_confirmed = true;
+                    w.done[i] = true;
+                }
+                ready
+            })
+            .unwrap_or(false);
+        return common::redirect(if confirmed {
+            "/setup/proxy"
+        } else {
+            "/setup/access"
+        });
+    }
     let result = st
         .with_session(&id, |s| {
             let mut w = s.wizard.clone();
@@ -1079,7 +1115,7 @@ async fn save_step(
         let Some(w) = st.with_session(&id, |s| s.wizard.clone()) else {
             return common::redirect("/setup");
         };
-        if w.ui != UiMode::Disabled && w.admin_confirmed.as_deref() != Some(w.admin_did.as_str()) {
+        if w.admin_ui && w.admin_confirmed.as_deref() != Some(w.admin_did.as_str()) {
             let already_seen = w
                 .admin_seen
                 .as_ref()
@@ -1092,6 +1128,14 @@ async fn save_step(
             }
             st.with_session(&id, |s| s.wizard.done[i] = false);
             return render_step(&st, &id, slug, None);
+        }
+        // Turning the public UI on is confirmed on a page that lists what
+        // becomes public (§8.4 step 6); the step is not done before that.
+        if w.public_ui && !w.public_confirmed {
+            st.with_session(&id, |s| s.wizard.done[i] = false);
+            let mut p = page(&st, slug, snapshot(&st, &id), None);
+            p.confirm_public = true;
+            return setup_response(&p);
         }
     }
     st.with_session(&id, |s| s.wizard.done[i] = true);
@@ -1384,8 +1428,10 @@ async fn proxy_preview(
 #[derive(Template)]
 #[template(path = "setup_done.html")]
 pub struct DonePage {
-    /// Admin UI available (ui not disabled).
+    /// The admin UI is on.
     pub ui: bool,
+    /// The public UI is on.
+    pub public: bool,
     /// Error, if the write failed.
     pub error: Option<String>,
     /// The admin account: the DID, and its handle when it verified.
@@ -1436,6 +1482,7 @@ async fn finish(
         Ok(false) => {
             return render_private(&DonePage {
                 ui: false,
+                public: false,
                 error: Some("Another setup session already completed setup.".into()),
                 admin: String::new(),
                 hosted: true,
@@ -1458,7 +1505,8 @@ async fn finish(
         .clear();
     let _ = st.completed.send(true);
     let mut r = render_private(&DonePage {
-        ui: config.access.ui != UiMode::Disabled,
+        ui: config.access.admin_ui,
+        public: config.access.public_ui,
         error: None,
         admin: match w.admin_seen.as_ref() {
             Some((did, Ok(i))) if *did == w.admin_did => match &i.handle {
@@ -1506,6 +1554,9 @@ mod tests {
         w.hostname = "farsight.example".into();
         w.contact = "mailto:ops@example".into();
         w.dsn = "postgres://u:p@db/farsight".into();
+        // A new wizard has both web interfaces off.
+        assert!(!w.admin_ui && !w.public_ui);
+        w.admin_ui = true;
         w.admin_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into();
         let text = farsight_core::config::to_toml(&w.build_config()).unwrap();
         assert!(!text.contains("admin_password_bcrypt"));
@@ -1515,13 +1566,17 @@ mod tests {
             farsight_core::config::AdminAuth::Configured(w.admin_did.clone())
         );
         assert!(l.warnings.is_empty());
-        // With the UI disabled no admin DID is written.
-        w.ui = UiMode::Disabled;
-        assert!(
-            !farsight_core::config::to_toml(&w.build_config())
-                .unwrap()
-                .contains("admin_did")
-        );
+        // The retired key is never written; the switch is.
+        assert!(text.contains("admin_ui = true") && !text.contains("\nui ="));
+        // Without the admin UI no admin DID is written.
+        w.admin_ui = false;
+        let off = farsight_core::config::to_toml(&w.build_config()).unwrap();
+        assert!(!off.contains("admin_did") && off.contains("admin_ui = false"));
+        // The public UI is written only once confirmed.
+        w.public_ui = true;
+        assert!(!w.build_config().access.public_ui);
+        w.public_confirmed = true;
+        assert!(w.build_config().access.public_ui);
         assert_eq!(l.config.storage.budget_bytes, 350_000_000_000);
         assert!(redacted_toml(&l.config).contains("<redacted>"));
         assert!(!redacted_toml(&l.config).contains("u:p@"));

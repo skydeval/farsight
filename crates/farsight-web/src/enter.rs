@@ -160,7 +160,7 @@ pub async fn page(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Respon
         AdminAuth::Unconfigured => unconfigured_page(&cfg),
         AdminAuth::Configured(_) => {
             if admin(&st, &headers).await.is_some() {
-                return common::redirect("/");
+                return common::redirect("/admin");
             }
             sign_in_page(&cfg, &headers, None, None)
         }
@@ -463,7 +463,7 @@ pub async fn callback(
     // 200, not a redirect: this response ends a cross-site redirect
     // chain, and a `SameSite=Strict` cookie set here would not be sent on
     // a redirect that continues it. The page starts a same-site
-    // navigation to `/`.
+    // navigation to `/admin`.
     let mut r = render_private(&DonePage {});
     no_referrer(&mut r);
     let h = r.headers_mut();
@@ -602,7 +602,7 @@ async fn migrate(
     };
     if let Err(e) = st.api.config.migrate_admin_did(&did).await {
         let code = match e {
-            EditError::AdminDid(_) => StatusCode::CONFLICT,
+            EditError::AdminDid(_) | EditError::AdminUi(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         return status(

@@ -1,4 +1,4 @@
-//! Profile cards (design §3.6, §8.6): `GET /public/card/{did}`, the HTML
+//! Profile cards (design §3.6, §8.6): `GET /card/{did}`, the HTML
 //! fragment the script shows when the pointer rests on an account in a
 //! row, or the link takes keyboard focus.
 //!
@@ -45,7 +45,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use farsight_api::clientip::ClientIp;
 use farsight_api::ratelimit::Class;
-use farsight_core::config::{Config, UiMode};
+use farsight_core::config::{AdminAuth, Config};
 use farsight_core::net::{OutboundClient, SafeClient};
 use farsight_core::{Did, DidMethod};
 use farsight_storage::handles::Cached;
@@ -364,7 +364,7 @@ async fn identity(
 /// Who a card is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum For {
-    /// Anyone: `/public/card/{did}`.
+    /// Anyone: `/card/{did}`.
     Public,
     /// A signed-in admin: `/admin/card/{did}`.
     Admin,
@@ -533,7 +533,7 @@ async fn card(
     fragment(cfg, who, &view, Cache::Public(FULL_CARD_MAX_AGE))
 }
 
-/// `GET /public/card/{did}`.
+/// `GET /card/{did}`.
 pub async fn route(
     State(st): State<Arc<WebState>>,
     client: Option<axum::Extension<ClientIp>>,
@@ -559,8 +559,8 @@ pub async fn route(
 }
 
 /// `GET /admin/card/{did}`: the card for a signed-in admin. It does not go
-/// through the admin pages' gate, whose answer without a session is a
-/// redirect to the sign-in page under `ui = public_read`.
+/// through the admin pages' gate, whose answer to a navigation without a
+/// session is a redirect to the sign-in page.
 pub async fn admin_route(
     State(st): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -568,7 +568,7 @@ pub async fn admin_route(
     path: Result<Path<String>, PathRejection>,
 ) -> Response {
     let loaded = st.api.config.current();
-    if loaded.config.access.ui == UiMode::Disabled
+    if loaded.admin_auth() == AdminAuth::Disabled
         || crate::pages::admin(&st, &headers).await.is_none()
     {
         return crate::common::not_found();

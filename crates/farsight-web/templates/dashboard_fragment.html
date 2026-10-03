@@ -1,4 +1,4 @@
-<div id="dash" hx-get="/dashboard/fragment" hx-trigger="every 10s" hx-swap="outerHTML">
+<div id="dash" hx-get="/admin/dashboard/fragment" hx-trigger="every 10s" hx-swap="outerHTML">
 {% if let Some(e) = error %}<div class="banner bad">Could not load: {{ e }}</div>{% endif %}
 {% for w in d.warnings %}<div class="banner {{ w.class }}">{{ w.text }}</div>{% endfor %}
 <div class="card"><strong>Coverage:</strong> {{ d.coverage }}</div>
@@ -14,7 +14,7 @@
 <div class="card"><h2>Lists by state</h2><table>{% for s in d.lists %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table></div>
 </div>
 <div class="card"><h2>Oldest pending lists</h2>
-{% if d.pending.is_empty() %}<p class="muted">None.</p>{% else %}<table><tr><th>List</th><th>Pending for</th></tr>{% for p in d.pending %}<tr><td><a href="/lookup/list?q={{ p.0|urlencode }}">{{ p.0 }}</a></td><td>{{ p.1 }}</td></tr>{% endfor %}</table>{% endif %}
+{% if d.pending.is_empty() %}<p class="muted">None.</p>{% else %}<table><tr><th>List</th><th>Pending for</th></tr>{% for p in d.pending %}<tr><td><a href="/admin/lookup/list?q={{ p.0|urlencode }}">{{ p.0 }}</a></td><td>{{ p.1 }}</td></tr>{% endfor %}</table>{% endif %}
 </div>
 <div class="card"><h2>Host buckets by lifetime interning</h2>
 {% if d.buckets.is_empty() %}<p class="muted">None yet.</p>{% else %}<table><tr><th>Bucket</th><th>Interned</th><th>Stored</th><th></th></tr>{% for b in d.buckets %}<tr><td>{{ b.0 }}</td><td>{{ b.1 }}</td><td>{{ b.2 }}</td><td>{{ b.3 }}</td></tr>{% endfor %}</table>{% endif %}

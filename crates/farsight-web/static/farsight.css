@@ -46,6 +46,12 @@ pre { background: var(--bg); border: 1px solid var(--line); padding: .75rem; ove
   border-radius: 4px; }
 form.stack label { display: block; margin: .75rem 0 .25rem; font-weight: 500; }
 form.stack .hint { color: var(--muted); font-size: .85rem; margin-top: .2rem; }
+/* A checkbox next to its label rather than inside it, so that what follows
+   can depend on it without script: the block after an unticked `.reveals`
+   box is not shown. */
+form.stack input.switch { margin: .9rem .4rem 0 0; }
+form.stack label.switch { display: inline; }
+form.stack input.reveals:not(:checked) ~ .revealed { display: none; }
 input[type=text], input[type=password], input[type=number], input[type=url], select, textarea {
   width: 100%; max-width: 40rem; padding: .45rem .55rem; border: 1px solid var(--line);
   border-radius: 4px; background: var(--card); color: var(--fg); font: inherit; }

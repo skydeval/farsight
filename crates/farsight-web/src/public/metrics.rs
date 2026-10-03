@@ -22,19 +22,20 @@ pub const CARDS: &str = "farsight_public_ui_cards_total";
 /// The matched route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
-    /// `/public`.
+    /// `/`, when it serves the public home.
     Home,
-    /// `/public/search`.
+    /// `/search`.
     Search,
-    /// `/public/did/{did}`.
+    /// `/did/{did}`.
     Did,
-    /// `/public/list/{did}/{rkey}`.
+    /// `/list/{did}/{rkey}`.
     List,
-    /// `/public/card/{did}`.
+    /// `/card/{did}`.
     Card,
     /// `/robots.txt`.
     Robots,
-    /// Anything else under `/public/`.
+    /// The pages' old addresses under `/public`: redirects and not-found
+    /// pages.
     Other,
 }
 

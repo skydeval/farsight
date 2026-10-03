@@ -413,17 +413,11 @@ pub enum ReadsMode {
     Disabled,
 }
 
-/// `access.ui` (§3.5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UiMode {
-    /// Dashboard and lookups public; operations need login.
-    PublicRead,
-    /// Everything needs login.
-    AuthAll,
-    /// No UI.
-    Disabled,
-}
+/// The retired `access.ui` key.
+pub const RETIRED_UI: &str = "access.ui";
+/// The one value of the retired `access.ui` that still means something:
+/// without `access.admin_ui`, it switches the admin UI off.
+pub const RETIRED_UI_DISABLED: &str = "disabled";
 
 /// `[access]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -431,13 +425,19 @@ pub enum UiMode {
 pub struct AccessConfig {
     /// Read access mode.
     pub reads: ReadsMode,
-    /// UI access mode.
-    pub ui: UiMode,
+    /// Retired (replaced by `admin_ui`): accepted with any value, warned
+    /// about, never written. Read only by the loader, which takes
+    /// `"disabled"` for `admin_ui = false` when `admin_ui` is absent.
+    #[serde(skip_serializing)]
+    pub ui: Option<String>,
     /// Send `Access-Control-Allow-Origin: *` on reads.
     pub cors: bool,
-    /// Serve the public UI under `/public` (§8.6). Requires `reads =
-    /// "public"`; independent of `ui`.
+    /// Serve the public UI at the root (§8.6). Requires `reads =
+    /// "public"`; independent of `admin_ui`.
     pub public_ui: bool,
+    /// Serve the admin UI under `/admin`, with its sign-in at `/enter`
+    /// (§8.6). Applied at start only: no in-process edit may change it.
+    pub admin_ui: bool,
     /// The DID of the one account that may sign in to the admin UI
     /// (§8.6). Empty = not set (see [`AdminAuth`]).
     pub admin_did: String,
@@ -447,9 +447,10 @@ impl Default for AccessConfig {
     fn default() -> Self {
         AccessConfig {
             reads: ReadsMode::Public,
-            ui: UiMode::PublicRead,
+            ui: None,
             cors: true,
             public_ui: false,
+            admin_ui: true,
             admin_did: String::new(),
         }
     }
@@ -653,7 +654,7 @@ pub const UNCONFIGURED_WARNING: &str = "admin sign-in is not configured: set acc
 /// How (and whether) anyone can sign in to the admin UI (design §8.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminAuth {
-    /// `access.ui = "disabled"`: no admin UI.
+    /// `access.admin_ui = false`: no admin UI.
     Disabled,
     /// `access.admin_did` is set: OAuth sign-in as that DID.
     Configured(String),
@@ -926,7 +927,7 @@ impl LoadedConfig {
     /// The admin sign-in state of this config.
     pub fn admin_auth(&self) -> AdminAuth {
         let c = &self.config;
-        if c.access.ui == UiMode::Disabled {
+        if !c.access.admin_ui {
             AdminAuth::Disabled
         } else if !c.access.admin_did.is_empty() {
             AdminAuth::Configured(c.access.admin_did.clone())
@@ -978,6 +979,7 @@ pub fn load_from_parts(
         None => toml::Table::new(),
     };
     let env_keys = apply_env_overrides(&mut table, env)?;
+    let ui_warning = resolve_admin_ui(&mut table);
     let config: Config = toml::Value::Table(table)
         .try_into()
         .map_err(|e: toml::de::Error| ConfigError::Schema(e.to_string()))?;
@@ -986,7 +988,8 @@ pub fn load_from_parts(
     } else {
         ConfigSource::EnvOnly
     };
-    let warnings = config.validate()?;
+    let mut warnings = config.validate()?;
+    warnings.extend(ui_warning);
     let mut loaded = LoadedConfig {
         config,
         env_keys,
@@ -1003,6 +1006,47 @@ pub fn load_from_parts(
         _ => {}
     }
     Ok(loaded)
+}
+
+/// Decides `access.admin_ui` on the merged table (file, then environment)
+/// and says what the retired `access.ui` came to (§16):
+///
+/// 1. `admin_ui` present: its value; `ui` is ignored.
+/// 2. else `ui = "disabled"`: off.
+/// 3. else: on (the default).
+///
+/// Run before the table is deserialized, which is the only point where
+/// "absent" and "default" can be told apart.
+fn resolve_admin_ui(table: &mut toml::Table) -> Option<String> {
+    let access = table.get_mut("access")?.as_table_mut()?;
+    let ui = access.get("ui")?.as_str()?.to_owned();
+    if access.contains_key("admin_ui") {
+        return Some(
+            "`access.ui` is retired and ignored; `access.admin_ui` is in force. Remove \
+             `access.ui`."
+                .to_owned(),
+        );
+    }
+    Some(match ui.as_str() {
+        RETIRED_UI_DISABLED => {
+            access.insert("admin_ui".to_owned(), toml::Value::Boolean(false));
+            "`access.ui` is retired; \"disabled\" is read as `access.admin_ui = false`. Replace \
+             it with that."
+                .to_owned()
+        }
+        "public_read" => "`access.ui` is retired. The admin UI is on (`access.admin_ui`) and \
+                          every admin page now needs sign-in: the dashboard and lookups are no \
+                          longer public. Remove `access.ui`."
+            .to_owned(),
+        "auth_all" => "`access.ui` is retired. The admin UI is on (`access.admin_ui`); without \
+                       a session its pages redirect to /enter instead of answering 404. Remove \
+                       `access.ui`."
+            .to_owned(),
+        other => format!(
+            "`access.ui` is retired and \"{other}\" was never one of its values; it is \
+             ignored. The admin UI is on (`access.admin_ui`). Remove `access.ui`."
+        ),
+    })
 }
 
 fn defaults_value() -> toml::Value {
@@ -1094,6 +1138,21 @@ pub fn apply_env_overrides(
                     reason: "`public_ui` in config.toml is not a table".to_owned(),
                 })?
                 .insert("show_history".to_owned(), value);
+            continue;
+        }
+        if path.join(".") == RETIRED_UI {
+            // Retired, like `show_history`: env-managed instances set it
+            // (`FARSIGHT__ACCESS__UI=disabled`) and must keep loading. Any
+            // string; never locked.
+            table
+                .entry("access")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| ConfigError::Invalid {
+                    key: RETIRED_UI.to_owned(),
+                    reason: "`access` in config.toml is not a table".to_owned(),
+                })?
+                .insert("ui".to_owned(), toml::Value::String(raw.clone()));
             continue;
         }
         let mut hint = &defaults;
@@ -1736,7 +1795,9 @@ gap_threshold = "300s"
         )
         .unwrap();
         assert!(ok.from_env_only);
-        assert_eq!(ok.config.access.ui, UiMode::Disabled);
+        assert!(!ok.config.access.admin_ui);
+        assert_eq!(ok.admin_auth(), AdminAuth::Disabled);
+        assert!(!ok.env_keys.iter().any(|k| k == RETIRED_UI), "never locked");
     }
 
     #[test]
@@ -1791,12 +1852,12 @@ gap_threshold = "300s"
 
     #[test]
     fn public_ui_needs_public_reads() {
-        // Every UI mode is fine with the public UI on.
-        for ui in [UiMode::PublicRead, UiMode::AuthAll, UiMode::Disabled] {
+        // The public UI is fine with the admin UI on or off.
+        for admin_ui in [true, false] {
             let mut c = complete();
             c.access.public_ui = true;
-            c.access.ui = ui;
-            assert!(c.validate().is_ok(), "{ui:?}");
+            c.access.admin_ui = admin_ui;
+            assert!(c.validate().is_ok(), "{admin_ui}");
         }
         for reads in [ReadsMode::ApiKey, ReadsMode::Disabled] {
             let mut c = complete();
@@ -2009,8 +2070,8 @@ gap_threshold = "300s"
         let l = file(&none, &[]);
         assert_eq!(l.admin_auth(), AdminAuth::Unconfigured);
         assert_eq!(l.warnings, [UNCONFIGURED_WARNING]);
-        // UI disabled: neither key matters.
-        none.access.ui = UiMode::Disabled;
+        // Admin UI off: neither key matters.
+        none.access.admin_ui = false;
         let l = file(&none, &[]);
         assert_eq!(l.admin_auth(), AdminAuth::Disabled);
         assert!(l.warnings.is_empty());
@@ -2038,6 +2099,65 @@ gap_threshold = "300s"
         ));
     }
 
+    /// The retired `access.ui` (§16): any value loads and is warned
+    /// about; only `"disabled"` without `admin_ui` still decides anything;
+    /// the key is never written.
+    #[test]
+    fn retired_ui_key() {
+        let base = to_toml(&complete()).unwrap();
+        assert!(base.contains("admin_ui = true") && !base.contains("\nui ="));
+        let with = |access: &str, env_pairs: &[(&str, &str)]| {
+            let text = base
+                .replace("admin_ui = true\n", "")
+                .replace("[access]\n", &format!("[access]\n{access}"));
+            load_from_parts(Some(&text), &env(env_pairs)).unwrap()
+        };
+        let warned = |l: &LoadedConfig| {
+            l.warnings
+                .iter()
+                .filter(|w| w.contains("access.ui"))
+                .count()
+        };
+        // Neither key: on, no warning.
+        let l = with("", &[]);
+        assert!(l.config.access.admin_ui && warned(&l) == 0);
+        // The three old values, and one that never existed.
+        for (ui, on) in [
+            ("public_read", true),
+            ("auth_all", true),
+            ("disabled", false),
+            ("garbage", true),
+        ] {
+            let l = with(&format!("ui = \"{ui}\"\n"), &[]);
+            assert_eq!(l.config.access.admin_ui, on, "{ui}");
+            assert_eq!(warned(&l), 1, "{ui}: {:?}", l.warnings);
+            assert_eq!(l.config.access.ui.as_deref(), Some(ui));
+            assert!(
+                !to_toml(&l.config).unwrap().contains("\nui ="),
+                "never written"
+            );
+        }
+        // `admin_ui` wins over `ui`, from the file or the environment,
+        // and over an environment `ui` too.
+        let l = with("ui = \"disabled\"\nadmin_ui = true\n", &[]);
+        assert!(l.config.access.admin_ui && warned(&l) == 1);
+        let l = with(
+            "ui = \"disabled\"\n",
+            &[("FARSIGHT__ACCESS__ADMIN_UI", "true")],
+        );
+        assert!(l.config.access.admin_ui);
+        assert!(l.env_keys.iter().any(|k| k == "access.admin_ui"));
+        let l = with("admin_ui = true\n", &[("FARSIGHT__ACCESS__UI", "disabled")]);
+        assert!(l.config.access.admin_ui && warned(&l) == 1);
+        // The environment's `ui` beats the file's, as for every key.
+        let l = with(
+            "ui = \"public_read\"\n",
+            &[("FARSIGHT__ACCESS__UI", "disabled")],
+        );
+        assert!(!l.config.access.admin_ui);
+        assert_eq!(l.admin_auth(), AdminAuth::Disabled);
+    }
+
     #[test]
     fn unset_admin_keys_are_not_written() {
         let mut c = complete();
@@ -2045,7 +2165,7 @@ gap_threshold = "300s"
         assert!(text.contains("admin_did = \"did:plc:"));
         assert!(!text.contains("admin_password_bcrypt"));
         c.access.admin_did.clear();
-        c.access.ui = UiMode::Disabled;
+        c.access.admin_ui = false;
         assert!(!to_toml(&c).unwrap().contains("admin_did"));
     }
 

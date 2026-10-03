@@ -3,10 +3,8 @@
 //!
 //! An account cell renders as on the public pages — `@handle` when the
 //! handle cache holds a verified one, the DID otherwise — as a link to the
-//! DID lookup. For a **signed-in admin** the link also opens a profile
-//! card. The lookup pages are served without a session under
-//! `ui = public_read`; such a viewer gets the link, the handle and the
-//! `title`, and no card, and never the "First seen" column.
+//! DID lookup that also opens a profile card. The pages these cells are
+//! on need a session, so every cell carries the card.
 
 use askama::Template;
 use chrono::{DateTime, Utc};
@@ -15,12 +13,12 @@ use crate::pages::WebState;
 use crate::public::text::{Record, Stamp, clean, seg};
 use crate::public::warming::Asked;
 
-/// `/lookup/did?q=…`.
+/// `/admin/lookup/did?q=…`.
 pub fn lookup_did_href(did: &str) -> String {
     let q: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("q", did)
         .finish();
-    format!("/lookup/did?{q}")
+    format!("/admin/lookup/did?{q}")
 }
 
 /// `/admin/card/{did}`: the profile-card fragment for a signed-in admin.
@@ -36,7 +34,7 @@ pub struct Account {
     pub did: String,
     /// Its lookup page.
     pub href: String,
-    /// Its profile-card fragment; only for a signed-in admin.
+    /// Its profile-card fragment.
     pub card: Option<String>,
     /// A verified handle, if cached.
     pub handle: Option<String>,
@@ -44,11 +42,11 @@ pub struct Account {
 
 /// The cell for `did`. Never fetches anything: an account shown as a DID
 /// is handed to the warming worker.
-pub fn account(st: &WebState, asked: &mut Asked, signed_in: bool, did: &str) -> Account {
+pub fn account(st: &WebState, asked: &mut Asked, did: &str) -> Account {
     Account {
         did: did.to_owned(),
         href: lookup_did_href(did),
-        card: signed_in.then(|| admin_card_href(did)),
+        card: Some(admin_card_href(did)),
         handle: asked.handle(st, did).map(|h| clean(&h)),
     }
 }
@@ -147,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn a_card_only_for_a_signed_in_admin() {
+    fn an_account_cell() {
         let a = |card: bool, handle: Option<&str>| {
             let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
             Cell::account(&Account {
@@ -158,15 +156,15 @@ mod tests {
             })
             .html
         };
-        let anon = a(false, None);
-        assert!(anon.contains("href=\"/lookup/did?q=did%3Aplc%3Aaaaaaaaaaaaaaaaaaaaaaaaa\""));
-        assert!(anon.contains("title=\"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\""));
-        assert!(anon.contains("<code>did:plc:aaaaaaaaaaaaaaaaaaaaaaaa</code>"));
-        assert!(!anon.contains("data-card"), "{anon}");
-        let admin = a(true, Some("alice.example"));
-        assert!(admin.contains("data-card=\"/admin/card/did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\""));
-        assert!(admin.contains("data-card-session"));
-        assert!(admin.contains(">@alice.example</a>"));
+        let bare = a(false, None);
+        assert!(bare.contains("href=\"/admin/lookup/did?q=did%3Aplc%3Aaaaaaaaaaaaaaaaaaaaaaaaa\""));
+        assert!(bare.contains("title=\"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\""));
+        assert!(bare.contains("<code>did:plc:aaaaaaaaaaaaaaaaaaaaaaaa</code>"));
+        assert!(!bare.contains("data-card"), "{bare}");
+        let full = a(true, Some("alice.example"));
+        assert!(full.contains("data-card=\"/admin/card/did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\""));
+        assert!(full.contains("data-card-session"));
+        assert!(full.contains(">@alice.example</a>"));
         // The script names no admin path: the page carries it.
         assert!(!crate::public::PUBLIC_JS.contains("/admin/"));
     }

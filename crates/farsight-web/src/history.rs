@@ -2,7 +2,7 @@
 //! `/admin/did/{did}/history` and `/admin/list/{did}/{rkey}/history`.
 //!
 //! They show the records this instance stored and later removed. They
-//! need an admin session in every `ui` mode, whether or not the public UI
+//! need an admin session, whether or not the public UI
 //! is on; no public page shows or links to them.
 //!
 //! Rules kept here:
@@ -11,7 +11,7 @@
 //!   included: a row whose author or list owner is hidden is not shown.
 //!   That, not the purge, is what keeps a deleted account's history from
 //!   being shown; an admin session does not lift it.
-//!   `public_ui.excluded_dids` is not applied: it governs `/public/*`.
+//!   `public_ui.excluded_dids` is not applied: it governs the public pages.
 //! - **Nothing is resolved while rendering.** An account cell shows a
 //!   handle when the cache holds a verified one and opens a profile card;
 //!   accounts shown as DIDs are handed to the warming worker.
@@ -40,7 +40,7 @@ use serde_json::json;
 
 use crate::cells::{self, Account, lookup_did_href};
 use crate::common::render_private;
-use crate::pages::{Nav, Need, WebState, gate, login_redirect, message, nav, permit};
+use crate::pages::{Nav, WebState, gate, message, nav, permit};
 use crate::public::pages::{Pager, next_link, purpose_words, state_words};
 use crate::public::text::{
     BLOCK, LISTBLOCK, LISTITEM, admin_did_history_href, admin_list_history_href, clean,
@@ -59,12 +59,12 @@ fn when(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }
 
-/// `/lookup/list?q=at://…`.
+/// `/admin/lookup/list?q=at://…`.
 fn lookup_list_href(owner: &str, rkey: &str) -> String {
     let q: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("q", &list_uri(owner, rkey))
         .finish();
-    format!("/lookup/list?{q}")
+    format!("/admin/lookup/list?{q}")
 }
 
 /// The list a removed membership or listblock pointed at.
@@ -205,7 +205,7 @@ fn removed_row(
 ) -> RemovedRow {
     RemovedRow {
         // These pages are served to a signed-in admin only.
-        who: (!h.party.is_empty()).then(|| cells::account(st, asked, true, &h.party)),
+        who: (!h.party.is_empty()).then(|| cells::account(st, asked, &h.party)),
         record: record_uri(kind, h, owner),
         list: h.list.as_ref().map(|l| ListCell {
             uri: list_uri(&l.owner_did, &l.rkey),
@@ -402,7 +402,7 @@ async fn load(
     hz: Option<DateTime<Utc>>,
 ) -> Result<HistoryData, farsight_api::error::XrpcError> {
     let args = |after| HistoryArgs {
-        // `excluded_dids` governs `/public/*` only.
+        // `excluded_dids` governs the public pages only.
         excluded: &[],
         horizon: hz,
         after,
@@ -493,14 +493,12 @@ async fn serve(
     raw_query: Option<String>,
     keys: [&'static str; 2],
 ) -> Response {
-    let admin = match gate(st, headers, Need::Admin).await {
-        Ok(Some(s)) => Some(s),
-        Ok(None) => return login_redirect(),
+    let admin = match gate(st, headers).await {
+        Ok(s) => Some(s),
         Err(r) => return r,
     };
     let Some(subject) = subject else {
         return message(
-            st,
             &admin,
             StatusCode::BAD_REQUEST,
             "That address cannot be read",
@@ -510,7 +508,6 @@ async fn serve(
     let q = Params::parse(raw_query.as_deref().unwrap_or(""));
     let (Ok(a), Ok(b)) = (history_cursor(&q, keys[0]), history_cursor(&q, keys[1])) else {
         return message(
-            st,
             &admin,
             StatusCode::BAD_REQUEST,
             "That address cannot be read",
@@ -521,7 +518,7 @@ async fn serve(
     let _permit = match permit(st).await {
         Ok(p) => p,
         Err(e) => {
-            return message(st, &admin, StatusCode::SERVICE_UNAVAILABLE, "Busy", &e);
+            return message(&admin, StatusCode::SERVICE_UNAVAILABLE, "Busy", &e);
         }
     };
     let cfg = st.api.config.current();
@@ -532,7 +529,6 @@ async fn serve(
         Err(e) => {
             tracing::error!(error = %e.message, "history page query failed");
             return message(
-                st,
                 &admin,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong",
@@ -540,7 +536,7 @@ async fn serve(
             );
         }
     };
-    let nav = nav(st, &admin);
+    let nav = nav(&admin);
     let mut asked = Asked::new(cfg);
     let page = match subject {
         Subject::Did(did) => {
@@ -740,12 +736,10 @@ mod tests {
     fn links_point_into_the_admin_ui() {
         assert_eq!(
             lookup_did_href("did:plc:abc"),
-            "/lookup/did?q=did%3Aplc%3Aabc"
+            "/admin/lookup/did?q=did%3Aplc%3Aabc"
         );
-        assert!(
-            lookup_list_href("did:plc:abc", "3k").starts_with(
-                "/lookup/list?q=at%3A%2F%2Fdid%3Aplc%3Aabc%2Fapp.bsky.graph.list%2F3k"
-            )
-        );
+        assert!(lookup_list_href("did:plc:abc", "3k").starts_with(
+            "/admin/lookup/list?q=at%3A%2F%2Fdid%3Aplc%3Aabc%2Fapp.bsky.graph.list%2F3k"
+        ));
     }
 }

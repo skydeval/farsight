@@ -139,6 +139,34 @@ complete as the sweep, and responses say so.</div>
 <div class="row"><a class="button secondary" href="/setup/firehose">Back</a><button type="submit">Next</button></div>
 </form>
 
+{% else if step == "access" && confirm_public %}
+<div class="banner">Nothing is public yet. Read what the public UI makes reachable, then confirm.</div>
+<div class="card" id="confirm-public">
+<p>With the public UI on, anyone can open <code>https://{{ w.hostname }}/</code> without logging in and see:</p>
+<ul>
+<li><strong>The instance hostname</strong>: {{ w.hostname }}.</li>
+<li><strong>The operator contact</strong> (shown on the home page): {{ w.contact }}.</li>
+<li><strong>When the index was last updated</strong>: one line at the foot of each page.</li>
+<li><strong>Incoming blocks</strong> for any account: which accounts block it.</li>
+<li><strong>Lists naming any account</strong>: the listblocked lists it is on, each with its name, owner and number of listblocks.</li>
+<li><strong>List memberships</strong>: the members of any indexed list, and the accounts that block the list.</li>
+<li>The blocks an account has made are <strong>not</strong> listed (<code>show_outgoing_blocks</code> is off).</li>
+<li><strong>Profile cards</strong>: for any account in a row, its handle, DID and the date the DID was created, fetched from
+the network when a visitor asks. The card has the account's avatar, which <strong>each visitor's browser fetches from the
+account's own server</strong> (<code>show_avatars</code> is on): that server's operator sees the visitor's address.</li>
+<li>Removed records are <strong>not</strong> public.</li>
+</ul>
+<p>Search engines are asked not to index the pages (<code>crawlable</code> is off). Accounts that are not active are not
+shown.</p>
+<p>These settings, and the switch itself, can be changed later: in Settings while the admin UI is on, otherwise in
+<code>config.toml</code>.</p>
+<form method="post" action="/setup/access">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="confirm_public" value="1">
+<div class="row"><a class="button secondary" href="/setup/access">Go back</a><button type="submit">Enable public UI</button></div>
+</form>
+</div>
+
 {% else if step == "access" %}
 <form class="stack card" method="post" action="/setup/access">
 <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -148,16 +176,24 @@ complete as the sweep, and responses say so.</div>
 <option value="api_key" {% if self.reads_is("api_key") %}selected{% endif %}>API key required</option>
 <option value="disabled" {% if self.reads_is("disabled") %}selected{% endif %}>Disabled (admin only)</option>
 </select>
-<label for="ui">Web UI</label>
-<select id="ui" name="ui">
-<option value="public_read" {% if self.ui_is("public_read") %}selected{% endif %}>Dashboard and lookups public; admin pages need login</option>
-<option value="auth_all" {% if self.ui_is("auth_all") %}selected{% endif %}>Everything needs login</option>
-<option value="disabled" {% if self.ui_is("disabled") %}selected{% endif %}>Disabled (API only)</option>
-</select>
+<h2>Web interfaces</h2>
+<p class="muted">Both are off unless ticked. With neither, this instance is API-only.</p>
+<input type="checkbox" class="switch" id="public_ui" name="public_ui"{% if w.public_ui %} checked{% endif %}>
+<label class="switch" for="public_ui">Enable public UI</label>
+<div class="hint">A lookup site at this hostname's root, open to anyone without login: for any account, which accounts
+block it and which listblocked lists it is on; for any list, its members and who blocks it. Profile cards show avatars,
+which each visitor's browser fetches from the account's own server, so that server's operator sees the visitor's address.
+Needs "Read queries: Public". The next page lists everything that becomes public and asks you to confirm.</div>
+<input type="checkbox" class="switch reveals" id="admin_ui" name="admin_ui"{% if w.admin_ui %} checked{% endif %}>
+<label class="switch" for="admin_ui">Enable admin UI</label>
+<div class="hint">Dashboard, lookups, operations and settings in a browser at <code>/admin</code>, after sign-in with
+your ATProto account. Without it, this instance is administered with the admin token and by editing its config; it is
+switched on later with <code>access.admin_ui</code> in <code>config.toml</code> and a restart.</div>
+<div class="revealed" id="admin-did-field">
 <label for="admin_did">Admin DID</label>
 <input type="text" id="admin_did" name="admin_did" value="{{ w.admin_did }}" spellcheck="false" autocomplete="off" placeholder="did:plc:…">
-<div class="hint">The ATProto account that administers this instance: you sign in to the web UI with it.
-<code>did:plc:…</code> or <code>did:web:…</code>, not a handle. Not needed when the UI is disabled.
+<div class="hint">The ATProto account that administers this instance: you sign in to the admin UI with it.
+<code>did:plc:…</code> or <code>did:web:…</code>, not a handle. Not used when the admin UI is off.
 Farsight does not check that the account is yours; a wrong DID is corrected later with
 <code>farsight set-admin-did</code> in the container.</div>
 {% if let Some(found) = self.admin_found() %}
@@ -169,6 +205,7 @@ Farsight does not check that the account is yours; a wrong DID is corrected late
 down and you are sure of the DID, tick the box and press Next.</div>
 <label><input type="checkbox" name="use_anyway"> Use this DID anyway</label>
 {% endif %}
+</div>
 <h2>Admin token</h2>
 {% if show_token %}
 <p>The admin token authorizes every API call, including admin procedures. It is shown

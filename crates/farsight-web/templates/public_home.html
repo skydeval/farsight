@@ -4,7 +4,7 @@
 {% for p in description %}<p>{{ p }}</p>
 {% endfor %}
 {% if !contact.is_empty() %}<p class="contact">Contact: {{ contact }}</p>{% endif %}
-<form class="search home-search" method="get" action="/public/search" role="search">
+<form class="search home-search" method="get" action="/search" role="search">
 <label for="q">Look up an account or a list</label>
 <div class="row"><input type="search" id="q" name="q" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="handle, DID, at:// URI or bsky.app link" required>
 <button type="submit">Look up</button></div>

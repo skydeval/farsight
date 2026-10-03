@@ -37,28 +37,37 @@ pub fn render_private<T: Template>(t: &T) -> Response {
     r
 }
 
-/// A static asset response.
-pub fn asset(body: &'static str, content_type: &'static str) -> Response {
+/// A static asset response (§9.4): the same in every configuration,
+/// with no gate and no rate class.
+pub fn asset(body: impl IntoResponse, content_type: &'static str) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "public, max-age=3600"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         body,
     )
         .into_response()
 }
 
-/// `GET /static/farsight.css`.
+/// Where the link-preview image is served.
+pub const OG_IMAGE_PATH: &str = "/static/og-default.png";
+
+/// `GET /static/farsight.css`: the stylesheet of the admin pages and the
+/// wizard.
 pub async fn css() -> Response {
     asset(CSS, "text/css; charset=utf-8")
 }
 
-/// `GET /static/farsight.js`: the script of the public pages, served a
-/// second time next to the admin stylesheet (`/public/static/*` does not
-/// exist while the public UI is off). It does nothing where its elements
-/// are absent, names no admin path, and is ungated like the other admin
-/// assets.
+/// `GET /static/public.css`: the stylesheet of the public pages.
+pub async fn public_css() -> Response {
+    asset(crate::public::PUBLIC_CSS, "text/css; charset=utf-8")
+}
+
+/// `GET /static/public.js`: the script of the public and the admin pages.
+/// It does nothing where its elements are absent and names no admin
+/// path.
 pub async fn js() -> Response {
     asset(crate::public::PUBLIC_JS, "text/javascript; charset=utf-8")
 }
@@ -66,6 +75,11 @@ pub async fn js() -> Response {
 /// `GET /static/htmx.min.js`.
 pub async fn htmx() -> Response {
     asset(HTMX, "text/javascript; charset=utf-8")
+}
+
+/// `GET /static/og-default.png`.
+pub async fn og_image() -> Response {
+    asset(crate::public::OG_IMAGE, "image/png")
 }
 
 /// The answer for a route that does not exist — or does not exist for
@@ -91,6 +105,36 @@ pub fn redirect(path: &str) -> Response {
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static(NO_STORE));
     r
+}
+
+/// A permanent redirect from an address a page had before v2.5 (§8.6),
+/// kept for one release. `to` is built by the caller from a fixed prefix
+/// and re-encoded path parameters — never from the request's raw path,
+/// which could name another host (`//host/…`). The request's query is
+/// carried over. A target that is not a path on this host, or not a valid
+/// header value, is answered with [`not_found`].
+pub fn moved(to: &str, query: Option<&str>) -> Response {
+    if !to.starts_with('/') || to.starts_with("//") || to.contains('\\') {
+        return not_found();
+    }
+    let location = match query {
+        Some(q) if !q.is_empty() => format!("{to}?{q}"),
+        _ => to.to_owned(),
+    };
+    let Ok(location) = HeaderValue::from_str(&location) else {
+        return not_found();
+    };
+    (
+        StatusCode::MOVED_PERMANENTLY,
+        [
+            (header::LOCATION, location),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=3600"),
+            ),
+        ],
+    )
+        .into_response()
 }
 
 /// 256 random bits, base64url.
@@ -223,6 +267,30 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("sec-fetch-site", "cross-site".parse().unwrap());
         assert!(!same_origin(&h));
+    }
+
+    #[test]
+    fn moved_stays_on_this_host() {
+        let r = moved("/did/did:plc:abc", Some("bc=x&nc=y"));
+        assert_eq!(r.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(r.headers()[header::LOCATION], "/did/did:plc:abc?bc=x&nc=y");
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "public, max-age=3600");
+        assert_eq!(moved("/", None).headers()[header::LOCATION], "/");
+        assert_eq!(
+            moved("/search", Some("")).headers()[header::LOCATION],
+            "/search"
+        );
+        for bad in [
+            "//evil.example/x",
+            "https://evil.example/",
+            "/\\evil.example",
+            "x",
+        ] {
+            let r = moved(bad, None);
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{bad}");
+            assert!(r.headers().get(header::LOCATION).is_none());
+        }
+        assert_eq!(moved("/a\nb", None).status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

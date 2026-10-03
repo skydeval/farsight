@@ -323,7 +323,7 @@ pub async fn home(r: &Req<'_>) -> Result<Response, Fail> {
                 "Block lookup",
                 &format!("Farsight at {host}"),
                 OG_INSTANCE,
-                "/public",
+                "/",
             ),
             hostname: host.clone(),
             description: if description.is_empty() {
@@ -370,7 +370,7 @@ async fn resolve(r: &Req<'_>, handle: &str, typed: &str) -> Result<Did, Fail> {
                     "Handle not found",
                     &format!("Farsight at {}", cfg.server.hostname),
                     OG_INSTANCE,
-                    "/public/search",
+                    "/search",
                 ),
                 q: clean(typed),
                 message: format!(
@@ -390,7 +390,7 @@ async fn resolve(r: &Req<'_>, handle: &str, typed: &str) -> Result<Did, Fail> {
     }
 }
 
-/// `/public/search?q=…`: resolves the input and redirects under
+/// `/search?q=…`: resolves the input and redirects under
 /// `/public/`. Every request is charged to the lookup rate class.
 pub async fn search(r: &Req<'_>, q: &Params) -> Result<Response, Fail> {
     let typed = q.get("q").unwrap_or("").trim().to_owned();
@@ -446,7 +446,7 @@ struct DidPage {
     updated: Option<Stamp>,
 }
 
-/// `/public/did/{did}`.
+/// `/did/{did}`.
 pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let cfg = r.config();
     let base = did_href(did.as_str());
@@ -659,7 +659,7 @@ struct ListPage {
     updated: Option<Stamp>,
 }
 
-/// `/public/list/{did}/{rkey}`.
+/// `/list/{did}/{rkey}`.
 pub async fn list(
     r: &Req<'_>,
     owner: &Did,
@@ -824,8 +824,8 @@ mod tests {
     fn links_keep_the_other_sections() {
         let q = Params::parse("bc=AAA&nc=BBB&utm=x");
         assert_eq!(
-            next_link("/public/did/did:plc:x", &q, &DID_CURSORS, "bc", "CCC"),
-            "/public/did/did:plc:x?nc=BBB&bc=CCC"
+            next_link("/did/did:plc:x", &q, &DID_CURSORS, "bc", "CCC"),
+            "/did/did:plc:x?nc=BBB&bc=CCC"
         );
         assert_eq!(count_words(1_000), "1,000");
         assert_eq!(count_words(1_001), "more than 1,000");

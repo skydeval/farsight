@@ -9,16 +9,15 @@ use std::time::{Duration, Instant};
 
 use askama::Template;
 use axum::Router;
-use axum::extract::{Form, Query, State};
+use axum::extract::{Form, Query, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
-use farsight_api::clientip::ClientIp;
 use farsight_api::params::Params;
 use farsight_api::ratelimit::Class;
 use farsight_api::{ApiState, admin as api_admin, handlers};
-use farsight_core::config::{AdminAuth, LoadedConfig, ReadsMode, UiMode};
+use farsight_core::config::{AdminAuth, LoadedConfig};
 use farsight_core::net::{OutboundClient, SafeClient};
 use farsight_core::{AtUri, Collection, Did};
 use farsight_storage::backfill_api::{self, Request, RequestOutcome, Requester};
@@ -29,7 +28,7 @@ use serde_json::Value;
 use tokio::sync::{Semaphore, watch};
 
 use crate::cells::{self, Cell};
-use crate::common::{self, NO_STORE, cookie, ct_eq, read_cookie, render, render_private};
+use crate::common::{self, NO_STORE, cookie, ct_eq, read_cookie, render_private};
 use crate::public::text::{BLOCK, LISTBLOCK, LISTITEM, Record};
 use crate::public::warming::Asked;
 use crate::rows;
@@ -161,50 +160,31 @@ pub(crate) async fn admin(st: &WebState, headers: &HeaderMap) -> Option<Admin> {
     Some(Admin { csrf: hex(&s.csrf) })
 }
 
-/// What a page needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Need {
-    /// Dashboard: public under `public_read`.
-    Dashboard,
-    /// DID/list lookups: public under `public_read` unless reads are gated.
-    Lookup,
-    /// Operations, settings, reset.
-    Admin,
-}
-
 pub(crate) fn login_redirect() -> Response {
     common::redirect("/enter")
 }
 
-/// Applies the UI access rules (§3.5, §8.6).
-pub(crate) async fn gate(
-    st: &WebState,
-    headers: &HeaderMap,
-    need: Need,
-) -> Result<Option<Admin>, Response> {
-    let cfg = st.api.config.current();
-    let access = &cfg.config.access;
-    if access.ui == UiMode::Disabled {
+/// Whether htmx sent the request: the dashboard's poll and the history
+/// tables' "Next" links. htmx follows a redirect and swaps what it gets,
+/// so such a request must not be sent to the sign-in page.
+fn is_htmx(headers: &HeaderMap) -> bool {
+    headers.contains_key("hx-request")
+}
+
+/// The admin UI's access rule (§3.5, §8.6): every page under `/admin`
+/// needs a session. With the admin UI off the pages do not exist; without
+/// a session a navigation is sent to the sign-in page and a request made
+/// by htmx gets the bare 404, which leaves the page it came from as it
+/// is.
+pub(crate) async fn gate(st: &WebState, headers: &HeaderMap) -> Result<Admin, Response> {
+    if st.api.config.current().admin_auth() == AdminAuth::Disabled {
         return Err(common::not_found());
     }
-    let session = admin(st, headers).await;
-    let needs_login = match need {
-        Need::Admin => true,
-        _ if access.ui == UiMode::AuthAll => true,
-        Need::Lookup => access.reads != ReadsMode::Public,
-        Need::Dashboard => false,
-    };
-    if needs_login && session.is_none() {
-        // `auth_all` hides the admin pages: without a session each is
-        // the same bare 404 as a path that does not exist. Elsewhere the
-        // dashboard is public anyway, and the redirect is how a visitor
-        // finds the sign-in.
-        return Err(match access.ui {
-            UiMode::AuthAll => common::not_found(),
-            _ => login_redirect(),
-        });
+    match admin(st, headers).await {
+        Some(a) => Ok(a),
+        None if is_htmx(headers) => Err(common::not_found()),
+        None => Err(login_redirect()),
     }
-    Ok(session)
 }
 
 pub(crate) fn check_form(
@@ -221,35 +201,40 @@ pub(crate) fn check_form(
     }
 }
 
-/// The normal-mode UI router.
+/// The normal-mode UI router (§8.6). Every route is always mounted; a
+/// handler whose surface is switched off answers [`common::not_found`].
 pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
-        .route("/", get(dashboard))
-        .route("/dashboard/fragment", get(dashboard_fragment))
+        .route("/admin", get(dashboard))
+        .route("/admin/", get(admin_slash))
+        .route("/admin/dashboard/fragment", get(dashboard_fragment))
         .route("/enter", get(crate::enter::page).post(crate::enter::submit))
         .route("/enter/callback", get(crate::enter::callback))
         .route(
             crate::oauth::METADATA_PATH,
             get(crate::enter::client_metadata),
         )
-        .route("/logout", post(logout))
-        .route("/lookup/did", get(lookup_did))
-        .route("/lookup/list", get(lookup_list))
+        .route("/admin/logout", post(logout))
+        .route("/admin/lookup/did", get(lookup_did))
+        .route("/admin/lookup/list", get(lookup_list))
         .route("/admin/did/{did}/history", get(crate::history::did_history))
         .route(
             "/admin/list/{did}/{rkey}/history",
             get(crate::history::list_history),
         )
-        .route("/ops", get(ops_page))
-        .route("/ops/{action}", post(ops_action))
-        .route("/settings", get(settings_page).post(settings_save))
-        .route("/settings/public-ui", post(crate::public_settings::save))
+        .route("/admin/ops", get(ops_page))
+        .route("/admin/ops/{action}", post(ops_action))
+        .route("/admin/settings", get(settings_page).post(settings_save))
         .route(
-            "/settings/public-ui/confirm",
+            "/admin/settings/public-ui",
+            post(crate::public_settings::save),
+        )
+        .route(
+            "/admin/settings/public-ui/confirm",
             post(crate::public_settings::confirm),
         )
-        .route("/settings/token", post(settings_token))
-        .route("/reset", get(reset_page).post(reset_submit))
+        .route("/admin/settings/token", post(settings_token))
+        .route("/admin/reset", get(reset_page).post(reset_submit))
         .route(
             "/setup",
             get(|| async { (StatusCode::NOT_FOUND, "not found") }),
@@ -260,10 +245,57 @@ pub fn router(state: Arc<WebState>) -> Router {
         )
         .route("/admin/card/{did}", get(crate::public::card::admin_route))
         .route("/static/farsight.css", get(common::css))
-        .route("/static/farsight.js", get(common::js))
+        .route("/static/public.css", get(common::public_css))
+        .route("/static/public.js", get(common::js))
         .route("/static/htmx.min.js", get(common::htmx))
+        .route(common::OG_IMAGE_PATH, get(common::og_image))
+        // The admin pages' addresses before they moved under `/admin`:
+        // redirected for one release, then gone.
+        .route("/lookup/did", get(old_lookup_did))
+        .route("/lookup/list", get(old_lookup_list))
+        .route("/ops", get(old_ops))
+        .route("/settings", get(old_settings))
+        .route("/reset", get(old_reset))
         .merge(crate::public::router())
         .with_state(state)
+}
+
+/// `GET /admin/`: the dashboard's address with a trailing slash.
+async fn admin_slash(State(st): State<Arc<WebState>>) -> Response {
+    if st.api.config.current().admin_auth() == AdminAuth::Disabled {
+        return common::not_found();
+    }
+    common::redirect("/admin")
+}
+
+/// A pre-`/admin` address of an admin page: a permanent redirect to the
+/// new one while the admin UI is on, with the request's query. The target
+/// is a constant; nothing of the request's path goes into it.
+fn old_admin_path(st: &WebState, to: &'static str, query: Option<String>) -> Response {
+    if st.api.config.current().admin_auth() == AdminAuth::Disabled {
+        return common::not_found();
+    }
+    common::moved(to, query.as_deref())
+}
+
+async fn old_lookup_did(State(st): State<Arc<WebState>>, RawQuery(q): RawQuery) -> Response {
+    old_admin_path(&st, "/admin/lookup/did", q)
+}
+
+async fn old_lookup_list(State(st): State<Arc<WebState>>, RawQuery(q): RawQuery) -> Response {
+    old_admin_path(&st, "/admin/lookup/list", q)
+}
+
+async fn old_ops(State(st): State<Arc<WebState>>, RawQuery(q): RawQuery) -> Response {
+    old_admin_path(&st, "/admin/ops", q)
+}
+
+async fn old_settings(State(st): State<Arc<WebState>>, RawQuery(q): RawQuery) -> Response {
+    old_admin_path(&st, "/admin/settings", q)
+}
+
+async fn old_reset(State(st): State<Arc<WebState>>, RawQuery(q): RawQuery) -> Response {
+    old_admin_path(&st, "/admin/reset", q)
 }
 
 // ---------------------------------------------------------------------------
@@ -272,19 +304,16 @@ pub fn router(state: Arc<WebState>) -> Router {
 /// Navigation shown in the page header.
 #[derive(Debug, Clone, Default)]
 pub struct Nav {
-    /// Logged in.
+    /// Logged in. Without a session (the sign-in pages) the header has
+    /// the brand and nothing else.
     pub admin: bool,
-    /// Lookups are visible.
-    pub lookups: bool,
     /// CSRF token (logout form).
     pub csrf: String,
 }
 
-pub(crate) fn nav(st: &WebState, session: &Option<Admin>) -> Nav {
-    let cfg = st.api.config.current();
+pub(crate) fn nav(session: &Option<Admin>) -> Nav {
     Nav {
         admin: session.is_some(),
-        lookups: session.is_some() || cfg.config.access.reads == ReadsMode::Public,
         csrf: session.as_ref().map(|s| s.csrf.clone()).unwrap_or_default(),
     }
 }
@@ -303,15 +332,9 @@ pub struct MessagePage {
     pub link: Option<(String, String)>,
 }
 
-pub(crate) fn message(
-    st: &WebState,
-    s: &Option<Admin>,
-    status: StatusCode,
-    title: &str,
-    msg: &str,
-) -> Response {
+pub(crate) fn message(s: &Option<Admin>, status: StatusCode, title: &str, msg: &str) -> Response {
     let mut r = render_private(&MessagePage {
-        nav: nav(st, s),
+        nav: nav(s),
         title: title.into(),
         message: msg.into(),
         link: None,
@@ -697,7 +720,7 @@ pub struct DashboardFragment {
 }
 
 async fn dashboard(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
-    let s = match gate(&st, &headers, Need::Dashboard).await {
+    let s = match gate(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -705,24 +728,18 @@ async fn dashboard(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Respo
         Ok(d) => (d, None),
         Err(e) => (DashboardData::default(), Some(e)),
     };
-    migration_warning(&st, &s, &mut d);
-    sort_warning(&st, &s, &mut d);
-    let page = DashboardPage {
-        nav: nav(&st, &s),
+    migration_warning(&st, &mut d);
+    sort_warning(&st, &mut d);
+    render_private(&DashboardPage {
+        nav: nav(&Some(s)),
         d,
         error,
-    };
-    if s.is_some() {
-        render_private(&page)
-    } else {
-        render(&page)
-    }
+    })
 }
 
-/// Tells a signed-in admin that sign-in is changing (the migration
-/// state, §8.6).
-fn migration_warning(st: &WebState, s: &Option<Admin>, d: &mut DashboardData) {
-    if s.is_some() && st.api.config.current().admin_auth() == AdminAuth::Migration {
+/// Tells the admin that sign-in is changing (the migration state, §8.6).
+fn migration_warning(st: &WebState, d: &mut DashboardData) {
+    if st.api.config.current().admin_auth() == AdminAuth::Migration {
         d.warnings.insert(
             0,
             Warning {
@@ -735,12 +752,12 @@ fn migration_warning(st: &WebState, s: &Option<Admin>, d: &mut DashboardData) {
     }
 }
 
-/// Tells a signed-in admin that the tables do not all sort by creation
+/// Tells the admin that the tables do not all sort by creation
 /// time yet: the sort indexes are still being built, or are held because
 /// the storage budget has no room for them (§7.6).
-fn sort_warning(st: &WebState, s: &Option<Admin>, d: &mut DashboardData) {
+fn sort_warning(st: &WebState, d: &mut DashboardData) {
     let ready = st.sort.count();
-    if s.is_none() || ready == 4 {
+    if ready == 4 {
         return;
     }
     let text = match st.status.get().sort_held_bytes {
@@ -759,16 +776,15 @@ fn sort_warning(st: &WebState, s: &Option<Admin>, d: &mut DashboardData) {
 }
 
 async fn dashboard_fragment(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
-    let s = match gate(&st, &headers, Need::Dashboard).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
+    if let Err(r) = gate(&st, &headers).await {
+        return r;
+    }
     let (mut d, error) = match dashboard_data(&st).await {
         Ok(d) => (d, None),
         Err(e) => (DashboardData::default(), Some(e)),
     };
-    migration_warning(&st, &s, &mut d);
-    sort_warning(&st, &s, &mut d);
+    migration_warning(&st, &mut d);
+    sort_warning(&st, &mut d);
     render_private(&DashboardFragment { d, error })
 }
 
@@ -780,6 +796,9 @@ pub(crate) fn metrics_rate_limited(c: Class) {
 }
 
 async fn logout(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+    if st.api.config.current().admin_auth() == AdminAuth::Disabled {
+        return common::not_found();
+    }
     if let Some(raw) = read_cookie(&headers, ADMIN_COOKIE) {
         if common::same_origin(&headers) {
             if let Some(key) = session_key(&st.api.config.current(), &raw) {
@@ -828,37 +847,6 @@ pub async fn resolve_handle(safe: &SafeClient, handle: &str) -> Result<Did, Stri
     Did::parse(body.trim()).map_err(|_| format!("{handle} did not resolve to a DID"))
 }
 
-async fn lookup_gate(
-    st: &WebState,
-    headers: &HeaderMap,
-    client: Option<ClientIp>,
-) -> Result<Option<Admin>, Response> {
-    let s = gate(st, headers, Need::Lookup).await?;
-    if s.is_none() {
-        let cfg = st.api.config.current();
-        let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
-        let limit = Class::UiLookup.limit(&cfg.config, None);
-        if let Err((_, retry)) =
-            st.api
-                .limiter
-                .check(Class::UiLookup, &farsight_api::ratelimit::ip_key(ip), limit)
-        {
-            metrics_rate_limited(Class::UiLookup);
-            let mut r = message(
-                st,
-                &None,
-                StatusCode::TOO_MANY_REQUESTS,
-                "Slow down",
-                "Too many lookups from your address; wait a few seconds.",
-            );
-            r.headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from(retry));
-            return Err(r);
-        }
-    }
-    Ok(s)
-}
-
 /// A table section of a lookup page.
 #[derive(Debug, Clone, Default)]
 pub struct Section {
@@ -892,7 +880,7 @@ pub struct DidPage {
     pub sections: Vec<Section>,
     /// Backfill state lines.
     pub backfill: Vec<String>,
-    /// The account's history page; offered to a logged-in admin only.
+    /// The account's history page.
     pub history: Option<String>,
 }
 
@@ -929,23 +917,21 @@ fn section_error(e: farsight_api::error::XrpcError) -> String {
 }
 
 /// The column headers of a section that sorts by shown time. "First seen"
-/// is for a signed-in admin only: nothing public serves that date, and an
-/// anonymous viewer of a lookup page is the public.
-fn time_columns(who: &str, record: &str, time: &str, signed_in: bool) -> Vec<String> {
-    let mut c = vec![who.to_owned(), record.to_owned(), time.to_owned()];
-    if signed_in {
-        c.push("First seen".to_owned());
-    }
-    c
+/// is an admin column: nothing public serves that date.
+fn time_columns(who: &str, record: &str, time: &str) -> Vec<String> {
+    vec![
+        who.to_owned(),
+        record.to_owned(),
+        time.to_owned(),
+        "First seen".to_owned(),
+    ]
 }
 
 /// The rows of such a section. `authority` is the account whose repo
 /// holds the records; `None`: the row's own account.
-#[allow(clippy::too_many_arguments)]
 fn time_rows(
     st: &WebState,
     asked: &mut Asked,
-    signed_in: bool,
     viewer: &str,
     collection: &'static str,
     authority: Option<&str>,
@@ -953,8 +939,8 @@ fn time_rows(
 ) -> Vec<Vec<Cell>> {
     rows.iter()
         .map(|b| {
-            let mut cells = vec![
-                Cell::account(&cells::account(st, asked, signed_in, &b.did)),
+            vec![
+                Cell::account(&cells::account(st, asked, &b.did)),
                 Cell::record(&Record::of(
                     viewer,
                     authority.unwrap_or(&b.did),
@@ -962,11 +948,8 @@ fn time_rows(
                     &b.rkey,
                 )),
                 Cell::time(b.created_at),
-            ];
-            if signed_in {
-                cells.push(Cell::first_seen(b.first_seen));
-            }
-            cells
+                Cell::first_seen(b.first_seen),
+            ]
         })
         .collect()
 }
@@ -978,17 +961,15 @@ fn text_cell(v: &Value) -> Cell {
 async fn lookup_did(
     State(st): State<Arc<WebState>>,
     headers: HeaderMap,
-    client: Option<axum::Extension<ClientIp>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let s = match lookup_gate(&st, &headers, client.map(|c| c.0)).await {
+    let s = match gate(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-    let signed_in = s.is_some();
     let query = q.get("q").map(|s| s.trim().to_owned()).unwrap_or_default();
     let mut page = DidPage {
-        nav: nav(&st, &s),
+        nav: nav(&Some(s)),
         q: query.clone(),
         did: None,
         error: None,
@@ -1012,7 +993,7 @@ async fn lookup_did(
         }
     };
     page.did = Some(did.as_str().to_owned());
-    page.history = signed_in.then(|| crate::public::text::admin_did_history_href(did.as_str()));
+    page.history = Some(crate::public::text::admin_did_history_href(did.as_str()));
     let _permit = match permit(&st).await {
         Ok(p) => p,
         Err(e) => {
@@ -1034,7 +1015,7 @@ async fn lookup_did(
             }
         }
         v.push(extra);
-        link_with("/lookup/did", &v)
+        link_with("/admin/lookup/did", &v)
     };
     let params = |cursor_key: Option<&str>| {
         let mut p = vec![("actor".to_owned(), actor.clone())];
@@ -1054,7 +1035,7 @@ async fn lookup_did(
     // section's own query, hidden accounts left out as the API does.
     let mut sec = Section {
         title: "Incoming blocks".into(),
-        columns: time_columns("Blocker", "Record", "Created", signed_in),
+        columns: time_columns("Blocker", "Record", "Created"),
         ..Section::default()
     };
     match handlers::get_incoming_blocks(&st.api, &params(None)).await {
@@ -1084,7 +1065,7 @@ async fn lookup_did(
         .await
         {
             Ok(p) => {
-                sec.rows = time_rows(&st, &mut asked, signed_in, viewer, BLOCK, None, &p.rows);
+                sec.rows = time_rows(&st, &mut asked, viewer, BLOCK, None, &p.rows);
                 sec.next = p.next.as_deref().map(|c| base_pairs(("bc", c)));
             }
             Err(e) => sec.error = Some(section_error(e)),
@@ -1110,7 +1091,7 @@ async fn lookup_did(
                     text_cell(&i["listPurpose"]),
                     text_cell(&i["listName"]),
                     match i["blocker"].as_str() {
-                        Some(d) => Cell::account(&cells::account(&st, &mut asked, signed_in, d)),
+                        Some(d) => Cell::account(&cells::account(&st, &mut asked, d)),
                         None => Cell::default(),
                     },
                 ]);
@@ -1210,17 +1191,15 @@ pub fn parse_list_ref(q: &str) -> Option<(String, String)> {
 async fn lookup_list(
     State(st): State<Arc<WebState>>,
     headers: HeaderMap,
-    client: Option<axum::Extension<ClientIp>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let s = match lookup_gate(&st, &headers, client.map(|c| c.0)).await {
+    let s = match gate(&st, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-    let signed_in = s.is_some();
     let query = q.get("q").map(|s| s.trim().to_owned()).unwrap_or_default();
     let mut page = ListPage {
-        nav: nav(&st, &s),
+        nav: nav(&Some(s)),
         q: query.clone(),
         uri: None,
         error: None,
@@ -1250,8 +1229,10 @@ async fn lookup_list(
     };
     let uri = format!("at://{}/app.bsky.graph.list/{rkey}", owner.as_str());
     page.uri = Some(uri.clone());
-    page.history =
-        signed_in.then(|| crate::public::text::admin_list_history_href(owner.as_str(), &rkey));
+    page.history = Some(crate::public::text::admin_list_history_href(
+        owner.as_str(),
+        &rkey,
+    ));
     let _permit = match permit(&st).await {
         Ok(p) => p,
         Err(e) => {
@@ -1277,7 +1258,7 @@ async fn lookup_list(
     ];
     let mut members = Section {
         title: "Members".into(),
-        columns: time_columns("Member", "Listitem", "Added", signed_in),
+        columns: time_columns("Member", "Listitem", "Added"),
         ..Section::default()
     };
     let mut serves = false;
@@ -1313,7 +1294,7 @@ async fn lookup_list(
     }
     let mut blockers = Section {
         title: "Inbound listblocks".into(),
-        columns: time_columns("Blocker", "Listblock", "Created", signed_in),
+        columns: time_columns("Blocker", "Listblock", "Created"),
         ..Section::default()
     };
     if let Some(info) = &info {
@@ -1333,16 +1314,14 @@ async fn lookup_list(
                     members.rows = time_rows(
                         &st,
                         &mut asked,
-                        signed_in,
                         viewer,
                         LISTITEM,
                         Some(owner.as_str()),
                         &p.rows,
                     );
-                    members.next = p
-                        .next
-                        .as_deref()
-                        .map(|c| link_with("/lookup/list", &[("q", uri.as_str()), ("mc", c)]));
+                    members.next = p.next.as_deref().map(|c| {
+                        link_with("/admin/lookup/list", &[("q", uri.as_str()), ("mc", c)])
+                    });
                 }
                 Err(e) => members.error = Some(section_error(e)),
             }
@@ -1358,12 +1337,11 @@ async fn lookup_list(
         .await
         {
             Ok(p) => {
-                blockers.rows =
-                    time_rows(&st, &mut asked, signed_in, viewer, LISTBLOCK, None, &p.rows);
+                blockers.rows = time_rows(&st, &mut asked, viewer, LISTBLOCK, None, &p.rows);
                 blockers.next = p
                     .next
                     .as_deref()
-                    .map(|c| link_with("/lookup/list", &[("q", uri.as_str()), ("bc", c)]));
+                    .map(|c| link_with("/admin/lookup/list", &[("q", uri.as_str()), ("bc", c)]));
             }
             Err(e) => blockers.error = Some(section_error(e)),
         }
@@ -1410,7 +1388,7 @@ async fn ops_render(
 ) -> Response {
     let cfg = st.api.config.current();
     let mut page = OpsPage {
-        nav: nav(st, &Some(s.clone())),
+        nav: nav(&Some(s.clone())),
         csrf: s.csrf.clone(),
         notice,
         error,
@@ -1452,9 +1430,8 @@ async fn ops_render(
 }
 
 async fn ops_page(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
-    match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => ops_render(&st, &s, None, None, None).await,
-        Ok(None) => login_redirect(),
+    match gate(&st, &headers).await {
+        Ok(s) => ops_render(&st, &s, None, None, None).await,
         Err(r) => r,
     }
 }
@@ -1465,9 +1442,8 @@ async fn ops_action(
     headers: HeaderMap,
     Form(form): Form<Vec<(String, String)>>,
 ) -> Response {
-    let s = match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return login_redirect(),
+    let s = match gate(&st, &headers).await {
+        Ok(s) => s,
         Err(r) => return r,
     };
     let map: HashMap<String, String> = form.iter().cloned().collect();
@@ -1715,7 +1691,7 @@ fn unredact(submitted: &str, current: &str) -> Result<String, String> {
 pub(crate) fn settings_base(st: &WebState, s: &Admin) -> SettingsPage {
     let cur = st.api.config.current();
     SettingsPage {
-        nav: nav(st, &Some(s.clone())),
+        nav: nav(&Some(s.clone())),
         csrf: s.csrf.clone(),
         text: st
             .api
@@ -1740,8 +1716,8 @@ pub(crate) fn settings_base(st: &WebState, s: &Admin) -> SettingsPage {
 }
 
 async fn settings_page(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
-    match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => {
+    match gate(&st, &headers).await {
+        Ok(s) => {
             // Resolve the admin handle for display (cached; two-second
             // budget), so that `settings_base` finds it.
             let cur = st.api.config.current();
@@ -1752,7 +1728,6 @@ async fn settings_page(State(st): State<Arc<WebState>>, headers: HeaderMap) -> R
             }
             render_private(&settings_base(&st, &s))
         }
-        Ok(None) => login_redirect(),
         Err(r) => r,
     }
 }
@@ -1762,9 +1737,8 @@ async fn settings_save(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    let s = match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return login_redirect(),
+    let s = match gate(&st, &headers).await {
+        Ok(s) => s,
         Err(r) => return r,
     };
     if let Err(r) = check_form(&s, &headers, &form) {
@@ -1825,9 +1799,8 @@ async fn settings_token(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    let s = match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return login_redirect(),
+    let s = match gate(&st, &headers).await {
+        Ok(s) => s,
         Err(r) => return r,
     };
     if let Err(r) = check_form(&s, &headers, &form) {
@@ -1885,14 +1858,13 @@ pub struct ResetPage {
 }
 
 async fn reset_page(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
-    let s = match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return login_redirect(),
+    let s = match gate(&st, &headers).await {
+        Ok(s) => s,
         Err(r) => return r,
     };
     let cur = st.api.config.current();
     render_private(&ResetPage {
-        nav: nav(&st, &Some(s.clone())),
+        nav: nav(&Some(s.clone())),
         csrf: s.csrf,
         hostname: cur.config.server.hostname.clone(),
         unavailable: cur.from_env_only,
@@ -1924,9 +1896,8 @@ async fn reset_submit(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    let s = match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return login_redirect(),
+    let s = match gate(&st, &headers).await {
+        Ok(s) => s,
         Err(r) => return r,
     };
     if let Err(r) = check_form(&s, &headers, &form) {
@@ -1934,7 +1905,7 @@ async fn reset_submit(
     }
     let cur = st.api.config.current();
     let page = |error: Option<String>| ResetPage {
-        nav: nav(&st, &Some(s.clone())),
+        nav: nav(&Some(s.clone())),
         csrf: s.csrf.clone(),
         hostname: cur.config.server.hostname.clone(),
         unavailable: cur.from_env_only,

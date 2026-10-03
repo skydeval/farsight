@@ -10,27 +10,29 @@
 {% if env_managed %}
 <div class="banner">The configuration comes from the environment (FARSIGHT_SKIP_WIZARD); edit it there.</div>
 {% else %}
-<form class="card" method="post" action="/settings">
+<form class="card" method="post" action="/admin/settings">
 <h2>config.toml</h2>
 <p class="muted">Secrets are shown as &lt;redacted&gt; and kept unless replaced. Access, auth,
 proxy, rate-limit (except the query concurrency) and backfill keys apply immediately; others
 need a restart. Writes are atomic and notify the backfill process.</p>
+<p class="muted">The admin UI itself is switched with <code>access.admin_ui</code> in config.toml, at restart; a save
+here that would change it is refused.</p>
 {% if !env_keys.is_empty() %}<p>Locked by environment variables: {% for k in env_keys %}<code>{{ k }}</code> {% endfor %}</p>{% endif %}
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <textarea class="mono" name="config" spellcheck="false">{{ text }}</textarea>
 <div class="row"><button type="submit">Save</button></div>
 </form>
 
-<form class="stack card" method="post" action="/settings/public-ui" id="public-ui">
+<form class="stack card" method="post" action="/admin/settings/public-ui" id="public-ui">
 <h2>Public UI</h2>
-<p class="muted">A public lookup site under <code>/public</code>: anyone can see who blocks an account,
+<p class="muted">A public lookup site at this hostname's root (<code>/</code>): anyone can see who blocks an account,
 directly and through lists. Removed records are never shown there; they are on the history pages reached from the
 DID and list lookups, after login. Every setting here applies on save, without
 a restart; a cache in front of Farsight keeps serving its copies for up to a minute.
-<a href="/public" target="_blank" rel="noopener">Open the public UI in a new tab</a>{% if !p.enabled %} (it answers 404 while switched off){% endif %}.</p>
+<a href="/" target="_blank" rel="noopener">Open the public UI in a new tab</a>{% if !p.enabled %} (it answers 404 while switched off){% endif %}.</p>
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label><input type="checkbox" name="enabled"{% if p.enabled %} checked{% endif %}> Serve the public UI (<code>access.public_ui</code>)</label>
-<div class="hint">Needs <code>access.reads = "public"</code> and <code>access.ui = "public_read"</code>. Turning it on asks for confirmation on a page that lists what becomes reachable without login.</div>
+<div class="hint">Needs <code>access.reads = "public"</code>. Turning it on asks for confirmation on a page that lists what becomes reachable without login.</div>
 
 <label for="instance_description">Description</label>
 <textarea id="instance_description" name="instance_description" maxlength="2000">{{ p.instance_description }}</textarea>
@@ -49,8 +51,8 @@ how long, or how to reach you about their data, say it here.</div>
 <input type="text" id="record_viewer_url" name="record_viewer_url" maxlength="500" spellcheck="false" placeholder="https://viewer.example/at/{authority}/{collection}/{rkey}" value="{{ p.record_viewer_url }}">
 <div class="hint">Used on the admin lookup pages; the public pages show no record addresses. Empty: block, listblock and
 listitem records are shown as plain <code>at://</code> text. Set: each is a link that opens in a new tab. The address must
-contain <code>{authority}</code>, <code>{collection}</code> and <code>{rkey}</code>, after the host. The lookup pages are
-open to anyone while <code>access.ui = "public_read"</code>; whoever follows a record link there is sent to this site.</div>
+contain <code>{authority}</code>, <code>{collection}</code> and <code>{rkey}</code>, after the host. Whoever
+follows a record link there is sent to this site.</div>
 
 <label><input type="checkbox" name="show_avatars"{% if p.show_avatars %} checked{% endif %}> Show avatars in profile cards (<code>show_avatars</code>)</label>
 <div class="hint">Resting the pointer on an account opens a card with its handle, DID and creation date. With this on, the card
@@ -128,13 +130,13 @@ password stops working once it is set.</p>
 in the container, then restart farsight; sessions of the previous DID end at that restart.</p>
 </div>
 
-<form class="card" method="post" action="/settings/token">
+<form class="card" method="post" action="/admin/settings/token">
 <h2>Admin token</h2>
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <p class="muted">Rotating invalidates the current admin token and signs out every session.</p>
 <div class="row"><button class="danger" type="submit">Rotate admin token</button></div>
 </form>
 
-<div class="card"><h2>Reset</h2><p><a href="/reset">Reset the configuration</a> (keeps the database).</p></div>
+<div class="card"><h2>Reset</h2><p><a href="/admin/reset">Reset the configuration</a> (keeps the database).</p></div>
 {% endif %}
 {% endblock %}

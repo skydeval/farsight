@@ -4,7 +4,7 @@
 <h1>Turn on the public UI?</h1>
 <div class="banner">Nothing has been changed yet. Read what becomes reachable, then confirm.</div>
 <div class="card">
-<p>With the public UI on, anyone can open <code>https://{{ e.hostname }}/public</code> without logging in and see:</p>
+<p>With the public UI on, anyone can open <code>https://{{ e.hostname }}/</code> without logging in and see:</p>
 <ul>
 <li><strong>The instance hostname</strong>: {{ e.hostname }}.</li>
 <li><strong>The operator contact</strong> (shown on the home page): {{ e.shown_contact }}. <code>server.contact</code> ({{ e.server_contact }}) is already public through <code>getStats</code> and the User-Agent of this instance's outbound requests.</li>
@@ -20,11 +20,12 @@
 </ul>
 <p>{% if e.crawlable %}Search engines <strong>will</strong> be allowed to index the account and list pages (<code>crawlable</code> is on).{% else %}Search engines are asked not to index the pages (<code>crawlable</code> is off).{% endif %}
 Accounts that are not active, and the accounts in <code>excluded_dids</code>, are not shown.</p>
+<p><code>/</code> on this hostname becomes the public home page; the dashboard stays at <code>/admin</code>.</p>
 <p>You can turn the public UI off again at any time; caches in front of Farsight keep their copies for up to a minute.</p>
-<form method="post" action="/settings/public-ui/confirm">
+<form method="post" action="/admin/settings/public-ui/confirm">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <input type="hidden" name="confirm" value="{{ token }}">
-<div class="row"><button type="submit">Turn on the public UI</button> <a class="button secondary" href="/settings">Cancel</a></div>
+<div class="row"><button type="submit">Turn on the public UI</button> <a class="button secondary" href="/admin/settings">Cancel</a></div>
 </form>
 </div>
 {% endblock %}

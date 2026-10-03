@@ -2,7 +2,7 @@
 {% block content %}
 <h1>Handle not found</h1>
 <div class="card"><p>{{ message }}</p></div>
-<form class="search home-search" method="get" action="/public/search" role="search">
+<form class="search home-search" method="get" action="/search" role="search">
 <label for="q">Look up an account or a list</label>
 <div class="row"><input type="search" id="q" name="q" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" value="{{ q }}" required>
 <button type="submit">Try again</button></div>

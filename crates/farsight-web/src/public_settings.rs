@@ -9,8 +9,8 @@
 //! for the form here and for the raw `config.toml` editor alike.
 //!
 //! Every save goes through the same loader as start-up, so a combination
-//! the loader refuses (the public UI without `reads = "public"` and `ui =
-//! "public_read"`) is refused here too and nothing is written.
+//! the loader refuses (the public UI without `reads = "public"`) is refused
+//! here too and nothing is written.
 //!
 //! The retired `show_history` key has no control. A save of this form
 //! deletes it from the file: the save edits the file's existing table, and
@@ -32,7 +32,7 @@ use farsight_core::config::{
 use farsight_core::{ConfigDuration, Did};
 
 use crate::common::{random_id, render_private};
-use crate::pages::{Admin, Nav, Need, WebState, check_form, gate, login_redirect, nav};
+use crate::pages::{Admin, Nav, WebState, check_form, gate, nav};
 use crate::public::PendingEnable;
 
 /// How long a confirmation page stays valid.
@@ -471,7 +471,7 @@ pub(crate) fn confirmation(
             },
         );
     Ok(Some(render_private(&ConfirmPage {
-        nav: nav(st, &Some(admin.clone())),
+        nav: nav(&Some(admin.clone())),
         csrf: admin.csrf.clone(),
         token,
         e: Exposure::of(&next),
@@ -510,7 +510,7 @@ fn outcome(
     render_private(&page)
 }
 
-/// `POST /settings/public-ui`: saves the Public UI form, or — when it
+/// `POST /admin/settings/public-ui`: saves the Public UI form, or — when it
 /// turns the public UI on — answers with the confirmation page and writes
 /// nothing.
 pub async fn save(
@@ -518,9 +518,8 @@ pub async fn save(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    let admin = match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return login_redirect(),
+    let admin = match gate(&st, &headers).await {
+        Ok(s) => s,
         Err(r) => return r,
     };
     if let Err(r) = check_form(&admin, &headers, &form) {
@@ -548,7 +547,7 @@ pub async fn save(
     }
 }
 
-/// `POST /settings/public-ui/confirm`: the second request. Commits the
+/// `POST /admin/settings/public-ui/confirm`: the second request. Commits the
 /// change the confirmation page was rendered for; a token that is
 /// unknown, expired, already used or from another session commits
 /// nothing.
@@ -557,9 +556,8 @@ pub async fn confirm(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    let admin = match gate(&st, &headers, Need::Admin).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return login_redirect(),
+    let admin = match gate(&st, &headers).await {
+        Ok(s) => s,
         Err(r) => return r,
     };
     if let Err(r) = check_form(&admin, &headers, &form) {

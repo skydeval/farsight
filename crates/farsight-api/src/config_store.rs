@@ -62,6 +62,14 @@ pub const ADMIN_DID_NOT_MIGRATING: &str = "there is nothing to migrate";
 pub const PASSWORD_NEEDED_FOR_MIGRATION: &str = "auth.admin_password_bcrypt cannot be removed before the admin DID is set: it is what \
      the migration page at /enter checks";
 
+/// Refusal: an edit whose result has another `access.admin_ui` than the
+/// config in force. The key is applied at start only (§8.6): an edit made
+/// in the admin UI would remove the page it was made from, and a change
+/// waiting in the file must not go live as a side effect of another edit.
+pub const ADMIN_UI_NEEDS_RESTART: &str = "`access.admin_ui` requires a restart to change: set it in config.toml and restart \
+     farsight. If config.toml was already edited by hand, restart to apply that, or undo it; \
+     until then no setting can be saved from the running server";
+
 /// Why an edit was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
@@ -78,6 +86,9 @@ pub enum EditError {
     /// The edit would change who may sign in to the admin UI (§8.6).
     #[error("{0}")]
     AdminDid(&'static str),
+    /// The edit would switch the admin UI on or off (§8.6).
+    #[error("{0}")]
+    AdminUi(&'static str),
     /// Reading or writing the file failed.
     #[error("{0}")]
     Io(String),
@@ -224,8 +235,11 @@ impl ConfigStore {
             .any(|k| k == "auth.admin_password_bcrypt");
         let edit = config::set_admin_did(&text, did, keep_password).map_err(EditError::Invalid)?;
         // Check the result before touching anything on disk.
-        config::load_from_parts(Some(&edit.text), &self.env)
+        let result = config::load_from_parts(Some(&edit.text), &self.env)
             .map_err(|e| EditError::Invalid(e.to_string()))?;
+        if result.config.access.admin_ui != cur.config.access.admin_ui {
+            return Err(EditError::AdminUi(ADMIN_UI_NEEDS_RESTART));
+        }
         config::write_replace(&config::pre_oauth_backup_path(&self.path), &text)
             .map_err(|e| EditError::Io(format!("writing the pre-OAuth backup failed: {e}")))?;
         self.store_locked(&text, &edit.text, true)
@@ -274,6 +288,10 @@ impl ConfigStore {
         }
         let loaded = config::load_from_parts(Some(new_text), &self.env)
             .map_err(|e| EditError::Invalid(e.to_string()))?;
+        // For every in-process edit, the migration's included.
+        if loaded.config.access.admin_ui != cur.config.access.admin_ui {
+            return Err(EditError::AdminUi(ADMIN_UI_NEEDS_RESTART));
+        }
         if !may_change_admin {
             // A stolen session must not become permanent control, and a
             // typo must not lock the operator out of the page they are on.

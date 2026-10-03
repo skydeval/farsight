@@ -2,7 +2,7 @@
 //! file, vendored htmx, no build step, no CDN. Setup mode serves the
 //! first-run wizard; normal mode serves the admin sign-in, the dashboard, lookups, operations,
 //! settings, reset and the admin history pages, and — when the operator
-//! turns it on — the public UI under `/public`.
+//! turns it on — the public UI at the root.
 
 #![warn(missing_docs)]
 // Handlers return early with a ready `Response` as the error value; boxing

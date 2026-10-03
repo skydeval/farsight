@@ -1,4 +1,5 @@
-//! The public UI (design §8.6): `/public/*` and `/robots.txt`.
+//! The public UI (design §8.6): `/`, `/search`, `/did/…`, `/list/…`,
+//! `/card/…`, their old addresses under `/public`, and `/robots.txt`.
 //!
 //! Anyone may look up the block relationships of a DID or a list. The
 //! surface is toggled by `access.public_ui` and shaped by `[public_ui]`,
@@ -6,13 +7,14 @@
 //!
 //! Rules every handler here keeps:
 //!
-//! - **Off means absent.** With the toggle off, `/public/*` answers like
-//!   any unknown route.
-//! - **No way out.** A public page links only to `/public/*` paths and,
-//!   when the operator configures one, to the record viewer. It carries no
+//! - **Off means absent.** With the toggle off, a public route answers
+//!   like any unknown route. (`/` is shared: it then leads to the admin
+//!   UI, or is a few lines of text.)
+//! - **No way out.** A public page links only to public pages and, when
+//!   the operator configures one, to the record viewer. It carries no
 //!   login link and names no admin route. Removed records are an admin
 //!   page ([`crate::history`]); the paths that once served them here
-//!   answer like any unknown `/public/…` path.
+//!   are not found.
 //! - **Responses do not depend on the caller.** A response is a function
 //!   of the path, the query string and the instance's state: no cookie is
 //!   read or set, and no request header changes the body. That is what
@@ -50,7 +52,7 @@ use axum::routing::get;
 use farsight_api::clientip::ClientIp;
 use farsight_api::params::Params;
 use farsight_api::ratelimit::Class;
-use farsight_core::config::{Config, LoadedConfig, UiMode};
+use farsight_core::config::{AdminAuth, Config, LoadedConfig};
 use farsight_core::{Did, RecordKey};
 use farsight_storage::codes::actor_status;
 use farsight_storage::handles::HandleCache;
@@ -98,9 +100,7 @@ pub const PUBLIC_CSS: &str = include_str!("../../static/public.css");
 pub const PUBLIC_JS: &str = include_str!("../../static/public.js");
 /// The one preview image, the same for every page (1200×630).
 pub const OG_IMAGE: &[u8] = include_bytes!("../../static/og-default.png");
-/// Where the preview image is served. Under `/public` so that a crawler
-/// allowed there by `robots.txt` may fetch it.
-pub const OG_IMAGE_PATH: &str = "/public/static/og-default.png";
+pub use crate::common::OG_IMAGE_PATH;
 
 // ---------------------------------------------------------------------------
 // State
@@ -511,7 +511,7 @@ fn message_page(
             title,
             &format!("Farsight at {}", cfg.server.hostname),
             OG_INSTANCE,
-            "/public",
+            "/",
         ),
         title: title.to_owned(),
         message: message.to_owned(),
@@ -523,7 +523,7 @@ fn message_page(
 
 /// The response for a [`Fail`].
 pub fn fail(cfg: &Config, f: Fail) -> Response {
-    let home = || Some(("/public".to_owned(), "Back to search".to_owned()));
+    let home = || Some(("/".to_owned(), "Back to search".to_owned()));
     match f {
         Fail::Absent => crate::common::not_found(),
         Fail::Limited(retry) => {
@@ -579,9 +579,9 @@ pub fn fail(cfg: &Config, f: Fail) -> Response {
     }
 }
 
-/// A relative redirect under `/public/` (§8.5), `no-store`.
+/// A relative redirect to a public page (§8.5), `no-store`.
 pub fn redirect(cfg: &Config, to: &str) -> Response {
-    debug_assert!(to.starts_with("/public/"));
+    debug_assert!(to.starts_with('/') && !to.starts_with("//"));
     let r = (
         StatusCode::SEE_OTHER,
         [(
@@ -732,11 +732,36 @@ where
 type St = State<Arc<WebState>>;
 type Client = Option<axum::Extension<ClientIp>>;
 
-async fn home(State(st): St, client: Client) -> Response {
-    serve(&st, Page::Home, client, Class::PublicUi, |r| async move {
-        pages::home(&r).await
-    })
-    .await
+/// The text page at `/` of an instance with neither UI (§8.6).
+const API_ONLY: &str = "Farsight\n\nThis instance exposes an ATProto block-graph API.\nSee \
+                        https://atproto.com for protocol details.\n";
+
+/// `GET /`: the public home while the public UI is on; else the way to
+/// the dashboard while the admin UI is on; else a few lines of text, so
+/// that an API-only instance does not look broken. Decided per request.
+/// Only the first is a public UI request (rate class, metrics).
+async fn root(State(st): St, client: Client) -> Response {
+    let cfg = st.api.config.current();
+    if cfg.config.access.public_ui {
+        return serve(&st, Page::Home, client, Class::PublicUi, |r| async move {
+            pages::home(&r).await
+        })
+        .await;
+    }
+    if cfg.admin_auth() != AdminAuth::Disabled {
+        // Not permanent and not stored: turning the public UI on changes
+        // what `/` is.
+        return crate::common::redirect("/admin");
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        API_ONLY,
+    )
+        .into_response()
 }
 
 async fn search_route(State(st): St, client: Client, RawQuery(q): RawQuery) -> Response {
@@ -778,10 +803,73 @@ async fn list_route(
     .await
 }
 
-/// Anything else under `/public/`, the withdrawn paths included
-/// (`/public/about` and the two history pages): the same 404, `no-store`,
-/// and no redirect — the history pages' new home is behind login, and a
-/// redirect would name it.
+// The addresses the public pages had under `/public` (§8.6): redirected
+// for one release while the public UI is on, then gone. One route per
+// page; each target is a fixed prefix plus the matched parameters,
+// re-encoded. `/public/card/{did}` is not among them: the script takes no
+// redirected card.
+
+/// Answers a request for an old public address: `to` while the public UI
+/// is on, the bare 404 otherwise.
+fn old_public_path(st: &WebState, to: Option<String>, query: Option<String>) -> Response {
+    let started = Instant::now();
+    let resp = match to {
+        Some(to) if st.api.config.current().config.access.public_ui => {
+            crate::common::moved(&to, query.as_deref())
+        }
+        _ => crate::common::not_found(),
+    };
+    metrics::observe(Page::Other, resp.status(), started.elapsed());
+    resp
+}
+
+async fn old_home(State(st): St, RawQuery(q): RawQuery) -> Response {
+    old_public_path(&st, Some("/".to_owned()), q)
+}
+
+async fn old_search(State(st): St, RawQuery(q): RawQuery) -> Response {
+    old_public_path(&st, Some("/search".to_owned()), q)
+}
+
+async fn old_did(
+    State(st): St,
+    path: Result<Path<String>, PathRejection>,
+    RawQuery(q): RawQuery,
+) -> Response {
+    old_public_path(&st, path.ok().map(|Path(did)| text::did_href(&did)), q)
+}
+
+async fn old_list(
+    State(st): St,
+    path: Result<Path<(String, String)>, PathRejection>,
+    RawQuery(q): RawQuery,
+) -> Response {
+    let to = path
+        .ok()
+        .map(|Path((did, rkey))| text::list_href(&did, &rkey));
+    old_public_path(&st, to, q)
+}
+
+async fn old_css(State(st): St) -> Response {
+    old_public_path(&st, Some("/static/public.css".to_owned()), None)
+}
+
+async fn old_js(State(st): St) -> Response {
+    old_public_path(&st, Some("/static/public.js".to_owned()), None)
+}
+
+async fn old_htmx(State(st): St) -> Response {
+    old_public_path(&st, Some("/static/htmx.min.js".to_owned()), None)
+}
+
+async fn old_og_image(State(st): St) -> Response {
+    old_public_path(&st, Some(OG_IMAGE_PATH.to_owned()), None)
+}
+
+/// Anything else under `/public/`: the public not-found page while the
+/// public UI is on, with no redirect. That covers the paths withdrawn in
+/// r21 (`/public/about` and the two history pages — their new home is
+/// behind login, and a redirect would name it) and `/public/card/{did}`.
 async fn other(State(st): St) -> Response {
     let started = Instant::now();
     let cfg = st.api.config.current();
@@ -801,87 +889,60 @@ async fn other(State(st): St) -> Response {
     resp
 }
 
-fn asset(st: &WebState, body: impl IntoResponse, content_type: &'static str) -> Response {
-    let cfg = st.api.config.current();
-    if !cfg.config.access.public_ui {
-        return crate::common::not_found();
-    }
-    let mut r = body.into_response();
-    let h = r.headers_mut();
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    h.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600"),
-    );
-    h.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    r
-}
-
-async fn css(State(st): St) -> Response {
-    asset(&st, PUBLIC_CSS, "text/css; charset=utf-8")
-}
-
-async fn js(State(st): St) -> Response {
-    asset(&st, PUBLIC_JS, "text/javascript; charset=utf-8")
-}
-
-async fn htmx(State(st): St) -> Response {
-    asset(&st, crate::common::HTMX, "text/javascript; charset=utf-8")
-}
-
-async fn og_image(State(st): St) -> Response {
-    asset(&st, OG_IMAGE, "image/png")
-}
+/// What crawlers may not fetch while the public UI is on and
+/// `crawlable`: the admin UI and sign-in, the wizard, the API, search and
+/// the card fragments (old addresses included), the health endpoints.
+/// The old `/public/…` page addresses are left open on purpose, so that a
+/// crawler sees their redirects. `Allow` comes last for crawlers that
+/// take the first match rather than the longest.
+const ROBOTS_CRAWLABLE: &str = "User-agent: *\nDisallow: /admin\nDisallow: /enter\nDisallow: \
+                                /setup\nDisallow: /xrpc/\nDisallow: /search\nDisallow: \
+                                /card/\nDisallow: /public/search\nDisallow: \
+                                /public/card/\nDisallow: /health\nDisallow: /livez\nAllow: /\n";
 
 /// The body of `/robots.txt`: nothing is offered to crawlers unless the
-/// public UI is on and `crawlable`. Search is never offered. The longer
-/// rule comes first for crawlers that take the first match rather than
-/// the longest.
+/// public UI is on and `crawlable`.
 pub fn robots_body(cfg: &Config) -> &'static str {
     if cfg.access.public_ui && cfg.public_ui.crawlable {
-        "User-agent: *\nDisallow: /public/search\nDisallow: /public/card\nAllow: /public\n\
-         Disallow: /\n"
+        ROBOTS_CRAWLABLE
     } else {
         "User-agent: *\nDisallow: /\n"
     }
 }
 
-/// `GET /robots.txt`: served in normal mode whenever the public UI is on
-/// or the admin UI is not disabled.
+/// `GET /robots.txt`: served in every normal-mode configuration, the body
+/// chosen from the config in force.
 async fn robots(State(st): St) -> Response {
     let started = Instant::now();
     let cfg = st.api.config.current();
-    let resp = if cfg.config.access.ui == UiMode::Disabled && !cfg.config.access.public_ui {
-        crate::common::not_found()
-    } else {
-        (
-            [
-                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                (header::CACHE_CONTROL, "public, max-age=300"),
-            ],
-            robots_body(&cfg.config),
-        )
-            .into_response()
-    };
+    let resp = (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        robots_body(&cfg.config),
+    )
+        .into_response();
     metrics::observe(Page::Robots, resp.status(), started.elapsed());
     resp
 }
 
-/// The public UI's routes.
+/// The public UI's routes, `/` and `/robots.txt`.
 pub fn router() -> Router<Arc<WebState>> {
     Router::new()
-        .route("/public", get(home))
-        .route("/public/search", get(search_route))
-        .route("/public/did/{did}", get(did_route))
-        .route("/public/list/{did}/{rkey}", get(list_route))
-        .route("/public/card/{did}", get(card::route))
-        .route("/public/static/public.css", get(css))
-        .route("/public/static/public.js", get(js))
-        .route("/public/static/htmx.min.js", get(htmx))
-        .route(OG_IMAGE_PATH, get(og_image))
+        .route("/", get(root))
+        .route("/search", get(search_route))
+        .route("/did/{did}", get(did_route))
+        .route("/list/{did}/{rkey}", get(list_route))
+        .route("/card/{did}", get(card::route))
+        .route("/public", get(old_home))
+        .route("/public/search", get(old_search))
+        .route("/public/did/{did}", get(old_did))
+        .route("/public/list/{did}/{rkey}", get(old_list))
+        .route("/public/static/public.css", get(old_css))
+        .route("/public/static/public.js", get(old_js))
+        .route("/public/static/htmx.min.js", get(old_htmx))
+        .route("/public/static/og-default.png", get(old_og_image))
         .route("/public/{*rest}", get(other))
         .route("/robots.txt", get(robots))
 }
@@ -899,11 +960,48 @@ mod tests {
         assert_eq!(robots_body(&c), "User-agent: *\nDisallow: /\n");
         c.access.public_ui = true;
         let b = robots_body(&c);
-        assert!(b.contains("Allow: /public\n") && b.contains("Disallow: /public/search\n"));
-        assert!(b.contains("Disallow: /public/card\n"));
-        // The narrower rules come before `Allow`, for first-match parsers.
-        assert!(b.find("Disallow: /public/card").unwrap() < b.find("Allow: /public").unwrap());
-        assert!(b.ends_with("Disallow: /\n"));
+        let lines: Vec<&str> = b.lines().collect();
+        assert_eq!(lines[0], "User-agent: *");
+        for closed in [
+            "/admin",
+            "/enter",
+            "/setup",
+            "/xrpc/",
+            "/search",
+            "/card/",
+            "/public/search",
+            "/public/card/",
+            "/health",
+            "/livez",
+        ] {
+            assert!(
+                lines.contains(&format!("Disallow: {closed}").as_str()),
+                "{closed}"
+            );
+        }
+        // No rule is a prefix of a public page or of an old page address
+        // that redirects to one.
+        for open in [
+            "/",
+            "/did/did:plc:x",
+            "/list/did:plc:x/k",
+            "/static/public.css",
+            "/public/did/did:plc:x",
+        ] {
+            assert!(
+                !lines
+                    .iter()
+                    .filter_map(|l| l.strip_prefix("Disallow: "))
+                    .any(|p| open.starts_with(p)),
+                "{open}"
+            );
+        }
+        // `Allow` comes after the narrower rules, for first-match parsers.
+        assert_eq!(lines.last(), Some(&"Allow: /"));
+        // Without the admin UI the body is the same: the paths are closed
+        // either way.
+        c.access.admin_ui = false;
+        assert_eq!(robots_body(&c), b);
     }
 
     #[test]
