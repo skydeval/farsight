@@ -1525,9 +1525,9 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
         format!("{d}; {pages} pages"),
     );
     c.check(
-        "a page shortened by the filter still offers \"next\"",
-        short >= 1,
-        format!("{short} short pages with a next link"),
+        "the withheld rule runs in the section's query, so it shortens no page: 50 rows while more follow, two pages for 62 members",
+        short == 0 && pages == 2,
+        format!("{short} short pages with a next link; {pages} pages"),
     );
     let want = h
         .strings(&format!(
