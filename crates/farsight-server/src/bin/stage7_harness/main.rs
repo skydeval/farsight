@@ -1560,6 +1560,35 @@ async fn check_rates(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), String>
 
 // ---------------------------------------------------------- 10. settings
 
+/// The session a completed sign-in made opens every admin surface, the
+/// profile-card route of the admin tables included (stage 8).
+async fn check_admin_card(c: &mut Checks, ctx: &Ctx, a: &Srv, cookie: &str) -> Result<(), String> {
+    c.section("9b. the signed-in session and /admin/card/{did}");
+    sqlx::query("INSERT INTO actors (did) VALUES ($1) ON CONFLICT (did) DO NOTHING")
+        .bind(OTHER)
+        .execute(&ctx.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let url = format!("{}/admin/card/{OTHER}", a.base);
+    let with = ctx.fresh().get(&url, &[("cookie", cookie)]).await?;
+    let without = ctx.fresh().get(&url, &[]).await?;
+    let nowhere = ctx
+        .fresh()
+        .get(&format!("{}/no/such/route", a.base), &[])
+        .await?;
+    c.check(
+        "the session the OAuth sign-in created opens /admin/card/{did} — 200, the card fragment, no-store, private; without it the route is the bare 404 of an unknown path under public_read too, never a redirect to /enter",
+        with.status == 200
+            && with.text.contains(&format!("<code class=\"pc-did\">{OTHER}</code>"))
+            && with.header("cache-control").as_deref() == Some("no-store, private")
+            && without.status == 404
+            && without.text == nowhere.text
+            && without.header("location").is_none(),
+        format!("{} / {}", with.status, without.status),
+    );
+    Ok(())
+}
+
 async fn check_settings(c: &mut Checks, ctx: &Ctx, a: &Srv, cookie: &str) -> Result<(), String> {
     c.section("10. Settings");
     let http = ctx.fresh();
@@ -2311,6 +2340,7 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
     check_hosted_flow(c, &ctx, &a).await?;
     check_nonces(c, &ctx, &a).await?;
     check_callback(c, &ctx, &a).await?;
+    check_admin_card(c, &ctx, &a, &admin_cookie).await?;
     check_settings(c, &ctx, &a, &admin_cookie).await?;
     // The CLI section restarts A on its directory and retires it.
     check_cli(c, &ctx, a, &admin_cookie).await?;

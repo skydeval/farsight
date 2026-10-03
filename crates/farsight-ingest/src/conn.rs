@@ -181,25 +181,33 @@ pub async fn connect(
 impl Session {
     /// The next decoded frame; `None` when the server closed the stream.
     pub async fn next_frame(&mut self) -> Option<Result<Frame, ReadError>> {
+        Some(match self.next_raw().await? {
+            Ok(raw) => self.decode(&raw),
+            Err(e) => Err(e),
+        })
+    }
+
+    /// The next frame as the source sent it, decompressed and not
+    /// decoded; `None` when the server closed the stream.
+    pub async fn next_raw(&mut self) -> Option<Result<Vec<u8>, ReadError>> {
         loop {
             let msg = match self.ws.next().await? {
                 Ok(m) => m,
                 Err(e) => return Some(Err(ReadError::Socket(e.to_string()))),
             };
-            let decoded = match msg {
-                Message::Text(t) => self.decode(t.as_bytes()),
+            let raw = match msg {
+                Message::Text(t) => Ok(t.as_bytes().to_vec()),
                 Message::Binary(b) => match self.dict {
-                    Some(d) => match dict::decompress(&b, d) {
-                        Ok(raw) => self.decode(&raw),
-                        Err(e) => Err(ReadError::Decompress(e.to_string())),
-                    },
-                    None => self.decode(&b),
+                    Some(d) => {
+                        dict::decompress(&b, d).map_err(|e| ReadError::Decompress(e.to_string()))
+                    }
+                    None => Ok(b.to_vec()),
                 },
                 Message::Close(_) => return None,
                 // Pings are answered by the library while reading.
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
             };
-            return Some(decoded);
+            return Some(raw);
         }
     }
 

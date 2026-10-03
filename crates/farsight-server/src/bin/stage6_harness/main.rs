@@ -116,6 +116,7 @@ admin_did = "{ADMIN_DID}"
 {access}
 
 [public_ui]
+handle_warming_enabled = false
 {public_ui}
 
 [auth]
@@ -2697,87 +2698,41 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
             w.o1
         ))
         .await?;
-    let shown = "a.status NOT IN (1, 2, 3, 4)";
+    // What the lookup pages list: incoming blocks without hidden blockers
+    // (as the API), every listblock and every item of the list.
     let incoming = h
         .strings(&format!(
             "SELECT 'at://' || a.did || '/app.bsky.graph.block/' || b.rkey FROM blocks b JOIN actors a ON a.id = b.author_id
-             WHERE b.subject_id = {sid} AND {shown}"
+             WHERE b.subject_id = {sid} AND a.status NOT IN (1, 2, 3, 4)"
         ))
         .await?;
-    let outgoing = h
-        .strings(&format!(
-            "SELECT 'at://{}/app.bsky.graph.block/' || b.rkey FROM blocks b JOIN actors a ON a.id = b.subject_id
-             WHERE b.author_id = {sid} AND {shown}",
-            w.s
-        ))
-        .await?;
-    let listblocks = h
+    let on_list = h
         .strings(&format!(
             "SELECT 'at://' || a.did || '/app.bsky.graph.listblock/' || b.rkey FROM list_blocks b JOIN actors a ON a.id = b.author_id
-             WHERE b.list_id = {lid} AND {shown}"
+             WHERE b.list_id = {lid}
+             UNION ALL
+             SELECT 'at://{}/app.bsky.graph.listitem/' || li.rkey FROM list_items li WHERE li.list_id = {lid}",
+            w.o1
         ))
         .await?;
-    // The first page of each section.
-    let page = h.get(&path_did(&w.s)).await?;
-    let lp = h.get(&w.list).await?;
-    let cells = |html: &str, id: &str| -> Vec<String> {
-        record_cells(section(html, id).unwrap_or(""))
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
-    };
-    let (b, o, l) = (
-        cells(&page.text, "blockers"),
-        cells(&page.text, "outgoing"),
-        cells(&lp.text, "listblockers"),
+    let did_lookup = format!("/lookup/did?q={}", enc(&w.s));
+    let list_lookup = format!(
+        "/lookup/list?q={}",
+        enc(&format!("at://{}/app.bsky.graph.list/{LIST}", w.o1))
     );
-    let plain = |cell: &String, set: &BTreeSet<String>| {
-        cell.strip_prefix("<code class=\"record\">")
-            .and_then(|x| x.strip_suffix("</code>"))
-            .is_some_and(|uri| set.contains(uri))
-    };
     let heads = |html: &str, id: &str| -> Vec<String> {
         between(section(html, id).unwrap_or(""), "<th>", "</th>")
             .into_iter()
             .map(str::to_owned)
             .collect()
     };
-    c.check(
-        "the three block tables have a Record column after the account; Members and On lists have none",
-        heads(&page.text, "blockers") == ["Account", "Record", "Created (as stated by the author)"]
-            && heads(&page.text, "outgoing") == ["Account", "Record", "Created (as stated by the author)"]
-            && heads(&lp.text, "listblockers") == ["Account", "Record", "Created (as stated by the author)"]
-            && heads(&lp.text, "members") == ["Account", "Added (as stated by the list's owner)"]
-            && !heads(&page.text, "lists").contains(&"Record".to_owned()),
-        format!("{:?}", heads(&lp.text, "members")),
-    );
-    c.check(
-        "record_viewer_url empty: every Record cell is the stored record's at-uri as plain text — no link anywhere",
-        b.len() == 50
-            && b.iter().all(|x| plain(x, &incoming))
-            && o.len() == outgoing.len()
-            && o.iter().all(|x| plain(x, &outgoing))
-            && l.len() == listblocks.len()
-            && l.iter().all(|x| plain(x, &listblocks))
-            && !page.text.contains("target=\"_blank\"")
-            && !lp.text.contains("target=\"_blank\""),
-        format!("{} / {} / {} cells; first {:?}", b.len(), o.len(), l.len(), b.first()),
-    );
-    let refused = h
-        .post_settings(&[(
-            "record_viewer_url",
-            Some("https://viewer.example/at/{authority}/{collection}"),
-        )])
-        .await?;
-    c.check(
-        "Settings refuses a viewer URL without its placeholders, naming the missing one under the form, and writes nothing",
-        banner(&refused.text).contains("Record viewer URL: `{rkey}` is missing.")
-            && h.config_text()?.contains("record_viewer_url = \"\""),
-        banner(&refused.text),
-    );
-    h.set(&[("record_viewer_url", Some(VIEWER))]).await?;
-    let page = h.get(&path_did(&w.s)).await?;
-    let lp = h.get(&w.list).await?;
+    let cells =
+        |html: &str| -> Vec<String> { record_cells(html).into_iter().map(str::to_owned).collect() };
+    let plain = |cell: &String, set: &BTreeSet<String>| {
+        cell.strip_prefix("<code class=\"record\">")
+            .and_then(|x| x.strip_suffix("</code>"))
+            .is_some_and(|uri| set.contains(uri))
+    };
     let linked = |cell: &String, set: &BTreeSet<String>| {
         let Some(rest) = cell.strip_prefix("<a class=\"record\" href=\"") else {
             return false;
@@ -2801,35 +2756,78 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
                     parts[0], parts[1], parts[2]
                 )
     };
-    let (b, o, l) = (
-        cells(&page.text, "blockers"),
-        cells(&page.text, "outgoing"),
-        cells(&lp.text, "listblockers"),
-    );
+    // No public table has a Record column, whatever the viewer setting.
+    let public_clean = |page: &Resp, lp: &Resp| {
+        let block_heads = ["Account", "Created (as stated by the author)"];
+        heads(&page.text, "blockers") == block_heads
+            && heads(&page.text, "outgoing") == block_heads
+            && heads(&lp.text, "listblockers") == block_heads
+            && heads(&lp.text, "members") == ["Account", "Added (as stated by the list's owner)"]
+            && !heads(&page.text, "lists").contains(&"Record".to_owned())
+            && [page, lp].iter().all(|r| {
+                !r.text.contains("class=\"record\"")
+                    && !r.text.contains("target=\"_blank\"")
+                    && !r.text.contains("/app.bsky.graph.block/")
+                    && !r.text.contains("/app.bsky.graph.listblock/")
+            })
+    };
+    let page = h.get(&path_did(&w.s)).await?;
+    let lp = h.get(&w.list).await?;
     c.check(
-        "record_viewer_url set, without restart: every Record cell is a link built from the template with the record's authority, collection and rkey, opening in a new tab with rel=noopener noreferrer nofollow, its text the at-uri",
+        "no public table has a Record column: the three block tables are Account and Created, and no public page carries a block or listblock at-uri",
+        public_clean(&page, &lp),
+        format!("{:?}", heads(&page.text, "blockers")),
+    );
+    let dl = h.get(&did_lookup).await?;
+    let ll = h.get(&list_lookup).await?;
+    let (b, l) = (cells(&dl.text), cells(&ll.text));
+    c.check(
+        "record_viewer_url empty: on the lookup pages every record cell is the stored record's at-uri as plain text — no link anywhere",
+        b.len() == 50
+            && b.iter().all(|x| plain(x, &incoming))
+            && !l.is_empty()
+            && l.iter().all(|x| plain(x, &on_list))
+            && l.iter().any(|x| x.contains("/app.bsky.graph.listitem/"))
+            && l.iter().any(|x| x.contains("/app.bsky.graph.listblock/"))
+            && !dl.text.contains("target=\"_blank\"")
+            && !ll.text.contains("target=\"_blank\""),
+        format!("{} / {} cells; first {:?}", b.len(), l.len(), b.first()),
+    );
+    let refused = h
+        .post_settings(&[(
+            "record_viewer_url",
+            Some("https://viewer.example/at/{authority}/{collection}"),
+        )])
+        .await?;
+    c.check(
+        "Settings refuses a viewer URL without its placeholders, naming the missing one under the form, and writes nothing",
+        banner(&refused.text).contains("Record viewer URL: `{rkey}` is missing.")
+            && h.config_text()?.contains("record_viewer_url = \"\""),
+        banner(&refused.text),
+    );
+    h.set(&[("record_viewer_url", Some(VIEWER))]).await?;
+    let dl = h.get(&did_lookup).await?;
+    let ll = h.get(&list_lookup).await?;
+    let (b, l) = (cells(&dl.text), cells(&ll.text));
+    c.check(
+        "record_viewer_url set, without restart: on the lookup pages every record cell is a link built from the template with the record's authority, collection and rkey, opening in a new tab with rel=noopener noreferrer nofollow, its text the at-uri",
         b.len() == 50
             && b.iter().all(|x| linked(x, &incoming))
-            && !o.is_empty()
-            && o.iter().all(|x| linked(x, &outgoing))
+            && b.iter().all(|x| x.contains("/app.bsky.graph.block/"))
             && !l.is_empty()
-            && l.iter().all(|x| linked(x, &listblocks))
-            && o.iter().all(|x| x.contains("/app.bsky.graph.block/"))
-            && l.iter().all(|x| x.contains("/app.bsky.graph.listblock/")),
+            && l.iter().all(|x| linked(x, &on_list)),
         format!("first {:?}", b.first()),
     );
+    let page = h.get(&path_did(&w.s)).await?;
+    let lp = h.get(&w.list).await?;
     let outside: Vec<String> = hrefs(&page.text)
         .into_iter()
         .chain(hrefs(&lp.text))
-        .filter(|x| {
-            !(x.starts_with("/public")
-                || x.starts_with('#')
-                || x.starts_with("https://viewer.example/at/did:plc:"))
-        })
+        .filter(|x| !(x.starts_with("/public") || x.starts_with('#')))
         .collect();
     c.check(
-        "the record viewer is the only place a public page links to outside /public",
-        outside.is_empty(),
+        "with a viewer set the public pages are unchanged: no Record column, and no link to anywhere outside /public",
+        public_clean(&page, &lp) && outside.is_empty(),
         format!("{outside:?}"),
     );
     h.set(&[
@@ -2837,12 +2835,10 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
         ("show_outgoing_blocks", None),
     ])
     .await?;
-    let page = h.get(&path_did(&w.s)).await?;
+    let dl = h.get(&did_lookup).await?;
     c.check(
         "record_viewer_url emptied again: plain text again",
-        cells(&page.text, "blockers")
-            .iter()
-            .all(|x| plain(x, &incoming)),
+        cells(&dl.text).iter().all(|x| plain(x, &incoming)),
         "plain",
     );
     Ok(())
