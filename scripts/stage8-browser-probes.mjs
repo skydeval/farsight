@@ -1,9 +1,10 @@
 // Browser probes of the stage-8 harness (Mode A): what only a browser can
 // show about the admin pages after UI v2.4.3 — the header stays at the top
 // while the page scrolls, account links open profile cards for a signed-in
-// admin (and only for one), a card request that is refused never puts
-// another page into the card, and times are rewritten to the viewer's
-// timezone by the script the admin pages now load.
+// admin, a card request that is refused never puts another page into the
+// card, times are rewritten to the viewer's timezone by the script the
+// admin pages load, and without a session the lookup page is not served
+// at all (the browser is sent to /enter).
 //
 // Run by `farsight-stage8-harness --browser` inside the Playwright image;
 // prints one JSON object per line: {"what", "ok", "detail"}.
@@ -18,7 +19,7 @@ function out(what, ok, detail = "") {
   console.log(JSON.stringify({ what, ok: !!ok, detail: String(detail).slice(0, 500) }));
 }
 
-const lookup = (did) => `${base}/lookup/did?q=${encodeURIComponent(did)}`;
+const lookup = (did) => `${base}/admin/lookup/did?q=${encodeURIComponent(did)}`;
 
 async function signedIn(browser) {
   const context = await browser.newContext({ viewport: { width: 1200, height: 700 } });
@@ -102,7 +103,7 @@ for (const [name, engine] of [
       await context.close();
       const plain = await browser.newContext({ viewport: { width: 1200, height: 700 } });
       const ppage = await plain.newPage();
-      await ppage.goto(`${base}/public/did/${subject}`);
+      await ppage.goto(`${base}/did/${subject}`);
       await ppage.waitForLoadState("load");
       const bar = await ppage.evaluate(() => {
         const n = document.querySelector("nav.public-nav");
@@ -160,7 +161,8 @@ for (const [name, engine] of [
     );
     await context.close();
 
-    // ---- An anonymous viewer of the same page (ui = public_read).
+    // ---- No session: the lookup page is not served; the browser follows
+    // the redirect to the sign-in page.
     const anon = await browser.newContext({ viewport: { width: 1200, height: 700 } });
     const apage = await anon.newPage();
     const asked = [];
@@ -169,20 +171,20 @@ for (const [name, engine] of [
     });
     await apage.goto(lookup(second));
     await apage.waitForLoadState("load");
+    const landed = new URL(apage.url()).pathname;
     const links = await apage.locator("a.who").count();
-    const withCard = await apage.locator("a.who[data-card]").count();
-    await apage.locator("a.who").first().hover();
-    await apage.waitForTimeout(900);
     const cards = await apage.locator(".profile-card").count();
+    const navs = await apage.locator("header.top nav").count();
+    const brand = await apage.locator("header.top .brand").count();
     const ah = await header(apage);
     out(
-      `${name}: an anonymous viewer of the lookup page gets the account links and the sticky header, no card attribute, no card and no card request`,
-      links >= 50 && withCard === 0 && cards === 0 && asked.length === 0 && ah.position === "sticky" && ah.top === 0,
-      `${links} links, ${withCard} with data-card, ${cards} cards, ${asked.length} requests`,
+      `${name}: without a session the lookup page is not served — the browser lands on /enter, with no account link, no card and no card request; the header there is sticky and has the brand and no nav`,
+      landed === "/enter" && links === 0 && cards === 0 && asked.length === 0 && navs === 0 && brand === 1 && ah.position === "sticky" && ah.top === 0,
+      `landed on ${landed}; ${links} links, ${cards} cards, ${asked.length} requests, ${navs} navs`,
     );
 
     // ---- The public pages still do what they did.
-    await apage.goto(`${base}/public/did/${subject}`);
+    await apage.goto(`${base}/did/${subject}`);
     await apage.waitForLoadState("load");
     const nav = await apage.evaluate(async () => {
       const n = document.querySelector("nav.public-nav");
@@ -202,8 +204,8 @@ for (const [name, engine] of [
       return t ? t.textContent : "";
     });
     out(
-      `${name}: the public page is as before — sticky bar, theme toggle shown, a card on hover from /public/card/{did}, times in the viewer's timezone`,
-      nav.position === "sticky" && nav.top === 0 && nav.toggle && ptext.includes("did:plc:") && asked.some((u) => u.includes("/public/card/")) && rel.length > 0,
+      `${name}: the public page is as before — sticky bar, theme toggle shown, a card on hover from /card/{did}, times in the viewer's timezone`,
+      nav.position === "sticky" && nav.top === 0 && nav.toggle && ptext.includes("did:plc:") && asked.some((u) => new URL(u).pathname.startsWith("/card/")) && rel.length > 0,
       `${JSON.stringify(nav)}; card: ${ptext.replace(/\s+/g, " ").slice(0, 80)}; time: ${rel}`,
     );
     await anon.close();

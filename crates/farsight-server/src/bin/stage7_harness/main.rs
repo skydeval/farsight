@@ -8,14 +8,14 @@
 //!
 //! Sections:
 //!
-//! - 1: config: admin DID syntax, the three states, the public UI's
-//!   independence of `ui`;
+//! - 1: config: admin DID syntax, the three states, the retired `ui` key,
+//!   the public UI's independence of `admin_ui`;
 //! - 2: client modes and the client metadata document;
 //! - 3: a loopback sign-in end to end, and the requests it made;
 //! - 4: a hosted sign-in end to end (client metadata without
 //!   `refresh_token`);
 //! - 5: DPoP nonces; 6: the callback's checks, in order;
-//! - 7: flow lifetime; 8: `gate` and `/robots.txt` by mode;
+//! - 7: flow lifetime; 8: `gate` and `/robots.txt` by configuration;
 //! - 9: rate limits; 10: Settings;
 //! - 11: migration from a password; 12: the CLI, and a changed admin DID;
 //! - 13: what is logged and what never is; 14: rollback;
@@ -481,7 +481,7 @@ fn check_config(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     let unconfigured = load("", "", &[]);
     let configured = load(&format!("admin_did = \"{D1}\""), &pw, &[]);
     let from_env = load("", &pw, &[("FARSIGHT__ACCESS__ADMIN_DID", D1)]);
-    let disabled = load("ui = \"disabled\"", "", &[]);
+    let disabled = load("admin_ui = false", "", &[]);
     let state = |r: &Result<config::LoadedConfig, config::ConfigError>| {
         r.as_ref().ok().map(|l| l.admin_auth())
     };
@@ -494,7 +494,7 @@ fn check_config(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         format!("{:?}", state(&migration)),
     );
     c.check(
-        "a file with neither loads, unconfigured, with a warning; with the UI disabled neither key matters",
+        "a file with neither loads, unconfigured, with a warning; with the admin UI off (admin_ui = false) neither key matters",
         state(&unconfigured) == Some(AdminAuth::Unconfigured)
             && unconfigured.as_ref().is_ok_and(|l| l.warnings.iter().any(|w| w.contains("not configured")))
             && state(&disabled) == Some(AdminAuth::Disabled),
@@ -526,19 +526,52 @@ fn check_config(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         state(&env_only) == Some(AdminAuth::Unconfigured),
         format!("{:?}", env_only.as_ref().map(|l| l.admin_auth()).map_err(ToString::to_string)),
     );
+    // The retired key: accepted, warned about, and read only for
+    // "disabled" when `admin_ui` is not in the file.
+    let retired = |access: &str| {
+        load(access, "", &[]).ok().map(|l| {
+            (
+                l.config.access.admin_ui,
+                l.warnings
+                    .iter()
+                    .any(|w| w.contains("`access.ui` is retired")),
+            )
+        })
+    };
+    let old = [
+        retired(&format!("ui = \"public_read\"\nadmin_did = \"{D1}\"")),
+        retired(&format!("ui = \"auth_all\"\nadmin_did = \"{D1}\"")),
+        retired("ui = \"disabled\""),
+        retired(&format!(
+            "ui = \"disabled\"\nadmin_ui = true\nadmin_did = \"{D1}\""
+        )),
+        retired("ui = \"public_read\"\nadmin_ui = false"),
+    ];
+    c.check(
+        "the retired access.ui still loads, with a warning: public_read and auth_all leave the admin UI on, \"disabled\" turns it off — unless admin_ui is in the file, which then decides",
+        old == [
+            Some((true, true)),
+            Some((true, true)),
+            Some((false, true)),
+            Some((true, true)),
+            Some((false, true)),
+        ] && load("admin_ui = true", "", &[])
+            .is_ok_and(|l| !l.warnings.iter().any(|w| w.contains("access.ui"))),
+        format!("{old:?}"),
+    );
     let mut combos = Vec::new();
-    for ui in ["public_read", "auth_all", "disabled"] {
+    for admin_ui in [true, false] {
         if let Err(e) = load(
-            &format!("ui = \"{ui}\"\npublic_ui = true\nadmin_did = \"{D1}\""),
+            &format!("admin_ui = {admin_ui}\npublic_ui = true\nadmin_did = \"{D1}\""),
             "",
             &[],
         ) {
-            combos.push(format!("{ui}: {e}"));
+            combos.push(format!("admin_ui = {admin_ui}: {e}"));
         }
     }
     for reads in ["api_key", "disabled"] {
         let text = ctx
-            .config(HOSTNAME, "ui = \"auth_all\"\npublic_ui = true", "")
+            .config(HOSTNAME, "admin_ui = true\npublic_ui = true", "")
             .replace("reads = \"public\"", &format!("reads = \"{reads}\""));
         if !config::load_from_parts(Some(&text), &[])
             .err()
@@ -548,7 +581,7 @@ fn check_config(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         }
     }
     c.check(
-        "public_ui = true loads with every ui mode (auth_all included) and still needs reads = public",
+        "public_ui = true loads with the admin UI on or off and still needs reads = public",
         combos.is_empty(),
         combos.join("; "),
     );
@@ -849,11 +882,11 @@ async fn check_loopback_flow(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<Strin
         .filter_map(|v| v.to_str().ok().map(str::to_owned))
         .collect();
     c.check(
-        "the callback answers 200 (not a redirect) with a page that continues to / by meta refresh and a Continue link; no-store, Referrer-Policy: no-referrer",
+        "the callback answers 200 (not a redirect) with a page that continues to /admin by meta refresh and a Continue link; no-store, Referrer-Policy: no-referrer",
         done.status == 200
             && done.header("location").is_none()
-            && done.text.contains("<meta http-equiv=\"refresh\" content=\"0;url=/\">")
-            && done.text.contains("<a class=\"button\" href=\"/\">Continue</a>")
+            && done.text.contains("<meta http-equiv=\"refresh\" content=\"0;url=/admin\">")
+            && done.text.contains("<a class=\"button\" href=\"/admin\">Continue</a>")
             && done.header("cache-control").as_deref() == Some("no-store, private")
             && done.header("referrer-policy").as_deref() == Some("no-referrer"),
         done.short(),
@@ -909,7 +942,7 @@ async fn check_loopback_flow(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<Strin
     );
     let settings = http
         .get(
-            &format!("{}/settings", a.base),
+            &format!("{}/admin/settings", a.base),
             &[("cookie", &admin_cookie)],
         )
         .await?;
@@ -917,10 +950,10 @@ async fn check_loopback_flow(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<Strin
         .get(&format!("{}/enter", a.base), &[("cookie", &admin_cookie)])
         .await?;
     c.check(
-        "the session works (Settings 200), and /enter with a session redirects to /",
+        "the session works (Settings 200), and /enter with a session redirects to /admin",
         settings.status == 200
             && enter.status == 303
-            && enter.header("location").as_deref() == Some("/"),
+            && enter.header("location").as_deref() == Some("/admin"),
         format!("{} / {}", settings.status, enter.status),
     );
     let schema = ctx
@@ -964,7 +997,7 @@ async fn check_hosted_flow(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<(), Str
     let admin = set_cookie(&done, "farsight_admin").unwrap_or_default();
     let ops = http
         .get(
-            &format!("{}/ops", a.base),
+            &format!("{}/admin/ops", a.base),
             &[("cookie", &admin), ("host", HOSTNAME)],
         )
         .await?;
@@ -1272,24 +1305,25 @@ async fn check_lifetime(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), Stri
 // ------------------------------------------------------------- 8. gates
 
 async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
-    c.section("8. gate and /robots.txt by mode");
+    c.section("8. gate and /robots.txt by configuration");
     const GATED: [&str; 9] = [
-        "/",
-        "/dashboard/fragment",
-        "/lookup/did",
-        "/lookup/list",
-        "/ops",
-        "/settings",
-        "/reset",
+        "/admin",
+        "/admin/dashboard/fragment",
+        "/admin/lookup/did",
+        "/admin/lookup/list",
+        "/admin/ops",
+        "/admin/settings",
+        "/admin/reset",
         "/admin/did/did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/history",
         "/admin/list/did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/3kabc/history",
     ];
-    // auth_all with the public UI on: the T7 configuration.
+    let to_enter = |r: &Resp| r.status == 303 && r.header("location").as_deref() == Some("/enter");
+    // Both UIs on: the T7 configuration.
     let s = Srv::with_config(
-        "authall",
+        "both",
         &ctx.config(
             HOSTNAME,
-            &format!("ui = \"auth_all\"\npublic_ui = true\nadmin_did = \"{D1}\""),
+            &format!("admin_ui = true\npublic_ui = true\nadmin_did = \"{D1}\""),
             "",
         ),
         &[],
@@ -1297,23 +1331,41 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     .await?;
     let http = ctx.fresh();
     let unknown = http.get(&format!("{}/no-such-route", s.base), &[]).await?;
+    let bare = |r: &Resp| {
+        r.status == 404
+            && r.text == unknown.text
+            && r.header("cache-control") == unknown.header("cache-control")
+            && r.header("location").is_none()
+    };
     let mut bad = Vec::new();
     for p in GATED {
         let r = http.get(&format!("{}{p}", s.base), &[]).await?;
-        if !(r.status == 404
-            && r.text == unknown.text
-            && r.header("cache-control") == unknown.header("cache-control")
-            && r.header("location").is_none())
-        {
+        if !to_enter(&r) {
             bad.push(format!("{p}: {}", r.short()));
+        }
+        // What htmx sends (the dashboard's poll, the history tables'
+        // "Next" links): a redirect would be followed and swapped in.
+        let hx = http
+            .get(&format!("{}{p}", s.base), &[("hx-request", "true")])
+            .await?;
+        if !bare(&hx) {
+            bad.push(format!("{p} (HX-Request): {}", hx.short()));
         }
     }
     let post = http
-        .post_form(&format!("{}/settings", s.base), &[], &[("config", "x")])
+        .post_form(
+            &format!("{}/admin/settings", s.base),
+            &[],
+            &[("config", "x")],
+        )
         .await?;
     c.check(
-        "auth_all, no session: every gated admin page (dashboard, fragment, lookups, operations, settings, reset, both history pages) is the bare 404 of an unknown path, byte for byte, with no redirect; a POST too",
-        bad.is_empty() && unknown.status == 404 && post.status == 404,
+        "both UIs on, no session: every admin page (dashboard, fragment, lookups, operations, settings, reset, both history pages) redirects (303) to /enter — none answers 404 to hide itself; the same request made by htmx (HX-Request) gets the bare 404 of an unknown path, byte for byte, with no redirect; a POST redirects too",
+        bad.is_empty()
+            && unknown.status == 404
+            && unknown.text == "not found"
+            && unknown.header("cache-control").as_deref() == Some("no-store")
+            && to_enter(&post),
         bad.join("; "),
     );
     let enter = http.get(&format!("{}/enter", s.base), &[]).await?;
@@ -1329,31 +1381,74 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     let css = http
         .get(&format!("{}/static/farsight.css", s.base), &[])
         .await?;
-    let public = http.get(&format!("{}/public", s.base), &[]).await?;
+    let public = http.get(&format!("{}/", s.base), &[]).await?;
     c.check(
-        "auth_all: /enter still renders the sign-in page, /enter/callback answers (400 without a flow), the client metadata and the stylesheet are served, and the public UI is up next to the hidden admin pages",
+        "both UIs on: /enter renders the sign-in page with the brand and no nav link, /enter/callback answers (400 without a flow), the client metadata and the stylesheet are served, and the public UI is up at / next to the admin pages",
         enter.status == 200
             && enter.text.contains("Sign in with ATProto")
+            && enter.text.contains("<span class=\"brand\">Farsight</span>")
+            && !enter.text.contains("<nav")
             && cb.status == 400
             && cb.text.contains(REFUSED)
             && meta.status == 200
             && css.status == 200
-            && public.status == 200,
+            && public.status == 200
+            && public.text.contains("<nav class=\"public-nav\""),
         format!(
             "{} {} {} {} {}",
             enter.status, cb.status, meta.status, css.status, public.status
+        ),
+    );
+    // The addresses the admin pages had at the root.
+    let mut moved = Vec::new();
+    for (old, new) in [
+        ("/lookup/did?q=x.example", "/admin/lookup/did?q=x.example"),
+        ("/lookup/list", "/admin/lookup/list"),
+        ("/ops", "/admin/ops"),
+        ("/settings", "/admin/settings"),
+        ("/reset", "/admin/reset"),
+    ] {
+        let r = http.get(&format!("{}{old}", s.base), &[]).await?;
+        if !(r.status == 301
+            && r.header("location").as_deref() == Some(new)
+            && r.header("cache-control").as_deref() == Some("public, max-age=3600"))
+        {
+            moved.push(format!("{old}: {} → {:?}", r.status, r.header("location")));
+        }
+    }
+    for p in ["/dashboard/fragment", "/logout"] {
+        let r = http.get(&format!("{}{p}", s.base), &[]).await?;
+        if !bare(&r) {
+            moved.push(format!("{p}: {}", r.short()));
+        }
+    }
+    let old_logout = http
+        .post_form(&format!("{}/logout", s.base), &[], &[])
+        .await?;
+    let slash = http.get(&format!("{}/admin/", s.base), &[]).await?;
+    c.check(
+        "the admin pages' old root addresses (/lookup/did, /lookup/list, /ops, /settings, /reset) answer 301 to the address under /admin, query kept, public, max-age=3600, without a session lookup; /dashboard/fragment and /logout (GET and POST) are unknown paths now; /admin/ redirects to /admin",
+        moved.is_empty()
+            && bare(&old_logout)
+            && slash.status == 303
+            && slash.header("location").as_deref() == Some("/admin"),
+        format!(
+            "{moved:?}; POST /logout {}; /admin/ {} → {:?}",
+            old_logout.status,
+            slash.status,
+            slash.header("location")
         ),
     );
     let signed = ctx.sign_in(&s, &http, &s.loopback()).await?;
     let cookie = set_cookie(&signed, "farsight_admin").unwrap_or_default();
     let mut closed = Vec::new();
     for p in [
-        "/",
-        "/dashboard/fragment",
-        "/lookup/did",
-        "/ops",
-        "/settings",
-        "/reset",
+        "/admin",
+        "/admin/dashboard/fragment",
+        "/admin/lookup/did",
+        "/admin/ops",
+        "/admin/settings",
+        "/admin/reset",
     ] {
         let r = http
             .get(&format!("{}{p}", s.base), &[("cookie", &cookie)])
@@ -1363,78 +1458,99 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         }
     }
     let logout = http
-        .post_form(&format!("{}/logout", s.base), &[("cookie", &cookie)], &[])
+        .post_form(
+            &format!("{}/admin/logout", s.base),
+            &[("cookie", &cookie)],
+            &[],
+        )
         .await?;
     let after = http
-        .get(&format!("{}/", s.base), &[("cookie", &cookie)])
+        .get(&format!("{}/admin", s.base), &[("cookie", &cookie)])
         .await?;
     c.check(
-        "auth_all: signing in works and opens every page; logout redirects to /enter and the session is gone (/ is 404 again)",
+        "both UIs on: signing in works and opens every page; POST /admin/logout redirects to /enter and the session is gone (/admin redirects to /enter again)",
         signed.status == 200
             && closed.is_empty()
-            && logout.status == 303
-            && logout.header("location").as_deref() == Some("/enter")
-            && after.status == 404,
+            && to_enter(&logout)
+            && to_enter(&after),
         format!("{closed:?} logout {} then {}", logout.status, after.status),
     );
     let robots = http.get(&format!("{}/robots.txt", s.base), &[]).await?;
     ctx.retire(s);
-    // public_read: unchanged.
+    // The admin UI alone: nothing of it is public any more.
     let s = Srv::with_config(
-        "pubread",
+        "adminonly",
         &ctx.config(
             HOSTNAME,
-            &format!("ui = \"public_read\"\nadmin_did = \"{D1}\""),
+            &format!("admin_ui = true\nadmin_did = \"{D1}\""),
             "",
         ),
         &[],
     )
     .await?;
     let http = ctx.fresh();
-    let dash = http.get(&format!("{}/", s.base), &[]).await?;
-    let frag = http
-        .get(&format!("{}/dashboard/fragment", s.base), &[])
-        .await?;
-    let lookup = http.get(&format!("{}/lookup/did", s.base), &[]).await?;
-    let mut redirects = Vec::new();
-    for p in ["/ops", "/settings", "/reset", GATED[7], GATED[8]] {
+    let root = http.get(&format!("{}/", s.base), &[]).await?;
+    let mut open = Vec::new();
+    for p in GATED {
         let r = http.get(&format!("{}{p}", s.base), &[]).await?;
-        if !(r.status == 303 && r.header("location").as_deref() == Some("/enter")) {
-            redirects.push(format!("{p}: {}", r.status));
+        if !to_enter(&r) {
+            open.push(format!("{p}: {}", r.status));
         }
     }
+    let enter = http.get(&format!("{}/enter", s.base), &[]).await?;
     c.check(
-        "public_read is unchanged: the dashboard, its fragment and the lookups render anonymously (reads = public); the other admin pages redirect (303) to /enter",
-        dash.status == 200
-            && dash.text.contains("<a href=\"/enter\">Sign in</a>")
-            && frag.status == 200
-            && lookup.status == 200
-            && redirects.is_empty(),
-        format!("{} {} {} {redirects:?}", dash.status, frag.status, lookup.status),
+        "the admin UI alone (public UI off): / is a 303 to /admin, no-store; there is no anonymous dashboard, fragment or lookup — every admin page redirects (303) to /enter; the sign-in page's header has no \"Dashboard\" or \"Sign in\" link",
+        root.status == 303
+            && root.header("location").as_deref() == Some("/admin")
+            && root
+                .header("cache-control")
+                .is_some_and(|v| v.contains("no-store"))
+            && open.is_empty()
+            && enter.status == 200
+            && !enter.text.contains("<nav")
+            && !enter.text.contains("Dashboard")
+            && !enter.text.contains("<a href=\"/enter\">Sign in</a>"),
+        format!(
+            "/ {} → {:?}; {open:?}",
+            root.status,
+            root.header("location")
+        ),
     );
-    let robots_pr = http.get(&format!("{}/robots.txt", s.base), &[]).await?;
+    let robots_admin = http.get(&format!("{}/robots.txt", s.base), &[]).await?;
     ctx.retire(s);
-    // disabled, with and without the public UI.
+    // The admin UI off, with and without the public UI.
     let mut disabled = Vec::new();
-    let mut robots_disabled = Vec::new();
+    let mut off = Vec::new();
+    let mut api_only = None;
     for public_ui in [true, false] {
         let s = Srv::with_config(
-            "disabled",
+            "adminoff",
             &ctx.config(
                 HOSTNAME,
-                &format!("ui = \"disabled\"\npublic_ui = {public_ui}"),
+                &format!("admin_ui = false\npublic_ui = {public_ui}"),
                 "",
             ),
             &[],
         )
         .await?;
         let http = ctx.fresh();
+        let unknown = http.get(&format!("{}/no-such-route", s.base), &[]).await?;
         for (p, host) in [
-            ("/", ""),
+            ("/admin", ""),
+            ("/admin/", ""),
+            ("/admin/dashboard/fragment", ""),
+            ("/admin/lookup/did", ""),
+            ("/admin/ops", ""),
+            ("/admin/settings", ""),
+            ("/admin/reset", ""),
+            (GATED[7], ""),
+            ("/admin/card/did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", ""),
             ("/enter", ""),
             ("/enter/callback?state=x", ""),
             ("/.well-known/atproto-oauth-client-metadata", HOSTNAME),
+            // The old addresses are not redirected either.
             ("/settings", ""),
+            ("/lookup/did", ""),
         ] {
             let headers: Vec<(&str, &str)> = if host.is_empty() {
                 vec![]
@@ -1442,33 +1558,62 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
                 vec![("host", host)]
             };
             let r = http.get(&format!("{}{p}", s.base), &headers).await?;
-            if r.status != 404 {
+            if r.status != 404 || r.text != unknown.text || r.header("location").is_some() {
                 disabled.push(format!("public_ui={public_ui} {p}: {}", r.status));
             }
         }
-        let post = ctx
-            .fresh()
-            .post_form(&format!("{}/enter", s.base), &[], &[])
-            .await?;
-        if post.status != 404 {
-            disabled.push(format!("POST /enter: {}", post.status));
+        for p in ["/enter", "/admin/logout", "/admin/settings"] {
+            let post = ctx
+                .fresh()
+                .post_form(&format!("{}{p}", s.base), &[], &[])
+                .await?;
+            if post.status != 404 {
+                disabled.push(format!("public_ui={public_ui} POST {p}: {}", post.status));
+            }
         }
         let robots = http.get(&format!("{}/robots.txt", s.base), &[]).await?;
-        let public = http.get(&format!("{}/public", s.base), &[]).await?;
-        robots_disabled.push((public_ui, robots.status, public.status));
+        let root = http.get(&format!("{}/", s.base), &[]).await?;
+        let css = http
+            .get(&format!("{}/static/farsight.css", s.base), &[])
+            .await?;
+        off.push((
+            public_ui,
+            robots.status,
+            robots.text == "User-agent: *\nDisallow: /\n",
+            root.status,
+            css.status,
+        ));
+        if public_ui {
+            if !root.text.contains("<nav class=\"public-nav\"") {
+                disabled.push("public_ui=true /: not the public home".to_owned());
+            }
+        } else {
+            api_only = Some(root);
+        }
         ctx.retire(s);
     }
     c.check(
-        "ui = disabled: /, /enter (GET and POST), /enter/callback, the client metadata and Settings are all 404, with or without the public UI",
+        "admin_ui = false: every admin page, /admin/card, /enter (GET and POST), /enter/callback, the client metadata, logout and the old root addresses are the bare 404, with or without the public UI",
         disabled.is_empty(),
         disabled.join("; "),
     );
     c.check(
-        "/robots.txt is served when public_ui = true or ui != disabled: 200 under auth_all and public_read; under ui = disabled, 200 with the public UI on (which is up) and 404 with it off",
+        "neither UI: / is a short text page — 200, text/plain, starting \"Farsight\", public, max-age=300 — so that an API-only instance does not look broken",
+        api_only.as_ref().is_some_and(|r| {
+            r.status == 200
+                && r.header("content-type")
+                    .is_some_and(|t| t.starts_with("text/plain"))
+                && r.text.starts_with("Farsight")
+                && r.header("cache-control").as_deref() == Some("public, max-age=300")
+        }),
+        api_only.as_ref().map(Resp::short).unwrap_or_default(),
+    );
+    c.check(
+        "/robots.txt is served in every configuration: 200 with both UIs on and with the admin UI alone; with the admin UI off, 200 and \"Disallow: /\" with the public UI on (crawlable is off) and with it off too, where it used to be 404; / and the admin stylesheet answer 200 in both",
         robots.status == 200
-            && robots_pr.status == 200
-            && robots_disabled == [(true, 200, 200), (false, 404, 404)],
-        format!("{} {} {robots_disabled:?}", robots.status, robots_pr.status),
+            && robots_admin.status == 200
+            && off == [(true, 200, true, 200, 200), (false, 200, true, 200, 200)],
+        format!("{} {} {off:?}", robots.status, robots_admin.status),
     );
     Ok(())
 }
@@ -1577,7 +1722,7 @@ async fn check_admin_card(c: &mut Checks, ctx: &Ctx, a: &Srv, cookie: &str) -> R
         .get(&format!("{}/no/such/route", a.base), &[])
         .await?;
     c.check(
-        "the session the OAuth sign-in created opens /admin/card/{did} — 200, the card fragment, no-store, private; without it the route is the bare 404 of an unknown path under public_read too, never a redirect to /enter",
+        "the session the OAuth sign-in created opens /admin/card/{did} — 200, the card fragment, no-store, private; without it the route is the bare 404 of an unknown path, never a redirect to /enter, unlike the pages",
         with.status == 200
             && with.text.contains(&format!("<code class=\"pc-did\">{OTHER}</code>"))
             && with.header("cache-control").as_deref() == Some("no-store, private")
@@ -1593,11 +1738,11 @@ async fn check_settings(c: &mut Checks, ctx: &Ctx, a: &Srv, cookie: &str) -> Res
     c.section("10. Settings");
     let http = ctx.fresh();
     let page = http
-        .get(&format!("{}/settings", a.base), &[("cookie", cookie)])
+        .get(&format!("{}/admin/settings", a.base), &[("cookie", cookie)])
         .await?;
     let csrf = csrf_of(&page.text).unwrap_or_default();
     c.check(
-        "Settings shows the admin DID read-only with the CLI to change it; there is no password form, and POST /settings/password is not a route",
+        "Settings shows the admin DID read-only with the CLI to change it; there is no password form, and POST /admin/settings/password is not a route",
         page.status == 200
             && page.text.contains(&format!("Sign-in is as <code>{D1}</code>"))
             && page.text.contains("farsight set-admin-did")
@@ -1605,7 +1750,7 @@ async fn check_settings(c: &mut Checks, ctx: &Ctx, a: &Srv, cookie: &str) -> Res
             && !page.text.contains("/settings/password")
             && http
                 .post_form(
-                    &format!("{}/settings/password", a.base),
+                    &format!("{}/admin/settings/password", a.base),
                     &[("cookie", cookie)],
                     &[("csrf", csrf.as_str()), ("password", "x")],
                 )
@@ -1625,7 +1770,7 @@ async fn check_settings(c: &mut Checks, ctx: &Ctx, a: &Srv, cookie: &str) -> Res
     ] {
         let r = http
             .post_form(
-                &format!("{}/settings", a.base),
+                &format!("{}/admin/settings", a.base),
                 &[("cookie", cookie)],
                 &[("csrf", csrf.as_str()), ("config", text.as_str())],
             )
@@ -1638,7 +1783,7 @@ async fn check_settings(c: &mut Checks, ctx: &Ctx, a: &Srv, cookie: &str) -> Res
     }
     let harmless = http
         .post_form(
-            &format!("{}/settings", a.base),
+            &format!("{}/admin/settings", a.base),
             &[("cookie", cookie)],
             &[
                 ("csrf", csrf.as_str()),
@@ -1664,7 +1809,7 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     let hash = bcrypt::hash(PASSWORD, 4).map_err(|e| e.to_string())?;
     let old_config = ctx.config(
         "203.0.113.7:18093",
-        "ui = \"public_read\"",
+        "admin_ui = true",
         &format!("admin_password_bcrypt = \"{hash}\""),
     );
     let s = Srv::with_config("migrate", &old_config, &[]).await?;
@@ -1698,12 +1843,15 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         page.short(),
     );
     let settings = http
-        .get(&format!("{}/settings", s.base), &[("cookie", &pw_header)])
+        .get(
+            &format!("{}/admin/settings", s.base),
+            &[("cookie", &pw_header)],
+        )
         .await?;
     let dash = http
-        .get(&format!("{}/", s.base), &[("cookie", &pw_header)])
+        .get(&format!("{}/admin", s.base), &[("cookie", &pw_header)])
         .await?;
-    let anon_dash = http.get(&format!("{}/", s.base), &[]).await?;
+    let anon_dash = http.get(&format!("{}/admin", s.base), &[]).await?;
     let cb = ctx
         .fresh()
         .get(
@@ -1712,10 +1860,13 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         )
         .await?;
     c.check(
-        "meanwhile an existing password session keeps working, its dashboard carries the warning (an anonymous one does not), Settings links to /enter, and /enter/callback is 400",
+        "meanwhile an existing password session keeps working, its dashboard carries the warning (without a session there is no dashboard: 303 to /enter), Settings links to /enter, and /enter/callback is 400",
         settings.status == 200
             && settings.text.contains("<a href=\"/enter\">Set the admin DID</a>")
+            && dash.status == 200
             && dash.text.contains("Admin sign-in is changing")
+            && anon_dash.status == 303
+            && anon_dash.header("location").as_deref() == Some("/enter")
             && !anon_dash.text.contains("Admin sign-in is changing")
             && cb.status == 400,
         format!("{} {} {}", settings.status, dash.status, cb.status),
@@ -1723,7 +1874,7 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     let csrf = csrf_of(&settings.text).unwrap_or_default();
     let stripped = http
         .post_form(
-            &format!("{}/settings", s.base),
+            &format!("{}/admin/settings", s.base),
             &[("cookie", &pw_header)],
             &[
                 ("csrf", csrf.as_str()),
@@ -1813,7 +1964,10 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         format!("identical: {}, mode {mode:o}", backup == old_config),
     );
     let after = http
-        .get(&format!("{}/settings", s.base), &[("cookie", &pw_header)])
+        .get(
+            &format!("{}/admin/settings", s.base),
+            &[("cookie", &pw_header)],
+        )
         .await?;
     let enter = http.get(&format!("{}/enter", s.base), &[]).await?;
     let pw_again = post(vec![
@@ -1849,7 +2003,7 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     ctx.retire(s);
 
     // "Use anyway", and the password locked by the environment.
-    let bare = ctx.config(HOSTNAME, "ui = \"public_read\"", "");
+    let bare = ctx.config(HOSTNAME, "admin_ui = true", "");
     let s = Srv::with_config(
         "migrate-env",
         &bare,
@@ -1915,7 +2069,7 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         .await?;
     let settings = http
         .get(
-            &format!("{}/settings", s.base),
+            &format!("{}/admin/settings", s.base),
             &[("cookie", &format!("farsight_admin={pw_cookie}"))],
         )
         .await?;
@@ -1995,7 +2149,7 @@ async fn check_cli(c: &mut Checks, ctx: &Ctx, a: Srv, cookie: &str) -> Result<()
     let after = std::fs::read_to_string(a.config_path()).map_err(|e| e.to_string())?;
     let http = ctx.fresh();
     let still = http
-        .get(&format!("{}/settings", a.base), &[("cookie", cookie)])
+        .get(&format!("{}/admin/settings", a.base), &[("cookie", cookie)])
         .await?;
     c.check(
         "set-admin-did <did> resolves the DID, writes it to config.toml, prints it with the handle line and \"Restart farsight to apply\"; it does not restart anything — the running server still serves the old DID's session",
@@ -2015,7 +2169,7 @@ async fn check_cli(c: &mut Checks, ctx: &Ctx, a: Srv, cookie: &str) -> Result<()
     let a = Srv::launch(&dir, &[]).await?;
     let http = ctx.fresh();
     let dead = http
-        .get(&format!("{}/settings", a.base), &[("cookie", cookie)])
+        .get(&format!("{}/admin/settings", a.base), &[("cookie", cookie)])
         .await?;
     c.check(
         "after the restart the old DID's session no longer authenticates (303 to /enter), although its row is still in the table: no revocation step was needed",
@@ -2033,7 +2187,10 @@ async fn check_cli(c: &mut Checks, ctx: &Ctx, a: Srv, cookie: &str) -> Result<()
         .and_then(|e| e.form.get("login_hint").cloned());
     let new_cookie = set_cookie(&signed, "farsight_admin").unwrap_or_default();
     let works = http
-        .get(&format!("{}/settings", a.base), &[("cookie", &new_cookie)])
+        .get(
+            &format!("{}/admin/settings", a.base),
+            &[("cookie", &new_cookie)],
+        )
         .await?;
     ctx.standin.set(Knobs {
         sub: Some(D1.into()),
@@ -2063,7 +2220,7 @@ async fn check_cli(c: &mut Checks, ctx: &Ctx, a: Srv, cookie: &str) -> Result<()
     let bare_dir = Srv::dir("repair")?;
     write_private(
         &bare_dir.join("config.toml"),
-        &ctx.config(HOSTNAME, "ui = \"auth_all\"", ""),
+        &ctx.config(HOSTNAME, "admin_ui = true", ""),
     )?;
     let (ok, _) = cli(&bare_dir, &["set-admin-did", D1], &[]);
     let repaired = std::fs::read_to_string(bare_dir.join("config.toml")).unwrap_or_default();
@@ -2157,7 +2314,9 @@ fn check_rollback(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         "postgres://nobody:x@127.0.0.1:9/none",
         HOSTNAME,
         "https://plc.directory",
-        "ui = \"public_read\"",
+        // Neither `ui` nor `admin_ui`: the old binary refuses the second
+        // and both binaries default to an admin UI.
+        "",
         &format!("admin_password_bcrypt = \"{hash}\""),
     );
     write_private(&dir.join("config.toml"), &old)?;
@@ -2216,21 +2375,17 @@ fn check_rollback(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
 
 // ----------------------------------------------------------- 15. browser
 
-async fn check_browser(
-    c: &mut Checks,
-    ctx: &Ctx,
-    cfg_public: &str,
-    cfg_auth_all: &str,
-) -> Result<(), String> {
+async fn check_browser(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), String> {
     c.section("15. the browser: the session cookie after the callback page");
     let dir = std::env::temp_dir().join("farsight-stage7-browser");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("probes.mjs"), BROWSER_SCRIPT).map_err(|e| e.to_string())?;
     let mut n = 0;
-    for (mode, cfg) in [("public_read", cfg_public), ("auth_all", cfg_auth_all)] {
-        let s = Srv::with_config(&format!("browser-{mode}"), cfg, &[]).await?;
+    // One configuration: the admin UI is on or it is not there.
+    {
+        let s = Srv::with_config("browser", cfg, &[]).await?;
         let script = format!(
-            "cd /work && ([ -d node_modules/playwright ] || npm install --no-save --no-audit --no-fund playwright@1.48.0 >npm.log 2>&1) && node probes.mjs '{}' '{}' '{mode}'",
+            "cd /work && ([ -d node_modules/playwright ] || npm install --no-save --no-audit --no-fund playwright@1.48.0 >npm.log 2>&1) && node probes.mjs '{}' '{}'",
             s.base, ctx.standin.base
         );
         let out = Command::new("docker")
@@ -2252,7 +2407,7 @@ async fn check_browser(
         }
         if !out.status.success() {
             c.check(
-                format!("the browser probes ({mode}) ran to completion"),
+                "the browser probes ran to completion",
                 false,
                 format!(
                     "exit {:?}: {} {}",
@@ -2312,14 +2467,7 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
         &ctx_dsn,
         HOSTNAME,
         &standin.base,
-        &format!("ui = \"public_read\"\nadmin_did = \"{D1}\""),
-        "",
-    );
-    let cfg_auth_all = config_toml(
-        &ctx_dsn,
-        HOSTNAME,
-        &standin.base,
-        &format!("ui = \"auth_all\"\nadmin_did = \"{D1}\""),
+        &format!("admin_ui = true\nadmin_did = \"{D1}\""),
         "",
     );
     let a = Srv::with_config("a", &cfg_a, &[]).await?;
@@ -2350,7 +2498,7 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
     check_rates(c, &ctx, &cfg_a).await?;
     check_migration(c, &ctx).await?;
     if browser {
-        check_browser(c, &ctx, &cfg_a, &cfg_auth_all).await?;
+        check_browser(c, &ctx, &cfg_a).await?;
     }
     check_logging(c, &ctx);
     check_rollback(c, &ctx)?;

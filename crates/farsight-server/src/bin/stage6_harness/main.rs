@@ -111,7 +111,7 @@ plc_url = "{plc}"
 
 [access]
 reads = "public"
-ui = "public_read"
+admin_ui = true
 admin_did = "{ADMIN_DID}"
 {access}
 
@@ -192,7 +192,7 @@ impl H {
     async fn post_config(&self, text: &str) -> Result<Resp, String> {
         self.admin
             .post_form(
-                &format!("{}/settings", self.base),
+                &format!("{}/admin/settings", self.base),
                 &[("cookie", &self.cookie)],
                 &[("csrf", self.csrf.as_str()), ("config", text)],
             )
@@ -243,11 +243,11 @@ impl H {
         let page = self
             .admin
             .get(
-                &format!("{}/settings", self.base),
+                &format!("{}/admin/settings", self.base),
                 &[("cookie", &self.cookie)],
             )
             .await?;
-        self.csrf = csrf_of(&page.text).ok_or("no csrf on /settings")?;
+        self.csrf = csrf_of(&page.text).ok_or("no csrf on /admin/settings")?;
         Ok(())
     }
 
@@ -276,7 +276,7 @@ impl H {
         }
         self.admin
             .post_form(
-                &format!("{}/settings/public-ui", self.base),
+                &format!("{}/admin/settings/public-ui", self.base),
                 &[("cookie", &self.cookie)],
                 &self.form_pairs(),
             )
@@ -286,7 +286,7 @@ impl H {
     async fn confirm(&self, token: &str) -> Result<Resp, String> {
         self.admin
             .post_form(
-                &format!("{}/settings/public-ui/confirm", self.base),
+                &format!("{}/admin/settings/public-ui/confirm", self.base),
                 &[("cookie", &self.cookie)],
                 &[("csrf", self.csrf.as_str()), ("confirm", token)],
             )
@@ -371,7 +371,7 @@ fn dids_in(text: &str) -> BTreeSet<String> {
 
 /// The DIDs of a section's rows: the accounts its row links point at.
 fn row_dids(sec: &str) -> Vec<String> {
-    let k = "href=\"/public/did/";
+    let k = "href=\"/did/";
     let mut out = Vec::new();
     let mut rest = sec;
     while let Some(i) = rest.find(k) {
@@ -419,7 +419,7 @@ fn percent_decode(s: &str) -> String {
 /// The DIDs of an admin history section's rows: the accounts its lookup
 /// links point at.
 fn admin_row_dids(sec: &str) -> Vec<String> {
-    let k = "href=\"/lookup/did?q=";
+    let k = "href=\"/admin/lookup/did?q=";
     let mut out = Vec::new();
     let mut rest = sec;
     while let Some(i) = rest.find(k) {
@@ -531,7 +531,25 @@ fn did_sql(prefix: &str, col: &str) -> String {
 }
 
 fn path_did(d: &str) -> String {
-    format!("/public/did/{d}")
+    format!("/did/{d}")
+}
+
+/// Whether `path` is an address of the public UI: its pages at the root,
+/// the card fragment, or one of the old addresses under `/public`.
+fn is_public(path: &str) -> bool {
+    path == "/"
+        || ["/?", "/search", "/did/", "/list/", "/card/", "/public"]
+            .iter()
+            .any(|p| path.starts_with(p))
+}
+
+/// Whether a link on a public page stays inside the public UI: its pages,
+/// its assets, or an anchor.
+fn own_href(href: &str) -> bool {
+    href == "/"
+        || ["/search", "/did/", "/list/", "/static/", "#"]
+            .iter()
+            .any(|p| href.starts_with(p))
 }
 
 /// Keeps `firehose_state` fresh as a connected v2 stream unless paused.
@@ -582,7 +600,7 @@ async fn seed_world(h: &H) -> Result<World, String> {
         o2: did("own", 2),
         hidden: (1..=4).map(|i| did("hid", i)).collect(),
         unknown: did("unk", 1),
-        list: format!("/public/list/{}/{LIST}", did("own", 1)),
+        list: format!("/list/{}/{LIST}", did("own", 1)),
         partial: did("sub", 3),
         card: did("sub", 4),
     };
@@ -823,13 +841,18 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
     let mut same = true;
     let mut detail = Vec::new();
     for p in [
+        "/search?q=x.example".to_owned(),
+        path_did(&w.s),
+        w.list.clone(),
+        format!("/card/{}", w.s),
+        // The addresses the pages had before they moved to the root.
         "/public".to_owned(),
         "/public/about".to_owned(),
         "/public/search?q=x.example".to_owned(),
-        path_did(&w.s),
-        format!("{}/history", path_did(&w.s)),
-        w.list.clone(),
-        format!("{}/history", w.list),
+        format!("/public{}", path_did(&w.s)),
+        format!("/public{}/history", path_did(&w.s)),
+        format!("/public{}", w.list),
+        format!("/public{}/history", w.list),
         format!("/public/card/{}", w.s),
         "/public/static/public.css".to_owned(),
         "/public/static/public.js".to_owned(),
@@ -847,13 +870,50 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
         }
     }
     c.check(
-        "public_ui = false ⇒ every /public/* route, the card route included, answers 404, byte-identical to an unknown route",
+        "public_ui = false ⇒ every public route, the card route included, and every old /public/* address answers 404, byte-identical to an unknown route",
         same && unknown.status == 404,
         if detail.is_empty() {
             unknown.short()
         } else {
             detail.join("; ")
         },
+    );
+    let root = h.get("/").await?;
+    c.check(
+        "public_ui = false with the admin UI on ⇒ / is a 303 to /admin, no-store",
+        root.status == 303
+            && root.header("location").as_deref() == Some("/admin")
+            && root
+                .header("cache-control")
+                .is_some_and(|v| v.contains("no-store")),
+        format!(
+            "{} → {:?}, {:?}",
+            root.status,
+            root.header("location"),
+            root.header("cache-control")
+        ),
+    );
+    let mut bad = Vec::new();
+    for p in [
+        "/static/farsight.css",
+        "/static/public.css",
+        "/static/public.js",
+        "/static/htmx.min.js",
+        "/static/og-default.png",
+    ] {
+        let r = h.get(p).await?;
+        if r.status != 200
+            || r.header("cache-control").as_deref() != Some("public, max-age=3600")
+            || r.header("x-content-type-options").as_deref() != Some("nosniff")
+        {
+            bad.push(format!("{p}: {} {:?}", r.status, r.header("cache-control")));
+        }
+    }
+    let old_js = h.get("/static/farsight.js").await?;
+    c.check(
+        "the five static assets are served whatever the switches say (200, public, max-age=3600, nosniff); /static/farsight.js is gone",
+        bad.is_empty() && old_js.status == 404 && old_js.text == unknown.text,
+        format!("{}; farsight.js {}", bad.join("; "), old_js.status),
     );
     let robots = h.get("/robots.txt").await?;
     c.check(
@@ -863,17 +923,17 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
             && robots.header("cache-control").as_deref() == Some("public, max-age=300"),
         robots.short(),
     );
-    // The loader refuses the public UI over gated reads, whatever the
-    // admin UI mode (the public UI no longer depends on it).
+    // The loader refuses the public UI over gated reads, with the admin
+    // UI on or off (the public UI does not depend on it).
     let mut refused = Vec::new();
     for (reads, ui) in [
-        ("api_key", "public_read"),
-        ("disabled", "public_read"),
-        ("api_key", "auth_all"),
-        ("disabled", "disabled"),
+        ("api_key", true),
+        ("disabled", true),
+        ("api_key", false),
+        ("disabled", false),
     ] {
         let text = minimal_config(&format!(
-            "[access]\nreads = \"{reads}\"\nui = \"{ui}\"\npublic_ui = true\n"
+            "[access]\nreads = \"{reads}\"\nadmin_ui = {ui}\npublic_ui = true\n"
         ));
         let on = farsight_core::config::load_from_parts(Some(&text), &[]);
         let off = farsight_core::config::load_from_parts(
@@ -889,16 +949,16 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
             refused.push(format!("{reads}/{ui}: {msg}"));
         }
     }
-    for ui in ["public_read", "auth_all", "disabled"] {
+    for ui in [true, false] {
         let text = minimal_config(&format!(
-            "[access]\nreads = \"public\"\nui = \"{ui}\"\npublic_ui = true\n"
+            "[access]\nreads = \"public\"\nadmin_ui = {ui}\npublic_ui = true\n"
         ));
         if let Err(e) = farsight_core::config::load_from_parts(Some(&text), &[]) {
             refused.push(format!("public/{ui} refused: {e}"));
         }
     }
     c.check(
-        "config load refuses public_ui = true without reads = public, naming the key, and accepts it with every ui mode",
+        "config load refuses public_ui = true without reads = public, naming the key, and accepts it with the admin UI on or off",
         refused.is_empty(),
         refused.join("; "),
     );
@@ -1076,10 +1136,11 @@ async fn check_retired_key_loads(c: &mut Checks, h: &H, w: &World) -> Result<(),
 async fn check_retired_key_removed(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
     c.section("1b. the retired show_history key (after a save)");
     let hist = h.get(&format!("{}/history", path_did(&w.s))).await?;
+    let old_hist = h.get(&format!("/public{}/history", path_did(&w.s))).await?;
     c.check(
-        "show_history = true does nothing: the public history path is 404 with the public UI on",
-        hist.status == 404,
-        hist.short(),
+        "show_history = true does nothing: there is no public history path with the public UI on — 404 under the account's page and at the old /public address",
+        hist.status == 404 && old_hist.status == 404,
+        format!("{} / {}", hist.short(), old_hist.short()),
     );
     let file = h.config_text()?;
     c.check(
@@ -1110,7 +1171,7 @@ async fn check_retired_key_removed(c: &mut Checks, h: &H, w: &World) -> Result<(
 
 async fn check_enable_flow(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> {
     c.section("1c. enable-confirmation flow and the Settings controls");
-    let settings = h.admin_get("/settings").await?;
+    let settings = h.admin_get("/admin/settings").await?;
     let controls = [
         "enabled",
         "instance_description",
@@ -1138,7 +1199,7 @@ async fn check_enable_flow(c: &mut Checks, h: &mut H, w: &World) -> Result<(), S
         "Settings has a control for the toggle and every [public_ui] key — the four new ones included — and none for show_history",
         missing.is_empty()
             && !settings.text.contains("name=\"show_history\"")
-            && settings.text.contains("href=\"/public\" target=\"_blank\"")
+            && settings.text.contains("href=\"/\" target=\"_blank\"")
             && settings.text.contains("placeholder=\"https://viewer.example/at/{authority}/{collection}/{rkey}\"")
             && settings.text.contains("fetches it from the account's own server"),
         format!("missing: {missing:?}"),
@@ -1147,7 +1208,7 @@ async fn check_enable_flow(c: &mut Checks, h: &mut H, w: &World) -> Result<(), S
     let direct = h.confirm("never-issued").await?;
     c.check(
         "a confirm POST without a pending confirmation is refused (400) and changes nothing",
-        direct.status == 400 && h.get("/public").await?.status == 404,
+        direct.status == 400 && h.get("/").await?.status == 303,
         banner(&direct.text),
     );
     let first = h.post_settings(&[("enabled", Some("on"))]).await?;
@@ -1175,26 +1236,26 @@ async fn check_enable_flow(c: &mut Checks, h: &mut H, w: &World) -> Result<(), S
         support::truncate(&first.text, 200),
     );
     c.check(
-        "…and writes nothing: /public is still 404 and the config still says off",
-        h.get("/public").await?.status == 404 && !h.config_text()?.contains("public_ui = true"),
+        "…and writes nothing: / is still the redirect to /admin and the config still says off",
+        h.get("/").await?.status == 303 && !h.config_text()?.contains("public_ui = true"),
         "not written",
     );
     let token = token.ok_or("no confirmation token")?;
     let bogus = h.confirm(&format!("{token}x")).await?;
     c.check(
         "a confirm POST with a wrong token is refused and the public UI stays off",
-        bogus.status == 400 && h.get("/public").await?.status == 404,
+        bogus.status == 400 && h.get("/").await?.status == 303,
         banner(&bogus.text),
     );
     let second = h.confirm(&token).await?;
-    let home = h.get("/public").await?;
+    let home = h.get("/").await?;
     c.check(
-        "second POST with the form token commits: the settings are saved and /public serves, with no restart",
+        "second POST with the form token commits: the settings are saved and / serves the public home, with no restart",
         second.status == 200
             && second.text.contains("Saved.")
             && second.text.contains("access.public_ui")
             && home.status == 200,
-        format!("{}; /public {}", banner(&second.text), home.status),
+        format!("{}; / {}", banner(&second.text), home.status),
     );
     let replay = h.confirm(&token).await?;
     c.check(
@@ -1251,15 +1312,27 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
         set_cookie(&posted, "farsight_admin").is_none() && posted.status != 200,
         format!("{}", posted.status),
     );
-    let gated = h.get("/settings").await?;
-    let dash = h.get("/").await?;
+    // There is no anonymous dashboard: it redirects like every admin page,
+    // and the header of the sign-in page has the brand and no link.
+    let gated = h.get("/admin/settings").await?;
+    let dash = h.get("/admin").await?;
     c.check(
-        "an admin page without a session redirects to /enter, and the admin header's link points there",
+        "an admin page without a session — the dashboard included — redirects to /enter; the sign-in page's header has the brand and no nav link",
         gated.status == 303
             && gated.header("location").as_deref() == Some("/enter")
-            && dash.text.contains("<a href=\"/enter\">Sign in</a>")
-            && !dash.text.contains("/login"),
-        format!("{} → {:?}", gated.status, gated.header("location")),
+            && dash.status == 303
+            && dash.header("location").as_deref() == Some("/enter")
+            && enter.text.contains("<span class=\"brand\">Farsight</span>")
+            && !enter.text.contains("<nav")
+            && !enter.text.contains("Dashboard")
+            && !enter.text.contains("/login"),
+        format!(
+            "{} → {:?}; {} → {:?}",
+            gated.status,
+            gated.header("location"),
+            dash.status,
+            dash.header("location")
+        ),
     );
     Ok(())
 }
@@ -1268,14 +1341,14 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
     c.section("2. routes");
     let mut bad = Vec::new();
     for p in [
-        "/public".to_owned(),
+        "/".to_owned(),
         path_did(&w.s),
         w.list.clone(),
-        format!("/public/card/{}", w.s),
-        "/public/static/public.css".to_owned(),
-        "/public/static/public.js".to_owned(),
-        "/public/static/htmx.min.js".to_owned(),
-        "/public/static/og-default.png".to_owned(),
+        format!("/card/{}", w.s),
+        "/static/public.css".to_owned(),
+        "/static/public.js".to_owned(),
+        "/static/htmx.min.js".to_owned(),
+        "/static/og-default.png".to_owned(),
     ] {
         let r = h.get(&p).await?;
         if r.status != 200 {
@@ -1289,22 +1362,75 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
     );
     let png = h
         .fresh()
-        .get(&format!("{}/public/static/og-default.png", h.base), &[])
+        .get(&format!("{}/static/og-default.png", h.base), &[])
         .await?;
     c.check(
         "the preview image is a PNG served as image/png",
         png.header("content-type").as_deref() == Some("image/png") && png.text.contains("PNG"),
         png.header("content-type").unwrap_or_default(),
     );
+    // The addresses the pages and assets had under /public: a permanent
+    // redirect to the new one, with the query.
+    let mut bad = Vec::new();
+    for (old, new) in [
+        ("/public".to_owned(), "/".to_owned()),
+        (
+            "/public/search?q=x.example".to_owned(),
+            "/search?q=x.example".to_owned(),
+        ),
+        (format!("/public{}", path_did(&w.s)), path_did(&w.s)),
+        (
+            format!("/public{}?bc=abc&nc=def", path_did(&w.s)),
+            format!("{}?bc=abc&nc=def", path_did(&w.s)),
+        ),
+        (format!("/public{}", w.list), w.list.clone()),
+        (
+            "/public/static/public.css".to_owned(),
+            "/static/public.css".to_owned(),
+        ),
+        (
+            "/public/static/public.js".to_owned(),
+            "/static/public.js".to_owned(),
+        ),
+        (
+            "/public/static/htmx.min.js".to_owned(),
+            "/static/htmx.min.js".to_owned(),
+        ),
+        (
+            "/public/static/og-default.png".to_owned(),
+            "/static/og-default.png".to_owned(),
+        ),
+    ] {
+        let r = h.get(&old).await?;
+        if r.status != 301
+            || r.header("location").as_deref() != Some(new.as_str())
+            || r.header("cache-control").as_deref() != Some("public, max-age=3600")
+        {
+            bad.push(format!(
+                "{old}: {} → {:?} {:?}",
+                r.status,
+                r.header("location"),
+                r.header("cache-control")
+            ));
+        }
+    }
+    c.check(
+        "the old /public addresses of the home, search, account and list pages and of the four assets answer 301 to the new address, query kept, public, max-age=3600",
+        bad.is_empty(),
+        bad.join("; "),
+    );
     // The withdrawn paths.
     let other = h.get("/public/nothing/here").await?;
     let mut bad = Vec::new();
     for p in [
         "/public/about".to_owned(),
-        format!("{}/history", path_did(&w.s)),
-        format!("{}/history?hb=AAAA", path_did(&w.s)),
-        format!("{}/history", w.list),
-        format!("{}/history", path_did(&w.unknown)),
+        format!("/public{}/history", path_did(&w.s)),
+        format!("/public{}/history?hb=AAAA", path_did(&w.s)),
+        format!("/public{}/history", w.list),
+        format!("/public{}/history", path_did(&w.unknown)),
+        // The old card address is not redirected: the script takes no
+        // redirected card.
+        format!("/public/card/{}", w.s),
     ] {
         for r in [h.get(&p).await?, h.admin_get(&p).await?] {
             if r.status != 404
@@ -1318,25 +1444,48 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
         }
     }
     c.check(
-        "/public/about and both public history paths answer the 404 page any unknown /public/… path gets — no-store, no redirect, with or without an admin session",
+        "/public/about, both old public history paths and the old card path answer the 404 page any unknown /public/… path gets — no-store, no redirect, with or without an admin session",
         bad.is_empty() && other.status == 404 && other.text.contains("There is no page at this address."),
+        bad.join("; "),
+    );
+    // Outside /public an unknown path is the bare 404, public UI or not.
+    let unknown = h.get("/no-such-route").await?;
+    let mut bad = Vec::new();
+    for p in [
+        "/about".to_owned(),
+        "/nonsense".to_owned(),
+        format!("{}/history", path_did(&w.s)),
+        format!("{}/history", w.list),
+    ] {
+        let r = h.get(&p).await?;
+        if r.status != 404
+            || r.text != unknown.text
+            || r.header("cache-control") != unknown.header("cache-control")
+            || r.header("content-security-policy").is_some()
+        {
+            bad.push(format!("{p}: {}", support::truncate(&r.short(), 80)));
+        }
+    }
+    c.check(
+        "an unknown root path — /about, a history path under an account or list page — is the bare 404 with the public UI on, not the public not-found page",
+        bad.is_empty() && unknown.status == 404 && unknown.text == "not found",
         bad.join("; "),
     );
     let mut bad = Vec::new();
     let long = "a".repeat(600);
     for p in [
-        "/public/did/not-a-did".to_owned(),
-        "/public/did/alice.example".to_owned(),
-        "/public/did/did:plc:short".to_owned(),
-        format!("/public/did/did:web:{long}.example"),
-        format!("/public/list/{}/bad%20key", w.o1),
-        format!("/public/list/alice.example/{LIST}"),
+        "/did/not-a-did".to_owned(),
+        "/did/alice.example".to_owned(),
+        "/did/did:plc:short".to_owned(),
+        format!("/did/did:web:{long}.example"),
+        format!("/list/{}/bad%20key", w.o1),
+        format!("/list/alice.example/{LIST}"),
         format!("{}?bc=!!!", path_did(&w.s)),
         format!("{}?nc=bm9wZQ", path_did(&w.s)),
         format!("{}?lc=!!!", w.list),
-        format!("/public/search?q={long}"),
-        "/public/card/alice.example".to_owned(),
-        "/public/card/did:plc:short".to_owned(),
+        format!("/search?q={long}"),
+        "/card/alice.example".to_owned(),
+        "/card/did:plc:short".to_owned(),
     ] {
         let r = h.get(&p).await?;
         if r.status != 400 || r.header("cache-control").as_deref() != Some("no-store") {
@@ -1372,7 +1521,7 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
             && actors_before == h.n("SELECT count(*) FROM actors").await?,
         u.short(),
     );
-    let ul = h.get(&format!("/public/list/{}/nosuchlist", w.o1)).await?;
+    let ul = h.get(&format!("/list/{}/nosuchlist", w.o1)).await?;
     c.check(
         "an unknown list ⇒ 404 page saying this instance has no record of it, with no link to a history page",
         ul.status == 404
@@ -1433,7 +1582,7 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     c.check(
         "a row names the account as a link to its page whose title is the DID and which carries its card address; with no handle cached it shows the DID",
         sec.contains(&format!(
-            "<span class=\"who-wrap\"><a class=\"who\" href=\"/public/did/{first}\" title=\"{first}\" data-card=\"/public/card/{first}\"><code>{first}</code></a></span>"
+            "<span class=\"who-wrap\"><a class=\"who\" href=\"/did/{first}\" title=\"{first}\" data-card=\"/card/{first}\"><code>{first}</code></a></span>"
         )),
         first,
     );
@@ -1464,7 +1613,7 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
             "<td class=\"num\" title=\"listblock records\">{stored_count}</td>"
         )) && !lists.contains("listblocks</td>")
             && lists.contains(&format!("href=\"{}\"", w.list))
-            && lists.contains(&format!("data-card=\"/public/card/{}\"", w.o1))
+            && lists.contains(&format!("data-card=\"/card/{}\"", w.o1))
             && !lists.contains("hiddenowned"),
         format!("counter {stored_count}; {}", support::truncate(lists, 160)),
     );
@@ -1581,7 +1730,7 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
             false,
         ),
     ] {
-        let r = h.get(&format!("/public/list/{}/{rkey}", w.o2)).await?;
+        let r = h.get(&format!("/list/{}/{rkey}", w.o2)).await?;
         let has = section(&r.text, "members").is_some();
         let nav_has = r.text.contains("<a href=\"#members\">Members</a>");
         if r.status != 200
@@ -1593,7 +1742,7 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
             bad.push(format!("{rkey}: {} members={has} nav={nav_has}", r.status));
         }
     }
-    let capped = h.get(&format!("/public/list/{}/st-capped", w.o2)).await?;
+    let capped = h.get(&format!("/list/{}/st-capped", w.o2)).await?;
     c.check(
         "each getListMembers state keeps its wording; the Members section and its nav link only for ready and retained; a capped list says so",
         bad.is_empty()
@@ -1663,7 +1812,7 @@ async fn check_search(c: &mut Checks, h: &H, live: Option<&H>, w: &World) -> Res
     ];
     let mut bad = Vec::new();
     for (q, want) in &cases {
-        let r = h.get(&format!("/public/search?q={}", enc(q))).await?;
+        let r = h.get(&format!("/search?q={}", enc(q))).await?;
         if r.status != 303
             || r.header("location").as_deref() != Some(want.as_str())
             || r.header("cache-control").as_deref() != Some("no-store")
@@ -1689,7 +1838,7 @@ async fn check_search(c: &mut Checks, h: &H, live: Option<&H>, w: &World) -> Res
         "not a handle".to_owned(),
         String::new(),
     ] {
-        let r = h.get(&format!("/public/search?q={}", enc(&q))).await?;
+        let r = h.get(&format!("/search?q={}", enc(&q))).await?;
         if r.status != 400 || r.elapsed > Duration::from_secs(2) {
             bad.push(format!("{q}: {} in {:?}", r.status, r.elapsed));
         }
@@ -1701,7 +1850,7 @@ async fn check_search(c: &mut Checks, h: &H, live: Option<&H>, w: &World) -> Res
     );
     let only = h
         .get(&format!(
-            "/public/search?q={}",
+            "/search?q={}",
             enc(&format!("at://{}/app.bsky.feed.post/3k", w.s))
         ))
         .await?;
@@ -1711,7 +1860,7 @@ async fn check_search(c: &mut Checks, h: &H, live: Option<&H>, w: &World) -> Res
             .contains("Only accounts and lists can be looked up."),
         support::truncate(&only.text, 100),
     );
-    let fail = h.get("/public/search?q=no-such-handle.invalid").await?;
+    let fail = h.get("/search?q=no-such-handle.invalid").await?;
     c.check(
         "a handle that does not resolve ⇒ the 404 search page suggesting a retry or the DID, no-store, noindex",
         fail.status == 404
@@ -1728,7 +1877,7 @@ async fn check_search(c: &mut Checks, h: &H, live: Option<&H>, w: &World) -> Res
             "--skip-live",
         ),
         Some(l) => {
-            let r = l.get(&format!("/public/search?q={LIVE_HANDLE}")).await?;
+            let r = l.get(&format!("/search?q={LIVE_HANDLE}")).await?;
             let want = path_did(LIVE_DID);
             if r.status == 303 && r.header("location").as_deref() == Some(want.as_str()) {
                 c.check("a real handle (DNS / well-known, through the safe client) redirects to its DID page", true, want);
@@ -1770,7 +1919,7 @@ async fn check_coverage(
     let q = |d: &str| format!("actor={}", enc(d));
     let page = h.get(&path_did(&w.s)).await?;
     let lp = h.get(&w.list).await?;
-    let home = h.get("/public").await?;
+    let home = h.get("/").await?;
     let found: Vec<&str> = [&page, &lp, &home]
         .iter()
         .flat_map(|r| coverage_words_in(&r.text))
@@ -1820,7 +1969,7 @@ async fn check_coverage(
     let blocks = h.xrpc("query.getIncomingBlocks", &q(&w.s)).await?;
     let naming = h.xrpc("query.getListsNaming", &q(&w.s)).await?;
     let stats = h.xrpc("query.getStats", "").await?;
-    let home = h.get("/public").await?;
+    let home = h.get("/").await?;
     let api_min = [&blocks, &naming]
         .iter()
         .filter_map(|v| v["freshness"]["indexedAt"].as_str().and_then(secs))
@@ -1952,9 +2101,15 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
         {
             bad.push(format!("{p}: {}", r.short()));
         }
+        // The tables' "Next" links are fetched by htmx, which would swap
+        // in whatever a redirect leads to.
+        let hx = h.get_with(&h.fresh(), p, &[("hx-request", "true")]).await?;
+        if hx.status != 404 || hx.text != "not found" || hx.header("location").is_some() {
+            bad.push(format!("{p} (HX-Request): {}", hx.short()));
+        }
     }
     c.check(
-        "the admin history routes need a session: without one they redirect to /enter like every admin page and show nothing",
+        "the admin history routes need a session: without one they redirect to /enter like every admin page and show nothing; a request made by htmx gets the bare 404 instead",
         bad.is_empty(),
         bad.join("; "),
     );
@@ -1963,7 +2118,9 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
         "a logged-in admin gets the account's history page, in the admin layout, never cached",
         page.status == 200
             && page.header("cache-control").as_deref() == Some("no-store, private")
-            && page.text.contains("<a href=\"/settings\">Settings</a>")
+            && page
+                .text
+                .contains("<a href=\"/admin/settings\">Settings</a>")
             && page
                 .text
                 .contains(&format!("Removed records naming <code>{}</code>", w.s))
@@ -2034,9 +2191,14 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
         support::truncate(lim, 160),
     );
     c.check(
-        "rows link into the admin UI (the lookup pages), not to /public",
-        page.text.contains("href=\"/lookup/did?q=did%3Aplc%3A")
-            && page.text.contains("href=\"/lookup/list?q=at%3A%2F%2F")
+        "rows link into the admin UI (the lookup pages), not to the public pages",
+        page.text
+            .contains("href=\"/admin/lookup/did?q=did%3Aplc%3A")
+            && page
+                .text
+                .contains("href=\"/admin/lookup/list?q=at%3A%2F%2F")
+            && !page.text.contains("href=\"/did/")
+            && !page.text.contains("href=\"/list/")
             && !page.text.contains("href=\"/public"),
         "lookup links",
     );
@@ -2108,25 +2270,32 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
         bad.join("; "),
     );
 
-    // Reaching them: links on the lookup pages, for a session only.
-    let did_lookup = format!("/lookup/did?q={}", enc(&w.s));
+    // Reaching them: links on the lookup pages, which need a session.
+    let did_lookup = format!("/admin/lookup/did?q={}", enc(&w.s));
     let list_lookup = format!(
-        "/lookup/list?q={}",
+        "/admin/lookup/list?q={}",
         enc(&format!("at://{}/app.bsky.graph.list/{LIST}", w.o1))
     );
     let with = h.admin_get(&did_lookup).await?;
     let without = h.get(&did_lookup).await?;
     let lwith = h.admin_get(&list_lookup).await?;
     let lwithout = h.get(&list_lookup).await?;
+    let to_enter = |r: &Resp| {
+        r.status == 303
+            && r.header("location").as_deref() == Some("/enter")
+            && !r.text.contains("/history")
+            && !r.text.contains("did:plc:")
+    };
     c.check(
-        "the DID and list lookup pages link to \"View history\" for a logged-in admin, and not otherwise",
+        "the DID and list lookup pages link to \"View history\" for a logged-in admin; without a session there is no lookup page, only the redirect to /enter",
         with.text.contains(&format!("<a href=\"{base}\">View history</a>"))
             && lwith.text.contains(&format!("<a href=\"{lbase}\">View history</a>"))
-            && without.status == 200
-            && !without.text.contains("/history")
-            && lwithout.status == 200
-            && !lwithout.text.contains("/history"),
-        format!("{} / {}", with.status, lwith.status),
+            && to_enter(&without)
+            && to_enter(&lwithout),
+        format!(
+            "{} / {}; without a session {} / {}",
+            with.status, lwith.status, without.status, lwithout.status
+        ),
     );
 
     // The storage queries directly: the two no page uses, too.
@@ -2268,14 +2437,14 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
     );
     let (rows, _) = admin_walk(h, &format!("/admin/did/{}/history", w.s), "removed-blocks").await?;
     c.check(
-        "excluded_dids governs /public/* only: the admin history page still shows the excluded account's removed block",
+        "excluded_dids governs the public pages only: the admin history page still shows the excluded account's removed block",
         rows.contains(&w.e),
         format!("{} rows", rows.len()),
     );
 
     c.section("8. withheld unification");
     let e_page = h.get(&path_did(&w.e)).await?;
-    let e_list = h.get(&format!("/public/list/{}/excluded", w.e)).await?;
+    let e_list = h.get(&format!("/list/{}/excluded", w.e)).await?;
     let only_notice = |name: &str, r: &Resp, notice: &str| -> Vec<String> {
         [
             ("status 200", r.status == 200),
@@ -2284,7 +2453,7 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
             ("no section", !r.text.contains("<section")),
             (
                 "no link to a data page",
-                !r.text.contains("href=\"/public/did/") && !r.text.contains("href=\"/public/list/"),
+                !r.text.contains("href=\"/did/") && !r.text.contains("href=\"/list/"),
             ),
             ("no table", !r.text.contains("<table")),
             (
@@ -2330,9 +2499,7 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
             if ok { "identical" } else { "DIFFERS" }
         ));
     }
-    let hl = h
-        .get(&format!("/public/list/{}/hiddenowned", w.hidden[1]))
-        .await?;
+    let hl = h.get(&format!("/list/{}/hiddenowned", w.hidden[1])).await?;
     identical &= canon(&hl.text, &w.hidden[1]).replace("hiddenowned", "L")
         == canon(&e_list.text, &w.e).replace("excluded", "L");
     c.check(
@@ -2341,12 +2508,12 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
         detail.join(", "),
     );
     // Cards: one 404 for every account this instance does not show.
-    let unknown = h.get(&format!("/public/card/{}", w.unknown)).await?;
+    let unknown = h.get(&format!("/card/{}", w.unknown)).await?;
     let mut same = unknown.status == 404
         && unknown.header("cache-control").as_deref() == Some("no-store")
         && !unknown.text.contains("did:");
     for d in w.hidden.iter().chain([&w.e]) {
-        let r = h.get(&format!("/public/card/{d}")).await?;
+        let r = h.get(&format!("/card/{d}")).await?;
         same &= r.status == 404
             && r.text == unknown.text
             && r.header("cache-control") == unknown.header("cache-control")
@@ -2386,7 +2553,7 @@ async fn check_opengraph(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Str
         .get_with(&h.fresh(), &path_did(&w.s), &[("host", "evil.example")])
         .await?;
     let want_url = format!("https://{HOSTNAME}{}", path_did(&w.s));
-    let image = format!("https://{HOSTNAME}/public/static/og-default.png");
+    let image = format!("https://{HOSTNAME}/static/og-default.png");
     let site = format!("Farsight at {HOSTNAME}");
     c.check(
         "text tags present; og:url and og:image come from server.hostname, not the Host header",
@@ -2437,25 +2604,25 @@ async fn check_cache_and_headers(c: &mut Checks, h: &H, w: &World) -> Result<(),
     c.section("11. cache and security headers");
     let mut bad = Vec::new();
     for (p, want) in [
-        ("/public".to_owned(), "public, max-age=60"),
+        ("/".to_owned(), "public, max-age=60"),
         (path_did(&w.s), "public, max-age=30"),
         (w.list.clone(), "public, max-age=30"),
-        (format!("/public/search?q={}", w.s), "no-store"),
-        ("/public/search?q=".to_owned(), "no-store"),
-        ("/public/did/nope".to_owned(), "no-store"),
+        (format!("/search?q={}", w.s), "no-store"),
+        ("/search?q=".to_owned(), "no-store"),
+        ("/did/nope".to_owned(), "no-store"),
         ("/public/nothing".to_owned(), "no-store"),
         ("/public/about".to_owned(), "no-store"),
-        (format!("{}/history", path_did(&w.s)), "no-store"),
+        (format!("/public{}/history", path_did(&w.s)), "no-store"),
         // A card whose fetch failed (the harness's PLC is unreachable).
-        (format!("/public/card/{}", w.s), "no-store"),
-        (format!("/public/card/{}", w.unknown), "no-store"),
+        (format!("/card/{}", w.s), "no-store"),
+        (format!("/card/{}", w.unknown), "no-store"),
         ("/robots.txt".to_owned(), "public, max-age=300"),
     ] {
         let r = h.get(&p).await?;
         if r.header("cache-control").as_deref() != Some(want) {
             bad.push(format!("{p}: {:?}", r.header("cache-control")));
         }
-        if p.starts_with("/public")
+        if is_public(&p)
             && (r.header("content-security-policy").as_deref() != Some(CSP_AVATARS)
                 || r.header("x-content-type-options").as_deref() != Some("nosniff")
                 || r.header("referrer-policy").as_deref() != Some("same-origin")
@@ -2522,11 +2689,11 @@ async fn check_independence(c: &mut Checks, h: &H, w: &World) -> Result<(), Stri
 async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> {
     c.section("12. each public_ui key, without restart");
     // dark_mode_default
-    let sys = h.get("/public").await?;
+    let sys = h.get("/").await?;
     h.set(&[("dark_mode_default", Some("dark"))]).await?;
-    let dark = h.get("/public").await?;
+    let dark = h.get("/").await?;
     h.set(&[("dark_mode_default", Some("light"))]).await?;
-    let light = h.get("/public").await?;
+    let light = h.get("/").await?;
     h.set(&[("dark_mode_default", Some("system"))]).await?;
     c.check(
         "dark_mode_default sets the initial data-theme on <html>: none for system, dark, light",
@@ -2540,8 +2707,8 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
                 .contains("<html lang=\"en\" data-theme=\"light\" data-theme-default=\"light\">"),
         "three values",
     );
-    let css = h.get("/public/static/public.css").await?;
-    let js = h.get("/public/static/public.js").await?;
+    let css = h.get("/static/public.css").await?;
+    let js = h.get("/static/public.js").await?;
     let toggle = between(&sys.text, "<div class=\"theme-toggle\"", "</div>");
     c.check(
         "the toggle is in the bar: three labelled buttons (light, dark, system), hidden until the script shows it",
@@ -2578,7 +2745,7 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
         "css rules",
     );
     // instance_description, contact
-    let default = h.get("/public").await?;
+    let default = h.get("/").await?;
     h.set(&[
         (
             "instance_description",
@@ -2587,7 +2754,7 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
         ("contact", Some("mailto:public@farsight.test")),
     ])
     .await?;
-    let custom = h.get("/public").await?;
+    let custom = h.get("/").await?;
     let account = h.get(&path_did(&w.s)).await?;
     c.check(
         "instance_description (escaped plain text, blank line = paragraph) and contact replace the defaults on home; the contact is on home only",
@@ -2604,9 +2771,9 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
     c.check(
         "home: instance name, the description, the contact, a search form and the Last updated line; no link to About",
         custom.text.contains(&format!("<h1>Farsight at {HOSTNAME}</h1>"))
-            && custom.text.matches("action=\"/public/search\"").count() == 2
+            && custom.text.matches("action=\"/search\"").count() == 2
             && updated_of(&custom.text).is_some()
-            && !custom.text.contains("/public/about")
+            && !custom.text.contains("/about")
             && !custom.text.contains("Instance-wide"),
         "home",
     );
@@ -2632,22 +2799,21 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
         "crawlable = false: Disallow: / and noindex on every page",
         robots.text == "User-agent: *\nDisallow: /\n"
             && page.header("x-robots-tag").as_deref() == Some("noindex, nofollow")
-            && h.get("/public").await?.header("x-robots-tag").as_deref()
-                == Some("noindex, nofollow"),
+            && h.get("/").await?.header("x-robots-tag").as_deref() == Some("noindex, nofollow"),
         robots.text.replace('\n', " / "),
     );
     h.set(&[("crawlable", Some("on"))]).await?;
     let robots = h.get("/robots.txt").await?;
     let mut bad = Vec::new();
     for (p, indexable) in [
-        ("/public".to_owned(), true),
+        ("/".to_owned(), true),
         (path_did(&w.s), true),
         (w.list.clone(), true),
-        (format!("/public/card/{}", w.s), false),
-        (format!("{}/history", path_did(&w.s)), false),
+        (format!("/card/{}", w.s), false),
+        (format!("/public{}/history", path_did(&w.s)), false),
         ("/public/about".to_owned(), false),
-        (format!("/public/search?q={}", w.s), false),
-        ("/public/did/nope".to_owned(), false),
+        (format!("/search?q={}", w.s), false),
+        ("/did/nope".to_owned(), false),
         (path_did(&w.e), false),
     ] {
         let r = h.get(&p).await?;
@@ -2657,9 +2823,9 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
         }
     }
     c.check(
-        "crawlable = true: robots.txt allows /public but not search or cards, the narrower rules first; cards, search, error and withheld pages stay noindex",
+        "crawlable = true: robots.txt keeps crawlers out of the admin UI, sign-in, the wizard, the API, search and cards (their old addresses too) and the health endpoints, and allows the rest; cards, search, error and withheld pages stay noindex",
         robots.text
-            == "User-agent: *\nDisallow: /public/search\nDisallow: /public/card\nAllow: /public\nDisallow: /\n"
+            == "User-agent: *\nDisallow: /admin\nDisallow: /enter\nDisallow: /setup\nDisallow: /xrpc/\nDisallow: /search\nDisallow: /card/\nDisallow: /public/search\nDisallow: /public/card/\nDisallow: /health\nDisallow: /livez\nAllow: /\n"
             && bad.is_empty(),
         if bad.is_empty() { robots.text.replace('\n', " / ") } else { bad.join("; ") },
     );
@@ -2674,12 +2840,13 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
 
 // ------------------------------------------------------ 15. record links
 
-/// The Record cells of a section, in row order.
+/// The Record cells of a lookup page, in row order: the second cell of
+/// each row of a table that has one (account, record, time, first seen).
 fn record_cells(sec: &str) -> Vec<&str> {
     let mut out = Vec::new();
     for row in between(sec, "<tr><td>", "</tr>") {
         let cells: Vec<&str> = row.split("</td><td>").collect();
-        if cells.len() == 3 {
+        if cells.len() == 4 && cells[1].contains("class=\"record\"") {
             out.push(cells[1]);
         }
     }
@@ -2698,7 +2865,8 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
             w.o1
         ))
         .await?;
-    // What the lookup pages list: incoming blocks without hidden blockers
+    // What the lookup pages (read with the admin session: there is no
+    // anonymous lookup) list: incoming blocks without hidden blockers
     // (as the API), every listblock and every item of the list.
     let incoming = h
         .strings(&format!(
@@ -2715,9 +2883,9 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
             w.o1
         ))
         .await?;
-    let did_lookup = format!("/lookup/did?q={}", enc(&w.s));
+    let did_lookup = format!("/admin/lookup/did?q={}", enc(&w.s));
     let list_lookup = format!(
-        "/lookup/list?q={}",
+        "/admin/lookup/list?q={}",
         enc(&format!("at://{}/app.bsky.graph.list/{LIST}", w.o1))
     );
     let heads = |html: &str, id: &str| -> Vec<String> {
@@ -2778,8 +2946,8 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
         public_clean(&page, &lp),
         format!("{:?}", heads(&page.text, "blockers")),
     );
-    let dl = h.get(&did_lookup).await?;
-    let ll = h.get(&list_lookup).await?;
+    let dl = h.admin_get(&did_lookup).await?;
+    let ll = h.admin_get(&list_lookup).await?;
     let (b, l) = (cells(&dl.text), cells(&ll.text));
     c.check(
         "record_viewer_url empty: on the lookup pages every record cell is the stored record's at-uri as plain text — no link anywhere",
@@ -2806,8 +2974,8 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
         banner(&refused.text),
     );
     h.set(&[("record_viewer_url", Some(VIEWER))]).await?;
-    let dl = h.get(&did_lookup).await?;
-    let ll = h.get(&list_lookup).await?;
+    let dl = h.admin_get(&did_lookup).await?;
+    let ll = h.admin_get(&list_lookup).await?;
     let (b, l) = (cells(&dl.text), cells(&ll.text));
     c.check(
         "record_viewer_url set, without restart: on the lookup pages every record cell is a link built from the template with the record's authority, collection and rkey, opening in a new tab with rel=noopener noreferrer nofollow, its text the at-uri",
@@ -2823,10 +2991,10 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
     let outside: Vec<String> = hrefs(&page.text)
         .into_iter()
         .chain(hrefs(&lp.text))
-        .filter(|x| !(x.starts_with("/public") || x.starts_with('#')))
+        .filter(|x| !own_href(x))
         .collect();
     c.check(
-        "with a viewer set the public pages are unchanged: no Record column, and no link to anywhere outside /public",
+        "with a viewer set the public pages are unchanged: no Record column, and no link to anywhere outside the public UI",
         public_clean(&page, &lp) && outside.is_empty(),
         format!("{outside:?}"),
     );
@@ -2835,7 +3003,7 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
         ("show_outgoing_blocks", None),
     ])
     .await?;
-    let dl = h.get(&did_lookup).await?;
+    let dl = h.admin_get(&did_lookup).await?;
     c.check(
         "record_viewer_url emptied again: plain text again",
         cells(&dl.text).iter().all(|x| plain(x, &incoming)),
@@ -2861,7 +3029,7 @@ async fn check_cards(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String>
     tokio::time::sleep(Duration::from_secs(3)).await;
     let m0 = h.metrics_text().await?;
     let target = did("blk", 7);
-    let r = h.get(&format!("/public/card/{target}")).await?;
+    let r = h.get(&format!("/card/{target}")).await?;
     let m1 = h.metrics_text().await?;
     c.check(
         "the card is an HTML fragment: no document, no bar, no footer, no preview tags; never indexed",
@@ -2889,8 +3057,8 @@ async fn check_cards(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String>
     );
     // Nothing is fetched for an account this instance does not hold or
     // does not show.
-    let unknown = h.get(&format!("/public/card/{}", w.unknown)).await?;
-    let hidden = h.get(&format!("/public/card/{}", w.hidden[0])).await?;
+    let unknown = h.get(&format!("/card/{}", w.unknown)).await?;
+    let hidden = h.get(&format!("/card/{}", w.hidden[0])).await?;
     let m2 = h.metrics_text().await?;
     let total = |t: &str| {
         [
@@ -2921,10 +3089,7 @@ async fn check_cards(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String>
     let before = h.metrics_text().await?;
     let mut tasks = Vec::new();
     for i in 1..=16u64 {
-        let (http, url) = (
-            h.fresh(),
-            format!("{}/public/card/{}", h.base, did("mem", i)),
-        );
+        let (http, url) = (h.fresh(), format!("{}/card/{}", h.base, did("mem", i)));
         tasks.push(tokio::spawn(async move { http.get(&url, &[]).await }));
     }
     let mut fetched = 0;
@@ -2957,7 +3122,7 @@ async fn check_cards(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String>
     tokio::time::sleep(Duration::from_secs(3)).await;
     let mut kinds = Vec::new();
     for i in 20..=25u64 {
-        let r = h.get(&format!("/public/card/{}", did("mem", i))).await?;
+        let r = h.get(&format!("/card/{}", did("mem", i))).await?;
         kinds.push(if r.text.contains("<dt>DID created</dt>") {
             'f'
         } else {
@@ -2989,14 +3154,14 @@ async fn check_cards(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String>
     let mut limited = None;
     for _ in 0..26 {
         let r = h
-            .get_with(&one, &format!("/public/card/{}", w.unknown), &[])
+            .get_with(&one, &format!("/card/{}", w.unknown), &[])
             .await?;
         codes.push(r.status);
         if r.status == 429 {
             limited = Some(r);
         }
     }
-    let elsewhere = h.get(&format!("/public/card/{}", w.unknown)).await?;
+    let elsewhere = h.get(&format!("/card/{}", w.unknown)).await?;
     let after = h.metrics_text().await?;
     let class = |t: &str| {
         metric(
@@ -3065,7 +3230,7 @@ async fn check_cards_live(c: &mut Checks, l: &mut H, w: &World) -> Result<(), St
     };
     tokio::time::sleep(Duration::from_secs(3)).await;
     let m0 = l.metrics_text().await?;
-    let r = l.get(&format!("/public/card/{LIVE_DID}")).await?;
+    let r = l.get(&format!("/card/{LIVE_DID}")).await?;
     let m1 = l.metrics_text().await?;
     let img = between(&r.text, "<img class=\"pc-avatar\" src=\"", "\"")
         .first()
@@ -3120,12 +3285,12 @@ async fn check_cards_live(c: &mut Checks, l: &mut H, w: &World) -> Result<(), St
     c.check(
         "the card's verification filled the handle cache: the row now shows @handle alone, as a link whose title is the DID",
         row_page.text.contains(&format!(
-            "<a class=\"who\" href=\"/public/did/{LIVE_DID}\" title=\"{LIVE_DID}\" data-card=\"/public/card/{LIVE_DID}\">@{LIVE_HANDLE}</a>"
+            "<a class=\"who\" href=\"/did/{LIVE_DID}\" title=\"{LIVE_DID}\" data-card=\"/card/{LIVE_DID}\">@{LIVE_HANDLE}</a>"
         )),
         "row",
     );
     l.set(&[("show_avatars", None)]).await?;
-    let off = l.get(&format!("/public/card/{LIVE_DID}")).await?;
+    let off = l.get(&format!("/card/{LIVE_DID}")).await?;
     let m2 = l.metrics_text().await?;
     c.check(
         "show_avatars = false, without restart: the card has no image and no placeholder, keeps the handle, DID and date, and is counted avatars_disabled; the CSP allows no foreign image",
@@ -3142,7 +3307,7 @@ async fn check_cards_live(c: &mut Checks, l: &mut H, w: &World) -> Result<(), St
     l.set(&[("show_avatars", Some("on"))]).await?;
 
     // did:web: no creation date to read.
-    let web = l.get(&format!("/public/card/{WEB_DID}")).await?;
+    let web = l.get(&format!("/card/{WEB_DID}")).await?;
     let m3 = l.metrics_text().await?;
     c.check(
         "a did:web account's card says the creation date is unknown and has no age (here the host does not exist: the document cannot be read, outcome pds_failed, not cached)",
@@ -3169,7 +3334,7 @@ async fn check_cards_live(c: &mut Checks, l: &mut H, w: &World) -> Result<(), St
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
     let m4 = l.metrics_text().await?;
-    let r = l.get(&format!("/public/card/{}", did("blk", 9))).await?;
+    let r = l.get(&format!("/card/{}", did("blk", 9))).await?;
     let m5 = l.metrics_text().await?;
     let text_ok = r.status == 200
         && r.text.contains("<dt>DID created</dt><dd>unavailable</dd>")
@@ -3254,7 +3419,7 @@ async fn check_limits(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String
     let mut codes = Vec::new();
     for _ in 0..8 {
         codes.push(
-            h.get_with(&one, &format!("/public/search?q={}", w.s), &[])
+            h.get_with(&one, &format!("/search?q={}", w.s), &[])
                 .await?
                 .status,
         );
@@ -3267,7 +3432,7 @@ async fn check_limits(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String
     let one = h.fresh();
     let mut codes = Vec::new();
     for _ in 0..12 {
-        codes.push(h.get_with(&one, "/public", &[]).await?.status);
+        codes.push(h.get_with(&one, "/", &[]).await?.status);
     }
     c.check(
         "home is on the public_ui class (12 quick views pass at burst 20)",
@@ -3468,7 +3633,7 @@ async fn check_settings_refusals(c: &mut Checks, h: &mut H) -> Result<(), String
         let r = h
             .admin
             .post_form(
-                &format!("{}/settings", h.base),
+                &format!("{}/admin/settings", h.base),
                 &[("cookie", &h.cookie)],
                 &[("csrf", h.csrf.as_str()), ("config", text.as_str())],
             )
@@ -3481,8 +3646,8 @@ async fn check_settings_refusals(c: &mut Checks, h: &mut H) -> Result<(), String
         }
     }
     c.check(
-        "changing reads while the public UI is on is rejected with a message naming the key; nothing is written (the ui mode is free: stage 7)",
-        bad.is_empty() && h.get("/public").await?.status == 200 && before.contains("public_ui = true"),
+        "changing reads while the public UI is on is rejected with a message naming the key; nothing is written",
+        bad.is_empty() && h.get("/").await?.status == 200 && before.contains("public_ui = true"),
         bad.join("; "),
     );
     Ok(())
@@ -3494,8 +3659,8 @@ async fn check_off_and_raw_editor(c: &mut Checks, h: &mut H, w: &World) -> Resul
     let off = h.get(&path_did(&w.s)).await?;
     let unknown = h.get("/no-such-route").await?;
     c.check(
-        "toggled off from admin: /public/* is 404 again, like any unknown route, without restart",
-        off.status == 404 && off.text == unknown.text && h.get("/public").await?.status == 404,
+        "toggled off from admin: the public pages are 404 again, like any unknown route, and / is the redirect to /admin, without restart",
+        off.status == 404 && off.text == unknown.text && h.get("/").await?.status == 303,
         off.short(),
     );
     let path = h.config_path.clone();
@@ -3503,7 +3668,7 @@ async fn check_off_and_raw_editor(c: &mut Checks, h: &mut H, w: &World) -> Resul
     let r = h
         .admin
         .post_form(
-            &format!("{}/settings", h.base),
+            &format!("{}/admin/settings", h.base),
             &[("cookie", &h.cookie)],
             &[
                 ("csrf", h.csrf.as_str()),
@@ -3518,14 +3683,14 @@ async fn check_off_and_raw_editor(c: &mut Checks, h: &mut H, w: &World) -> Resul
     let token = confirm_token(&r.text);
     c.check(
         "the raw config editor cannot turn the public UI on without the same confirmation",
-        token.is_some() && h.get("/public").await?.status == 404,
+        token.is_some() && h.get("/").await?.status == 303,
         support::truncate(&r.text, 120),
     );
     if let Some(t) = token {
         let done = h.confirm(&t).await?;
         c.check(
             "…and the confirmation commits the edited file",
-            done.text.contains("Saved.") && h.get("/public").await?.status == 200,
+            done.text.contains("Saved.") && h.get("/").await?.status == 200,
             banner(&done.text),
         );
         h.form.insert("enabled", "on".to_owned());
@@ -3610,18 +3775,14 @@ async fn check_metrics(c: &mut Checks, h: &H) -> Result<(), String> {
 fn check_page_rules(c: &mut Checks, h: &H) {
     c.section("17. rules every page keeps");
     let pages = h.pages.lock().unwrap_or_else(|e| e.into_inner());
-    let public: Vec<&(String, String)> = pages
-        .iter()
-        .filter(|(p, _)| p.starts_with("/public"))
-        .collect();
+    let public: Vec<&(String, String)> = pages.iter().filter(|(p, _)| is_public(p)).collect();
     let documents: Vec<&&(String, String)> =
         public.iter().filter(|(_, t)| t.contains("<html")).collect();
     let mut inline = Vec::new();
     for (path, html) in &public {
         let scripts = between(html, "<script", ">");
         let external = scripts.iter().all(|s| {
-            s.starts_with(" src=\"/public/static/")
-                && (s.ends_with(".js\"") || s.ends_with(".js\" defer"))
+            s.starts_with(" src=\"/static/") && (s.ends_with(".js\"") || s.ends_with(".js\" defer"))
         });
         let handlers = [
             " onclick=",
@@ -3638,7 +3799,7 @@ fn check_page_rules(c: &mut Checks, h: &H) {
         }
     }
     c.check(
-        "no inline script, handler or style on any public response: every <script> loads /public/static/*.js",
+        "no inline script, handler or style on any public response: every <script> loads /static/*.js",
         inline.is_empty() && public.len() > 100,
         format!("{} responses scanned; offenders: {inline:?}", public.len()),
     );
@@ -3646,9 +3807,9 @@ fn check_page_rules(c: &mut Checks, h: &H) {
     for (path, html) in &documents {
         let nav = between(html, "<nav class=\"public-nav\"", "</nav>");
         let ok = nav.len() == 1
-            && nav[0].contains("<a class=\"brand\" href=\"/public\">Farsight</a>")
+            && nav[0].contains("<a class=\"brand\" href=\"/\">Farsight</a>")
             && nav[0].contains(
-                "<form class=\"search\" action=\"/public/search\" method=\"get\" role=\"search\">",
+                "<form class=\"search\" action=\"/search\" method=\"get\" role=\"search\">",
             )
             && nav[0].contains("<input type=\"search\" name=\"q\"")
             && !nav[0].contains(" value=\"")
@@ -3658,7 +3819,7 @@ fn check_page_rules(c: &mut Checks, h: &H) {
         }
     }
     c.check(
-        "the bar is on every public page — data pages, the withheld notice, error pages: brand link to /public, a GET search form to /public/search with one empty field q, the theme toggle",
+        "the bar is on every public page — data pages, the withheld notice, error pages: brand link to /, a GET search form to /search with one empty field q, the theme toggle",
         bad.is_empty() && documents.len() > 100,
         format!("{} pages scanned; offenders: {bad:?}", documents.len()),
     );
@@ -3666,11 +3827,7 @@ fn check_page_rules(c: &mut Checks, h: &H) {
     for (path, html) in &public {
         let out: Vec<String> = hrefs(html)
             .into_iter()
-            .filter(|x| {
-                !(x.starts_with("/public")
-                    || x.starts_with('#')
-                    || x.starts_with("https://viewer.example/"))
-            })
+            .filter(|x| !(own_href(x) || x.starts_with("https://viewer.example/")))
             .collect();
         let lower = html.to_ascii_lowercase();
         let names = [
@@ -3690,7 +3847,7 @@ fn check_page_rules(c: &mut Checks, h: &H) {
         }
     }
     c.check(
-        "no link out of /public/* on any public response (the configured record viewer aside): no login link, no admin route named",
+        "no link out of the public UI on any public response (the configured record viewer aside): no login link, no admin route named",
         bad.is_empty(),
         support::truncate(&bad.join("; "), 400),
     );
@@ -3785,7 +3942,7 @@ fn check_browser(
 fn check_no_relative_time(c: &mut Checks, h: &H) {
     let pages = h.pages.lock().unwrap_or_else(|e| e.into_inner());
     let mut bad = Vec::new();
-    for (path, html) in pages.iter().filter(|(p, _)| p.starts_with("/public")) {
+    for (path, html) in pages.iter().filter(|(p, _)| is_public(p)) {
         let lower = html.to_ascii_lowercase();
         if [
             " ago",
@@ -3960,12 +4117,12 @@ async fn phase_ui(
             "== holding: {} (admin DID {ADMIN_DID}; sessions are made by the harness)",
             h.base
         );
-        println!("   account {}/public/did/{}", h.base, w.s);
+        println!("   account {}/did/{}", h.base, w.s);
         println!("   list    {}{}", h.base, w.list);
-        println!("   withheld {}/public/did/{}", h.base, w.e);
+        println!("   withheld {}/did/{}", h.base, w.e);
         println!("   history {}/admin/did/{}/history", h.base, w.s);
         if let Some((_, l)) = &live {
-            println!("   live cards {}/public/did/{}", l.base, w.card);
+            println!("   live cards {}/did/{}", l.base, w.card);
         }
         let _ = tokio::signal::ctrl_c().await;
     }

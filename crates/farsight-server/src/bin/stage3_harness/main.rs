@@ -75,7 +75,7 @@ urls = ["{firehose}"]
 
 [access]
 reads = "{reads}"
-ui = "public_read"
+admin_ui = true
 admin_did = "{ADMIN_DID}"
 
 [auth]
@@ -928,25 +928,24 @@ async fn check_rate_limits(
         false,
     )
     .await;
-    // UI lookup (anonymous, per IP): 1/s, burst 5.
-    let mut statuses = Vec::new();
-    let start = Instant::now();
+    // There is no anonymous admin lookup (UI v2.5): without a session the
+    // page is a redirect to the sign-in page, and no rate class is charged
+    // for it (`ui_lookup` is charged by public search only).
+    let mut answers = Vec::new();
     for _ in 0..8 {
         let r = ctx
             .http
             .get(
-                &format!("{base}/lookup/did?q={}", enc(&p.subject)),
+                &format!("{base}/admin/lookup/did?q={}", enc(&p.subject)),
                 &[("cf-connecting-ip", &cf_ip(20))],
             )
             .await?;
-        statuses.push(r.status);
+        answers.push((r.status, r.header("location").unwrap_or_default()));
     }
-    let ok = statuses.iter().filter(|s| **s == 200).count();
-    let max_ok = 5.0 + start.elapsed().as_secs_f64() + 1.0;
     c.check(
-        "UI lookup (anonymous): 429 at the stated threshold (burst 5, 1/s)",
-        ok >= 5 && (ok as f64) <= max_ok && statuses.contains(&429),
-        format!("{statuses:?} in {:?}", start.elapsed()),
+        "admin lookup without a session: 303 to /enter every time, never 429",
+        answers.iter().all(|(s, l)| *s == 303 && l == "/enter"),
+        format!("{answers:?}"),
     );
     // UI login: 5/min per IP.
     let mut statuses = Vec::new();
@@ -1023,7 +1022,7 @@ async fn check_rate_limits(
         cc(&r) == "no-store" && cc(&r2) == "no-store",
         format!("{} / {}", cc(&r), cc(&r2)),
     );
-    let r = ctx.http.get(&format!("{base}/ops"), &[]).await?;
+    let r = ctx.http.get(&format!("{base}/admin/ops"), &[]).await?;
     c.check(
         "UI admin page without a session ⇒ redirect to /enter",
         r.status == 303 && r.header("location").as_deref() == Some("/enter"),
@@ -1134,13 +1133,13 @@ async fn check_reset(
     let cookie = admin_session(pool, ADMIN_DID).await?;
     let page = ctx
         .http
-        .get(&format!("{base}/reset"), &[("cookie", &cookie)])
+        .get(&format!("{base}/admin/reset"), &[("cookie", &cookie)])
         .await?;
     let csrf = csrf_of(&page.text).unwrap_or_default();
     let r = ctx
         .http
         .post_form(
-            &format!("{base}/reset"),
+            &format!("{base}/admin/reset"),
             &[("cookie", &cookie)],
             &[("csrf", &csrf), ("hostname", "wrong.example")],
         )
@@ -1153,7 +1152,7 @@ async fn check_reset(
     let r = ctx
         .http
         .post_form(
-            &format!("{base}/reset"),
+            &format!("{base}/admin/reset"),
             &[("cookie", &cookie)],
             &[("csrf", "bogus"), ("hostname", HOSTNAME)],
         )
@@ -1173,7 +1172,7 @@ async fn check_reset(
     let r = ctx
         .http
         .post_form(
-            &format!("{base}/reset"),
+            &format!("{base}/admin/reset"),
             &[("cookie", &cookie)],
             &[("csrf", &csrf), ("hostname", HOSTNAME)],
         )
@@ -1891,7 +1890,13 @@ async fn phase_cloudflare(c: &mut Checks, ctx: &Ctx, pg: &Pg) -> Result<(), Stri
             "-c",
             &format!("for i in $(seq 1 30); do wget -q -O /dev/null {url} || true; done"),
         ]))?;
-        let r = ctx.http.get(&format!("{}/", server.base), &[]).await?;
+        // The dashboard needs a session.
+        let pool = pg.pool("farsight_cov", 2).await?;
+        let cookie = admin_session(&pool, ADMIN_DID).await?;
+        let r = ctx
+            .http
+            .get(&format!("{}/admin", server.base), &[("cookie", &cookie)])
+            .await?;
         c.check(
             "> 50% of 5-minute requests from untrusted Cloudflare peers ⇒ dashboard warning",
             r.text.contains("came from Cloudflare edges"),

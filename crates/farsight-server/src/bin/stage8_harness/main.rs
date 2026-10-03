@@ -9,7 +9,7 @@
 //!   through ties, index use, cursors);
 //! - 7–8: public pages (no Record column; handles after warming);
 //! - 9–15: admin pages (sticky header and cards in a browser, handles,
-//!   `/admin/card/{did}` in both `ui` modes, record cells, "First seen",
+//!   `/admin/card/{did}` with and without a session, record cells, "First seen",
 //!   the shared card budget);
 //! - 16–20: handle warming (queue, drain, cap, toggle, no duplicates);
 //! - 21–23: the index build (in the background, held by the storage
@@ -97,7 +97,6 @@ fn did_sql(prefix: &str, col: &str) -> String {
 struct Cfg<'a> {
     dsn: &'a str,
     plc: &'a str,
-    ui: &'a str,
     budget: u64,
     public_ui: &'a str,
 }
@@ -125,7 +124,7 @@ allow_http_hosts = ["{STANDIN_ADDR}"]
 
 [access]
 reads = "public"
-ui = "{}"
+admin_ui = true
 admin_did = "{ADMIN_DID}"
 public_ui = true
 
@@ -144,7 +143,6 @@ bind = "{metrics}"
         c.dsn,
         c.budget,
         c.plc,
-        c.ui,
         c.public_ui,
         farsight_api::auth::hex(&farsight_api::auth::sha256("stage8-admin-token")),
     );
@@ -803,7 +801,7 @@ async fn seed_world(pool: &PgPool) -> Result<World, String> {
         t4_id,
         o4,
         o4_id,
-        l4_path: format!("/public/list/{lo}/ties"),
+        l4_path: format!("/list/{lo}/ties"),
         l4_uri: format!("at://{lo}/app.bsky.graph.list/ties"),
         l4_id,
         w16,
@@ -818,15 +816,15 @@ async fn seed_world(pool: &PgPool) -> Result<World, String> {
 }
 
 fn public_did(d: &str) -> String {
-    format!("/public/did/{d}")
+    format!("/did/{d}")
 }
 
 fn lookup_did(d: &str) -> String {
-    format!("/lookup/did?q={}", enc(d))
+    format!("/admin/lookup/did?q={}", enc(d))
 }
 
 fn lookup_list(uri: &str) -> String {
-    format!("/lookup/list?q={}", enc(uri))
+    format!("/admin/lookup/list?q={}", enc(uri))
 }
 
 // ------------------------------------------------- 1–6. sort key and clamp
@@ -1216,7 +1214,6 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
         config_toml(&Cfg {
             dsn: &dsn,
             plc: LIVE_PLC,
-            ui: "public_read",
             budget: 70_000_000_000,
             public_ui: "",
         }),
@@ -1311,7 +1308,7 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
     let sec = admin_section(&admin.text, "Incoming blocks").unwrap_or("");
     let handles = LIVE.iter().filter(|(d, h)| {
         sec.contains(&format!(
-            "<a class=\"who\" href=\"/lookup/did?q={}\" title=\"{d}\" data-card=\"/admin/card/{d}\" data-card-session>@{h}</a>",
+            "<a class=\"who\" href=\"/admin/lookup/did?q={}\" title=\"{d}\" data-card=\"/admin/card/{d}\" data-card-session>@{h}</a>",
             enc(d)
         ))
     }).count();
@@ -1328,11 +1325,14 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
         );
     }
     let anon = l.get(&lookup_did(&subject)).await?;
-    let asec = admin_section(&anon.text, "Incoming blocks").unwrap_or("");
     c.check(
-        "an anonymous viewer of the lookup page (ui = public_read) gets the handles and the links, and no card attribute",
-        anon.status == 200 && !asec.contains("data-card") && (shown == 0 || asec.contains(&format!(">@{}</a>", LIVE[0].1))),
-        format!("{}", anon.status),
+        "without a session there is no lookup page: the answer is the 303 to /enter, with no handle, no DID and no card attribute in it",
+        anon.status == 303
+            && anon.header("location").as_deref() == Some("/enter")
+            && !anon.text.contains("data-card")
+            && !anon.text.contains("did:plc:")
+            && !anon.text.contains(&format!("@{}", LIVE[0].1)),
+        format!("{} → {:?}", anon.status, anon.header("location")),
     );
     Ok(())
 }
@@ -1348,15 +1348,19 @@ async fn check_admin_card(
     w: &World,
 ) -> Result<(), String> {
     let known = did("sbl", 1);
-    let other = did("sbl", 2);
     let card = |d: &str| format!("/admin/card/{d}");
     let nowhere = b.get("/no/such/route").await?;
-    c.section("11. /admin/card/{did} under ui = auth_all");
+    c.section("11–12. /admin/card/{did} with and without a session");
     let anon = b.get(&card(&known)).await?;
+    let settings = b.get("/admin/settings").await?;
     c.check(
-        "anonymous: the bare 404 of a path that does not exist — same status, same body, no redirect",
-        anon.status == 404 && anon.text == nowhere.text && anon.header("location").is_none(),
-        anon.short(),
+        "anonymous: the bare 404 of a path that does not exist — same status, same body — never the 303 to /enter that the admin pages answer with: there is no redirect for a script to follow into the card (v2.4.3 §3.3)",
+        anon.status == 404
+            && anon.text == nowhere.text
+            && anon.header("location").is_none()
+            && settings.status == 303
+            && settings.header("location").as_deref() == Some("/enter"),
+        format!("card {} / settings {}", anon.status, settings.status),
     );
     // B's card budget is 1 a second (section 15): leave it full.
     tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -1388,43 +1392,21 @@ async fn check_admin_card(
             && plc.audit_total() == before + 1,
         format!("{} / {} / {}", unknown.status, bad.status, wrong.status),
     );
-    c.section("12. /admin/card/{did} under ui = public_read");
-    let nowhere_a = a.get("/no/such/route").await?;
-    let anon = a.get(&card(&known)).await?;
-    let settings = a.get("/settings").await?;
-    c.check(
-        "anonymous: the same bare 404, never the 303 to /enter that the admin pages answer with in this mode — there is no redirect for a script to follow into the card (v2.4.3 §3.3; the kickoff expected a 303 that the script detects)",
-        anon.status == 404
-            && anon.text == nowhere_a.text
-            && anon.header("location").is_none()
-            && settings.status == 303
-            && settings.header("location").as_deref() == Some("/enter"),
-        format!("card {} / settings {}", anon.status, settings.status),
-    );
-    let admin = a.admin_get(cookie, &card(&other)).await?;
-    c.check(
-        "signed-in admin: 200 with the card, no-store, private",
-        admin.status == 200
-            && admin
-                .text
-                .contains(&format!("<code class=\"pc-did\">{other}</code>"))
-            && admin.header("cache-control").as_deref() == Some("no-store, private"),
-        format!("{}", admin.status),
-    );
-    let js = a.get("/static/farsight.js").await?;
-    let public_js = a.get("/public/static/public.js").await?;
+    let js = a.get("/static/public.js").await?;
+    let old_js = a.get("/static/farsight.js").await?;
     let page = a.admin_get(cookie, &lookup_did(&w.s)).await?;
     c.check(
-        "the three fixes of v2.4.3 §3.3 are in what the browser gets: admin pages load /static/farsight.js (the public script, served a second time, ungated); the script asks with credentials \"same-origin\" only for a link marked data-card-session and never injects an answer that is not a 200 or was reached through a redirect; it names no admin path",
+        "the three fixes of v2.4.3 §3.3 are in what the browser gets: admin pages load /static/public.js (the one UI script, ungated; its second name /static/farsight.js is gone); the script asks with credentials \"same-origin\" only for a link marked data-card-session and never injects an answer that is not a 200 or was reached through a redirect; it names no admin path",
         js.status == 200
-            && js.text == public_js.text
-            && page.text.contains("<script src=\"/static/farsight.js\" defer></script>")
+            && old_js.status == 404
+            && page.text.contains("<script src=\"/static/public.js\" defer></script>")
+            && !page.text.contains("/static/farsight.js")
             && js.text.contains("link.hasAttribute(\"data-card-session\")")
             && js.text.contains("credentials: session ? \"same-origin\" : \"omit\"")
             && js.text.contains("r.status !== 200 || r.redirected")
             && !js.text.contains("/admin/")
             && !js.text.contains("/lookup"),
-        format!("js {}", js.status),
+        format!("public.js {} / farsight.js {}", js.status, old_js.status),
     );
     Ok(())
 }
@@ -1466,7 +1448,7 @@ async fn check_admin_columns(
         "listitem and listblock links",
     );
 
-    c.section("14. \"First seen\" is for a signed-in admin only");
+    c.section("14. \"First seen\" is an admin column: on the lookup pages, which need a session, and on no public page");
     let admin = a.admin_get(cookie, &lookup_did(&w.s)).await?;
     let asec = admin_section(&admin.text, "Incoming blocks").unwrap_or("");
     // Rows stored before the date was kept sort further down: look for
@@ -1484,35 +1466,35 @@ async fn check_admin_columns(
     // Row g of S was first seen at BASE - g minutes: 23:5x on 2026-08-31,
     // minutes no stated createdAt of these rows falls in.
     c.check(
-        "signed-in admin on /lookup/did: a \"First seen\" column, last, with the stored first_seen in a <time> element, and \"—\" with its title for rows stored before the date was kept",
+        "signed-in admin on /admin/lookup/did: a \"First seen\" column, last, with the stored first_seen in a <time> element, and \"—\" with its title for rows stored before the date was kept",
         heads(asec) == ["Blocker", "Record", "Created", "First seen"]
             && asec.contains("<td><time datetime=\"2026-08-31T23:59:00Z\">2026-08-31 23:59:00 UTC</time></td></tr>")
             && undated,
         format!("{:?}; undated cell seen: {undated}", heads(asec)),
     );
-    let anon = a.get(&lookup_did(&w.s)).await?;
-    let nsec = admin_section(&anon.text, "Incoming blocks").unwrap_or("");
-    c.check(
-        "anonymous on /lookup/did under public_read: the same rows, no \"First seen\" header, three cells a row, and not one first_seen value anywhere in the response",
-        anon.status == 200
-            && heads(nsec) == ["Blocker", "Record", "Created"]
-            && row_dids(nsec) == row_dids(asec)
-            && !anon.text.contains("First seen")
-            && !anon.text.contains("2026-08-31T23:5")
-            && !anon.text.contains("2026-08-31 23:5")
-            && !anon.text.contains(NO_FIRST_SEEN)
-            && between(nsec, "<tr><td>", "</tr>").iter().all(|r| r.matches("</td><td>").count() == 2),
-        format!("{:?}", heads(nsec)),
-    );
     let ladmin = a.admin_get(cookie, &lookup_list(&w.l4_uri)).await?;
+    c.check(
+        "the list lookup the same: Members and Inbound listblocks have \"First seen\"",
+        heads(admin_section(&ladmin.text, "Members").unwrap_or(""))
+            == ["Member", "Listitem", "Added", "First seen"]
+            && heads(admin_section(&ladmin.text, "Inbound listblocks").unwrap_or(""))
+                == ["Blocker", "Listblock", "Created", "First seen"],
+        "list lookup",
+    );
+    let anon = a.get(&lookup_did(&w.s)).await?;
     let lanon = a.get(&lookup_list(&w.l4_uri)).await?;
     c.check(
-        "the list lookup the same: Members and Inbound listblocks gain \"First seen\" for the admin and not for an anonymous viewer",
-        heads(admin_section(&ladmin.text, "Members").unwrap_or("")) == ["Member", "Listitem", "Added", "First seen"]
-            && heads(admin_section(&ladmin.text, "Inbound listblocks").unwrap_or("")) == ["Blocker", "Listblock", "Created", "First seen"]
-            && heads(admin_section(&lanon.text, "Members").unwrap_or("")) == ["Member", "Listitem", "Added"]
-            && !lanon.text.contains("First seen"),
-        "list lookup",
+        "without a session there is no lookup page to read the column from: /admin/lookup/did and /admin/lookup/list answer 303 to /enter, with no row, no \"First seen\" and not one first_seen value in the response",
+        [&anon, &lanon].iter().all(|r| {
+            r.status == 303
+                && r.header("location").as_deref() == Some("/enter")
+                && !r.text.contains("First seen")
+                && !r.text.contains("did:plc:")
+                && !r.text.contains("2026-08-31T23:5")
+                && !r.text.contains("2026-08-31 23:5")
+                && !r.text.contains(NO_FIRST_SEEN)
+        }),
+        format!("{} / {}", anon.status, lanon.status),
     );
     let public = a.get(&public_did(&w.s)).await?;
     c.check(
@@ -1547,7 +1529,7 @@ async fn check_shared_budget(
     tokio::time::sleep(Duration::from_millis(1300)).await;
     let m0 = b.metrics_text().await?;
     let fetched = plc.audit_total();
-    let p1 = b.get(&format!("/public/card/{}", did("sbl", 11))).await?;
+    let p1 = b.get(&format!("/card/{}", did("sbl", 11))).await?;
     let a1 = b
         .admin_get(cookie, &format!("/admin/card/{}", did("sbl", 12)))
         .await?;
@@ -1555,7 +1537,7 @@ async fn check_shared_budget(
     let a2 = b
         .admin_get(cookie, &format!("/admin/card/{}", did("sbl", 13)))
         .await?;
-    let p2 = b.get(&format!("/public/card/{}", did("sbl", 14))).await?;
+    let p2 = b.get(&format!("/card/{}", did("sbl", 14))).await?;
     let m1 = b.metrics_text().await?;
     c.check(
         "with card_rps = 1: a public card takes the token and the admin card right after it is the short card; a second later the admin card takes it and the public one is short — two cards fetched, two refused, in farsight_public_ui_cards_total",
@@ -1604,13 +1586,13 @@ fn warming_form(csrf: &str, warming: bool) -> Vec<(&'static str, String)> {
 }
 
 async fn set_warming(a: &Srv, cookie: &str, on: bool) -> Result<Resp, String> {
-    let page = a.admin_get(cookie, "/settings").await?;
-    let csrf = csrf_of(&page.text).ok_or("no csrf on /settings")?;
+    let page = a.admin_get(cookie, "/admin/settings").await?;
+    let csrf = csrf_of(&page.text).ok_or("no csrf on /admin/settings")?;
     let form = warming_form(&csrf, on);
     let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
     a.admin
         .post_form(
-            &format!("{}/settings/public-ui", a.base),
+            &format!("{}/admin/settings/public-ui", a.base),
             &[("cookie", cookie)],
             &pairs,
         )
@@ -1798,7 +1780,6 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let roomy = |extra: &'static str| Cfg {
         dsn: &dsn,
         plc: "https://127.0.0.1:9",
-        ui: "public_read",
         budget: 70_000_000_000,
         public_ui: extra,
     };
@@ -1813,7 +1794,7 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let have = wait_indexes(&pool, 4, Duration::from_secs(300)).await?;
     // `/health` also wants a connected firehose, which the harness has
     // none of: a page is the evidence that the server serves.
-    let health = e.get("/public").await?;
+    let health = e.get("/").await?;
     let log = e.log();
     let serving = log.find("normal mode: serving");
     let building = log.find("sort index: building");
@@ -1829,7 +1810,7 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
             && serving < building
             && log.matches("sort index: built").count() == 4
             && log.contains("sort indexes: all four ready"),
-        format!("live after {:?}; {have} of 4 valid; /public {}", e.came_up, health.status),
+        format!("live after {:?}; {have} of 4 valid; / {}", e.came_up, health.status),
     );
     c.check(
         "each build is logged at INFO with its duration and the resulting index size, and farsight_ui_sort_indexes_ready reads 4",
@@ -1900,7 +1881,6 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let tight = Cfg {
         dsn: &dsn,
         plc: "https://127.0.0.1:9",
-        ui: "public_read",
         budget,
         public_ui: "handle_warming_enabled = false",
     };
@@ -1909,8 +1889,9 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let valid = valid_indexes(&pool).await?;
     let log = h.log();
     let cookie = admin_session(&pool, ADMIN_DID).await?;
-    let dash = h.admin_get(&cookie, "/").await?;
-    let anon = h.get("/").await?;
+    let dash = h.admin_get(&cookie, "/admin").await?;
+    let anon = h.get("/admin").await?;
+    let home = h.get("/").await?;
     c.check(
         "budget_bytes = database size + 2 MB, an index on `blocks` estimated at ~18.6 MB: the server starts and serves, the two indexes that fit are built, the two on `blocks` are not, the log says so at WARN on every check, and the gauge reads 2",
         valid == ["list_blocks_by_list_created", "list_items_by_list_created"]
@@ -1920,11 +1901,14 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
         format!("valid: {valid:?}; database {size} B, budget {budget} B, estimate {estimate} B"),
     );
     c.check(
-        "the dashboard tells a signed-in admin — \"2 of 4 indexes ready … the storage budget has no room (needs ~18.6 MB)\" — and tells an anonymous viewer nothing",
+        "the dashboard tells a signed-in admin — \"2 of 4 indexes ready … the storage budget has no room (needs ~18.6 MB)\" — and nobody else: without a session the dashboard is the 303 to /enter, and the public home says nothing of it",
         dash.text.contains("Sorting by creation time: 2 of 4 indexes ready")
             && dash.text.contains("the storage budget has no room (needs ~18.6 MB)")
-            && anon.status == 200
-            && !anon.text.contains("Sorting by creation time"),
+            && anon.status == 303
+            && anon.header("location").as_deref() == Some("/enter")
+            && !anon.text.contains("Sorting by creation time")
+            && home.status == 200
+            && !home.text.contains("Sorting by creation time"),
         support::truncate(between(&dash.text, "Sorting by creation time", "</div>").first().unwrap_or(&""), 200),
     );
     // The section without its index keeps the order it had: blocker id,
@@ -1953,8 +1937,8 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     );
 
     c.section("23. raising the budget releases the build");
-    let settings = h.admin_get(&cookie, "/settings").await?;
-    let csrf = csrf_of(&settings.text).ok_or("no csrf on /settings")?;
+    let settings = h.admin_get(&cookie, "/admin/settings").await?;
+    let csrf = csrf_of(&settings.text).ok_or("no csrf on /admin/settings")?;
     let text = std::fs::read_to_string(h.dir.join("config.toml")).map_err(|e| e.to_string())?;
     let raised = text.replace(
         &format!("budget_bytes = {budget}"),
@@ -1963,7 +1947,7 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let save = h
         .admin
         .post_form(
-            &format!("{}/settings", h.base),
+            &format!("{}/admin/settings", h.base),
             &[("cookie", &cookie)],
             &[("csrf", csrf.as_str()), ("config", raised.as_str())],
         )
@@ -1971,7 +1955,7 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let have = wait_indexes(&pool, 4, Duration::from_secs(120)).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let log = h.log();
-    let dash = h.admin_get(&cookie, "/").await?;
+    let dash = h.admin_get(&cookie, "/admin").await?;
     c.check(
         "storage.budget_bytes raised in Settings, without a restart: on its next check the task builds the two held indexes, the gauge reads 4 and the dashboard warning is gone",
         save.status < 400
@@ -2346,7 +2330,6 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
         config_toml(&Cfg {
             dsn: &dsn,
             plc: &plc.base,
-            ui: "public_read",
             budget: 70_000_000_000,
             public_ui: "",
         }),
@@ -2362,13 +2345,12 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     }
     let w = seed_world(&pool).await?;
     let cookie = admin_session(&pool, ADMIN_DID).await?;
-    // B: admin pages hidden, a record viewer, a card budget of one a second.
+    // B: a record viewer, a card budget of one a second.
     let b = Srv::start(
         "b",
         config_toml(&Cfg {
             dsn: &dsn,
             plc: &plc.base,
-            ui: "auth_all",
             budget: 70_000_000_000,
             public_ui: &format!("record_viewer_url = \"{VIEWER}\"\ncard_rps = 1\ncard_burst = 1\nhandle_warming_enabled = false"),
         }),

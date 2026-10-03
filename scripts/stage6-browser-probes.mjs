@@ -94,7 +94,7 @@ await probe(
   },
 );
 
-await probe("the bar is sticky, holds the search form and the three-state toggle, and no link leaves /public", async () => {
+await probe("the bar is sticky, holds the search form and the three-state toggle, and no link leaves the public UI", async () => {
   const d = await page.evaluate(() => {
     const nav = document.querySelector("nav.public-nav");
     const form = nav.querySelector("form");
@@ -110,7 +110,8 @@ await probe("the bar is sticky, holds the search form and the three-state toggle
       value: input.value,
       buttons: [...nav.querySelectorAll(".theme-toggle button")].map((b) => b.getAttribute("data-theme-choice")),
       toggleShown: !nav.querySelector(".theme-toggle").hidden,
-      out: hrefs.filter((h) => !(h.startsWith("/public") || h.startsWith("#"))),
+      // Links that leave the public UI: anything but its pages at the root and anchors.
+      out: hrefs.filter((h) => !(h === "/" || ["/search", "/did/", "/list/", "#"].some((p) => h.startsWith(p)))),
       text: nav.textContent,
     };
   });
@@ -119,7 +120,7 @@ await probe("the bar is sticky, holds the search form and the three-state toggle
       d.position === "sticky" &&
       d.top === 0 &&
       d.scrolled > 0 &&
-      d.action === "/public/search" &&
+      d.action === "/search" &&
       d.method === "get" &&
       d.value === "" &&
       d.buttons.join() === "light,dark,system" &&
@@ -235,7 +236,7 @@ await probe("a card opens after the pointer rests on a row's link, is requested 
   await page.goto(base + accountPath);
   const requests = [];
   page.on("request", (r) => {
-    if (r.url().includes("/public/card/")) {
+    if (r.url().includes("/card/")) {
       requests.push(r.url());
     }
   });
@@ -246,7 +247,7 @@ await probe("a card opens after the pointer rests on a row's link, is requested 
   const early = requests.length;
   const card = page.locator("#blockers .who-wrap").first().locator(".profile-card");
   await card.waitFor({ state: "visible", timeout: 5000 });
-  await page.waitForResponse((r) => r.url().includes("/public/card/"), { timeout: 8000 }).catch(() => null);
+  await page.waitForResponse((r) => r.url().includes("/card/"), { timeout: 8000 }).catch(() => null);
   await page.waitForTimeout(300);
   const text = await card.innerText();
   const role = await card.getAttribute("role");
@@ -268,13 +269,13 @@ await probe("a card opens after the pointer rests on a row's link, is requested 
       early === 0 &&
       requests.length === 1 &&
       afterSecondHover === 1 &&
-      requests[0].endsWith("/public/card/" + did) &&
+      requests[0].endsWith("/card/" + did) &&
       text.includes(did) &&
       role === "tooltip" &&
       hiddenAfterLeave &&
       onFocus &&
       afterEscape &&
-      href === "/public/did/" + did,
+      href === "/did/" + did,
     detail: JSON.stringify({ early, requests: requests.length, afterSecondHover, hiddenAfterLeave, onFocus, afterEscape, text: text.slice(0, 120) }),
   };
 });
@@ -361,7 +362,7 @@ await probe("without JavaScript the page reads the same: UTC times, working link
       texts.every((t) => /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC$/.test(t)) &&
       !toggle &&
       links >= 10 &&
-      action === "/public/search" &&
+      action === "/search" &&
       cards === 0,
     detail: `${texts.length} times, first ${texts[0]}; toggle visible ${toggle}; ${links} row links; ${cards} cards`,
   };
@@ -379,7 +380,7 @@ await probe("on a touch device (hover: none) there are no cards: no request, no 
   watch(p);
   let requests = 0;
   p.on("request", (r) => {
-    if (r.url().includes("/public/card/")) {
+    if (r.url().includes("/card/")) {
       requests += 1;
     }
   });
@@ -403,7 +404,7 @@ await probe("on a touch device (hover: none) there are no cards: no request, no 
   const href = await link.getAttribute("href");
   await c.close();
   return {
-    ok: hover === false && requests === 0 && cards === 0 && !!rule && rule.includes(".profile-card") && href.startsWith("/public/did/"),
+    ok: hover === false && requests === 0 && cards === 0 && !!rule && rule.includes(".profile-card") && href.startsWith("/did/"),
     detail: `matchMedia(hover: hover) = ${hover}; ${requests} card requests; ${cards} cards; rule: ${rule}`,
   };
 });

@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [features]
-# Builds the stage-3, stage-5, stage-6, stage-7 and stage-8 Phase B harness binaries and the API's
+# Builds the stage-3, stage-5, stage-6, stage-7, stage-8 and stage-9 Phase B harness binaries and the API's
 # harness hooks.
 # Off by default so release builds contain neither.
 harness = [
@@ -48,6 +48,11 @@ required-features = ["harness"]
 [[bin]]
 name = "farsight-stage8-harness"
 path = "src/bin/stage8_harness/main.rs"
+required-features = ["harness"]
+
+[[bin]]
+name = "farsight-stage9-harness"
+path = "src/bin/stage9_harness/main.rs"
 required-features = ["harness"]
 
 [dependencies]
