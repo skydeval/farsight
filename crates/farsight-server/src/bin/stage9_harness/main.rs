@@ -394,6 +394,30 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
             && !did.text.contains("/public/"),
         brief(&did),
     );
+    // The fingerprint the page asks for its stylesheet under.
+    let version = did
+        .text
+        .split("/static/public.css?v=")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or("")
+        .to_owned();
+    let stamped = a.get(&format!("/static/public.css?v={version}")).await?;
+    let plain = a.get("/static/public.css").await?;
+    let dash = a.admin_get(cookie, "/admin").await?;
+    c.check(
+        "pages name their stylesheet and scripts with this build's fingerprint (?v=, ten hex digits, the same on public and admin pages), so a new build's files are fetched at once instead of after the hour they may be cached; the address with the fingerprint and the one without serve the same file",
+        version.len() == 10
+            && version.bytes().all(|b| b.is_ascii_hexdigit())
+            && did.text.contains(&format!("/static/public.js?v={version}\""))
+            && did.text.contains(&format!("/static/htmx.min.js?v={version}\""))
+            && dash.text.contains(&format!("/static/farsight.css?v={version}\""))
+            && dash.text.contains(&format!("/static/public.js?v={version}\""))
+            && stamped.status == 200
+            && stamped.text == plain.text
+            && cc(&stamped) == "public, max-age=3600",
+        format!("v={version}; {} / {}", brief(&stamped), brief(&plain)),
+    );
     let search = a.get(&format!("/search?q={}", enc(&w.subject))).await?;
     c.check(
         "/search redirects to the account's page at the root",
@@ -441,7 +465,7 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
             && dash.text.contains("href=\"/admin/ops\"")
             && dash.text.contains("href=\"/admin/settings\"")
             && dash.text.contains("action=\"/admin/logout\"")
-            && dash.text.contains("src=\"/static/public.js\"")
+            && dash.text.contains("src=\"/static/public.js?v=")
             && !dash.text.contains("farsight.js"),
         support::truncate(&dash.text, 120),
     );

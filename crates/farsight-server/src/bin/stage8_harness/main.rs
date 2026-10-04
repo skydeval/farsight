@@ -1527,7 +1527,7 @@ async fn check_admin_card(
         "the three fixes of v2.4.3 §3.3 are in what the browser gets: admin pages load /static/public.js (the one UI script, ungated; its second name /static/farsight.js is gone); the script asks with credentials \"same-origin\" only for a link marked data-card-session and never injects an answer that is not a 200 or was reached through a redirect; it names no admin path",
         js.status == 200
             && old_js.status == 404
-            && page.text.contains("<script src=\"/static/public.js\" defer></script>")
+            && page.text.contains("<script src=\"/static/public.js?v=")
             && !page.text.contains("/static/farsight.js")
             && js.text.contains("link.hasAttribute(\"data-card-session\")")
             && js.text.contains("credentials: session ? \"same-origin\" : \"omit\"")

@@ -15,6 +15,32 @@ pub const CSS: &str = include_str!("../static/farsight.css");
 /// Vendored htmx (see `static/NOTICE.md`).
 pub const HTMX: &str = include_str!("../static/htmx.min.js");
 
+/// A short fingerprint of the stylesheets and scripts this build serves.
+/// Every page names them as `/static/<file>?v=<this>`: the files may be
+/// cached for an hour, and a new build's pages ask for them under a new
+/// address, so a change shows on the next page view instead of an hour
+/// later. The path alone still serves the file.
+pub fn asset_version() -> &'static str {
+    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let mut h = Sha256::new();
+        for file in [
+            CSS,
+            HTMX,
+            crate::public::PUBLIC_CSS,
+            crate::public::PUBLIC_JS,
+        ] {
+            h.update(file.as_bytes());
+            h.update([0]);
+        }
+        h.finalize()
+            .iter()
+            .take(5)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    });
+    &VERSION
+}
+
 /// `Cache-Control` of UI pages that show admin or setup state (§9.4).
 pub const NO_STORE: &str = "no-store, private";
 
@@ -254,6 +280,14 @@ pub fn human_secs(s: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_asset_version_is_ten_hex_digits_and_stable() {
+        let v = asset_version();
+        assert_eq!(v.len(), 10);
+        assert!(v.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(v, asset_version());
+    }
 
     #[test]
     fn origin_rules() {

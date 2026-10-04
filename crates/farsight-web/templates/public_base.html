@@ -7,9 +7,9 @@
 <meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false}'>
 <title>{{ c.title }}</title>
 {{ c.og|safe }}
-<link rel="stylesheet" href="/static/public.css">
-<script src="/static/public.js"></script>
-<script src="/static/htmx.min.js" defer></script>
+<link rel="stylesheet" href="/static/public.css?v={{ crate::common::asset_version() }}">
+<script src="/static/public.js?v={{ crate::common::asset_version() }}"></script>
+<script src="/static/htmx.min.js?v={{ crate::common::asset_version() }}" defer></script>
 </head>
 <body>
 {% include "_public_nav.html" %}

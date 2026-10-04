@@ -3991,8 +3991,22 @@ fn check_page_rules(c: &mut Checks, h: &H) {
     let mut inline = Vec::new();
     for (path, html) in &public {
         let scripts = between(html, "<script", ">");
+        // ` src="/static/<name>.js[?v=<fingerprint>]"`, alone or with `defer`.
         let external = scripts.iter().all(|s| {
-            s.starts_with(" src=\"/static/") && (s.ends_with(".js\"") || s.ends_with(".js\" defer"))
+            let Some(rest) = s.strip_prefix(" src=\"/static/") else {
+                return false;
+            };
+            let Some((url, tail)) = rest.split_once('"') else {
+                return false;
+            };
+            let (file, query) = url.split_once('?').unwrap_or((url, ""));
+            file.ends_with(".js")
+                && !file.contains(['/', ':'])
+                && (query.is_empty()
+                    || query
+                        .strip_prefix("v=")
+                        .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_hexdigit())))
+                && (tail.is_empty() || tail == " defer")
         });
         let handlers = [
             " onclick=",
