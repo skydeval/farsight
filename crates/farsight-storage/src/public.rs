@@ -447,6 +447,7 @@ pub async fn bounded_count(
     key: i64,
     excluded: &[i64],
     banned: bool,
+    find: Option<&crate::ui_rows::Find>,
     cap: i64,
 ) -> Result<i64> {
     let (from, on, col) = match what {
@@ -459,12 +460,17 @@ pub async fn bounded_count(
         "SELECT count(*) FROM (
            SELECT 1 FROM {from} r JOIN actors a ON a.id = {on}
            WHERE {col} = $1 AND a.status NOT IN {} AND NOT (a.id = ANY($2))
+             AND ($4::bigint[] IS NULL OR a.id = ANY($4) OR a.did LIKE $5::text
+                  OR EXISTS (SELECT 1 FROM handle_cache h
+                             WHERE h.did = a.did AND h.handle LIKE $5::text))
            LIMIT $3) x",
         crate::ui_rows::hidden_statuses(true, banned)
     ))
     .bind(key)
     .bind(excluded)
     .bind(cap + 1)
+    .bind(find.map(|f| &f.ids[..]))
+    .bind(find.and_then(|f| f.pattern.as_deref()))
     .fetch_one(conn)
     .await?)
 }

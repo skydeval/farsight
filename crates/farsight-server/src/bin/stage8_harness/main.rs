@@ -1183,6 +1183,7 @@ async fn check_plans(c: &mut Checks, pool: &PgPool, w: &World) -> Result<(), Str
             hide_inactive: true,
             show_suspended: false,
             show_banned: false,
+            find: None,
             excluded: &[],
         };
         let first = ui_rows::rows(&mut conn, section_, key, Order::Shown, filter, None, 50)
@@ -1321,6 +1322,45 @@ async fn check_history_tab(c: &mut Checks, a: &Srv, plc: &Plc, w: &World) -> Res
         format!(
             "audit requests: {before} → {after_plain} → {after_asked} → {}",
             plc.audit_total()
+        ),
+    );
+    c.section("7c. the filter box of an account page's tables");
+    let base = public_did(&w.w21);
+    let whole = a.get(&base).await?;
+    let (fresh, stale, none) = (did("wxe", 1), did("wxe", 2), did("wxe", 3));
+    let by_handle = a.get(&format!("{base}?find=Stored-FR")).await?;
+    let by_did = a.get(&format!("{base}?find={none}")).await?;
+    let nothing = a.get(&format!("{base}?find=no%25such_thing")).await?;
+    let empty = a.get(&format!("{base}?find=&page=1")).await?;
+    let padded = a.get(&format!("{base}?find=+stored+")).await?;
+    let sec = |r: &Resp| section(&r.text, "blockers").unwrap_or("").to_owned();
+    let (hs, ds, ns) = (sec(&by_handle), sec(&by_did), sec(&nothing));
+    c.check(
+        "each table has a filter box; part of a handle (any case) keeps the rows of accounts whose stored handle contains it, a DID keeps that account's rows, and text that matches nothing — its % and _ taken literally — leaves no row and says so instead of \"none on record\"; the heading keeps the table's whole count, the note states the matches, and an empty or padded filter is redirected to the plain or trimmed address",
+        sec(&whole).contains("<form class=\"find\" method=\"get\"")
+            && sec(&whole).contains("name=\"find\" value=\"\"")
+            && row_dids(&sec(&whole)).len() == 3
+            && row_dids(&hs) == [fresh.clone()]
+            && hs.contains("name=\"find\" value=\"Stored-FR\"")
+            && hs.contains("<p class=\"find-note\" role=\"status\">1 match. Part of a handle")
+            && hs.contains("<span class=\"count count-big\">3</span>")
+            && row_dids(&ds) == [none.clone()]
+            && ds.contains("<p class=\"find-note\" role=\"status\">1 match.</p>")
+            && row_dids(&ns).is_empty()
+            && ns.contains(">No match.")
+            && !ns.contains("class=\"empty\"")
+            && !row_dids(&hs).contains(&stale)
+            && empty.status == 301
+            && empty.header("location").as_deref() == Some(base.as_str())
+            && padded.status == 301
+            && padded.header("location").as_deref() == Some(format!("{base}?find=stored").as_str()),
+        format!(
+            "{:?} / {:?} / {:?}; {} {}",
+            row_dids(&hs),
+            row_dids(&ds),
+            row_dids(&ns),
+            empty.status,
+            padded.status
         ),
     );
     Ok(())
@@ -2449,6 +2489,7 @@ async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Resul
         hide_inactive: true,
         show_suspended: false,
         show_banned: false,
+        find: None,
         excluded: &[],
     };
     let deep = ui_rows::rows(
@@ -2500,6 +2541,7 @@ async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Resul
                 hide_inactive: true,
                 show_suspended: false,
                 show_banned: false,
+                find: None,
                 excluded: &excluded,
             },
             None,

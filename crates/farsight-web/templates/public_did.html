@@ -19,9 +19,11 @@
 <section id="blockers" class="card data-section tab-panel">
 <div class="section-header">
 <p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<form class="find" method="get" action="{{ base }}#blockers" role="search">{% if banned %}<input type="hidden" name="banned" value="1">{% endif %}<input type="search" name="find" value="{{ find }}" placeholder="Filter by handle or DID" aria-label="Filter this table" maxlength="100" autocomplete="off" spellcheck="false"></form>
 <h2><span class="sr-only">Blocked by </span><span class="count count-big">{% if let Some(n) = blockers.count %}{{ n }}{% else %}—{% endif %}</span>{% if let Some(n) = blockers.count_all %} <span class="count-all">({{ n }} counting banned accounts)</span>{% endif %}</h2>
 <p class="muted">Accounts which have blocked this user.</p>
 </div>
+{% if let Some(n) = blockers.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
 {% if let Some(t) = blockers.toggle %}<p class="table-options"><a class="toggle{% if t.on %} on{% endif %}" role="checkbox" aria-checked="{% if t.on %}true{% else %}false{% endif %}" href="{{ t.href }}#blockers" rel="nofollow" data-swap><span class="box" aria-hidden="true"></span>Show banned accounts</a></p>{% endif %}
 {% if !blockers.rows.is_empty() %}
 {{ blockers.pager|safe }}
@@ -62,9 +64,11 @@
 <section id="lists" class="card data-section tab-panel">
 <div class="section-header">
 <p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<form class="find" method="get" action="{{ base }}#lists" role="search"><input type="hidden" name="tab" value="lists">{% if banned %}<input type="hidden" name="banned" value="1">{% endif %}<input type="search" name="find" value="{{ find }}" placeholder="Filter by list or owner" aria-label="Filter this table" maxlength="100" autocomplete="off" spellcheck="false"></form>
 <h2><span class="sr-only">Blocked by lists </span><span class="count count-big" title="listblock records on the lists below">{% if let Some(n) = lists.count %}{{ n }}{% else %}—{% endif %}</span></h2>
 <p class="muted">Moderation Lists which this user has been added to.</p>
 </div>
+{% if let Some(n) = lists.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
 {% if let Some(t) = lists.toggle %}<p class="table-options"><a class="toggle{% if t.on %} on{% endif %}" role="checkbox" aria-checked="{% if t.on %}true{% else %}false{% endif %}" href="{{ t.href }}#lists" rel="nofollow" data-swap><span class="box" aria-hidden="true"></span>Show banned accounts</a></p>{% endif %}
 {% if !lists.rows.is_empty() %}
 {{ lists.pager|safe }}
@@ -114,9 +118,11 @@
 <section id="outgoing" class="card data-section tab-panel">
 <div class="section-header">
 <p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<form class="find" method="get" action="{{ base }}#outgoing" role="search"><input type="hidden" name="tab" value="outgoing">{% if banned %}<input type="hidden" name="banned" value="1">{% endif %}<input type="search" name="find" value="{{ find }}" placeholder="Filter by handle or DID" aria-label="Filter this table" maxlength="100" autocomplete="off" spellcheck="false"></form>
 <h2><span class="sr-only">Blocking </span><span class="count count-big">{% if let Some(n) = outgoing.count %}{{ n }}{% else %}—{% endif %}</span>{% if let Some(n) = outgoing.count_all %} <span class="count-all">({{ n }} counting banned accounts)</span>{% endif %}</h2>
 <p class="muted">Accounts this user has blocked.</p>
 </div>
+{% if let Some(n) = outgoing.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
 {% if let Some(t) = outgoing.toggle %}<p class="table-options"><a class="toggle{% if t.on %} on{% endif %}" role="checkbox" aria-checked="{% if t.on %}true{% else %}false{% endif %}" href="{{ t.href }}#outgoing" rel="nofollow" data-swap><span class="box" aria-hidden="true"></span>Show banned accounts</a></p>{% endif %}
 {% if !outgoing.rows.is_empty() %}
 {{ outgoing.pager|safe }}

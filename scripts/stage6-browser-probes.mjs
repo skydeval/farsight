@@ -293,7 +293,8 @@ await probe("a card opens after the pointer rests on a row's link, is requested 
 if (livePath) {
   await probe("a real account's card shows its avatar (fetched by the browser from the account's PDS), handle, DID, creation date and age", async () => {
     await page.goto(base + livePath);
-    const link = page.locator(`a.who[title="${liveDid}"]`).first();
+    // By address: the link's title is put aside while its card is open.
+    const link = page.locator(`a.who[href="/did/${liveDid}"]`).first();
     await link.hover();
     const card = page.locator(".who-wrap", { has: link }).first().locator(".profile-card");
     await card.waitFor({ state: "visible", timeout: 5000 });

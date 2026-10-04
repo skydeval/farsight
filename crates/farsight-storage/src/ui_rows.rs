@@ -257,6 +257,38 @@ pub struct Position {
     pub rkey: String,
 }
 
+/// What a visitor typed into a table's filter box, as the queries use
+/// it: the rows whose account is one of `ids`, or whose DID or stored
+/// handle matches `pattern`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Find {
+    /// `actors.id` of the accounts named outright (a DID, or a handle
+    /// that was resolved).
+    pub ids: Vec<i64>,
+    /// A `LIKE` pattern, lower-case, its wildcards already escaped: it is
+    /// matched against DIDs and against the handles in `handle_cache`, so
+    /// an account whose handle was never verified is found by its DID
+    /// only.
+    pub pattern: Option<String>,
+}
+
+impl Find {
+    /// The `LIKE` pattern for "contains `text`": lower-cased, with `%`,
+    /// `_` and `\` taken literally.
+    pub fn containing(text: &str) -> String {
+        let mut p = String::with_capacity(text.len() + 2);
+        p.push('%');
+        for c in text.to_lowercase().chars() {
+            if matches!(c, '%' | '_' | '\\') {
+                p.push('\\');
+            }
+            p.push(c);
+        }
+        p.push('%');
+        p
+    }
+}
+
 /// Which rows a page leaves out, in the query.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Filter<'a> {
@@ -271,6 +303,8 @@ pub struct Filter<'a> {
     /// Rows whose listed account is one of these `actors.id` values
     /// (`public_ui.excluded_dids`).
     pub excluded: &'a [i64],
+    /// Only the rows the filter box asks for.
+    pub find: Option<&'a Find>,
 }
 
 /// Whether `section` in `order` compares the listed account in its keyset.
@@ -308,6 +342,21 @@ fn build<'a>(
         q.push(" AND NOT (a.id = ANY(");
         q.push_bind(filter.excluded);
         q.push("))");
+    }
+    if let Some(f) = filter.find {
+        q.push(" AND (a.id = ANY(");
+        q.push_bind(&f.ids[..]);
+        q.push(")");
+        if let Some(p) = &f.pattern {
+            q.push(" OR a.did LIKE ");
+            q.push_bind(p.as_str());
+            q.push(
+                " OR EXISTS (SELECT 1 FROM handle_cache h WHERE h.did = a.did AND h.handle LIKE ",
+            );
+            q.push_bind(p.as_str());
+            q.push(")");
+        }
+        q.push(")");
     }
     let by_party = keyed_by_party(section, order);
     // The keyset is a row comparison on the index's own columns, so it is
@@ -445,12 +494,20 @@ impl NamingRow {
 }
 
 /// Which lists name `$1` and may be shown; `$2` is the excluded owners.
-fn naming_from() -> String {
+/// `ids` and `pattern` are the numbers of the two parameters of the
+/// filter box: a `bigint[]` of owners named outright (NULL: no filter)
+/// and a pattern for the list's name and its owner's DID or stored
+/// handle (NULL: none).
+fn naming_from(ids: u8, pattern: u8) -> String {
     format!(
         "JOIN lists l ON l.id = x.list_id
          JOIN actors o ON o.id = l.owner_id
          WHERE l.track_state IN (2, 3) AND l.record_state = 1
-           AND o.status NOT IN {} AND NOT (o.id = ANY($2))",
+           AND o.status NOT IN {} AND NOT (o.id = ANY($2))
+           AND (${ids}::bigint[] IS NULL OR o.id = ANY(${ids})
+                OR lower(l.name) LIKE ${pattern}::text OR o.did LIKE ${pattern}::text
+                OR EXISTS (SELECT 1 FROM handle_cache h
+                           WHERE h.did = o.did AND h.handle LIKE ${pattern}::text))",
         hidden_statuses(true, false)
     )
 }
@@ -463,7 +520,7 @@ fn naming_sql() -> String {
                ORDER BY li.list_id, li.rkey) x
          {}
          ORDER BY {SHOWN_X} DESC, l.id DESC LIMIT $3 OFFSET $4",
-        naming_from()
+        naming_from(5, 6)
     )
 }
 
@@ -478,6 +535,7 @@ pub async fn lists_naming(
     conn: &mut PgConnection,
     subject_id: i64,
     excluded: &[i64],
+    find: Option<&Find>,
     offset: i64,
     limit: i64,
 ) -> Result<Vec<NamingRow>> {
@@ -495,6 +553,8 @@ pub async fn lists_naming(
         .bind(excluded)
         .bind(limit)
         .bind(offset)
+        .bind(find.map(|f| &f.ids[..]))
+        .bind(find.and_then(|f| f.pattern.as_deref()))
         .fetch_all(conn)
         .await?;
     Ok(rows
@@ -519,6 +579,7 @@ pub async fn lists_naming_count(
     conn: &mut PgConnection,
     subject_id: i64,
     excluded: &[i64],
+    find: Option<&Find>,
     cap: i64,
 ) -> Result<i64> {
     Ok(sqlx::query_scalar(&format!(
@@ -527,11 +588,13 @@ pub async fn lists_naming_count(
                           WHERE li.subject_id = $1) x
            {}
            LIMIT $3) y",
-        naming_from()
+        naming_from(4, 5)
     ))
     .bind(subject_id)
     .bind(excluded)
     .bind(cap + 1)
+    .bind(find.map(|f| &f.ids[..]))
+    .bind(find.and_then(|f| f.pattern.as_deref()))
     .fetch_one(conn)
     .await?)
 }
@@ -550,10 +613,12 @@ pub async fn lists_naming_listblocks(
          FROM (SELECT DISTINCT li.list_id FROM list_items li
                WHERE li.subject_id = $1) x
          {}",
-        naming_from()
+        naming_from(3, 4)
     ))
     .bind(subject_id)
     .bind(excluded)
+    .bind(None::<&[i64]>)
+    .bind(None::<&str>)
     .fetch_one(conn)
     .await?)
 }
@@ -792,6 +857,7 @@ mod tests {
             hide_inactive: true,
             show_suspended: false,
             show_banned: false,
+            find: None,
             excluded: &ids,
         };
         let q = sql(Section::ListBlockers, Order::Shown, false, f);
@@ -833,7 +899,10 @@ mod tests {
         )));
         assert!(!q.contains("ORDER BY x.created_at"), "{q}");
         // The count applies the filters of the rows.
-        assert!(q.contains(&naming_from()));
+        assert!(q.contains(&naming_from(5, 6)));
+        // The filter box: wildcards typed by a visitor are literal.
+        assert_eq!(Find::containing("Al_ice%"), "%al\\_ice\\%%");
+        assert_eq!(Find::containing(""), "%%");
         let t = |h| Utc.with_ymd_and_hms(2026, 10, 3, h, 0, 0).unwrap();
         let row = |c, f| NamingRow {
             list_id: 1,

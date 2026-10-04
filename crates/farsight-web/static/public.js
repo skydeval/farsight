@@ -296,7 +296,7 @@
 
   // Requests the fragment once per link per page load.
   function load(link, card) {
-    var did = link.getAttribute("title") || "";
+    var did = link.getAttribute("title") || link.getAttribute("data-did") || "";
     placeholder(card, did, "Loading…");
     var failed = function () {
       placeholder(card, did, "Profile not available.");
@@ -339,12 +339,23 @@
       wrap.appendChild(card);
       load(link, card);
     }
+    // The card states the DID: while it is open the link's own tooltip
+    // (its title, the DID again) is put aside, or the browser draws it
+    // over the card.
+    if (link.hasAttribute("title")) {
+      link.setAttribute("data-did", link.getAttribute("title"));
+      link.removeAttribute("title");
+    }
     wrap.classList.add("open");
   }
 
   function close(wrap) {
     if (wrap) {
       wrap.classList.remove("open");
+      var link = wrap.querySelector("a.who");
+      if (link && !link.hasAttribute("title") && link.hasAttribute("data-did")) {
+        link.setAttribute("title", link.getAttribute("data-did"));
+      }
     }
   }
 
@@ -590,6 +601,7 @@
     tabs();
     pending();
     swaps();
+    finds();
     heroAvatar();
     fitPagers();
     var refit = null;
@@ -779,65 +791,158 @@
       });
   }
 
+  // Puts the tabs and tables of the page at `href` in place of the ones
+  // shown, without a page load, and shows that address. `done` runs once
+  // they are in place; `fallback` if the page could not be read.
+  var swapRun = 0;
+  function swapTo(href, done, fallback) {
+    var box = document.querySelector(".tabbed");
+    if (!box || !window.fetch) {
+      fallback();
+      return;
+    }
+    var run = ++swapRun;
+    fetch(href, { credentials: "same-origin", cache: "no-store" })
+      .then(function (r) {
+        if (r.status !== 200) {
+          throw new Error("not the page");
+        }
+        // A table that got shorter answers with its last page: the
+        // address shown is the one the server settled on.
+        if (r.redirected) {
+          var to = new URL(r.url);
+          if (to.origin !== location.origin) {
+            throw new Error("not the page");
+          }
+          var hash = href.indexOf("#");
+          href = to.pathname + to.search + (hash < 0 ? "" : href.slice(hash));
+        }
+        return r.text();
+      })
+      .then(function (html) {
+        // An answer overtaken by a later request is dropped.
+        if (run !== swapRun) {
+          return;
+        }
+        var doc = new DOMParser().parseFromString(html, "text/html");
+        var fresh = doc.querySelector(".tabbed");
+        if (!fresh) {
+          throw new Error("not the page");
+        }
+        box.innerHTML = fresh.innerHTML;
+        box.setAttribute("data-active", fresh.getAttribute("data-active"));
+        var nav = document.querySelector("nav.tabs");
+        var freshNav = doc.querySelector("nav.tabs");
+        if (nav && freshNav) {
+          nav.innerHTML = freshNav.innerHTML;
+        }
+        times(box);
+        zoneNote();
+        fitPagers();
+        try {
+          history.replaceState(null, "", href.replace(/([?&])go=1(&|$)/, "$1").replace(/[?&]$/, ""));
+        } catch (e) {
+          // The tables are in place either way.
+        }
+        pending();
+        if (done) {
+          done();
+        }
+      })
+      .catch(function () {
+        if (run === swapRun) {
+          fallback();
+        }
+      });
+  }
+
   // A link marked data-swap (the "Show banned accounts" switch) changes
-  // what the tables hold: the page at its address is read and the tabs
-  // and tables are put in place, without a page load. Without this
-  // script the link is followed.
+  // what the tables hold. Without this script the link is followed.
   function swaps() {
     document.addEventListener("click", function (event) {
       var a = event.target.closest ? event.target.closest("a[data-swap]") : null;
       if (!a || !window.fetch || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button) {
         return;
       }
-      var box = document.querySelector(".tabbed");
-      if (!box) {
+      if (!document.querySelector(".tabbed")) {
         return;
       }
       event.preventDefault();
       var href = a.getAttribute("href");
-      fetch(href, { credentials: "same-origin", cache: "no-store" })
-        .then(function (r) {
-          if (r.status !== 200) {
-            throw new Error("not the page");
-          }
-          // A table that got shorter answers with its last page: the
-          // address shown is the one the server settled on.
-          if (r.redirected) {
-            var to = new URL(r.url);
-            if (to.origin !== location.origin) {
-              throw new Error("not the page");
+      swapTo(href, null, function () {
+        location.href = href;
+      });
+    });
+  }
+
+  // The filter box of a table: what is typed filters the page's tables
+  // in place, a moment after the typing stops; Enter also looks up a
+  // whole handle. Without this script the form is sent as it is.
+  function finds() {
+    var timer = null;
+    function send(form, go) {
+      var input = form.querySelector('input[name="find"]');
+      var typed = input.value;
+      var pairs = [];
+      var fields = form.querySelectorAll("input[name]");
+      for (var i = 0; i < fields.length; i++) {
+        var v = fields[i].name === "find" ? typed.trim() : fields[i].value;
+        if (v) {
+          pairs.push(encodeURIComponent(fields[i].name) + "=" + encodeURIComponent(v));
+        }
+      }
+      if (go && typed.trim()) {
+        pairs.push("go=1");
+      }
+      var action = form.getAttribute("action");
+      var hash = action.indexOf("#");
+      var path = hash < 0 ? action : action.slice(0, hash);
+      var section = hash < 0 ? "" : action.slice(hash + 1);
+      var href = path + (pairs.length ? "?" + pairs.join("&") : "") + (hash < 0 ? "" : action.slice(hash));
+      swapTo(
+        href,
+        function () {
+          // The box was replaced with the page's: keep what the visitor
+          // has typed since, and the caret.
+          var again = document.querySelector("#" + section + ' form.find input[name="find"]');
+          if (again) {
+            var now = lastTyped === null ? typed : lastTyped;
+            again.value = now;
+            again.focus();
+            try {
+              again.setSelectionRange(now.length, now.length);
+            } catch (e) {
+              // Not every input type has a caret to set.
             }
-            var hash = href.indexOf("#");
-            href = to.pathname + to.search + (hash < 0 ? "" : href.slice(hash));
           }
-          return r.text();
-        })
-        .then(function (html) {
-          var doc = new DOMParser().parseFromString(html, "text/html");
-          var fresh = doc.querySelector(".tabbed");
-          if (!fresh) {
-            throw new Error("not the page");
-          }
-          box.innerHTML = fresh.innerHTML;
-          box.setAttribute("data-active", fresh.getAttribute("data-active"));
-          var nav = document.querySelector("nav.tabs");
-          var freshNav = doc.querySelector("nav.tabs");
-          if (nav && freshNav) {
-            nav.innerHTML = freshNav.innerHTML;
-          }
-          times(box);
-          zoneNote();
-          fitPagers();
-          try {
-            history.replaceState(null, "", href);
-          } catch (e) {
-            // The tables are in place either way.
-          }
-          pending();
-        })
-        .catch(function () {
+        },
+        function () {
           location.href = href;
-        });
+        }
+      );
+    }
+    var lastTyped = null;
+    document.addEventListener("input", function (event) {
+      var input = event.target;
+      if (!input || !input.matches || !input.matches('form.find input[name="find"]')) {
+        return;
+      }
+      lastTyped = input.value;
+      clearTimeout(timer);
+      var form = input.form;
+      timer = setTimeout(function () {
+        send(form, false);
+      }, 350);
+    });
+    document.addEventListener("submit", function (event) {
+      var form = event.target;
+      if (!form || !form.matches || !form.matches("form.find") || !window.fetch) {
+        return;
+      }
+      event.preventDefault();
+      clearTimeout(timer);
+      lastTyped = form.querySelector('input[name="find"]').value;
+      send(form, true);
     });
   }
 

@@ -261,6 +261,14 @@ nothing else in a browser.
   the account claimed at the time; they are not verified. The log is
   read only when the tab is opened (`?tab=history`): one request to
   the PLC directory, under the profile-card budget.
+- **Filter box.** Each table of an account page has a small box that
+  filters it (`?find=…`), across all its pages. A DID keeps that
+  account's rows. Part of a handle keeps the accounts whose stored
+  handle contains it, so an account whose handle this instance has
+  never verified is not found that way; pressing Enter on a whole
+  handle resolves it (one lookup from the handle budget) and finds the
+  account either way. On "Blocked By Lists" the text is matched
+  against the list's name and its owner.
 - **Headings.** A table's heading is its count: accounts that block
   the account, accounts it blocks, and, for "Blocked By Lists", the
   listblock records on the lists that name it, added up (an account

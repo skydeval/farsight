@@ -513,6 +513,33 @@ p.tz-note {
   font-size: 0.8rem;
   color: var(--muted);
 }
+/* The filter box of a table, under the time zone line. */
+.section-header form.find {
+  position: absolute;
+  top: 1.6rem;
+  right: 0;
+  margin: 0;
+}
+form.find input[type="search"] {
+  width: 13rem;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--card);
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.82rem;
+}
+form.find input[type="search"]:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+p.find-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
 /* A table's count as its heading. */
 .section-header h2 .count.count-big {
   padding: 0;
@@ -1469,6 +1496,22 @@ footer {
   box-shadow: var(--shadow-sm);
   margin-top: 0.75rem;
 }
+/* Where a pointer can hover and the table has room, its frame clips
+   nothing: a profile card opened from a row near the bottom lies over
+   the page controls instead of being cut off at the frame's edge. (A
+   frame that scrolls sideways clips downwards too; narrow screens keep
+   the scroll and have no cards.) */
+@media (hover: hover) and (min-width: 44rem) {
+  .table-responsive, .table-responsive > .data-table {
+    overflow: visible;
+  }
+  /* Nothing is clipped to the frame's rounded corners any more, so the
+     corner cells are rounded themselves. */
+  .data-table thead th:first-child { border-top-left-radius: var(--radius); }
+  .data-table thead th:last-child { border-top-right-radius: var(--radius); }
+  .data-table tbody tr:last-child td:first-child { border-bottom-left-radius: var(--radius); }
+  .data-table tbody tr:last-child td:last-child { border-bottom-right-radius: var(--radius); }
+}
 .data-table {
   width: 100%;
   border-collapse: separate;
@@ -1801,6 +1844,8 @@ footer {
   nav.tabs { margin: 0 -1rem; padding: 0 0.4rem; gap: 0.1rem; }
   nav.tabs a.tab { padding: 0.5rem 0.5rem; font-size: 0.8rem; }
   p.tz-note { position: static; text-align: right; margin-bottom: 0.25rem; }
+  .section-header form.find { position: static; margin: 0 0 0.5rem; }
+  form.find input[type="search"] { width: 100%; }
   .section-header h2 .count.count-big { font-size: 1.7rem; }
   .profile-id-block h1.subject .handle { font-size: 1.15rem; letter-spacing: 0; }
   .profile-id-block h1.subject .did-code { font-size: 0.76rem; }

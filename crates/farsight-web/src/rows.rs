@@ -173,12 +173,20 @@ pub async fn numbered_naming(
     st: &WebState,
     subject: i64,
     excluded: &[i64],
+    find: Option<&ui_rows::Find>,
     number: i64,
     limit: i64,
 ) -> Result<Numbered<NamingRow>, XrpcError> {
     let mut tx = st.api.read_tx().await?;
-    let rows =
-        ui_rows::lists_naming(&mut tx, subject, excluded, (number - 1) * limit, limit + 1).await?;
+    let rows = ui_rows::lists_naming(
+        &mut tx,
+        subject,
+        excluded,
+        find,
+        (number - 1) * limit,
+        limit + 1,
+    )
+    .await?;
     tx.rollback().await?;
     Ok(Numbered::of(rows, limit))
 }

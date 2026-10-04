@@ -30,7 +30,7 @@ use farsight_core::{Did, RecordKey};
 use farsight_storage::codes::actor_status;
 use farsight_storage::public::{self as store, Counted};
 use farsight_storage::queries::{self, ActorRef};
-use farsight_storage::ui_rows::{Filter, Row, Section as Rows};
+use farsight_storage::ui_rows::{Filter, Find, Row, Section as Rows};
 use serde_json::Value;
 
 use super::coverage::{EMPTY, last_updated};
@@ -45,6 +45,8 @@ use super::{
 };
 use crate::pages::resolve_handle;
 
+/// Longest the filter box waits for a handle to resolve.
+pub const RESOLVE_FIND_WAIT: Duration = Duration::from_secs(3);
 /// Longest a search waits for a handle to resolve.
 pub const SEARCH_RESOLVE_WAIT: Duration = Duration::from_secs(10);
 
@@ -136,6 +138,8 @@ pub struct Section<R> {
     /// The switch that adds taken-down accounts to the rows; `None` on a
     /// table that does not list accounts by status (the lists).
     pub toggle: Option<Toggle>,
+    /// What the table says under its filter box, while it is filtered.
+    pub note: Option<String>,
     /// Rows shown.
     pub rows: Vec<R>,
     /// Rows of this page held back because their account's handle has
@@ -292,6 +296,22 @@ fn empty_line<R>(rows: &[R], pending: usize, more: bool, number: i64) -> Option<
     (rows.is_empty() && pending == 0 && !more && number == 1).then_some(EMPTY)
 }
 
+/// The same for a table with a filter box: while it is filtered, the
+/// note under the box says "No match" and the empty-state line stays out.
+fn empty_unless<R>(
+    filtered: bool,
+    rows: &[R],
+    pending: usize,
+    more: bool,
+    number: i64,
+) -> Option<&'static str> {
+    if filtered {
+        None
+    } else {
+        empty_line(rows, pending, more, number)
+    }
+}
+
 pub(crate) fn purpose_words(p: &str) -> &'static str {
     match p {
         "modlist" => "moderation list",
@@ -366,10 +386,17 @@ impl Shown<'_> {
 /// section's size costs: about a tenth of a second for 40,000 rows.
 /// [`Total::Unknown`] when the query fails or times out; the section
 /// still renders.
-async fn total(r: &Req<'_>, what: Counted, key: i64, w: &Withheld, banned: bool) -> Total {
+async fn total(
+    r: &Req<'_>,
+    what: Counted,
+    key: i64,
+    w: &Withheld,
+    banned: bool,
+    find: Option<&Find>,
+) -> Total {
     let n = async {
         let mut tx = r.st.api.read_tx().await.ok()?;
-        let n = store::bounded_count(&mut tx, what, key, &w.ids, banned, COUNT_CAP)
+        let n = store::bounded_count(&mut tx, what, key, &w.ids, banned, find, COUNT_CAP)
             .await
             .ok()?;
         let _ = tx.rollback().await;
@@ -386,6 +413,8 @@ struct Counts {
     count_all: Option<String>,
     toggle: Option<Toggle>,
     pages: Total,
+    /// What the table says under its filter box, while it is filtered.
+    note: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -398,13 +427,21 @@ async fn counts(
     q: &Params,
     keys: &[&str],
     tab: Option<&str>,
+    finder: Option<&Finder>,
 ) -> Counts {
     let (rest, all) = match key {
         Some((what, key)) => (
-            total(r, what, key, w, false).await,
-            total(r, what, key, w, true).await,
+            total(r, what, key, w, false, None).await,
+            total(r, what, key, w, true, None).await,
         ),
         None => (Total::Rows(0), Total::Rows(0)),
+    };
+    // The heading keeps the table's whole count; the page controls and
+    // the note go by what the filter leaves.
+    let matching = match (finder, key) {
+        (Some(f), Some((what, key))) => Some(total(r, what, key, w, banned, Some(&f.find)).await),
+        (Some(_), None) => Some(Total::Rows(0)),
+        (None, _) => None,
     };
     let more = match (rest, all) {
         (Total::Rows(a), Total::Rows(b)) => b > a,
@@ -425,7 +462,8 @@ async fn counts(
             href: paging::banned_link(base, q, keys, tab, !banned),
             on: banned,
         }),
-        pages: if banned { all } else { rest },
+        pages: matching.unwrap_or(if banned { all } else { rest }),
+        note: matching.and_then(|m| find_note(finder, m)),
     }
 }
 
@@ -441,12 +479,14 @@ async fn naming_listblocks(r: &Req<'_>, subject: i64, w: &Withheld) -> Option<i6
 }
 
 /// The same for the lists naming an account.
-async fn naming_total(r: &Req<'_>, subject: i64, w: &Withheld) -> Total {
+async fn naming_total(r: &Req<'_>, subject: i64, w: &Withheld, find: Option<&Find>) -> Total {
     let n = async {
         let mut tx = r.st.api.read_tx().await.ok()?;
-        let n = farsight_storage::ui_rows::lists_naming_count(&mut tx, subject, &w.ids, COUNT_CAP)
-            .await
-            .ok()?;
+        let n = farsight_storage::ui_rows::lists_naming_count(
+            &mut tx, subject, &w.ids, find, COUNT_CAP,
+        )
+        .await
+        .ok()?;
         let _ = tx.rollback().await;
         Some(n)
     };
@@ -475,13 +515,98 @@ fn cache_for(held: usize) -> Cache {
 }
 
 /// The withheld rule as the row queries apply it.
-fn row_filter(w: &Withheld, banned: bool) -> Filter<'_> {
+fn row_filter<'a>(w: &'a Withheld, banned: bool, find: Option<&'a Find>) -> Filter<'a> {
     Filter {
         hide_inactive: true,
         show_suspended: true,
         show_banned: banned,
         excluded: &w.ids,
+        find,
     }
+}
+
+/// What the filter box of an account page asks for.
+struct Finder {
+    /// As typed, for the box.
+    text: String,
+    /// As the queries take it.
+    find: Find,
+    /// The text is matched as part of a handle: that finds only accounts
+    /// whose handle this instance has verified and stored.
+    partial: bool,
+}
+
+/// Reads the filter box. A DID names its account outright. Anything
+/// else is matched as part of a DID or of a stored handle; and when the
+/// visitor pressed Enter (`go=1`) on what reads as a whole handle, the
+/// handle is resolved — one lookup from the handle budget — so that an
+/// account whose handle was never stored is found too.
+async fn finder(r: &Req<'_>, q: &Params) -> Result<Option<Finder>, Fail> {
+    let Some(raw) = paging::find(q) else {
+        return Ok(None);
+    };
+    if raw.chars().count() > paging::MAX_FIND {
+        return Err(Fail::Bad {
+            message: "The filter text is too long.".into(),
+            link: None,
+        });
+    }
+    let text = raw.trim_start_matches('@');
+    let id_of = |did: Did| async move {
+        let mut conn = r.st.api.pool.acquire().await?;
+        Ok::<_, Fail>(queries::actor(&mut conn, did.as_str()).await?.map(|a| a.id))
+    };
+    if let Ok(did) = Did::parse(text) {
+        return Ok(Some(Finder {
+            text: clean(raw),
+            find: Find {
+                ids: id_of(did).await?.into_iter().collect(),
+                pattern: None,
+            },
+            partial: false,
+        }));
+    }
+    let mut ids = Vec::new();
+    let whole = text.to_ascii_lowercase();
+    if q.get("go") == Some("1")
+        && whole.contains('.')
+        && farsight_core::did::is_valid_hostname(&whole)
+        && take_budget(r.st, r.config())
+    {
+        let found =
+            tokio::time::timeout(RESOLVE_FIND_WAIT, resolve_handle(&r.st.safe, &whole)).await;
+        if let Ok(Ok(did)) = found {
+            ids.extend(id_of(did).await?);
+        }
+    }
+    Ok(Some(Finder {
+        text: clean(raw),
+        find: Find {
+            ids,
+            pattern: Some(Find::containing(text)),
+        },
+        partial: true,
+    }))
+}
+
+/// What a table says under its filter box.
+fn find_note(finder: Option<&Finder>, matching: Total) -> Option<String> {
+    let f = finder?;
+    let n = match matching {
+        Total::Rows(0) => "No match".to_owned(),
+        Total::Rows(1) => "1 match".to_owned(),
+        Total::Rows(n) => format!("{} matches", thousands(n)),
+        Total::MoreThan(n) => format!("More than {} matches", thousands(n)),
+        Total::Unknown => "Matches".to_owned(),
+    };
+    Some(if f.partial {
+        format!(
+            "{n}. Part of a handle finds only accounts whose handle this instance has verified; \
+             press Enter to look up a whole handle."
+        )
+    } else {
+        format!("{n}.")
+    })
 }
 
 /// The rows of a section that may be shown, as the tables render them,
@@ -691,6 +816,12 @@ struct DidPage {
     /// avatar for the header; `None` for an account this instance has no
     /// row for.
     card: Option<String>,
+    /// The page's own address, for the filter box.
+    base: String,
+    /// What the filter box says.
+    find: String,
+    /// Taken-down accounts are in the tables (the filter keeps it so).
+    banned: bool,
     tabs: Vec<Tab>,
     /// The id of the table in view.
     active: &'static str,
@@ -732,10 +863,14 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     } else {
         None
     };
+    // The filter box: read (and a whole handle resolved) before the
+    // render slot, like the page's own handle.
+    let finder = finder(r, q).await?;
+    let find = finder.as_ref().map(|f| &f.find);
     let (_slot, _permit) = r.render_slots().await?;
     let api = &r.st.api;
     let banned = paging::banned(q);
-    let filter = row_filter(&withheld, banned);
+    let filter = row_filter(&withheld, banned, find);
     let numbered =
         |section, key, number| crate::rows::numbered(r.st, section, key, filter, number, PAGE_ROWS);
 
@@ -753,7 +888,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         .body;
     let naming_page = match actor {
         Some(a) => {
-            crate::rows::numbered_naming(r.st, a.id, &withheld.ids, l_page, PAGE_ROWS).await?
+            crate::rows::numbered_naming(r.st, a.id, &withheld.ids, find, l_page, PAGE_ROWS).await?
         }
         None => Default::default(),
     };
@@ -799,6 +934,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         q,
         &DID_PAGES,
         None,
+        finder.as_ref(),
     )
     .await;
     let b_total = b.pages;
@@ -813,7 +949,8 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         count: b.count,
         count_all: b.count_all,
         toggle: b.toggle,
-        empty: empty_line(&b_rows, b_pending, block_page.more, b_page),
+        note: b.note,
+        empty: empty_unless(find.is_some(), &b_rows, b_pending, block_page.more, b_page),
         rows: b_rows,
         pending: b_pending,
         pager: pager(
@@ -827,7 +964,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     };
 
     let l_total = match actor {
-        Some(a) => naming_total(r, a.id, &withheld).await,
+        Some(a) => naming_total(r, a.id, &withheld, find).await,
         None => Total::Rows(0),
     };
     let mut l_pending = 0;
@@ -864,7 +1001,8 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         count: l_blocks.map(thousands),
         count_all: None,
         toggle: None,
-        empty: empty_line(&l_rows, l_pending, naming_page.more, l_page),
+        note: find_note(finder.as_ref(), l_total),
+        empty: empty_unless(find.is_some(), &l_rows, l_pending, naming_page.more, l_page),
         rows: l_rows,
         pending: l_pending,
         pager: pager(
@@ -890,6 +1028,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
                 q,
                 &DID_PAGES,
                 Some("outgoing"),
+                finder.as_ref(),
             )
             .await;
             let o_total = o.pages;
@@ -905,7 +1044,8 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
                 count: o.count,
                 count_all: o.count_all,
                 toggle: o.toggle,
-                empty: empty_line(&rows, pending, out_page.more, o_page),
+                note: o.note,
+                empty: empty_unless(find.is_some(), &rows, pending, out_page.more, o_page),
                 rows,
                 pending,
                 pager: pager(
@@ -940,6 +1080,9 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         active,
         card: actor.map(|_| card_href(did.as_str())),
         history,
+        find: finder.map(|f| f.text).unwrap_or_default(),
+        banned,
+        base: base.clone(),
         c: chrome(cfg, did.as_str(), &og_title, OG_ACCOUNT, &base),
         did: did.to_string(),
         handle,
@@ -1050,7 +1193,7 @@ pub async fn list(
         .body;
     let (state, show_members) = state_words(listing["state"].as_str().unwrap_or(""));
     let banned = paging::banned(q);
-    let filter = row_filter(&withheld, banned);
+    let filter = row_filter(&withheld, banned, None);
     let member_page = if show_members {
         crate::rows::numbered(r.st, Rows::ListMembers, info.id, filter, m_page, PAGE_ROWS).await?
     } else {
@@ -1092,6 +1235,7 @@ pub async fn list(
             q,
             &LIST_PAGES,
             None,
+            None,
         )
         .await;
         let m_total = m.pages;
@@ -1108,6 +1252,7 @@ pub async fn list(
             count: None,
             count_all: m.count_all,
             toggle: m.toggle,
+            note: None,
             empty: empty_line(&rows, pending, member_page.more, m_page),
             rows,
             pending,
@@ -1133,6 +1278,7 @@ pub async fn list(
         q,
         &LIST_PAGES,
         Some("listblockers"),
+        None,
     )
     .await;
     let k_total = k.pages;
@@ -1156,6 +1302,7 @@ pub async fn list(
         count: k.count,
         count_all: k.count_all,
         toggle: k.toggle,
+        note: None,
         empty: empty_line(&rows, pending, blocker_page.more, k_page),
         rows,
         pending,

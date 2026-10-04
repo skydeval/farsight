@@ -1057,6 +1057,7 @@ async fn lookup_did(
             hide_inactive: true,
             show_suspended: false,
             show_banned: false,
+            find: None,
             excluded: &[],
         };
         match rows::page(

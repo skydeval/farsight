@@ -25,6 +25,16 @@ pub const MAX_PAGE: i64 = 1_000_000;
 pub const TAB: &str = "tab";
 /// The parameter that adds taken-down accounts to the tables: `banned=1`.
 pub const BANNED: &str = "banned";
+/// The parameter that holds what the filter box of an account page says.
+pub const FIND: &str = "find";
+/// Longest filter text.
+pub const MAX_FIND: usize = 100;
+
+/// What the filter box says, if anything.
+pub fn find(q: &Params) -> Option<&str> {
+    q.get(FIND).map(str::trim).filter(|t| !t.is_empty())
+}
+
 /// Pages linked on each side of the current one: a run of
 /// `2 * NEIGHBOURS + 1` pages, which near either end of the section
 /// slides to stay that long. It is as many as a wide screen holds; the
@@ -56,6 +66,9 @@ fn query(q: &Params, keys: &[&str], set: Option<(&str, i64)>, tab: Option<&str>)
     if banned(q) {
         s.append_pair(BANNED, "1");
     }
+    if let Some(f) = find(q) {
+        s.append_pair(FIND, f);
+    }
     for k in keys {
         let value = match set {
             Some((key, page)) if key == *k => Some(page.to_string()),
@@ -83,6 +96,9 @@ pub fn banned_link(base: &str, q: &Params, keys: &[&str], tab: Option<&str>, on:
     }
     if on {
         s.append_pair(BANNED, "1");
+    }
+    if let Some(f) = find(q) {
+        s.append_pair(FIND, f);
     }
     for k in keys {
         if let Some(v) = q.get(k).filter(|v| *v != "1") {
@@ -123,7 +139,10 @@ pub fn canonical(q: &Params, keys: &[&str], retired: &[&str], tabs: &[&str]) -> 
     let tab = q.get(TAB);
     let kept = tab.filter(|t| tabs.iter().skip(1).any(|k| k == t));
     // `banned` has one spelling: `1`.
-    let odd = q.get(BANNED).is_some_and(|v| v != "1");
+    // …and an empty filter is no filter.
+    let odd = q.get(BANNED).is_some_and(|v| v != "1")
+        || q.get(FIND)
+            .is_some_and(|v| v.trim().is_empty() || v != v.trim());
     (stale || first || tab != kept || odd).then(|| query(q, keys, None, kept))
 }
 
@@ -438,6 +457,19 @@ mod tests {
             tab_link("/did/x", &b, &keys, Some("lists")),
             "/did/x?tab=lists&banned=1&lists=3"
         );
+        // The filter travels with every link too; an empty one is dropped.
+        let f = Params::parse("find=alice&lists=2");
+        assert_eq!(
+            link("/did/x", &f, &keys, "page", 3, None),
+            "/did/x?find=alice&page=3&lists=2"
+        );
+        assert_eq!(
+            tab_link("/did/x", &f, &keys, Some("lists")),
+            "/did/x?tab=lists&find=alice&lists=2"
+        );
+        assert_eq!(c("find=&page=2").as_deref(), Some("page=2"));
+        assert_eq!(c("find=+alice+").as_deref(), Some("find=alice"));
+        assert_eq!(c("find=alice"), None);
         // The switch keeps the pages the tables are on.
         assert_eq!(
             banned_link("/did/x", &b, &keys, None, false),
