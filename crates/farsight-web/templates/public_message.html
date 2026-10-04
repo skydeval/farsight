@@ -10,7 +10,7 @@
 </div>
 <h1 class="error-title">{{ title }}</h1>
 <p class="error-message">{{ message }}</p>
-{% if let Some(l) = link %}<p style="margin-top: 1.25rem;"><a href="{{ l.0 }}" class="action-btn"><span>{{ l.1 }}</span></a></p>{% endif %}
+{% if let Some(l) = link %}<p class="error-link"><a href="{{ l.0 }}" class="action-btn"><span>{{ l.1 }}</span></a></p>{% endif %}
 </div>
 </div>
 {% endblock %}

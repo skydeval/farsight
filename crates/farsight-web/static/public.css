@@ -589,7 +589,8 @@ a.who:hover, a.who:focus-visible {
     position: absolute;
     left: 0;
     top: calc(100% + 6px);
-    z-index: 60;
+    /* Under the sticky header (50), over the section pills (25). */
+    z-index: 40;
     width: 22rem;
     max-width: 85vw;
     min-height: 5.5rem;
@@ -780,7 +781,6 @@ form.home-search .search-box button {
   color: var(--fg);
 }
 
-/* Feature grid on home */
 /* Status dot pulse */
 .pulse-dot {
   width: 8px;
@@ -1382,7 +1382,6 @@ footer {
   color: var(--muted-light);
 }
 
-/* Quick sample chips on search */
 .search-hints {
   display: flex;
   align-items: center;
@@ -1460,6 +1459,9 @@ footer {
   font-weight: 800;
   color: var(--fg-strong);
   margin: 0 0 0.5rem;
+}
+.error-link {
+  margin-top: 1.25rem;
 }
 .error-message {
   color: var(--muted);
