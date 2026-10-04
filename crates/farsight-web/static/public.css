@@ -583,6 +583,14 @@ nav.pager > .pager-step:first-child {
 nav.pager > .pager-step:last-child {
   margin-left: auto;
 }
+/* The script hides the outermost numbers until the row fits on one
+   line (.fit); without it the controls wrap. */
+nav.pager [hidden] {
+  display: none;
+}
+nav.pager.fit {
+  flex-wrap: nowrap;
+}
 
 /* "Show banned accounts": a link that reads as a checkbox. */
 p.table-options {

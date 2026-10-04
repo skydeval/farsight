@@ -591,6 +591,12 @@
     pending();
     swaps();
     heroAvatar();
+    fitPagers();
+    var refit = null;
+    window.addEventListener("resize", function () {
+      clearTimeout(refit);
+      refit = setTimeout(fitPagers, 120);
+    });
   });
 
   // Tabs of a data page: each brings one table into view. The link is a
@@ -604,6 +610,7 @@
     }
     function show(id) {
       box.setAttribute("data-active", id);
+      fitPagers();
       var all = nav.querySelectorAll("a.tab");
       for (var i = 0; i < all.length; i++) {
         var on = all[i].getAttribute("data-tab") === id;
@@ -628,6 +635,70 @@
     var hash = location.hash.slice(1);
     if (/^[a-z]+$/.test(hash) && nav.querySelector('a.tab[data-tab="' + hash + '"]')) {
       show(hash);
+    }
+  }
+
+  // Page controls list a long run of pages around the current one. Each
+  // set is cut to what its row holds: the numbers farthest from the
+  // current page go first, the first and last page stay, and a gap is
+  // written wherever numbers are missing. A table behind a tab has no
+  // width yet; it is fitted when its tab is shown.
+  function fitPager(nav) {
+    if (!nav.clientWidth) {
+      return;
+    }
+    var current = nav.querySelector("[aria-current]");
+    var here = current ? Number(current.getAttribute("data-p")) : 1;
+    var pages = [].slice.call(nav.querySelectorAll("[data-p]"));
+    var last = nav.lastElementChild;
+    var far = 0;
+    for (var i = 0; i < pages.length; i++) {
+      if (!pages[i].hasAttribute("data-keep")) {
+        far = Math.max(far, Math.abs(Number(pages[i].getAttribute("data-p")) - here));
+      }
+    }
+    function gap() {
+      var s = document.createElement("span");
+      s.className = "pager-gap";
+      s.setAttribute("aria-hidden", "true");
+      s.textContent = "\u2026";
+      return s;
+    }
+    function show(reach) {
+      var gaps = nav.querySelectorAll(".pager-gap");
+      for (var g = 0; g < gaps.length; g++) {
+        nav.removeChild(gaps[g]);
+      }
+      var before = 0;
+      for (var j = 0; j < pages.length; j++) {
+        var n = Number(pages[j].getAttribute("data-p"));
+        var keep = pages[j].hasAttribute("data-keep") || Math.abs(n - here) <= reach;
+        pages[j].hidden = !keep;
+        if (!keep) {
+          continue;
+        }
+        if (n > before + 1) {
+          nav.insertBefore(gap(), pages[j]);
+        }
+        before = n;
+      }
+      if (nav.hasAttribute("data-open")) {
+        nav.insertBefore(gap(), last);
+      }
+    }
+    nav.classList.add("fit");
+    for (var reach = far; reach >= 0; reach--) {
+      show(reach);
+      if (nav.scrollWidth <= nav.clientWidth + 1) {
+        break;
+      }
+    }
+  }
+
+  function fitPagers() {
+    var list = document.querySelectorAll("nav.pager");
+    for (var i = 0; i < list.length; i++) {
+      fitPager(list[i]);
     }
   }
 
@@ -707,6 +778,7 @@
             nav.innerHTML = freshNav.innerHTML;
           }
           times(box);
+          fitPagers();
           try {
             history.replaceState(null, "", href);
           } catch (e) {
@@ -762,6 +834,7 @@
               if (here.querySelector("[data-pending]") && fresh && fresh.tagName === "SECTION") {
                 here.innerHTML = fresh.innerHTML;
                 times(here);
+                fitPagers();
               }
             }
             again();

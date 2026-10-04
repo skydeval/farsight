@@ -1,5 +1,5 @@
-{% if prev.is_some() || next.is_some() %}<nav class="pager" aria-label="Pages of {{ label }}">
+{% if prev.is_some() || next.is_some() %}<nav class="pager" aria-label="Pages of {{ label }}"{% if open %} data-open{% endif %}>
 {% if let Some(p) = prev %}<a class="pager-step" rel="prev nofollow" href="{{ p }}#{{ section }}" aria-label="Previous page">←</a>{% else %}<span class="pager-step" aria-disabled="true">←</span>{% endif %}
-{% for c in controls %}{% if let Some(n) = c.page %}{% if let Some(h) = c.href %}<a class="pager-page" rel="nofollow" href="{{ h }}#{{ section }}" aria-label="Page {{ n }}">{{ n }}</a>{% else %}<span class="pager-page current" aria-current="page" aria-label="Page {{ n }}">{{ n }}</span>{% endif %}{% else %}<span class="pager-gap" aria-hidden="true">…</span>{% endif %}
+{% for c in controls %}{% if let Some(n) = c.page %}{% if let Some(h) = c.href %}<a class="pager-page" rel="nofollow" href="{{ h }}#{{ section }}" aria-label="Page {{ n }}" data-p="{{ n }}"{% if c.keep %} data-keep{% endif %}>{{ n }}</a>{% else %}<span class="pager-page current" aria-current="page" aria-label="Page {{ n }}" data-p="{{ n }}" data-keep>{{ n }}</span>{% endif %}{% else %}<span class="pager-gap" aria-hidden="true">…</span>{% endif %}
 {% endfor %}{% if let Some(n) = next %}<a class="pager-step" rel="next nofollow" href="{{ n }}#{{ section }}" aria-label="Next page">→</a>{% else %}<span class="pager-step" aria-disabled="true">→</span>{% endif %}
 </nav>{% endif %}

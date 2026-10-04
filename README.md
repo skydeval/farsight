@@ -228,7 +228,9 @@ nothing else in a browser.
   that and the moment Farsight first stored the record: a record dated
   in the future sits where it arrived, not at the top of the page.
 - **Pages.** Every table shows 50 rows and ends with numbered page
-  controls (`← 1 2 3 … 21 →`). They are plain links with the page in
+  controls above and below it (`← 1 2 3 … 21 →`): as many page numbers
+  as the row holds, with the first and last page and the arrows at the
+  two edges. They are plain links with the page in
   the address (`?page=2`, and `lists`, `out`, `blockers` for a page's
   other tables). The count in a table's heading and its last page are
   the real numbers, counted with the page's filters on every view; if

@@ -25,8 +25,11 @@ pub const MAX_PAGE: i64 = 1_000_000;
 pub const TAB: &str = "tab";
 /// The parameter that adds taken-down accounts to the tables: `banned=1`.
 pub const BANNED: &str = "banned";
-/// Pages linked on each side of the current one.
-pub const NEIGHBOURS: i64 = 2;
+/// Pages linked on each side of the current one: a run of
+/// `2 * NEIGHBOURS + 1` pages, which near either end of the section
+/// slides to stay that long. It is as many as a wide screen holds; the
+/// page's script hides the outermost ones until the row fits.
+pub const NEIGHBOURS: i64 = 12;
 
 /// The page `key` asks for: 1 when the parameter is absent.
 pub fn number(q: &Params, key: &str, base: &str) -> Result<i64, Fail> {
@@ -173,7 +176,11 @@ pub fn items(current: i64, total: Total, more: bool, size: i64) -> (Vec<Item>, b
     // Past the cap only the next page is known to exist.
     let open = open && (more || current < last);
     let mut pages: Vec<i64> = vec![1];
-    pages.extend((current - NEIGHBOURS).max(1)..=(current + NEIGHBOURS).min(last));
+    // The run around the current page, slid back inside [1, last].
+    let from = (current - NEIGHBOURS).max(1);
+    let to = (from + 2 * NEIGHBOURS).min(last);
+    let from = (to - 2 * NEIGHBOURS).max(1);
+    pages.extend(from..=to);
     if !open {
         pages.push(last);
     }
@@ -206,6 +213,9 @@ pub struct Control {
     pub page: Option<i64>,
     /// Its address; `None`: the current page or a gap.
     pub href: Option<String>,
+    /// The first page, or the last one when it is known: shown however
+    /// narrow the row.
+    pub keep: bool,
 }
 
 /// The page controls of a section. Rendered only when the section has
@@ -225,6 +235,8 @@ pub struct Pager {
     pub prev: Option<String>,
     /// The next page, while one follows.
     pub next: Option<String>,
+    /// The last page is not known: the numbers end in a gap.
+    pub open: bool,
 }
 
 impl Pager {
@@ -263,19 +275,23 @@ impl Pager {
                     Item::Page(p) => Control {
                         page: Some(p),
                         href: Some(to(p)),
+                        keep: p == 1 || (!open && p == last),
                     },
                     Item::Current(p) => Control {
                         page: Some(p),
                         href: None,
+                        keep: true,
                     },
                     Item::Gap => Control {
                         page: None,
                         href: None,
+                        keep: false,
                     },
                 })
                 .collect(),
             prev: (current > 1).then(|| to(current - 1)),
             next: (more || (!open && current < last)).then(|| to(current + 1)),
+            open,
         }
     }
 
@@ -291,26 +307,29 @@ mod tests {
     use Item::{Current as C, Gap as G, Page as P};
 
     #[test]
-    fn known_totals_show_first_last_and_neighbours() {
-        // 1,023 rows: 21 pages.
-        let t = Total::Rows(1_023);
-        assert_eq!(
-            items(1, t, true, 50),
-            (vec![C(1), P(2), P(3), G, P(21)], false)
-        );
-        assert_eq!(
-            items(10, t, true, 50).0,
-            vec![P(1), G, P(8), P(9), C(10), P(11), P(12), G, P(21)]
-        );
-        assert_eq!(
-            items(21, t, false, 50).0,
-            vec![P(1), G, P(19), P(20), C(21)]
-        );
-        // No gap is printed for a single missing step.
-        assert_eq!(
-            items(4, Total::Rows(300), true, 50).0,
-            vec![P(1), P(2), P(3), C(4), P(5), P(6)]
-        );
+    fn known_totals_show_first_last_and_a_run_of_pages() {
+        let run = |from: i64, to: i64, current: i64| -> Vec<Item> {
+            (from..=to)
+                .map(|p| if p == current { C(p) } else { P(p) })
+                .collect()
+        };
+        // 4,234 rows: 85 pages. On page 1 the run is the first 25.
+        let t = Total::Rows(4_234);
+        let mut want = run(1, 25, 1);
+        want.extend([G, P(85)]);
+        assert_eq!(items(1, t, true, 50), (want, false));
+        // In the middle: twelve each side.
+        let mut want = vec![P(1), G];
+        want.extend(run(28, 52, 40));
+        want.extend([G, P(85)]);
+        assert_eq!(items(40, t, true, 50).0, want);
+        // At the end the run slides back to stay 25 long.
+        let mut want = vec![P(1), G];
+        want.extend(run(61, 85, 85));
+        assert_eq!(items(85, t, false, 50).0, want);
+        // A short section lists every page; no gap for a single step.
+        assert_eq!(items(4, Total::Rows(300), true, 50).0, run(1, 6, 4));
+        assert_eq!(items(11, Total::Rows(1_050), true, 50).0, run(1, 21, 11));
         // One page: nothing to turn.
         assert_eq!(items(1, Total::Rows(50), false, 50).0, vec![C(1)]);
         assert_eq!(items(1, Total::Rows(0), false, 50).0, vec![C(1)]);
@@ -320,23 +339,25 @@ mod tests {
 
     #[test]
     fn past_the_cap_the_list_stays_open() {
+        let run = |from: i64, to: i64, current: i64| -> Vec<Item> {
+            (from..=to)
+                .map(|p| if p == current { C(p) } else { P(p) })
+                .collect()
+        };
         let t = Total::MoreThan(1_000);
         // Pages 1–21 are known to exist; there is no last page.
-        assert_eq!(items(1, t, true, 50), (vec![C(1), P(2), P(3), G], true));
-        assert_eq!(
-            items(20, t, true, 50).0,
-            vec![P(1), G, P(18), P(19), C(20), P(21), G]
-        );
+        let mut want = run(1, 21, 1);
+        want.push(G);
+        assert_eq!(items(1, t, true, 50), (want, true));
         // Beyond the cap only the next page is known.
-        assert_eq!(
-            items(40, t, true, 50).0,
-            vec![P(1), G, P(38), P(39), C(40), P(41), G]
-        );
+        let mut want = vec![P(1), G];
+        want.extend(run(17, 41, 40));
+        want.push(G);
+        assert_eq!(items(40, t, true, 50).0, want);
         // The real end closes the list.
-        assert_eq!(
-            items(400, t, false, 50),
-            (vec![P(1), G, P(398), P(399), C(400)], false)
-        );
+        let mut want = vec![P(1), G];
+        want.extend(run(376, 400, 400));
+        assert_eq!(items(400, t, false, 50), (want, false));
     }
 
     #[test]

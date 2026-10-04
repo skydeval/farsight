@@ -922,14 +922,14 @@ async fn check_order(
         section(&past.text, "blockers").unwrap_or(""),
     );
     c.check(
-        "\"Blocked by\" is 50 rows a page with numbered page controls, plain links with the page in the query: 305 records are seven pages; the controls show the first and last page, the current one and its neighbours, a gap where pages are left out, and arrows that are not links at the ends; page 4 is rows 151–200 of the order; a page past the end is an empty table that still leads back",
+        "\"Blocked by\" is 50 rows a page with numbered page controls, plain links with the page in the query: 305 records are seven pages; the controls list the pages (a run of up to twenty-five around the current one, with the first and last page and a gap where pages are left out; the page's script hides what does not fit the row) and arrows that are not links at the ends; page 4 is rows 151–200 of the order; a page past the end is an empty table that still leads back",
         pages == 7
             && row_dids(sec).len() == 50
-            && controls_of(sec) == "(←) [1] 2 3 … 7 →"
+            && controls_of(sec) == "(←) [1] 2 3 4 5 6 7 →"
             && next_of(sec) == Some(at(2))
             && controls_of(mid_sec) == "← 1 2 3 [4] 5 6 7 →"
             && row_dids(mid_sec) == want[150..200]
-            && controls_of(last_sec) == "← 1 … 5 6 [7] (→)"
+            && controls_of(last_sec) == "← 1 2 3 4 5 6 [7] (→)"
             && row_dids(last_sec).len() == 5
             && past.status == 200
             && row_dids(past_sec).is_empty()
@@ -947,9 +947,11 @@ async fn check_order(
     c.check(
         "a long section shows its real last page and stays reachable to the end: on page 20 of a 20,000-member list the controls name page 400, and page 400 holds the last 50 rows and closes the list",
         row_dids(dense_sec).len() == 50
-            && controls_of(dense_sec) == "← 1 … 18 19 [20] 21 22 … 400 →"
+            && controls_of(dense_sec)
+                == "← 1 … 8 9 10 11 12 13 14 15 16 17 18 19 [20] 21 22 23 24 25 26 27 28 29 30 31 32 … 400 →"
             && row_dids(deep_sec).len() == 50
-            && controls_of(deep_sec) == "← 1 … 398 399 [400] (→)",
+            && controls_of(deep_sec)
+                == "← 1 … 376 377 378 379 380 381 382 383 384 385 386 387 388 389 390 391 392 393 394 395 396 397 398 399 [400] (→)",
         format!("{:?} / {:?}", controls_of(dense_sec), controls_of(deep_sec)),
     );
     let (admin, _) = admin_walk(a, cookie, &lookup_did(&w.s), "Incoming blocks").await?;
