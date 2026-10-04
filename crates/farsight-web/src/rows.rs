@@ -12,7 +12,9 @@
 use chrono::{DateTime, Utc};
 use farsight_api::cursor;
 use farsight_api::error::XrpcError;
-use farsight_storage::ui_rows::{self, Filter, Order, Position, Row, Section};
+use farsight_storage::ui_rows::{
+    self, Filter, NamingPosition, NamingRow, Order, Position, Row, Section,
+};
 
 use crate::pages::WebState;
 
@@ -109,6 +111,59 @@ pub async fn page(
     Ok(Page { rows, next })
 }
 
+/// One page of the lists naming an account and the cursor of the next.
+#[derive(Debug, Clone, Default)]
+pub struct NamingPage {
+    /// Rows, newest first by shown time.
+    pub rows: Vec<NamingRow>,
+    /// Cursor continuing after the last row; `None` when the query ran
+    /// out.
+    pub next: Option<String>,
+}
+
+/// Reads a cursor of the lists section: a tagged shown time and the list
+/// id. A cursor of the order the section had before (a bare list id) does
+/// not parse.
+pub fn decode_naming(raw: Option<&str>) -> Result<Option<NamingPosition>, XrpcError> {
+    Ok(match cursor::shown_id_rkey(raw)? {
+        Some((t, list_id, _)) => Some((time_of(t)?, list_id)),
+        None => None,
+    })
+}
+
+/// The cursor after `row` of the lists section.
+pub fn encode_naming(row: &NamingRow) -> String {
+    cursor::encode_shown(
+        row.shown_time().map(|t| t.timestamp_micros()),
+        Some(row.list_id),
+        "",
+    )
+}
+
+/// One page of the lists naming the account `subject` (`None`: an account
+/// this instance has no row for), newest first by shown time. The cursor
+/// is checked either way.
+pub async fn naming_page(
+    st: &WebState,
+    subject: Option<i64>,
+    excluded: &[i64],
+    raw_cursor: Option<&str>,
+    limit: i64,
+) -> Result<NamingPage, XrpcError> {
+    let after = decode_naming(raw_cursor)?;
+    let Some(subject) = subject else {
+        return Ok(NamingPage::default());
+    };
+    let mut tx = st.api.read_tx().await?;
+    let rows = ui_rows::lists_naming(&mut tx, subject, excluded, after, limit).await?;
+    tx.rollback().await?;
+    let next = (rows.len() as i64 == limit)
+        .then(|| rows.last())
+        .flatten()
+        .map(encode_naming);
+    Ok(NamingPage { rows, next })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +206,26 @@ mod tests {
             assert!(decode(s, Order::Stored, Some(&new)).is_err(), "{s:?}");
         }
         assert!(decode(Section::ListMembers, Order::Shown, Some("!!")).is_err());
+    }
+
+    #[test]
+    fn a_lists_cursor_carries_the_clamped_time_and_the_list() {
+        let r = NamingRow {
+            list_id: 7,
+            owner_did: "did:plc:x".into(),
+            rkey: "3l2x".into(),
+            name: None,
+            listblock_count: 0,
+            added_at: Some(Utc.with_ymd_and_hms(9999, 12, 31, 0, 0, 0).unwrap()),
+            first_seen: Some(Utc.with_ymd_and_hms(2026, 10, 3, 1, 2, 3).unwrap()),
+        };
+        let c = encode_naming(&r);
+        assert_eq!(decode_naming(Some(&c)).unwrap(), Some((r.first_seen, 7)));
+        assert_eq!(decode_naming(None).unwrap(), None);
+        // The cursor the section had before: a bare list id.
+        let old = cursor::encode(&[serde_json::json!(7)]);
+        assert!(decode_naming(Some(&old)).is_err());
+        assert!(decode_naming(Some("bm9wZQ")).is_err());
     }
 
     #[test]

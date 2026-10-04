@@ -175,11 +175,13 @@ await probe("every <time> is rewritten once, in the visitor's timezone, with the
       title: t.getAttribute("title"),
       done: t.getAttribute("data-local"),
       updated: !!t.closest(".updated"),
+      abs: t.hasAttribute("data-abs"),
     })),
   );
   const bad = [];
   let rows = 0;
   let footer = 0;
+  let abs = 0;
   for (const t of times) {
     const utc = /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC$/.test(t.title || "");
     if (t.updated) {
@@ -191,12 +193,15 @@ await probe("every <time> is rewritten once, in the visitor's timezone, with the
     }
     rows += 1;
     const m = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (\S+)( \(\d+ (second|minute|hour|day)s? ago\))?$/.exec(t.text);
-    if (!(utc && t.done === "1" && m && m[1] === wallClock(t.iso) && /^(EDT|EST|GMT-[45])$/.test(m[2]))) {
+    // A time marked data-abs (the account page's tables) reads as the
+    // instant alone.
+    abs += t.abs ? 1 : 0;
+    if (!(utc && t.done === "1" && m && m[1] === wallClock(t.iso) && /^(EDT|EST|GMT-[45])$/.test(m[2]) && !(t.abs && m[3]))) {
       bad.push(t);
     }
   }
   return {
-    ok: bad.length === 0 && rows >= 10 && footer === 1,
+    ok: bad.length === 0 && rows >= 10 && footer === 1 && abs >= 10,
     detail: `${rows} row times, ${footer} footer; first: ${JSON.stringify(times[0])}; bad: ${JSON.stringify(bad.slice(0, 2))}`,
   };
 });

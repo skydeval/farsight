@@ -858,6 +858,32 @@ async fn check_order(
         got == want && got.len() == 305,
         format!("{} rows over {pages} pages; first differing position: {:?}", got.len(), got.iter().zip(&want).position(|(x, y)| x != y)),
     );
+    let first = a.get(&public_did(&w.s)).await?;
+    let sec = section(&first.text, "blockers").unwrap_or("");
+    let more = between(sec, "<p class=\"pager\" id=\"blockers-more\">", "</p>")
+        .first()
+        .copied()
+        .unwrap_or("");
+    let last = match next_of(sec) {
+        Some(n) => a.get(&n).await?,
+        None => return Err("no \"Load more\" link on a 305-row section".into()),
+    };
+    let last_sec = section(&last.text, "blockers").unwrap_or("");
+    c.check(
+        "\"Blocked by\" is 200 rows and a \"Load more\" link that appends: it asks for the next page's rows alone (hx-select on the table body's rows, hx-swap beforeend into #blockers-rows), replaces its own paragraph out of band, and pushes the URL; the second page is the other 105 rows and an empty paragraph, so the link goes away",
+        pages == 2
+            && row_dids(sec).len() == 200
+            && sec.contains("<tbody id=\"blockers-rows\">")
+            && more.contains(">Load more</a>")
+            && more.contains("hx-target=\"#blockers-rows\"")
+            && more.contains("hx-select=\"#blockers-rows > tr\"")
+            && more.contains("hx-swap=\"beforeend\"")
+            && more.contains("hx-select-oob=\"#blockers-more\"")
+            && more.contains("hx-push-url=\"true\"")
+            && row_dids(last_sec).len() == 105
+            && last_sec.contains("<p class=\"pager\" id=\"blockers-more\"></p>"),
+        format!("{} + {} rows; {}", row_dids(sec).len(), row_dids(last_sec).len(), support::truncate(more, 200)),
+    );
     let (admin, _) = admin_walk(a, cookie, &lookup_did(&w.s), "Incoming blocks").await?;
     c.check(
         "the admin \"Incoming blocks\" table is in the same order",
@@ -1016,13 +1042,15 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
     c.section("4. keyset paging through rows with one shown time");
     let mut ok = true;
     let mut detail = Vec::new();
-    for (name, first, id, section_, key) in [
+    // An account's "Blocked by" holds 200 rows a page, the others 50.
+    for (name, first, id, section_, key, want_pages) in [
         (
             "Blocked by (account)",
             public_did(&w.t4),
             "blockers",
             Section::IncomingBlocks,
             w.t4_id,
+            1,
         ),
         (
             "Blocks by this account",
@@ -1030,6 +1058,7 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
             "outgoing",
             Section::OutgoingBlocks,
             w.o4_id,
+            3,
         ),
         (
             "Members",
@@ -1037,6 +1066,7 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
             "members",
             Section::ListMembers,
             w.l4_id,
+            3,
         ),
         (
             "Blocked by (list)",
@@ -1044,11 +1074,12 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
             "listblockers",
             Section::ListBlockers,
             w.l4_id,
+            3,
         ),
     ] {
         let (got, pages) = walk(a, &first, id).await?;
         let want = expected(pool, section_, key, true).await?;
-        let good = exactly_once(&got, 120) && pages == 3 && got == want;
+        let good = exactly_once(&got, 120) && pages == want_pages && got == want;
         ok &= good;
         detail.push(format!(
             "{name}: {} rows, {pages} pages, {}",
@@ -1057,7 +1088,7 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
         ));
     }
     c.check(
-        "120 rows with the same shown time, 50 a page, in each of the four sections: every row exactly once across three pages, in the order of the tiebreak",
+        "120 rows with the same shown time in each of the four sections: every row exactly once, in the order of the tiebreak — across three pages of 50, and on the one page of 200 an account's \"Blocked by\" holds",
         ok,
         detail.join("; "),
     );
@@ -1867,10 +1898,10 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     seed_blockers(
         &pool,
         "hbl",
-        120,
+        250,
         sid,
-        &format!("{BASE} - make_interval(mins => 121 - g)"),
-        &format!("{BASE} - make_interval(mins => 121 - g)"),
+        &format!("{BASE} - make_interval(mins => 251 - g)"),
+        &format!("{BASE} - make_interval(mins => 251 - g)"),
     )
     .await?;
     seed::exec(&pool, &format!("INSERT INTO actors (did) SELECT {} FROM generate_series(1, 3000) g ON CONFLICT DO NOTHING", did_sql("hfl", "g"))).await?;
@@ -1888,7 +1919,7 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     .await?;
     seed::exec(&pool, "ANALYZE").await?;
     let size = n(&pool, "SELECT pg_database_size(current_database())").await? as u64;
-    let estimate = 300_120 * ui_rows::ENTRY_BYTES;
+    let estimate = 300_250 * ui_rows::ENTRY_BYTES;
     // Room for the two list indexes (their tables are empty), none for an
     // index on `blocks`.
     let budget = size + 2_000_000;
@@ -1943,7 +1974,7 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     c.check(
         "until its index is valid a section keeps its previous order and cursors, with the same columns and filters: the public table pages in the old order with an untagged [id, rkey] cursor, and the admin table still has its \"First seen\" column",
         walked == stored
-            && walked.len() == 120
+            && walked.len() == 250
             && old_cursor[0].is_i64()
             && old_cursor.as_array().is_some_and(|x| x.len() == 2)
             && heads(admin_section(&admin.text, "Incoming blocks").unwrap_or("")) == ["Blocker", "Record", "Created", "First seen"],

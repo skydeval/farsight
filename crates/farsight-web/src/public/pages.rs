@@ -3,12 +3,17 @@
 //! The four sections that show a creation time — blockers, outgoing
 //! blocks, a list's members and its listblockers — read their rows through
 //! [`crate::rows`], newest first by shown time once the section's index is
-//! ready, with the withheld rule applied in the query. The handlers behind
-//! the stable read queries are still called in-process, with default
-//! filtering, for the lists section and for every section's freshness.
+//! ready, with the withheld rule applied in the query. The lists naming an
+//! account are read the same way, newest first by the shown time of the
+//! listitem. The handlers behind the stable read queries are still called
+//! in-process, with default filtering, for every section's freshness.
 //! Rows are filtered once more with one batched status lookup for the
-//! page's DIDs, so a page can hold fewer than 50 rows while more follow;
-//! the cursor is still offered.
+//! page's DIDs, so a page can hold fewer rows than its size while more
+//! follow; the cursor is still offered.
+//!
+//! An account's "Blocked by" section holds [`BLOCKER_ROWS`] rows a page
+//! and grows in place: its "Load more" link appends the next page's rows.
+//! Every other section holds [`PAGE_ROWS`] and replaces itself.
 //!
 //! A page prints no coverage level. It ends with one "Last updated" line
 //! (see [`super::coverage`]); removed records are an admin page
@@ -22,7 +27,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use farsight_api::params::Params;
 use farsight_api::{handlers, public_ui};
-use farsight_core::{AtUri, Did, RecordKey};
+use farsight_core::{Did, RecordKey};
 use farsight_storage::codes::actor_status;
 use farsight_storage::public::{self as store, Counted};
 use farsight_storage::queries::{self, ActorRef};
@@ -35,8 +40,8 @@ use super::search::{self, Authority, Target};
 use super::text::{Stamp, card_href, clean, did_href, list_href, list_uri, paragraphs, thousands};
 use super::warming::Asked;
 use super::{
-    COUNT_CAP, Cache, Chrome, Fail, OG_ACCOUNT, OG_INSTANCE, OG_LIST, PAGE_ROWS, Req, Withheld,
-    chrome, metrics as m, page, redirect,
+    BLOCKER_ROWS, COUNT_CAP, Cache, Chrome, Fail, OG_ACCOUNT, OG_INSTANCE, OG_LIST, PAGE_ROWS, Req,
+    Withheld, chrome, metrics as m, page, redirect,
 };
 use crate::pages::resolve_handle;
 
@@ -80,7 +85,9 @@ fn who(r: &Req<'_>, asked: &mut Asked, did: &str) -> Who {
 }
 
 /// The "next" link of a section: a plain link that htmx upgrades to an
-/// in-place swap of the section. The response is always the full page.
+/// in-place swap of the section, or, where the section grows in place
+/// (`more`), to an append of the next page's rows to the table body
+/// `#{section}-rows`. The response is always the full page.
 #[derive(Debug, Clone, Template)]
 #[template(path = "_pagination.html")]
 pub struct Pager {
@@ -88,6 +95,10 @@ pub struct Pager {
     pub section: &'static str,
     /// Target without the fragment, if there is a next page.
     pub next: Option<String>,
+    /// "Load more": the link appends instead of replacing. Its paragraph
+    /// `#{section}-more` is rendered even without a link, so that the last
+    /// page's response takes the link away.
+    pub more: bool,
 }
 
 /// An account row with one author-stated time.
@@ -212,22 +223,6 @@ async fn count(r: &Req<'_>, what: Counted, key: i64, w: &Withheld) -> Option<Str
         .ok()?;
     let _ = tx.rollback().await;
     (n > 0).then(|| count_words(n))
-}
-
-fn stamp_of(v: &Value) -> Option<Stamp> {
-    v.as_str().and_then(Stamp::parse)
-}
-
-fn handler_params(pairs: &[(&str, &str)], cursor: Option<&str>) -> Params {
-    let mut p: Vec<(String, String)> = pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-        .collect();
-    p.push(("limit".to_owned(), PAGE_ROWS.to_string()));
-    if let Some(c) = cursor {
-        p.push(("cursor".to_owned(), c.to_owned()));
-    }
-    Params::from_pairs(p)
 }
 
 /// Parameters for a handler that is called for its freshness only: the
@@ -476,19 +471,25 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
             a.id,
             row_filter(&withheld),
             q.get("bc"),
-            PAGE_ROWS,
+            BLOCKER_ROWS,
         )
         .await
         .map_err(|e| or_first_page(e.into(), &base))?,
         None => crate::rows::Page::default(),
     };
-    let naming = handlers::get_lists_naming(
-        api,
-        &handler_params(&[("actor", did.as_str())], q.get("nc")),
+    // Called for its freshness; the rows are read below.
+    let naming = handlers::get_lists_naming(api, &freshness_params(&[("actor", did.as_str())]))
+        .await?
+        .body;
+    let naming_page = crate::rows::naming_page(
+        r.st,
+        actor.map(|a| a.id),
+        &withheld.ids,
+        q.get("nc"),
+        PAGE_ROWS,
     )
     .await
-    .map_err(|e| or_first_page(e.into(), &base))?
-    .body;
+    .map_err(|e| or_first_page(e.into(), &base))?;
     let show_outgoing = cfg.public_ui.show_outgoing_blocks;
     let (out_page, out_fresh) = if show_outgoing {
         let page = match actor {
@@ -509,13 +510,8 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         (crate::rows::Page::default(), None)
     };
 
-    let list_rows = naming["lists"].as_array().cloned().unwrap_or_default();
-    let lists: Vec<(AtUri, &Value)> = list_rows
-        .iter()
-        .filter_map(|l| Some((AtUri::parse(l["uri"].as_str()?).ok()?, l)))
-        .collect();
     let mut dids: Vec<String> = block_page.rows.iter().map(|b| b.did.clone()).collect();
-    dids.extend(lists.iter().map(|(u, _)| u.authority.as_str().to_owned()));
+    dids.extend(naming_page.rows.iter().map(|l| l.owner_did.clone()));
     dids.extend(out_page.rows.iter().map(|o| o.did.clone()));
     let shown = Shown::load(r, &withheld, dids).await?;
     let mut asked = Asked::new(cfg);
@@ -535,22 +531,25 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         pager: Pager {
             section: "blockers",
             next: b_next,
+            more: true,
         },
     };
 
-    let l_next = naming["cursor"]
-        .as_str()
+    let l_next = naming_page
+        .next
+        .as_deref()
         .map(|c| next_link(&base, q, &DID_CURSORS, "nc", c));
-    let l_rows: Vec<ListRow> = lists
+    let l_rows: Vec<ListRow> = naming_page
+        .rows
         .iter()
-        .filter(|(u, _)| shown.ok(u.authority.as_str()))
-        .map(|(u, l)| ListRow {
-            uri: u.to_string(),
-            href: list_href(u.authority.as_str(), u.rkey.as_str()),
-            name: l["name"].as_str().map(clean).filter(|n| !n.is_empty()),
-            owner: who(r, &mut asked, u.authority.as_str()),
-            listblocks: l["listblockCount"].as_i64().unwrap_or(0).to_string(),
-            added: stamp_of(&l["addedAt"]),
+        .filter(|l| shown.ok(&l.owner_did))
+        .map(|l| ListRow {
+            uri: list_uri(&l.owner_did, &l.rkey),
+            href: list_href(&l.owner_did, &l.rkey),
+            name: l.name.as_deref().map(clean).filter(|n| !n.is_empty()),
+            owner: who(r, &mut asked, &l.owner_did),
+            listblocks: l.listblock_count.to_string(),
+            added: l.added_at.map(Stamp::of),
         })
         .collect();
     let lists = Section {
@@ -560,6 +559,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         pager: Pager {
             section: "lists",
             next: l_next,
+            more: false,
         },
     };
 
@@ -583,6 +583,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
                 pager: Pager {
                     section: "outgoing",
                     next,
+                    more: false,
                 },
             })
         }
@@ -742,6 +743,7 @@ pub async fn list(
             pager: Pager {
                 section: "members",
                 next,
+                more: false,
             },
         })
     } else {
@@ -762,6 +764,7 @@ pub async fn list(
         pager: Pager {
             section: "listblockers",
             next,
+            more: false,
         },
     };
 

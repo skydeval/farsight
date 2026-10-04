@@ -162,14 +162,15 @@
           continue;
         }
         var t = { el: el, then: then, abs: local(new Date(then)), updated: !!el.closest(".updated") };
-        // A card states the age on its own line.
-        var inCard = !!el.closest(".pc");
-        var text = inCard ? t.abs : reading(t, now);
+        // A card states the age on its own line; a time marked data-abs
+        // reads as the instant alone.
+        var fixed = !!el.closest(".pc") || el.hasAttribute("data-abs");
+        var text = fixed ? t.abs : reading(t, now);
         var utc = el.textContent;
         el.setAttribute("title", utc);
         el.textContent = text;
         el.setAttribute("data-local", "1");
-        if (!inCard) {
+        if (!fixed) {
           shown.push(t);
         }
       } catch (e) {

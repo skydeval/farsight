@@ -18,6 +18,11 @@
 //! ([`crate::queries`]) are not touched: their order is part of the stable
 //! contract (§12.1).
 //!
+//! A fifth section, the lists naming an account ([`lists_naming`]), sorts
+//! by the same shown time — of the listitem naming the account — without
+//! an index of its own: it reads the account's listitems on
+//! `list_items_by_subject` and sorts them, so it has one order and no flag.
+//!
 //! The indexes are not created by a migration: a build inside the migration
 //! transaction would outlast a health check on a large table and be rolled
 //! back by the restart. The server builds them after it starts serving;
@@ -356,6 +361,108 @@ pub async fn rows(
         .collect())
 }
 
+/// The shown time of the listitem a list names the account with.
+const SHOWN_X: &str = "COALESCE(LEAST(x.created_at, x.first_seen), '-infinity'::timestamptz)";
+
+/// One list naming an account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamingRow {
+    /// `lists.id`.
+    pub list_id: i64,
+    /// The list owner's DID.
+    pub owner_did: String,
+    /// The list's record key.
+    pub rkey: String,
+    /// Its name, if the record has one.
+    pub name: Option<String>,
+    /// Counted listblocks on it.
+    pub listblock_count: i32,
+    /// Owner-claimed `createdAt` of the listitem naming the account (the
+    /// one with the lowest record key if it is named twice).
+    pub added_at: Option<DateTime<Utc>>,
+    /// When Farsight first stored that listitem.
+    pub first_seen: Option<DateTime<Utc>>,
+}
+
+impl NamingRow {
+    /// The row's shown time; `None` when it has neither time and sorts
+    /// last.
+    pub fn shown_time(&self) -> Option<DateTime<Utc>> {
+        match (self.added_at, self.first_seen) {
+            (Some(c), Some(f)) => Some(c.min(f)),
+            (c, f) => c.or(f),
+        }
+    }
+}
+
+/// A keyset position in the lists naming an account: the last row's shown
+/// time (`None` = "last") and its list id.
+pub type NamingPosition = (Option<DateTime<Utc>>, i64);
+
+fn naming_sql() -> String {
+    format!(
+        "SELECT l.id, o.did, l.rkey, l.name, l.listblock_count, x.created_at, x.first_seen
+         FROM (SELECT DISTINCT ON (li.list_id) li.list_id, li.created_at, li.first_seen
+               FROM list_items li WHERE li.subject_id = $1
+               ORDER BY li.list_id, li.rkey) x
+         JOIN lists l ON l.id = x.list_id
+         JOIN actors o ON o.id = l.owner_id
+         WHERE l.track_state IN (2, 3) AND l.record_state = 1
+           AND o.status NOT IN {HIDDEN} AND NOT (o.id = ANY($2))
+           AND ($3::bigint IS NULL
+                OR ({SHOWN_X}, l.id) < (COALESCE($4::timestamptz, '-infinity'::timestamptz), $3))
+         ORDER BY {SHOWN_X} DESC, l.id DESC LIMIT $5"
+    )
+}
+
+/// Ready or retained lists with a present record naming `subject_id`, once
+/// per list, newest first by the shown time of the listitem, then by list
+/// id descending. Lists of hidden owners and of `excluded` owners are left
+/// out. `after` is the last row of the page before: its shown time and its
+/// list id.
+///
+/// The same lists as `queries::lists_naming`, whose order (by list id) is
+/// part of the stable API and is not touched.
+pub async fn lists_naming(
+    conn: &mut PgConnection,
+    subject_id: i64,
+    excluded: &[i64],
+    after: Option<NamingPosition>,
+    limit: i64,
+) -> Result<Vec<NamingRow>> {
+    type Raw = (
+        i64,
+        String,
+        String,
+        Option<String>,
+        i32,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+    );
+    let rows: Vec<Raw> = sqlx::query_as(&naming_sql())
+        .bind(subject_id)
+        .bind(excluded)
+        .bind(after.map(|(_, id)| id))
+        .bind(after.and_then(|(t, _)| t))
+        .bind(limit)
+        .fetch_all(conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(list_id, owner_did, rkey, name, listblock_count, added_at, first_seen)| NamingRow {
+                list_id,
+                owner_did,
+                rkey,
+                name,
+                listblock_count,
+                added_at,
+                first_seen,
+            },
+        )
+        .collect())
+}
+
 /// The plan of the query [`rows`] runs, one line per plan node
 /// (`EXPLAIN (ANALYZE, COSTS OFF)`). The Phase B harness checks that each
 /// section's shown-time order runs on its index.
@@ -618,6 +725,27 @@ mod tests {
         assert_eq!(row(Some(t(9)), Some(t(2))).shown_time(), Some(t(2)));
         assert_eq!(row(None, Some(t(2))).shown_time(), Some(t(2)));
         assert_eq!(row(Some(t(1)), None).shown_time(), Some(t(1)));
+        assert_eq!(row(None, None).shown_time(), None);
+    }
+
+    #[test]
+    fn lists_naming_sorts_by_the_clamped_time() {
+        let q = naming_sql();
+        assert!(q.contains(&format!("ORDER BY {SHOWN_X} DESC, l.id DESC LIMIT $5")));
+        assert!(!q.contains("ORDER BY x.created_at"), "{q}");
+        assert!(q.contains(&format!("({SHOWN_X}, l.id) < (COALESCE($4::timestamptz")));
+        let t = |h| Utc.with_ymd_and_hms(2026, 10, 3, h, 0, 0).unwrap();
+        let row = |c, f| NamingRow {
+            list_id: 1,
+            owner_did: String::new(),
+            rkey: String::new(),
+            name: None,
+            listblock_count: 0,
+            added_at: c,
+            first_seen: f,
+        };
+        assert_eq!(row(Some(t(9)), Some(t(2))).shown_time(), Some(t(2)));
+        assert_eq!(row(Some(t(1)), Some(t(2))).shown_time(), Some(t(1)));
         assert_eq!(row(None, None).shown_time(), None);
     }
 

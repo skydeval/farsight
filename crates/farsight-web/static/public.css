@@ -506,6 +506,9 @@ p.pager {
   display: flex;
   gap: 0.5rem;
 }
+p.pager:empty {
+  display: none;
+}
 p.pager a {
   display: inline-flex;
   align-items: center;
@@ -591,7 +594,7 @@ a.who:hover, a.who:focus-visible {
     top: calc(100% + 6px);
     /* Under the sticky header (50), over the section pills (25). */
     z-index: 40;
-    width: 22rem;
+    width: 26rem;
     max-width: 85vw;
     min-height: 5.5rem;
     padding: 1rem 1.1rem;
@@ -610,10 +613,9 @@ a.who:hover, a.who:focus-visible {
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* Header, body and footer are stacked: the card is one column. */
 .pc {
-  display: flex;
-  gap: 0.85rem;
-  align-items: flex-start;
+  display: block;
 }
 .pc-avatar {
   flex: 0 0 56px;
@@ -978,6 +980,10 @@ footer {
   align-items: center;
   gap: 1.25rem;
   margin-bottom: 1.5rem;
+}
+/* The account page's header ends with this row. */
+.profile-main-row:last-child {
+  margin-bottom: 0;
 }
 
 .profile-avatar-badge {

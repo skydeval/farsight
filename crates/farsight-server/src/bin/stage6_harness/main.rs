@@ -615,9 +615,14 @@ struct World {
     /// An account blocked by [`LIVE_DID`]: its page has a row whose card
     /// can be complete.
     card: String,
+    /// An account on the three lists of [`SORT_OWNER`], added at different
+    /// times, one of them with a stated date in the future.
+    sorted: String,
 }
 
 const LIST: &str = "modlist1";
+/// Owner of the lists naming [`World::sorted`].
+const SORT_OWNER: (&str, u64) = ("own", 3);
 const LIST_NAME: &str = "<script>alert(1)</script> & friends";
 
 async fn seed_world(h: &H) -> Result<World, String> {
@@ -632,6 +637,7 @@ async fn seed_world(h: &H) -> Result<World, String> {
         list: format!("/list/{}/{LIST}", did("own", 1)),
         partial: did("sub", 3),
         card: did("sub", 4),
+        sorted: did("sub", 5),
     };
     let s = seed::actor(p, &w.s).await?;
     let e = seed::actor(p, &w.e).await?;
@@ -728,6 +734,36 @@ async fn seed_world(h: &H) -> Result<World, String> {
     seed::item(p, hid[1], "3lih", lh, s).await?;
     let le = seed::list(p, e, "excluded", 2, 1, 1, false, Some(3600)).await?;
     seed::item(p, e, "3lie", le, s).await?;
+
+    // Lists naming one account, stored in an order that is neither the
+    // order of their stated dates nor of their shown times. "srt-spoof"
+    // states the year 9999 and was stored five days ago.
+    let sorted = seed::actor(p, &w.sorted).await?;
+    let so = seed::actor(p, &did(SORT_OWNER.0, SORT_OWNER.1)).await?;
+    for (rkey, stated, seen) in [
+        (
+            "srt-old",
+            "now() - interval '10 days'",
+            "now() - interval '10 days'",
+        ),
+        (
+            "srt-spoof",
+            "'9999-12-31T00:00:00Z'::timestamptz",
+            "now() - interval '5 days'",
+        ),
+        (
+            "srt-new",
+            "now() - interval '1 day'",
+            "now() - interval '1 day'",
+        ),
+    ] {
+        let id = seed::list(p, so, rkey, 2, 1, 1, false, Some(3600)).await?;
+        h.sql(&format!(
+            "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev, first_seen, last_seen)
+             VALUES ({so}, '3li{rkey}', {id}, {sorted}, {stated}, 1, {seen}, now())"
+        ))
+        .await?;
+    }
 
     // One list per state, and a capped one.
     for (rkey, state, record, count, capped) in [
@@ -1574,10 +1610,11 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let page = h.get(&path_did(&w.s)).await?;
     let navs = section_navs(&page.text);
     c.check(
-        "account page section nav: exactly two links, Blocked by and On lists (outgoing is off)",
-        navs == [["blockers", "lists"]]
-            && page.text.contains("<span>Blocked by</span>")
-            && page.text.contains("<span>On lists</span>"),
+        "the account page's header is the DID and its copy button: no stat tiles, no section nav",
+        navs.is_empty()
+            && !page.text.contains("stat-card")
+            && !page.text.contains("section-pill")
+            && page.text.contains(&format!("data-copy=\"{}\"", w.s)),
         format!("{navs:?}"),
     );
     let ids: Vec<&str> = between(&page.text, "<section id=\"", "\"");
@@ -1595,10 +1632,23 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let (ok, d) = exactly_once(&rows, &want);
     c.check(
         "Blocked by: paging through the section returns every blocker with an active account exactly once",
-        ok && pages == 2 && want.len() == 61,
+        ok && pages == 1 && want.len() == 61,
         format!("{d}; {pages} pages"),
     );
     let sec = section(&page.text, "blockers").unwrap_or("");
+    c.check(
+        "Blocked by holds 200 rows a page: 61 blockers are one page, whose table body and empty \"Load more\" paragraph are there for a later page to fill, with no link",
+        sec.contains("<tbody id=\"blockers-rows\">")
+            && sec.contains("<p class=\"pager\" id=\"blockers-more\"></p>")
+            && !sec.contains("Load more"),
+        support::truncate(sec.rsplit("</table>").next().unwrap_or(""), 160),
+    );
+    c.check(
+        "row times on the account page are marked to read as the instant alone (no relative part)",
+        sec.matches("<time ").count() == row_dids(sec).len()
+            && sec.matches("class=\"time-badge\" data-abs>").count() == row_dids(sec).len(),
+        format!("{} times", sec.matches("<time ").count()),
+    );
     c.check(
         "the bounded count equals the stored count with the page's filters",
         sec.contains(&format!("<span class=\"count\">{}</span>", want.len())),
@@ -1636,6 +1686,19 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
             && lists.contains(&format!("data-card=\"/card/{}\"", w.o1))
             && !lists.contains("hiddenowned"),
         format!("counter {stored_count}; {}", support::truncate(lists, 160)),
+    );
+    let sorted = h.get(&path_did(&w.sorted)).await?;
+    let so = did(SORT_OWNER.0, SORT_OWNER.1);
+    let order: Vec<&str> = between(
+        section(&sorted.text, "lists").unwrap_or(""),
+        &format!("href=\"/list/{so}/"),
+        "\"",
+    );
+    c.check(
+        "On lists is newest first by the earlier of the stated date and the date this instance stored the listitem: a listitem dated in the year 9999 sits where it arrived, between the newer and the older one, and still shows its stated date",
+        order == ["srt-new", "srt-spoof", "srt-old"]
+            && sorted.text.contains("<time datetime=\"9999-12-31T00:00:00Z\""),
+        format!("{order:?}"),
     );
     c.check(
         "a list name carrying markup renders as text",
@@ -2051,11 +2114,11 @@ async fn check_coverage(
         ))
         .await?;
     c.check(
-        "show_outgoing_blocks = true, without restart: the section lists the account's blocks (inactive targets left out), and the nav gains its link",
+        "show_outgoing_blocks = true, without restart: the section lists the account's blocks (inactive targets left out), after the other two",
         row_dids(out).into_iter().collect::<BTreeSet<_>>() == want
             && want.len() == 4
-            && section_navs(&page.text) == [["blockers", "lists", "outgoing"]]
-            && page.text.contains("<span>Blocks by this account</span>"),
+            && between(&page.text, "<section id=\"", "\"") == ["blockers", "lists", "outgoing"]
+            && out.contains("<h2>Blocks by this account"),
         format!("{} rows, {} expected", row_dids(out).len(), want.len()),
     );
     c.check(

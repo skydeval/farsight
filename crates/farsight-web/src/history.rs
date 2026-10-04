@@ -370,7 +370,11 @@ fn history_section(
     HistorySection {
         empty: out.is_empty() && next.is_none() && q.get(key).is_none(),
         rows: out,
-        pager: Pager { section, next },
+        pager: Pager {
+            section,
+            next,
+            more: false,
+        },
     }
 }
 

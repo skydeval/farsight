@@ -63,6 +63,9 @@ use crate::pages::WebState;
 
 /// Rows per section page. There is no `limit` parameter.
 pub const PAGE_ROWS: i64 = 50;
+/// Rows per page of an account's "Blocked by" section, which grows in
+/// place ("Load more").
+pub const BLOCKER_ROWS: i64 = 200;
 /// A section's count stops here: "more than 1,000" beyond it.
 pub const COUNT_CAP: i64 = 1_000;
 /// Longest a page waits for a render slot before `503`.

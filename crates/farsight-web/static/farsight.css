@@ -576,7 +576,7 @@ a.record {
     top: calc(100% + 6px);
     /* Under the sticky header (50), over the section pills (25). */
     z-index: 40;
-    width: 22rem;
+    width: 26rem;
     max-width: 85vw;
     min-height: 5.5rem;
     padding: 1rem 1.1rem;
@@ -590,10 +590,24 @@ a.record {
     animation: cardFadeIn 0.15s cubic-bezier(0.16, 1, 0.3, 1);
   }
 }
+/* Header, body and footer are stacked: the card is one column. */
 .pc {
+  display: block;
+}
+.pc-header {
   display: flex;
+  align-items: center;
   gap: 0.85rem;
-  align-items: flex-start;
+  margin-bottom: 0.85rem;
+}
+.pc-identity { min-width: 0; }
+.pc-identity p { margin: 0; }
+.pc-footer {
+  margin-top: 0.85rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.72rem;
+  color: var(--muted);
 }
 .pc-avatar {
   flex: 0 0 56px;
