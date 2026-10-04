@@ -501,29 +501,52 @@ button.danger:hover {
   opacity: 0.9;
 }
 
-p.pager {
-  margin: 1rem 0 0;
+/* Page controls of a table: ← 1 2 3 … 21 → */
+nav.pager {
+  margin: 0.85rem 0 0;
   display: flex;
-  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
 }
-p.pager:empty {
-  display: none;
-}
-p.pager a {
+nav.pager a, nav.pager span {
   display: inline-flex;
   align-items: center;
-  padding: 0.4rem 0.95rem;
+  justify-content: center;
+  min-width: 2.1rem;
+  height: 2.1rem;
+  padding: 0 0.5rem;
   border-radius: var(--radius-sm);
-  border: 1px solid var(--line);
+  border: 1px solid transparent;
+  font-size: 0.86rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+nav.pager a {
+  border-color: var(--line);
   background: var(--card);
   color: var(--fg);
-  font-size: 0.88rem;
-  font-weight: 500;
 }
-p.pager a:hover {
+nav.pager a:hover {
   border-color: var(--accent);
   color: var(--accent);
   text-decoration: none;
+}
+nav.pager .current {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 700;
+}
+nav.pager [aria-disabled="true"] {
+  border-color: var(--line);
+  color: var(--muted);
+  opacity: 0.45;
+}
+nav.pager .pager-gap {
+  min-width: 1.1rem;
+  padding: 0;
+  color: var(--muted);
 }
 
 /* Tables */
@@ -1251,14 +1274,17 @@ footer {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  padding: 0.55rem 1rem;
+  padding: 0.4rem 0.85rem;
   border-bottom: 1px solid var(--line);
   text-align: left;
   white-space: nowrap;
 }
-/* Dense rows: 41px with text alone, 44px with a time or count badge. */
+/* Compact rows, about 34px: one line of text at line-height 1.4 and
+   0.4rem above and below. A badge is no taller than that line, so a row
+   with a time is as high as one without. */
 .data-table td {
-  padding: 0.55rem 1rem;
+  padding: 0.4rem 0.85rem;
+  line-height: 1.4;
   border-bottom: 1px solid var(--line);
   color: var(--fg);
   vertical-align: middle;
@@ -1295,10 +1321,12 @@ footer {
   font-family: var(--font-mono);
   color: var(--muted);
   background: var(--pill);
-  padding: 0.1rem 0.5rem;
+  padding: 0 0.45rem;
+  line-height: 1.4;
   border-radius: var(--radius-sm);
   border: 1px solid var(--line);
   white-space: nowrap;
+  vertical-align: middle;
 }
 
 .listblock-badge {
@@ -1309,8 +1337,10 @@ footer {
   background: var(--accent-subtle);
   color: var(--accent);
   border: 1px solid var(--accent-glow);
-  padding: 0.1rem 0.6rem;
+  padding: 0 0.5rem;
+  line-height: 1.35;
   border-radius: var(--radius-sm);
+  vertical-align: middle;
 }
 
 .list-link {

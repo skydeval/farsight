@@ -227,6 +227,13 @@ nothing else in a browser.
   The time is the author's own claim, so the order uses the earlier of
   that and the moment Farsight first stored the record: a record dated
   in the future sits where it arrived, not at the top of the page.
+- **Pages.** Every table shows 50 rows and ends with numbered page
+  controls (`← 1 2 3 … 21 →`). They are plain links with the page in
+  the address (`?page=2`, and `lists`, `out`, `blockers` for a page's
+  other tables). A table's last page is shown while it has at most
+  1,000 rows; a longer one has no last page in its controls, and the
+  next arrow works for as long as rows follow. Links made by an
+  earlier version (`?bc=…` and the like) lead to the first page.
 - **Handles.** A row shows `@handle` once Farsight has verified it in
   both directions, the DID until then. A background worker verifies
   the accounts that pages had to show as DIDs (`handle_warming_enabled`,
@@ -236,7 +243,12 @@ nothing else in a browser.
   stored (table `handle_cache`) and survives a restart. One verified
   more than seven days ago is still shown and is verified again in the
   background the next time a page reads it; if that fails, the old
-  handle stays. To start over, `DELETE FROM handle_cache;`.
+  handle stays. To start over, `DELETE FROM handle_cache;`. With
+  `handle_warming_enabled = false` nothing does that background work:
+  a stored handle is never checked again, so an account that changes
+  its handle keeps showing the old one, and an account not seen before
+  shows as a DID (unless its own page or card is opened) until the key
+  is switched back on.
 - **No coverage detail.** A public page prints no coverage level. It
   says "None on record at this instance" for an empty section, says so
   when a list is not indexed, and ends with one "Last updated" line.

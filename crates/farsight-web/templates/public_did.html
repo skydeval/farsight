@@ -23,7 +23,7 @@
 <h2>Blocked by{% if let Some(n) = blockers.count %} <span class="count">{{ n }}</span>{% endif %}</h2>
 <p class="muted">Direct blocks naming this account. One account can hold several block records; each is listed.</p>
 </div>
-{% if !blockers.rows.is_empty() || blockers.pager.next.is_some() %}
+{% if !blockers.rows.is_empty() %}
 <div class="table-responsive">
 <table class="data-table">
 <thead>
@@ -32,7 +32,7 @@
 <th scope="col" class="th-date">Created (Author Claim)</th>
 </tr>
 </thead>
-<tbody id="blockers-rows">
+<tbody>
 {% for r in blockers.rows %}
 <tr class="data-row">
 <td class="td-account">{{ r.who|safe }}</td>

@@ -380,13 +380,45 @@ fn row_dids(sec: &str) -> Vec<String> {
         .collect()
 }
 
-/// The "Next" link of a public section.
+/// The next page of a public section (the arrow of its page controls),
+/// without the fragment.
 fn next_of(sec: &str) -> Option<String> {
-    let i = sec.find("class=\"pager\"")?;
-    let k = "hx-get=\"";
+    let i = sec.find("<nav class=\"pager\"")?;
+    let k = "rel=\"next nofollow\" href=\"";
     let a = sec[i..].find(k)? + i + k.len();
     let b = sec[a..].find('"')? + a;
-    Some(sec[a..b].replace("&amp;", "&"))
+    let href = sec[a..b].replace("&amp;", "&");
+    Some(href.split('#').next().unwrap_or("").to_owned())
+}
+
+/// What a public section's page controls read, in order: `←`, numbers
+/// (the current one in brackets), `…`, `→`; an arrow that leads nowhere
+/// is in parentheses.
+fn controls_of(sec: &str) -> String {
+    let Some(nav) = between(sec, "<nav class=\"pager\"", "</nav>")
+        .first()
+        .copied()
+    else {
+        return String::new();
+    };
+    let mut out = Vec::new();
+    for part in nav.split('<').skip(1) {
+        let Some((tag, text)) = part.split_once('>') else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push(if tag.contains("aria-current") {
+            format!("[{text}]")
+        } else if tag.contains("aria-disabled") {
+            format!("({text})")
+        } else {
+            text.to_owned()
+        });
+    }
+    out.join(" ")
 }
 
 /// The "Next page" link of an admin section.
@@ -430,7 +462,7 @@ fn cursor_json(raw: &str) -> Option<Value> {
     serde_json::from_slice(&URL_SAFE_NO_PAD.decode(raw).ok()?).ok()
 }
 
-/// Walks a public section through its "Next" links.
+/// Walks a public section through its pages.
 async fn walk(s: &Srv, first: &str, id: &str) -> Result<(Vec<String>, usize), String> {
     let mut rows = Vec::new();
     let mut url = first.to_owned();
@@ -569,6 +601,7 @@ struct World {
     /// An author of 3,000 blocks; a list with 20,000 members and listblocks.
     dense_author_id: i64,
     filler_list_id: i64,
+    filler_path: String,
     sparse_id: i64,
 }
 
@@ -842,6 +875,7 @@ async fn seed_world(pool: &PgPool) -> Result<World, String> {
         w21,
         dense_author_id,
         filler_list_id,
+        filler_path: format!("/list/{}/filler", did("flo", 1)),
         sparse_id,
     })
 }
@@ -877,29 +911,45 @@ async fn check_order(
     );
     let first = a.get(&public_did(&w.s)).await?;
     let sec = section(&first.text, "blockers").unwrap_or("");
-    let more = between(sec, "<p class=\"pager\" id=\"blockers-more\">", "</p>")
-        .first()
-        .copied()
-        .unwrap_or("");
-    let last = match next_of(sec) {
-        Some(n) => a.get(&n).await?,
-        None => return Err("no \"Load more\" link on a 305-row section".into()),
-    };
-    let last_sec = section(&last.text, "blockers").unwrap_or("");
+    let at = |n: i64| format!("{}?page={n}", public_did(&w.s));
+    let middle = a.get(&at(4)).await?;
+    let last = a.get(&at(7)).await?;
+    let past = a.get(&at(8)).await?;
+    let (mid_sec, last_sec, past_sec) = (
+        section(&middle.text, "blockers").unwrap_or(""),
+        section(&last.text, "blockers").unwrap_or(""),
+        section(&past.text, "blockers").unwrap_or(""),
+    );
     c.check(
-        "\"Blocked by\" is 200 rows and a \"Load more\" link that appends: it asks for the next page's rows alone (hx-select on the table body's rows, hx-swap beforeend into #blockers-rows), replaces its own paragraph out of band, and pushes the URL; the second page is the other 105 rows and an empty paragraph, so the link goes away",
-        pages == 2
-            && row_dids(sec).len() == 200
-            && sec.contains("<tbody id=\"blockers-rows\">")
-            && more.contains(">Load more</a>")
-            && more.contains("hx-target=\"#blockers-rows\"")
-            && more.contains("hx-select=\"#blockers-rows > tr\"")
-            && more.contains("hx-swap=\"beforeend\"")
-            && more.contains("hx-select-oob=\"#blockers-more\"")
-            && more.contains("hx-push-url=\"true\"")
-            && row_dids(last_sec).len() == 105
-            && last_sec.contains("<p class=\"pager\" id=\"blockers-more\"></p>"),
-        format!("{} + {} rows; {}", row_dids(sec).len(), row_dids(last_sec).len(), support::truncate(more, 200)),
+        "\"Blocked by\" is 50 rows a page with numbered page controls, plain links with the page in the query: 305 records are seven pages; the controls show the first and last page, the current one and its neighbours, a gap where pages are left out, and arrows that are not links at the ends; page 4 is rows 151–200 of the order; a page past the end is an empty table that still leads back",
+        pages == 7
+            && row_dids(sec).len() == 50
+            && controls_of(sec) == "(←) [1] 2 3 … 7 →"
+            && next_of(sec) == Some(at(2))
+            && controls_of(mid_sec) == "← 1 2 3 [4] 5 6 7 →"
+            && row_dids(mid_sec) == want[150..200]
+            && controls_of(last_sec) == "← 1 … 5 6 [7] (→)"
+            && row_dids(last_sec).len() == 5
+            && past.status == 200
+            && row_dids(past_sec).is_empty()
+            && controls_of(past_sec).starts_with("← 1 ")
+            && !sec.contains("hx-")
+            && !sec.contains("Load more"),
+        format!("{pages} pages; {:?} / {:?} / {:?} / {:?}", controls_of(sec), controls_of(mid_sec), controls_of(last_sec), controls_of(past_sec)),
+    );
+    let dense = a.get(&format!("{}?page=20", w.filler_path)).await?;
+    let deep = a.get(&format!("{}?page=400", w.filler_path)).await?;
+    let (dense_sec, deep_sec) = (
+        section(&dense.text, "members").unwrap_or(""),
+        section(&deep.text, "members").unwrap_or(""),
+    );
+    c.check(
+        "a section longer than the count's cap of 1,000 has no last page in its controls: on page 20 of a 20,000-member list they end in a gap and the next arrow, and every row stays reachable — page 400 holds the last 50 and closes the list",
+        row_dids(dense_sec).len() == 50
+            && controls_of(dense_sec) == "← 1 … 18 19 [20] 21 … →"
+            && row_dids(deep_sec).len() == 50
+            && controls_of(deep_sec) == "← 1 … 398 399 [400] (→)",
+        format!("{:?} / {:?}", controls_of(dense_sec), controls_of(deep_sec)),
     );
     let (admin, _) = admin_walk(a, cookie, &lookup_did(&w.s), "Incoming blocks").await?;
     c.check(
@@ -1059,7 +1109,6 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
     c.section("4. keyset paging through rows with one shown time");
     let mut ok = true;
     let mut detail = Vec::new();
-    // An account's "Blocked by" holds 200 rows a page, the others 50.
     for (name, first, id, section_, key, want_pages) in [
         (
             "Blocked by (account)",
@@ -1067,7 +1116,7 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
             "blockers",
             Section::IncomingBlocks,
             w.t4_id,
-            1,
+            3,
         ),
         (
             "Blocks by this account",
@@ -1083,7 +1132,7 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
             "members",
             Section::ListMembers,
             w.l4_id,
-            1,
+            3,
         ),
         (
             "Blocked by (list)",
@@ -1099,13 +1148,17 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
         let good = exactly_once(&got, 120) && pages == want_pages && got == want;
         ok &= good;
         detail.push(format!(
-            "{name}: {} rows, {pages} pages, {}",
+            "{name}: {} rows, {} distinct, {pages} pages, {}",
             got.len(),
-            if good { "exact" } else { "WRONG" }
+            got.iter().collect::<BTreeSet<_>>().len(),
+            match got.iter().zip(&want).position(|(x, y)| x != y) {
+                None if good => "exact".to_owned(),
+                at => format!("WRONG (first differing position: {at:?})"),
+            }
         ));
     }
     c.check(
-        "120 rows with the same shown time in each of the four sections: every row exactly once, in the order of the tiebreak — across three pages of 50, and on the one page of 200 an account's \"Blocked by\" holds",
+        "120 rows with the same shown time in each of the four sections: every row exactly once, in the order of the tiebreak, across three pages of 50",
         ok,
         detail.join("; "),
     );
@@ -1172,23 +1225,23 @@ fn order_of(plan: &str) -> &'static str {
 }
 
 async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<(), String> {
-    c.section("6. cursors");
-    let page = a.get(&public_did(&w.s)).await?;
-    let next = section(&page.text, "blockers")
-        .and_then(next_of)
+    c.section("6. cursors (admin tables) and page numbers (public tables)");
+    let page = a.admin_get(cookie, &lookup_did(&w.s)).await?;
+    let next = admin_section(&page.text, "Incoming blocks")
+        .and_then(admin_next)
         .unwrap_or_default();
     let raw = query_of(&next, "bc").unwrap_or_default();
     let v = cursor_json(&raw).unwrap_or(Value::Null);
     c.check(
-        "a cursor of the new order is the codebase's opaque format — base64url of a JSON array — tagged \"t\": [\"t\", microseconds, blocker id, record key]",
+        "a cursor of the new order (admin tables) is the codebase's opaque format — base64url of a JSON array — tagged \"t\": [\"t\", microseconds, blocker id, record key]",
         v[0] == "t" && v[1].is_i64() && v[2].is_i64() && v[3].is_string() && v.as_array().is_some_and(|x| x.len() == 4),
         v.to_string(),
     );
-    let out = a.get(&public_did(&w.o4)).await?;
-    let onext = section(&out.text, "outgoing")
-        .and_then(next_of)
+    let out = a.admin_get(cookie, &lookup_list(&w.l4_uri)).await?;
+    let onext = admin_section(&out.text, "Members")
+        .and_then(admin_next)
         .unwrap_or_default();
-    let ov = cursor_json(&query_of(&onext, "oc").unwrap_or_default()).unwrap_or(Value::Null);
+    let ov = cursor_json(&query_of(&onext, "mc").unwrap_or_default()).unwrap_or(Value::Null);
     c.check(
         "sections that list one author's or one list's records carry [\"t\", microseconds, record key]",
         ov[0] == "t" && ov[1].is_i64() && ov[2].is_string() && ov.as_array().is_some_and(|x| x.len() == 3),
@@ -1196,20 +1249,23 @@ async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Resu
     );
     // A cursor of the order before the indexes: [blocker id, record key].
     let old = URL_SAFE_NO_PAD.encode(br#"[42,"3ksbl00000007"]"#);
+    let public = a.get(&public_did(&w.s)).await?;
+    let public_next = section(&public.text, "blockers")
+        .and_then(next_of)
+        .unwrap_or_default();
     let stale = a.get(&format!("{}?bc={old}", public_did(&w.s))).await?;
     let garbage = a.get(&format!("{}?bc=%21%21", public_did(&w.s))).await?;
-    let untagged = URL_SAFE_NO_PAD.encode(br#"["x",1725148800000000,42,"3ksbl00000007"]"#);
-    let odd = a
-        .get(&format!("{}?bc={untagged}", public_did(&w.s)))
-        .await?;
+    let zero = a.get(&format!("{}?page=0", public_did(&w.s))).await?;
     c.check(
-        "an old-format cursor, an untagged one and garbage each get the 400 page with its \"Open the first page\" link — never a 500, never an empty table read as a position",
-        [&stale, &garbage, &odd].iter().all(|r| {
-            r.status == 400
-                && r.text.contains("Open the first page")
-                && r.text.contains(&format!("href=\"{}\"", public_did(&w.s)))
-        }),
-        format!("{} / {} / {}", stale.status, garbage.status, odd.status),
+        "the public tables carry no cursor: the next page is ?page=2; an address that still has a cursor of an earlier version, readable or not, is redirected (301) to the first page of its section; a page number that is not one gets the 400 page with its \"Open the first page\" link — never a 500",
+        public_next == format!("{}?page=2", public_did(&w.s))
+            && [&stale, &garbage].iter().all(|r| {
+                r.status == 301 && r.header("location").as_deref() == Some(public_did(&w.s).as_str())
+            })
+            && zero.status == 400
+            && zero.text.contains("Open the first page")
+            && zero.text.contains(&format!("href=\"{}\"", public_did(&w.s))),
+        format!("{public_next}; {} / {} / {}", stale.status, garbage.status, zero.status),
     );
     let admin = a
         .admin_get(cookie, &format!("{}&bc={old}", lookup_did(&w.s)))
@@ -2046,15 +2102,15 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     .fetch_all(&pool)
     .await
     .map_err(|e| e.to_string())?;
-    let page = h.get(&public_did(&subject)).await?;
-    let sec = section(&page.text, "blockers").unwrap_or("");
-    let old_next = next_of(sec).unwrap_or_default();
-    let old_cursor =
-        cursor_json(&query_of(&old_next, "bc").unwrap_or_default()).unwrap_or(Value::Null);
     let (walked, _) = walk(&h, &public_did(&subject), "blockers").await?;
     let admin = h.admin_get(&cookie, &lookup_did(&subject)).await?;
+    let old_next = admin_section(&admin.text, "Incoming blocks")
+        .and_then(admin_next)
+        .unwrap_or_default();
+    let old_cursor =
+        cursor_json(&query_of(&old_next, "bc").unwrap_or_default()).unwrap_or(Value::Null);
     c.check(
-        "until its index is valid a section keeps its previous order and cursors, with the same columns and filters: the public table pages in the old order with an untagged [id, rkey] cursor, and the admin table still has its \"First seen\" column",
+        "until its index is valid a section keeps its previous order and cursors, with the same columns and filters: the public table pages in the old order, the admin table with an untagged [id, rkey] cursor, and the admin table still has its \"First seen\" column",
         walked == stored
             && walked.len() == 250
             && old_cursor[0].is_i64()
@@ -2095,10 +2151,15 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     );
     let want = expected(&pool, Section::IncomingBlocks, sid, true).await?;
     let (walked, _) = walk(&h, &public_did(&subject), "blockers").await?;
-    let stale = h.get(&old_next).await?;
+    let stale = h.admin_get(&cookie, &old_next).await?;
+    let stale_sec = admin_section(&stale.text, "Incoming blocks").unwrap_or("");
     c.check(
-        "the section switched by itself: it now pages by shown time, and the link made before the switch answers once with the 400 page and its \"Open the first page\" link",
-        walked == want && walked != stored && stale.status == 400 && stale.text.contains("Open the first page"),
+        "the section switched by itself: the public table now pages by shown time, and the admin link made before the switch gives the section's error line and no rows",
+        walked == want
+            && walked != stored
+            && stale.status == 200
+            && stale_sec.contains(STALE_LINK)
+            && row_dids(stale_sec).is_empty(),
         format!("stale link: {}", stale.status),
     );
     Ok(())

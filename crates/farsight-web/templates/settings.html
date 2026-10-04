@@ -80,7 +80,9 @@ pages draw on the same budget.</div>
 <div class="hint">When a page has to show an account as a bare DID, a background worker verifies its handle so that the next
 view shows it. It uses what the handle budget (2 lookups per second) has to spare and never slows a page down; the first
 view of a page nobody has opened still shows DIDs. Applies to the admin pages too, also with the public UI off. Off:
-handles appear only as cards are opened and account pages are visited.</div>
+handles appear only as cards are opened and account pages are visited, and a stored handle is never checked again: an
+account that changes its handle keeps showing the old one, and an account not seen before shows as a DID, until this is
+switched back on.</div>
 
 <label><input type="checkbox" name="show_opengraph_image"{% if p.show_opengraph_image %} checked{% endif %}> Offer the preview image (<code>show_opengraph_image</code>)</label>
 <div class="hint">Link previews carry a title, a fixed description and one static image; never data.</div>

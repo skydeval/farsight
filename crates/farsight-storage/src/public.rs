@@ -430,6 +430,8 @@ pub enum Counted {
     OutgoingBlocks,
     /// Listblocks on a list (`list_blocks_by_list`).
     ListBlockers,
+    /// Listitems of a list (`list_items_by_list`).
+    ListMembers,
 }
 
 /// Counts the records of a section with the section's filters, scanning
@@ -446,6 +448,7 @@ pub async fn bounded_count(
         Counted::IncomingBlocks => ("blocks", "r.author_id", "r.subject_id"),
         Counted::OutgoingBlocks => ("blocks", "r.subject_id", "r.author_id"),
         Counted::ListBlockers => ("list_blocks", "r.author_id", "r.list_id"),
+        Counted::ListMembers => ("list_items", "r.subject_id", "r.list_id"),
     };
     Ok(sqlx::query_scalar(&format!(
         "SELECT count(*) FROM (

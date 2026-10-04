@@ -361,6 +361,34 @@ pub async fn rows(
         .collect())
 }
 
+/// `limit` rows of `section` for `key` in `order`, skipping the first
+/// `offset`: a numbered page of the public tables. The cost grows with
+/// the offset; the order is total, so pages do not overlap.
+pub async fn rows_at(
+    conn: &mut PgConnection,
+    section: Section,
+    key: i64,
+    order: Order,
+    filter: Filter<'_>,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<Row>> {
+    let mut q = build("", section, key, order, filter, None, limit);
+    q.push(" OFFSET ");
+    q.push_bind(offset);
+    let rows: Vec<Raw> = q.build_query_as().fetch_all(conn).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(party_id, did, rkey, created_at, first_seen)| Row {
+            party_id,
+            did,
+            rkey,
+            created_at,
+            first_seen,
+        })
+        .collect())
+}
+
 /// The shown time of the listitem a list names the account with.
 const SHOWN_X: &str = "COALESCE(LEAST(x.created_at, x.first_seen), '-infinity'::timestamptz)";
 
@@ -395,9 +423,15 @@ impl NamingRow {
     }
 }
 
-/// A keyset position in the lists naming an account: the last row's shown
-/// time (`None` = "last") and its list id.
-pub type NamingPosition = (Option<DateTime<Utc>>, i64);
+/// Which lists name `$1` and may be shown; `$2` is the excluded owners.
+fn naming_from() -> String {
+    format!(
+        "JOIN lists l ON l.id = x.list_id
+         JOIN actors o ON o.id = l.owner_id
+         WHERE l.track_state IN (2, 3) AND l.record_state = 1
+           AND o.status NOT IN {HIDDEN} AND NOT (o.id = ANY($2))"
+    )
+}
 
 fn naming_sql() -> String {
     format!(
@@ -405,21 +439,16 @@ fn naming_sql() -> String {
          FROM (SELECT DISTINCT ON (li.list_id) li.list_id, li.created_at, li.first_seen
                FROM list_items li WHERE li.subject_id = $1
                ORDER BY li.list_id, li.rkey) x
-         JOIN lists l ON l.id = x.list_id
-         JOIN actors o ON o.id = l.owner_id
-         WHERE l.track_state IN (2, 3) AND l.record_state = 1
-           AND o.status NOT IN {HIDDEN} AND NOT (o.id = ANY($2))
-           AND ($3::bigint IS NULL
-                OR ({SHOWN_X}, l.id) < (COALESCE($4::timestamptz, '-infinity'::timestamptz), $3))
-         ORDER BY {SHOWN_X} DESC, l.id DESC LIMIT $5"
+         {}
+         ORDER BY {SHOWN_X} DESC, l.id DESC LIMIT $3 OFFSET $4",
+        naming_from()
     )
 }
 
 /// Ready or retained lists with a present record naming `subject_id`, once
 /// per list, newest first by the shown time of the listitem, then by list
 /// id descending. Lists of hidden owners and of `excluded` owners are left
-/// out. `after` is the last row of the page before: its shown time and its
-/// list id.
+/// out. `limit` rows, skipping the first `offset`.
 ///
 /// The same lists as `queries::lists_naming`, whose order (by list id) is
 /// part of the stable API and is not touched.
@@ -427,7 +456,7 @@ pub async fn lists_naming(
     conn: &mut PgConnection,
     subject_id: i64,
     excluded: &[i64],
-    after: Option<NamingPosition>,
+    offset: i64,
     limit: i64,
 ) -> Result<Vec<NamingRow>> {
     type Raw = (
@@ -442,9 +471,8 @@ pub async fn lists_naming(
     let rows: Vec<Raw> = sqlx::query_as(&naming_sql())
         .bind(subject_id)
         .bind(excluded)
-        .bind(after.map(|(_, id)| id))
-        .bind(after.and_then(|(t, _)| t))
         .bind(limit)
+        .bind(offset)
         .fetch_all(conn)
         .await?;
     Ok(rows
@@ -461,6 +489,29 @@ pub async fn lists_naming(
             },
         )
         .collect())
+}
+
+/// How many lists [`lists_naming`] would return for `subject_id` in all,
+/// counted up to `cap + 1`: a result above `cap` means "more than `cap`".
+pub async fn lists_naming_count(
+    conn: &mut PgConnection,
+    subject_id: i64,
+    excluded: &[i64],
+    cap: i64,
+) -> Result<i64> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM (
+           SELECT 1 FROM (SELECT DISTINCT li.list_id FROM list_items li
+                          WHERE li.subject_id = $1) x
+           {}
+           LIMIT $3) y",
+        naming_from()
+    ))
+    .bind(subject_id)
+    .bind(excluded)
+    .bind(cap + 1)
+    .fetch_one(conn)
+    .await?)
 }
 
 /// The plan of the query [`rows`] runs, one line per plan node
@@ -731,9 +782,12 @@ mod tests {
     #[test]
     fn lists_naming_sorts_by_the_clamped_time() {
         let q = naming_sql();
-        assert!(q.contains(&format!("ORDER BY {SHOWN_X} DESC, l.id DESC LIMIT $5")));
+        assert!(q.contains(&format!(
+            "ORDER BY {SHOWN_X} DESC, l.id DESC LIMIT $3 OFFSET $4"
+        )));
         assert!(!q.contains("ORDER BY x.created_at"), "{q}");
-        assert!(q.contains(&format!("({SHOWN_X}, l.id) < (COALESCE($4::timestamptz")));
+        // The count applies the filters of the rows.
+        assert!(q.contains(&naming_from()));
         let t = |h| Utc.with_ymd_and_hms(2026, 10, 3, h, 0, 0).unwrap();
         let row = |c, f| NamingRow {
             list_id: 1,

@@ -407,8 +407,9 @@ fn row_dids(sec: &str) -> Vec<String> {
         let from = i + k.len();
         if let Some(j) = rest[from..].find('"') {
             let d = &rest[from..from + j];
-            // Row links are bare DIDs; the pager's link carries a query.
-            if !d.contains(['?', '/']) {
+            // Row links are bare DIDs; a page control's link carries a
+            // query, a fragment or both.
+            if !d.contains(['?', '/', '#']) {
                 out.push(d.to_owned());
             }
         }
@@ -516,8 +517,55 @@ fn updated_of(html: &str) -> Option<String> {
     Some(html[a..][..html[a..].find('"')?].to_owned())
 }
 
-/// The "Next" link of a section, if it has one.
+/// The address a link of a public section's page controls leads to,
+/// without its fragment: `rel` is `next` or `prev`.
+fn step_of(sec: &str, rel: &str) -> Option<String> {
+    let i = sec.find("<nav class=\"pager\"")?;
+    let k = format!("rel=\"{rel} nofollow\" href=\"");
+    let a = sec[i..].find(&k)? + i + k.len();
+    let b = sec[a..].find('"')? + a;
+    let href = sec[a..b].replace("&amp;", "&");
+    Some(href.split('#').next().unwrap_or("").to_owned())
+}
+
+/// The next page of a public section, if it has one.
 fn next_of(sec: &str) -> Option<String> {
+    step_of(sec, "next")
+}
+
+/// What a public section's page controls read, in order: `←`, numbers
+/// (the current one in brackets), `…`, `→`; an arrow that leads nowhere
+/// is in parentheses.
+fn controls_of(sec: &str) -> String {
+    let Some(nav) = between(sec, "<nav class=\"pager\"", "</nav>")
+        .first()
+        .copied()
+    else {
+        return String::new();
+    };
+    let mut out = Vec::new();
+    for part in nav.split('<').skip(1) {
+        let Some((tag, text)) = part.split_once('>') else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push(if tag.contains("aria-current") {
+            format!("[{text}]")
+        } else if tag.contains("aria-disabled") {
+            format!("({text})")
+        } else {
+            text.to_owned()
+        });
+    }
+    out.join(" ")
+}
+
+/// The "Next" link of an admin history section (a cursor, fetched by
+/// htmx), if it has one.
+fn cursor_next(sec: &str) -> Option<String> {
     let i = sec.find("class=\"pager\"")?;
     let k = "hx-get=\"";
     let a = sec[i..].find(k)? + i + k.len();
@@ -1545,9 +1593,10 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
         format!("/did/did:web:{long}.example"),
         format!("/list/{}/bad%20key", w.o1),
         format!("/list/alice.example/{LIST}"),
-        format!("{}?bc=!!!", path_did(&w.s)),
-        format!("{}?nc=bm9wZQ", path_did(&w.s)),
-        format!("{}?lc=!!!", w.list),
+        format!("{}?page=0", path_did(&w.s)),
+        format!("{}?lists=x", path_did(&w.s)),
+        format!("{}?page=2&out=-1", path_did(&w.s)),
+        format!("{}?blockers=1000001", w.list),
         format!("/search?q={long}"),
         "/card/alice.example".to_owned(),
         "/card/did:plc:short".to_owned(),
@@ -1563,15 +1612,47 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
         }
     }
     c.check(
-        "malformed DID, list key, cursor and over-long input ⇒ 400, no-store (pages and the card route)",
+        "malformed DID, list key, page number and over-long input ⇒ 400, no-store (pages and the card route)",
         bad.is_empty(),
         bad.join("; "),
     );
-    let cur = h.get(&format!("{}?bc=!!!", path_did(&w.s))).await?;
+    let cur = h.get(&format!("{}?page=0", path_did(&w.s))).await?;
     c.check(
-        "a cursor that no longer parses links to the first page",
+        "a page number that cannot be read links to the first page",
         cur.text.contains(&format!("href=\"{}\"", path_did(&w.s))),
         support::truncate(&cur.text, 120),
+    );
+    let mut bad = Vec::new();
+    for (from, to) in [
+        // A cursor of an earlier version: its section starts over.
+        (format!("{}?bc=!!!", path_did(&w.s)), path_did(&w.s)),
+        (
+            format!("{}?bc=abc&lists=2", path_did(&w.s)),
+            format!("{}?lists=2", path_did(&w.s)),
+        ),
+        (format!("{}?nc=bm9wZQ&oc=x", path_did(&w.s)), path_did(&w.s)),
+        (format!("{}?mc=abc", w.list), w.list.clone()),
+        (
+            format!("{}?lc=!!!&page=2", w.list),
+            format!("{}?page=2", w.list),
+        ),
+        // Page 1 has one address: the one without the parameter.
+        (format!("{}?page=1", path_did(&w.s)), path_did(&w.s)),
+        (
+            format!("{}?page=2&lists=1", path_did(&w.s)),
+            format!("{}?page=2", path_did(&w.s)),
+        ),
+        (format!("{}?blockers=1", w.list), w.list.clone()),
+    ] {
+        let r = h.get(&from).await?;
+        if r.status != 301 || r.header("location").as_deref() != Some(to.as_str()) {
+            bad.push(format!("{from}: {} {:?}", r.status, r.header("location")));
+        }
+    }
+    c.check(
+        "an address with a cursor of an earlier version (bc, nc, oc, mc, lc) or with a page parameter of 1 ⇒ 301 to the address without it; the other sections keep their page",
+        bad.is_empty(),
+        bad.join("; "),
     );
     let u = h.get(&path_did(&w.unknown)).await?;
     let actors_before = h.n("SELECT count(*) FROM actors").await?;
@@ -1633,17 +1714,34 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let (rows, pages, _) = walk(h, &path_did(&w.s), "blockers").await?;
     let (ok, d) = exactly_once(&rows, &want);
     c.check(
-        "Blocked by: paging through the section returns every blocker with an active account exactly once",
-        ok && pages == 1 && want.len() == 61,
+        "Blocked by: paging through the section returns every blocker with an active account exactly once, 50 a page",
+        ok && pages == 2 && want.len() == 61,
         format!("{d}; {pages} pages"),
     );
     let sec = section(&page.text, "blockers").unwrap_or("");
+    let second = h.get(&format!("{}?page=2", path_did(&w.s))).await?;
+    let sec2 = section(&second.text, "blockers").unwrap_or("");
     c.check(
-        "Blocked by holds 200 rows a page: 61 blockers are one page, whose table body and empty \"Load more\" paragraph are there for a later page to fill, with no link",
-        sec.contains("<tbody id=\"blockers-rows\">")
-            && sec.contains("<p class=\"pager\" id=\"blockers-more\"></p>")
+        "Blocked by holds 50 rows a page with numbered page controls: 61 blockers are two pages; the controls are plain links (no htmx) that carry the page in the query and the section as the fragment, the current page is marked, and an arrow that leads nowhere is not a link",
+        row_dids(sec).len() == 50
+            && row_dids(sec2).len() == 11
+            && controls_of(sec) == "(←) [1] 2 →"
+            && controls_of(sec2) == "← 1 [2] (→)"
+            && sec.contains(&format!(
+                "rel=\"next nofollow\" href=\"{}?page=2#blockers\"",
+                path_did(&w.s)
+            ))
+            && step_of(sec2, "prev") == Some(path_did(&w.s))
+            && sec2.contains("aria-current=\"page\"")
+            && !sec.contains("hx-")
             && !sec.contains("Load more"),
-        support::truncate(sec.rsplit("</table>").next().unwrap_or(""), 160),
+        format!("{:?} / {:?}", controls_of(sec), controls_of(sec2)),
+    );
+    let lists_sec = section(&page.text, "lists").unwrap_or("");
+    c.check(
+        "a section that fits on one page has no page controls",
+        !lists_sec.contains("<nav class=\"pager\""),
+        support::truncate(lists_sec.rsplit("</table>").next().unwrap_or(""), 120),
     );
     c.check(
         "row times on the account page are marked to read as the instant alone (no relative part)",
@@ -1737,10 +1835,10 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let navs = section_navs(&lp.text);
     let ids: Vec<&str> = between(&lp.text, "<section id=\"", "\"");
     c.check(
-        "list page section nav: exactly two links, Members and Blocked by; two sections",
-        navs == [["members", "listblockers"]]
-            && lp.text.contains("<span>Members</span>")
-            && lp.text.contains("<span>Blocked by</span>")
+        "the list page has the two sections, Members and Blocked by, and like the account page no stat tiles and no section nav",
+        navs.is_empty()
+            && !lp.text.contains("stat-card")
+            && !lp.text.contains("section-pill")
             && ids == ["members", "listblockers"],
         format!("{navs:?} {ids:?}"),
     );
@@ -1758,13 +1856,9 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     );
     let sec = section(&lp.text, "members").unwrap_or("");
     c.check(
-        "Members holds 200 rows a page and grows in place: 62 members are one page, whose table body and empty \"Load more\" paragraph are there for a later page to fill, with no link",
-        short == 0
-            && pages == 1
-            && sec.contains("<tbody id=\"members-rows\">")
-            && sec.contains("<p class=\"pager\" id=\"members-more\"></p>")
-            && !sec.contains("Load more"),
-        format!("{short} short pages with a next link; {pages} pages"),
+        "the withheld rule runs in the section's query, so it shortens no page and the page count is that of the rows shown: 50 rows while more follow, two pages for 62 members",
+        short == 0 && pages == 2 && controls_of(sec) == "(←) [1] 2 →" && !sec.contains("hx-"),
+        format!("{short} short pages with a next link; {pages} pages; {:?}", controls_of(sec)),
     );
     let times = |sec: &str| {
         sec.matches("<time ").count() == row_dids(sec).len()
@@ -1829,21 +1923,17 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     ] {
         let r = h.get(&format!("/list/{}/{rkey}", w.o2)).await?;
         let has = section(&r.text, "members").is_some();
-        let nav_has = section_navs(&r.text)
-            .first()
-            .is_some_and(|n| n.contains(&"members"));
         if r.status != 200
             || !r.text.contains(&format!("State: {words}"))
             || has != members
-            || nav_has != members
             || r.text.contains("No members")
         {
-            bad.push(format!("{rkey}: {} members={has} nav={nav_has}", r.status));
+            bad.push(format!("{rkey}: {} members={has}", r.status));
         }
     }
     let capped = h.get(&format!("/list/{}/st-capped", w.o2)).await?;
     c.check(
-        "each getListMembers state keeps its wording; the Members section and its nav link only for ready and retained; a capped list says so",
+        "each getListMembers state keeps its wording; the Members section only for ready and retained; a capped list says so",
         bad.is_empty()
             && capped
                 .text
@@ -2171,7 +2261,7 @@ async fn admin_walk(h: &H, first: &str, id: &str) -> Result<(Vec<String>, usize)
         let sec = card_div(&r.text, id).ok_or_else(|| format!("{url}: no #{id}"))?;
         rows.extend(admin_row_dids(sec));
         pages += 1;
-        match next_of(sec) {
+        match cursor_next(sec) {
             Some(n) if pages < 40 => url = n,
             _ => break,
         }
@@ -2247,8 +2337,8 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
     c.check(
         "the first page is the newest removals, 50 rows, with a next link on the admin route carrying its own cursor",
         admin_row_dids(sec).len() == 50
-            && next_of(sec).is_some_and(|n| n.starts_with(&base) && n.contains("hb=")),
-        format!("{} rows; next {:?}", admin_row_dids(sec).len(), next_of(sec)),
+            && cursor_next(sec).is_some_and(|n| n.starts_with(&base) && n.contains("hb=")),
+        format!("{} rows; next {:?}", admin_row_dids(sec).len(), cursor_next(sec)),
     );
     let leaked: Vec<&String> = w.hidden.iter().filter(|d| rows.contains(d)).collect();
     c.check(

@@ -916,11 +916,12 @@ async fn check_old_paths(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Re
         bad.is_empty(),
         if bad.is_empty() { format!("{} requests", cases.len()) } else { bad.join(" | ") },
     );
-    let target = a.get(&format!("/did/{s}?bc=abc")).await?;
+    let hop = a.get(&format!("/did/{s}?bc=abc")).await?;
+    let target = a.get(&format!("/did/{s}")).await?;
     c.check(
-        "a redirect's target is a page that exists",
-        target.status == 200 || target.status == 400,
-        brief(&target),
+        "a redirect's target leads to a page that exists: the cursor parameter the old address carried is retired, so the target answers with one more 301, to the page itself",
+        hop.status == 301 && loc(&hop) == format!("/did/{s}") && target.status == 200,
+        format!("{} then {}", brief(&hop), brief(&target)),
     );
     let cases = [
         ("/lookup/did", "/admin/lookup/did"),

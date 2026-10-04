@@ -41,7 +41,7 @@ use serde_json::json;
 use crate::cells::{self, Account, lookup_did_href};
 use crate::common::render_private;
 use crate::pages::{Nav, WebState, gate, message, nav, permit};
-use crate::public::pages::{Pager, next_link, purpose_words, state_words};
+use crate::public::pages::{purpose_words, state_words};
 use crate::public::text::{
     BLOCK, LISTBLOCK, LISTITEM, admin_did_history_href, admin_list_history_href, clean,
     duration_words, list_uri,
@@ -114,6 +114,36 @@ pub struct HistorySection {
     pub pager: Pager,
     /// "No removals recorded.": only on a first page with nothing after it.
     pub empty: bool,
+}
+
+/// The "next" link of a history section: a plain link that htmx upgrades
+/// to an in-place swap of the section. The response is always the full
+/// page. (The public tables turn by page number; these pages keep their
+/// cursors.)
+#[derive(Debug, Clone, Template)]
+#[template(
+    source = r##"{% if let Some(n) = next %}<p class="pager"><a href="{{ n }}#{{ section }}" hx-get="{{ n }}" hx-select="#{{ section }}" hx-target="#{{ section }}" hx-swap="outerHTML" hx-push-url="true" rel="nofollow">Next</a></p>{% endif %}"##,
+    ext = "html"
+)]
+pub struct Pager {
+    /// The section's fragment id.
+    pub section: &'static str,
+    /// Target without the fragment, if there is a next page.
+    pub next: Option<String>,
+}
+
+/// `base?…` keeping the other sections' positions and setting `key`.
+fn next_link(base: &str, q: &Params, keys: &[&str], key: &str, value: &str) -> String {
+    let mut s = url::form_urlencoded::Serializer::new(String::new());
+    for k in keys {
+        if *k != key {
+            if let Some(v) = q.get(k) {
+                s.append_pair(k, v);
+            }
+        }
+    }
+    s.append_pair(key, value);
+    format!("{base}?{}", s.finish())
 }
 
 /// What kind of record a history section lists (the wording of causes).
@@ -370,11 +400,7 @@ fn history_section(
     HistorySection {
         empty: out.is_empty() && next.is_none() && q.get(key).is_none(),
         rows: out,
-        pager: Pager {
-            section,
-            next,
-            more: false,
-        },
+        pager: Pager { section, next },
     }
 }
 

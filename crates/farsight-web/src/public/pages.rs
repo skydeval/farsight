@@ -9,12 +9,10 @@
 //! in-process, with default filtering, for every section's freshness.
 //! Rows are filtered once more with one batched status lookup for the
 //! page's DIDs, so a page can hold fewer rows than its size while more
-//! follow; the cursor is still offered.
+//! follow; the next page is still offered.
 //!
-//! An account's "Blocked by" section and a list's "Members" section hold
-//! [`BLOCKER_ROWS`] and [`MEMBER_ROWS`] rows a page and grow in place:
-//! their "Load more" link appends the next page's rows. Every other
-//! section holds [`PAGE_ROWS`] and replaces itself.
+//! Every section holds [`PAGE_ROWS`] rows a page and ends with numbered
+//! page controls ([`super::paging`]): plain links, the page in the query.
 //!
 //! A page prints no coverage level. It ends with one "Last updated" line
 //! (see [`super::coverage`]); removed records are an admin page
@@ -37,12 +35,13 @@ use serde_json::Value;
 
 use super::coverage::{EMPTY, last_updated};
 use super::handles::{page_handle, recall, take_budget};
+use super::paging::{self, Pager, Total};
 use super::search::{self, Authority, Target};
 use super::text::{Stamp, card_href, clean, did_href, list_href, list_uri, paragraphs, thousands};
 use super::warming::Asked;
 use super::{
-    BLOCKER_ROWS, COUNT_CAP, Cache, Chrome, Fail, MEMBER_ROWS, OG_ACCOUNT, OG_INSTANCE, OG_LIST,
-    PAGE_ROWS, Req, Withheld, chrome, metrics as m, page, redirect,
+    COUNT_CAP, Cache, Chrome, Fail, OG_ACCOUNT, OG_INSTANCE, OG_LIST, PAGE_ROWS, Req, Withheld,
+    chrome, metrics as m, page, redirect,
 };
 use crate::pages::resolve_handle;
 
@@ -86,23 +85,6 @@ fn who(r: &Req<'_>, asked: &mut Asked, did: &str) -> Who {
     }
 }
 
-/// The "next" link of a section: a plain link that htmx upgrades to an
-/// in-place swap of the section, or, where the section grows in place
-/// (`more`), to an append of the next page's rows to the table body
-/// `#{section}-rows`. The response is always the full page.
-#[derive(Debug, Clone, Template)]
-#[template(path = "_pagination.html")]
-pub struct Pager {
-    /// The section's fragment id.
-    pub section: &'static str,
-    /// Target without the fragment, if there is a next page.
-    pub next: Option<String>,
-    /// "Load more": the link appends instead of replacing. Its paragraph
-    /// `#{section}-more` is rendered even without a link, so that the last
-    /// page's response takes the link away.
-    pub more: bool,
-}
-
 /// An account row with one author-stated time.
 #[derive(Debug, Clone)]
 pub struct PartyRow {
@@ -120,52 +102,40 @@ pub struct Section<R> {
     pub count: Option<String>,
     /// Rows shown.
     pub rows: Vec<R>,
-    /// Next link.
+    /// Page controls.
     pub pager: Pager,
     /// Empty-state line: only on a first page with nothing after it.
     pub empty: Option<&'static str>,
 }
 
-/// The cursor parameters of the pages. Cursors are opaque and unstable.
+/// The page parameters of the account page's sections: "Blocked by", "On
+/// lists", "Blocks by this account".
+const DID_PAGES: [&str; 3] = ["page", "lists", "out"];
+/// Of the list page's: "Members", "Blocked by".
+const LIST_PAGES: [&str; 2] = ["page", "blockers"];
+/// The cursor parameters of earlier versions. An address that still
+/// carries one is redirected to the first page of its section.
 const DID_CURSORS: [&str; 3] = ["bc", "nc", "oc"];
 const LIST_CURSORS: [&str; 2] = ["mc", "lc"];
 
-/// `base?…` keeping the other sections' positions and setting `key`.
-pub(crate) fn next_link(base: &str, q: &Params, keys: &[&str], key: &str, value: &str) -> String {
-    let mut s = url::form_urlencoded::Serializer::new(String::new());
-    for k in keys {
-        if *k != key {
-            if let Some(v) = q.get(k) {
-                s.append_pair(k, v);
-            }
-        }
-    }
-    s.append_pair(key, value);
-    format!("{base}?{}", s.finish())
-}
-
-fn count_words(n: i64) -> String {
-    if n > COUNT_CAP {
-        format!("more than {}", thousands(COUNT_CAP))
-    } else {
-        thousands(n)
+fn count_words(total: Total) -> Option<String> {
+    match total {
+        Total::Rows(n) if n > 0 => Some(thousands(n)),
+        Total::MoreThan(n) => Some(format!("more than {}", thousands(n))),
+        _ => None,
     }
 }
 
-/// A cursor that no longer parses gets a 400 page linking to the first
-/// page; everything else keeps its meaning.
-fn or_first_page(f: Fail, base: &str) -> Fail {
-    match f {
-        Fail::Bad { message, .. } => Fail::Bad {
-            message,
-            link: Some((base.to_owned(), "Open the first page".to_owned())),
-        },
-        other => other,
+fn total_of(n: Option<i64>) -> Total {
+    match n {
+        Some(n) if n > COUNT_CAP => Total::MoreThan(COUNT_CAP),
+        Some(n) => Total::Rows(n),
+        None => Total::Unknown,
     }
 }
 
-fn empty_line<R>(rows: &[R], next: &Option<String>, on_first_page: bool) -> Option<&'static str> {
-    (rows.is_empty() && next.is_none() && on_first_page).then_some(EMPTY)
+fn empty_line<R>(rows: &[R], more: bool, number: i64) -> Option<&'static str> {
+    (rows.is_empty() && !more && number == 1).then_some(EMPTY)
 }
 
 pub(crate) fn purpose_words(p: &str) -> &'static str {
@@ -215,16 +185,32 @@ impl Shown<'_> {
     }
 }
 
-/// A count that is left out when it is zero (an empty section's heading
-/// shows none) or when its query fails or times out; the section still
-/// renders.
-async fn count(r: &Req<'_>, what: Counted, key: i64, w: &Withheld) -> Option<String> {
-    let mut tx = r.st.api.read_tx().await.ok()?;
-    let n = store::bounded_count(&mut tx, what, key, &w.ids, COUNT_CAP)
-        .await
-        .ok()?;
-    let _ = tx.rollback().await;
-    (n > 0).then(|| count_words(n))
+/// A section's length with its filters, counted up to [`COUNT_CAP`].
+/// [`Total::Unknown`] when the query fails or times out; the section
+/// still renders.
+async fn total(r: &Req<'_>, what: Counted, key: i64, w: &Withheld) -> Total {
+    let n = async {
+        let mut tx = r.st.api.read_tx().await.ok()?;
+        let n = store::bounded_count(&mut tx, what, key, &w.ids, COUNT_CAP)
+            .await
+            .ok()?;
+        let _ = tx.rollback().await;
+        Some(n)
+    };
+    total_of(n.await)
+}
+
+/// The same for the lists naming an account.
+async fn naming_total(r: &Req<'_>, subject: i64, w: &Withheld) -> Total {
+    let n = async {
+        let mut tx = r.st.api.read_tx().await.ok()?;
+        let n = farsight_storage::ui_rows::lists_naming_count(&mut tx, subject, &w.ids, COUNT_CAP)
+            .await
+            .ok()?;
+        let _ = tx.rollback().await;
+        Some(n)
+    };
+    total_of(n.await)
 }
 
 /// Parameters for a handler that is called for its freshness only: the
@@ -447,6 +433,12 @@ struct DidPage {
 pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let cfg = r.config();
     let base = did_href(did.as_str());
+    if let Some(query) = paging::canonical(q, &DID_PAGES, &DID_CURSORS) {
+        return Ok(crate::common::moved(&base, Some(&query)));
+    }
+    let b_page = paging::number(q, "page", &base)?;
+    let l_page = paging::number(q, "lists", &base)?;
+    let o_page = paging::number(q, "out", &base)?;
     let withheld = r.withheld().await?;
     let actor = actor_row(r, did).await?;
     if let Some(reason) = withheld.reason(did.as_str(), actor.map(|a| a.status)) {
@@ -461,55 +453,37 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     };
     let (_slot, _permit) = r.render_slots().await?;
     let api = &r.st.api;
+    let filter = row_filter(&withheld);
+    let numbered =
+        |section, key, number| crate::rows::numbered(r.st, section, key, filter, number, PAGE_ROWS);
 
     // Called for its freshness; the rows are read below.
     let blocks = handlers::get_incoming_blocks(api, &freshness_params(&[("actor", did.as_str())]))
         .await?
         .body;
     let block_page = match actor {
-        Some(a) => crate::rows::page(
-            r.st,
-            Rows::IncomingBlocks,
-            a.id,
-            row_filter(&withheld),
-            q.get("bc"),
-            BLOCKER_ROWS,
-        )
-        .await
-        .map_err(|e| or_first_page(e.into(), &base))?,
-        None => crate::rows::Page::default(),
+        Some(a) => numbered(Rows::IncomingBlocks, a.id, b_page).await?,
+        None => Default::default(),
     };
     // Called for its freshness; the rows are read below.
     let naming = handlers::get_lists_naming(api, &freshness_params(&[("actor", did.as_str())]))
         .await?
         .body;
-    let naming_page = crate::rows::naming_page(
-        r.st,
-        actor.map(|a| a.id),
-        &withheld.ids,
-        q.get("nc"),
-        PAGE_ROWS,
-    )
-    .await
-    .map_err(|e| or_first_page(e.into(), &base))?;
+    let naming_page = match actor {
+        Some(a) => {
+            crate::rows::numbered_naming(r.st, a.id, &withheld.ids, l_page, PAGE_ROWS).await?
+        }
+        None => Default::default(),
+    };
     let show_outgoing = cfg.public_ui.show_outgoing_blocks;
     let (out_page, out_fresh) = if show_outgoing {
         let page = match actor {
-            Some(a) => crate::rows::page(
-                r.st,
-                Rows::OutgoingBlocks,
-                a.id,
-                row_filter(&withheld),
-                q.get("oc"),
-                PAGE_ROWS,
-            )
-            .await
-            .map_err(|e| or_first_page(e.into(), &base))?,
-            None => crate::rows::Page::default(),
+            Some(a) => numbered(Rows::OutgoingBlocks, a.id, o_page).await?,
+            None => Default::default(),
         };
         (page, Some(public_ui::outgoing_freshness(api, did).await?))
     } else {
-        (crate::rows::Page::default(), None)
+        (Default::default(), None)
     };
 
     let mut dids: Vec<String> = block_page.rows.iter().map(|b| b.did.clone()).collect();
@@ -518,30 +492,35 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     recall(r.st, cfg, &dids).await;
     let shown = Shown::load(r, &withheld, dids).await?;
     let mut asked = Asked::new(cfg);
-
-    let b_next = block_page
-        .next
-        .as_deref()
-        .map(|c| next_link(&base, q, &DID_CURSORS, "bc", c));
-    let b_rows = party_rows(r, &mut asked, &shown, &block_page.rows);
-    let blockers = Section {
-        count: match actor {
-            Some(a) => count(r, Counted::IncomingBlocks, a.id, &withheld).await,
-            None => None,
-        },
-        empty: empty_line(&b_rows, &b_next, q.get("bc").is_none()),
-        rows: b_rows,
-        pager: Pager {
-            section: "blockers",
-            next: b_next,
-            more: true,
-        },
+    let pager = |section, label, key, number, total, more| {
+        Pager::new(
+            section, label, &base, q, &DID_PAGES, key, number, total, more, PAGE_ROWS,
+        )
     };
 
-    let l_next = naming_page
-        .next
-        .as_deref()
-        .map(|c| next_link(&base, q, &DID_CURSORS, "nc", c));
+    let b_total = match actor {
+        Some(a) => total(r, Counted::IncomingBlocks, a.id, &withheld).await,
+        None => Total::Rows(0),
+    };
+    let b_rows = party_rows(r, &mut asked, &shown, &block_page.rows);
+    let blockers = Section {
+        count: count_words(b_total),
+        empty: empty_line(&b_rows, block_page.more, b_page),
+        rows: b_rows,
+        pager: pager(
+            "blockers",
+            "Blocked by",
+            "page",
+            b_page,
+            b_total,
+            block_page.more,
+        ),
+    };
+
+    let l_total = match actor {
+        Some(a) => naming_total(r, a.id, &withheld).await,
+        None => Total::Rows(0),
+    };
     let l_rows: Vec<ListRow> = naming_page
         .rows
         .iter()
@@ -557,37 +536,40 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         .collect();
     let lists = Section {
         count: None,
-        empty: empty_line(&l_rows, &l_next, q.get("nc").is_none()),
+        empty: empty_line(&l_rows, naming_page.more, l_page),
         rows: l_rows,
-        pager: Pager {
-            section: "lists",
-            next: l_next,
-            more: false,
-        },
+        pager: pager(
+            "lists",
+            "On lists",
+            "lists",
+            l_page,
+            l_total,
+            naming_page.more,
+        ),
     };
 
     // The sections this page rendered; the earliest dates the page.
     let mut fresh: Vec<&Value> = vec![&blocks["freshness"], &naming["freshness"]];
     let outgoing = match &out_fresh {
         Some(f) => {
-            let next = out_page
-                .next
-                .as_deref()
-                .map(|c| next_link(&base, q, &DID_CURSORS, "oc", c));
+            let o_total = match actor {
+                Some(a) => total(r, Counted::OutgoingBlocks, a.id, &withheld).await,
+                None => Total::Rows(0),
+            };
             let rows = party_rows(r, &mut asked, &shown, &out_page.rows);
             fresh.push(f);
             Some(Section {
-                count: match actor {
-                    Some(a) => count(r, Counted::OutgoingBlocks, a.id, &withheld).await,
-                    None => None,
-                },
-                empty: empty_line(&rows, &next, q.get("oc").is_none()),
+                count: count_words(o_total),
+                empty: empty_line(&rows, out_page.more, o_page),
                 rows,
-                pager: Pager {
-                    section: "outgoing",
-                    next,
-                    more: false,
-                },
+                pager: pager(
+                    "outgoing",
+                    "Blocks by this account",
+                    "out",
+                    o_page,
+                    o_total,
+                    out_page.more,
+                ),
             })
         }
         None => None,
@@ -673,6 +655,11 @@ pub async fn list(
     let cfg = r.config();
     let base = list_href(owner.as_str(), rkey.as_str());
     let uri = list_uri(owner.as_str(), rkey.as_str());
+    if let Some(query) = paging::canonical(q, &LIST_PAGES, &LIST_CURSORS) {
+        return Ok(crate::common::moved(&base, Some(&query)));
+    }
+    let m_page = paging::number(q, "page", &base)?;
+    let k_page = paging::number(q, "blockers", &base)?;
     let withheld = r.withheld().await?;
     let actor = actor_row(r, owner).await?;
     if let Some(reason) = withheld.reason(owner.as_str(), actor.map(|a| a.status)) {
@@ -700,30 +687,14 @@ pub async fn list(
         .await?
         .body;
     let (state, show_members) = state_words(listing["state"].as_str().unwrap_or(""));
+    let filter = row_filter(&withheld);
     let member_page = if show_members {
-        crate::rows::page(
-            r.st,
-            Rows::ListMembers,
-            info.id,
-            row_filter(&withheld),
-            q.get("mc"),
-            MEMBER_ROWS,
-        )
-        .await
-        .map_err(|e| or_first_page(e.into(), &base))?
+        crate::rows::numbered(r.st, Rows::ListMembers, info.id, filter, m_page, PAGE_ROWS).await?
     } else {
-        crate::rows::Page::default()
+        Default::default()
     };
-    let blocker_page = crate::rows::page(
-        r.st,
-        Rows::ListBlockers,
-        info.id,
-        row_filter(&withheld),
-        q.get("lc"),
-        PAGE_ROWS,
-    )
-    .await
-    .map_err(|e| or_first_page(e.into(), &base))?;
+    let blocker_page =
+        crate::rows::numbered(r.st, Rows::ListBlockers, info.id, filter, k_page, PAGE_ROWS).await?;
     let blockers_fresh = public_ui::listblock_freshness(api)?;
 
     let mut dids: Vec<String> = member_page.rows.iter().map(|m| m.did.clone()).collect();
@@ -731,45 +702,59 @@ pub async fn list(
     recall(r.st, cfg, &dids).await;
     let shown = Shown::load(r, &withheld, dids).await?;
     let mut asked = Asked::new(cfg);
+    let pager = |section, label, key, number, total, more| {
+        Pager::new(
+            section,
+            label,
+            &base,
+            q,
+            &LIST_PAGES,
+            key,
+            number,
+            total,
+            more,
+            PAGE_ROWS,
+        )
+    };
 
     let mut fresh: Vec<&Value> = Vec::new();
     let members = if show_members {
-        let next = member_page
-            .next
-            .as_deref()
-            .map(|c| next_link(&base, q, &LIST_CURSORS, "mc", c));
+        let m_total = total(r, Counted::ListMembers, info.id, &withheld).await;
         let rows = party_rows(r, &mut asked, &shown, &member_page.rows);
         fresh.push(&listing["freshness"]);
         Some(Section {
             count: None,
-            empty: empty_line(&rows, &next, q.get("mc").is_none()),
+            empty: empty_line(&rows, member_page.more, m_page),
             rows,
-            pager: Pager {
-                section: "members",
-                next,
-                more: true,
-            },
+            pager: pager(
+                "members",
+                "Members",
+                "page",
+                m_page,
+                m_total,
+                member_page.more,
+            ),
         })
     } else {
         None
     };
 
-    let next = blocker_page
-        .next
-        .as_deref()
-        .map(|c| next_link(&base, q, &LIST_CURSORS, "lc", c));
+    let k_total = total(r, Counted::ListBlockers, info.id, &withheld).await;
     let rows = party_rows(r, &mut asked, &shown, &blocker_page.rows);
     asked.submit(r.st);
     fresh.push(&blockers_fresh);
     let blockers = Section {
-        count: count(r, Counted::ListBlockers, info.id, &withheld).await,
-        empty: empty_line(&rows, &next, q.get("lc").is_none()),
+        count: count_words(k_total),
+        empty: empty_line(&rows, blocker_page.more, k_page),
         rows,
-        pager: Pager {
-            section: "listblockers",
-            next,
-            more: false,
-        },
+        pager: pager(
+            "listblockers",
+            "Blocked by",
+            "blockers",
+            k_page,
+            k_total,
+            blocker_page.more,
+        ),
     };
 
     let name = listing["name"]
@@ -828,13 +813,14 @@ mod tests {
     }
 
     #[test]
-    fn links_keep_the_other_sections() {
-        let q = Params::parse("bc=AAA&nc=BBB&utm=x");
+    fn counts_in_words() {
+        assert_eq!(count_words(total_of(Some(1_000))).as_deref(), Some("1,000"));
         assert_eq!(
-            next_link("/did/did:plc:x", &q, &DID_CURSORS, "bc", "CCC"),
-            "/did/did:plc:x?nc=BBB&bc=CCC"
+            count_words(total_of(Some(1_001))).as_deref(),
+            Some("more than 1,000")
         );
-        assert_eq!(count_words(1_000), "1,000");
-        assert_eq!(count_words(1_001), "more than 1,000");
+        // An empty section's heading shows no count; nor does a failed one.
+        assert_eq!(count_words(total_of(Some(0))), None);
+        assert_eq!(count_words(total_of(None)), None);
     }
 }

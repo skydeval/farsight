@@ -33,6 +33,7 @@ pub mod coverage;
 pub mod handles;
 pub mod metrics;
 pub mod pages;
+pub mod paging;
 pub mod search;
 pub mod text;
 pub mod warming;
@@ -61,14 +62,10 @@ use tokio::sync::Notify;
 use self::metrics::Page;
 use crate::pages::WebState;
 
-/// Rows per section page. There is no `limit` parameter.
+/// Rows per page of every public table. There is no `limit` parameter.
 pub const PAGE_ROWS: i64 = 50;
-/// Rows per page of an account's "Blocked by" section, which grows in
-/// place ("Load more").
-pub const BLOCKER_ROWS: i64 = 200;
-/// Rows per page of a list's "Members" section, which grows the same way.
-pub const MEMBER_ROWS: i64 = 200;
-/// A section's count stops here: "more than 1,000" beyond it.
+/// A section's count stops here: "more than 1,000" beyond it, and page
+/// controls without a last page.
 pub const COUNT_CAP: i64 = 1_000;
 /// Longest a page waits for a render slot before `503`.
 pub const RENDER_WAIT: Duration = Duration::from_secs(2);
