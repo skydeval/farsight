@@ -45,11 +45,6 @@ pub const UI_LOGIN_START_RPS: f64 = 1.0;
 /// Burst of the same budget.
 pub const UI_LOGIN_START_BURST: f64 = 10.0;
 
-/// Handle resolutions per second the public UI may start, process-wide
-/// (§3.6).
-pub const PUBLIC_HANDLE_RPS: f64 = 2.0;
-/// Burst of the same budget.
-pub const PUBLIC_HANDLE_BURST: f64 = 10.0;
 /// Profile-card requests per second per client address (§3.6). Cards have
 /// their own class so that moving the pointer down a table does not spend
 /// the visitor's page budget.
@@ -103,7 +98,11 @@ impl Class {
                 f64::from(config.public_ui.rate_limit_rps),
                 f64::from(config.public_ui.rate_limit_burst),
             ),
-            Class::PublicHandle => Limit::new(PUBLIC_HANDLE_RPS, PUBLIC_HANDLE_BURST),
+            // Process-wide (§3.6): `public_ui.handle_rps`.
+            Class::PublicHandle => Limit::new(
+                f64::from(config.public_ui.handle_rps),
+                f64::from(config.public_ui.handle_burst()),
+            ),
             Class::PublicCard => Limit::new(PUBLIC_CARD_RPS, PUBLIC_CARD_BURST),
             Class::PublicCardBudget => Limit::new(
                 f64::from(config.public_ui.card_rps),
@@ -337,6 +336,8 @@ mod tests {
         c.public_ui.rate_limit_rps = 2;
         c.public_ui.rate_limit_burst = 3;
         assert_eq!(Class::PublicUi.limit(&c, None), Limit::new(2.0, 3.0));
+        assert_eq!(Class::PublicHandle.limit(&c, None), Limit::new(20.0, 20.0));
+        c.public_ui.handle_rps = 2;
         assert_eq!(Class::PublicHandle.limit(&c, None), Limit::new(2.0, 10.0));
         assert_eq!(Class::UiLookup.limit(&c, None), Limit::new(1.0, 5.0));
         assert_eq!(Class::PublicUi.label(), "public_ui");

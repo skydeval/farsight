@@ -133,6 +133,7 @@ public_ui = true
 show_outgoing_blocks = true
 rate_limit_rps = 1000
 rate_limit_burst = 10000
+handle_rps = 2
 {}
 
 [auth]
@@ -1366,16 +1367,23 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
     let first = l.get(&public_did(&subject)).await?;
     let took = started.elapsed();
     let sec = section(&first.text, "blockers").unwrap_or("").to_owned();
-    let bare = LIVE.iter().all(|(d, h)| {
-        sec.contains(&format!("<code>{d}</code>")) && !sec.contains(&format!("@{h}"))
-    });
+    let held = LIVE
+        .iter()
+        .all(|(d, h)| !sec.contains(&format!("title=\"{d}\"")) && !sec.contains(&format!("@{h}")));
     c.check(
-        "a new instance with an empty cache renders the page at once with bare DIDs: rendering a row waits for no outbound request",
-        first.status == 200 && bare && took < Duration::from_secs(3),
-        format!("{} in {took:?}", first.status),
+        "a new instance with an empty cache renders the page at once, waiting for no outbound request, and shows no account it has not checked: every row is held back and the table says how many",
+        first.status == 200
+            && held
+            && row_dids(&sec).is_empty()
+            && pending_of(&sec) == LIVE.len() + 1
+            && first.header("cache-control").as_deref() == Some("no-store")
+            && took < Duration::from_secs(3),
+        format!("{} in {took:?}; {} held back", first.status, pending_of(&sec)),
     );
     // The harness holds for the worker; 15 s is the kickoff's bound.
     let mut shown = 0;
+    let mut ghost_as_did = false;
+    let mut left = usize::MAX;
     for _ in 0..15 {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let second = l.get(&public_did(&subject)).await?;
@@ -1384,7 +1392,9 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
             .iter()
             .filter(|(_, h)| s.contains(&format!(">@{h}</a>")))
             .count();
-        if shown == LIVE.len() {
+        ghost_as_did = shown_as(s, &ghost) == format!("<code>{ghost}</code>");
+        left = pending_of(s);
+        if shown == LIVE.len() && ghost_as_did {
             break;
         }
     }
@@ -1401,9 +1411,9 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
         );
     } else {
         c.check(
-            "within 15 s the same page shows @handle for the accounts the worker verified against the live PLC directory and DNS (both directions), with no card opened and no visit to their pages",
-            shown == LIVE.len() && resolved >= LIVE.len() as f64,
-            format!("{shown} of {} handles shown; warming resolved = {resolved}", LIVE.len()),
+            "within 15 s the same page shows @handle for the accounts the worker verified against the live PLC directory and DNS (both directions), with no card opened and no visit to their pages; the account the directory does not know is shown as its DID; nothing is held back any more",
+            shown == LIVE.len() && resolved >= LIVE.len() as f64 && ghost_as_did && left == 0,
+            format!("{shown} of {} handles shown; warming resolved = {resolved}; ghost as DID: {ghost_as_did}; {left} held back", LIVE.len()),
         );
     }
     c.section("10. admin tables: handles for cached accounts, DIDs otherwise");
@@ -1717,6 +1727,14 @@ async fn set_warming(a: &Srv, cookie: &str, on: bool) -> Result<Resp, String> {
         .await
 }
 
+/// How many rows a public section says it holds back for a handle check.
+fn pending_of(sec: &str) -> usize {
+    between(sec, "data-pending=\"", "\"")
+        .first()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
 /// What the row naming `did` shows inside its link.
 fn shown_as<'a>(sec: &'a str, did: &str) -> &'a str {
     let Some(i) = sec.find(&format!("title=\"{did}\"")) else {
@@ -1755,13 +1773,17 @@ async fn check_warming(
     let waiting = metric(&m1, queue, &[]);
     let done = processed(&m1) - processed(&m0);
     c.check(
-        "a page with 50 accounts not in the cache: right after the render the queue gauge plus what the worker has already taken accounts for all 50 — most still waiting, since the worker gets only what the handle budget has to spare",
+        "a page with 50 accounts not in the cache holds all 50 rows back and says so, and is not to be cached; right after the render the queue gauge plus what the worker has already taken accounts for all 50 — most still waiting, since the worker gets only what the handle budget has to spare",
         page.status == 200
-            && row_dids(section(&page.text, "blockers").unwrap_or("")).len() == 50
+            && row_dids(section(&page.text, "blockers").unwrap_or("")).is_empty()
+            && pending_of(section(&page.text, "blockers").unwrap_or("")) == 50
+            && page.header("cache-control").as_deref() == Some("no-store")
             && metric(&m0, queue, &[]) == 0.0
             && (40.0..=50.0).contains(&waiting)
             && waiting + done <= 50.0
-            && waiting + done >= 47.0,
+            // Up to five can be in flight: what the bucket holds above
+            // its reserve.
+            && waiting + done >= 45.0,
         format!("queue {waiting}, finished {done}"),
     );
 
@@ -1786,8 +1808,11 @@ async fn check_warming(
     tokio::time::sleep(Duration::from_secs(1)).await;
     let m3 = a.metrics_text().await?;
     c.check(
-        "the answers are in the cache: rendering the page again queues nothing and requests nothing (a failure is remembered for 10 minutes)",
+        "the answers are in the cache: rendering the page again queues nothing and requests nothing (a failure is remembered for 10 minutes); the 50 accounts, checked and without a handle, are now rows showing their DIDs, nothing is held back and the page may be cached again",
         again.status == 200
+            && row_dids(section(&again.text, "blockers").unwrap_or("")).len() == 50
+            && pending_of(section(&again.text, "blockers").unwrap_or("")) == 0
+            && again.header("cache-control").as_deref() == Some("public, max-age=30")
             && metric(&m3, queue, &[]) == 0.0
             && processed(&m3) == processed(&m2)
             && plc.document_total() - docs0 == asked,
@@ -1798,18 +1823,20 @@ async fn check_warming(
     let twice = did("wxd", 1);
     let p1 = a.get(&public_did(&w.w20)).await?;
     let p2 = a.get(&public_did(&w.w20)).await?;
-    let rows = row_dids(section(&p1.text, "blockers").unwrap_or(""));
+    let held = pending_of(section(&p1.text, "blockers").unwrap_or(""));
     let started = Instant::now();
     while a.gauge(queue).await? > 0.0 && started.elapsed() < Duration::from_secs(30) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     tokio::time::sleep(Duration::from_secs(6)).await;
-    let _ = a.get(&public_did(&w.w20)).await?;
+    let p3 = a.get(&public_did(&w.w20)).await?;
+    let rows = row_dids(section(&p3.text, "blockers").unwrap_or(""));
     tokio::time::sleep(Duration::from_secs(2)).await;
     let counts: Vec<u32> = (1..=10).map(|i| plc.documents(&did("wxd", i))).collect();
     c.check(
         "an account that is on a page twice, on a page rendered twice before the worker reached it, and rendered again afterwards: its document was requested exactly once — and so was every other account's",
         p2.status == 200
+            && held == 11
             && rows.iter().filter(|d| **d == twice).count() == 2
             && rows.len() == 11
             && counts.iter().all(|n| *n == 1),
@@ -1821,11 +1848,12 @@ async fn check_warming(
     let first = a.get(&public_did(&w.w21)).await?;
     let sec = section(&first.text, "blockers").unwrap_or("");
     c.check(
-        "a page nobody has rendered since the server started shows the stored handles at once — the one verified a day ago and the one verified eight days ago — and the DID of the account that has none",
+        "a page nobody has rendered since the server started shows the stored handles at once — the one verified a day ago and the one verified eight days ago — and holds back the one account that has never been checked",
         first.status == 200
             && shown_as(sec, &fresh) == "@stored-fresh.example"
             && shown_as(sec, &stale) == "@stored-stale.example"
-            && shown_as(sec, &none) == format!("<code>{none}</code>"),
+            && shown_as(sec, &none).is_empty()
+            && pending_of(sec) == 1,
         format!(
             "{:?} {:?} {:?}",
             shown_as(sec, &fresh),
@@ -1850,18 +1878,26 @@ async fn check_warming(
         ),
     )
     .await?;
-    let rows = n(pool, "SELECT count(*) FROM handle_cache").await?;
+    let rows = n(pool, "SELECT count(*) FROM handle_cache WHERE handle <> ''").await?;
+    let checked = n(
+        pool,
+        &format!("SELECT count(*) FROM handle_cache WHERE did = '{none}' AND handle = ''"),
+    )
+    .await?;
     c.check(
-        "only the handle older than seven days is verified again, in the background (its document is requested once, the fresh one's never); the verification fails here (the stand-in names no handle), so the old handle stays on the page and in the table, and a failure writes no row",
+        "only the handle older than seven days is verified again, in the background (its document is requested once, the fresh one's never); the verification fails here (the stand-in names no handle), so the old handle stays on the page and in the table; the account that was held back has been checked, is now a row showing its DID, and its check is stored as \"no handle\" without touching a stored handle",
         plc.documents(&fresh) == 0
             && plc.documents(&stale) == 1
             && plc.documents(&none) == 1
             && shown_as(sec, &fresh) == "@stored-fresh.example"
             && shown_as(sec, &stale) == "@stored-stale.example"
+            && shown_as(sec, &none) == format!("<code>{none}</code>")
+            && pending_of(sec) == 0
             && kept == 2
-            && rows == 2,
+            && rows == 2
+            && checked == 1,
         format!(
-            "documents: fresh {}, stale {}, none {}; {kept} of 2 rows unchanged, {rows} rows",
+            "documents: fresh {}, stale {}, none {}; {kept} of 2 rows unchanged, {rows} with a handle, {checked} stored as none",
             plc.documents(&fresh),
             plc.documents(&stale),
             plc.documents(&none)
@@ -2519,7 +2555,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
             dsn: &dsn,
             plc: &plc.base,
             budget: 70_000_000_000,
-            public_ui: "",
+            public_ui: "handle_warming_enabled = false",
         }),
         &[],
     )

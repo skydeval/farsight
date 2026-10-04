@@ -77,12 +77,18 @@ limit. With the budget used up, cards show the DID only. A burst below the rate 
 pages draw on the same budget.</div>
 
 <label><input type="checkbox" name="handle_warming_enabled"{% if p.handle_warming_enabled %} checked{% endif %}> Look up handles in the background (<code>handle_warming_enabled</code>)</label>
-<div class="hint">When a page has to show an account as a bare DID, a background worker verifies its handle so that the next
-view shows it. It uses what the handle budget (2 lookups per second) has to spare and never slows a page down; the first
-view of a page nobody has opened still shows DIDs. Applies to the admin pages too, also with the public UI off. Off:
-handles appear only as cards are opened and account pages are visited, and a stored handle is never checked again: an
-account that changes its handle keeps showing the old one, and an account not seen before shows as a DID, until this is
-switched back on.</div>
+<div class="hint">A background worker verifies the handle of every account a page is about to show and has not seen before.
+A public table leaves such an account out, says how many it left out, and adds them in place as they are verified, so a
+row is never shown with a handle Farsight has not checked; an account whose check finds no handle is shown as its DID.
+Admin tables show the DID meanwhile. Applies also with the public UI off. Off: nothing is held back, accounts not seen
+before show as DIDs, handles appear only as cards are opened and account pages are visited, and a stored handle is never
+checked again.</div>
+
+<label for="handle_rps">Handle checks per second, for the whole instance (<code>handle_rps</code>)</label>
+<input type="number" id="handle_rps" name="handle_rps" min="1" max="200" value="{{ p.handle_rps }}">
+<div class="hint">How many accounts' handles Farsight verifies per second, for pages, cards and the background worker together. Each
+check is up to two requests: the account's DID document, then the handle on its own host. At 20 a page of 50 accounts nobody
+has seen is complete in about three seconds. Lower it if those hosts start refusing requests.</div>
 
 <label><input type="checkbox" name="show_opengraph_image"{% if p.show_opengraph_image %} checked{% endif %}> Offer the preview image (<code>show_opengraph_image</code>)</label>
 <div class="hint">Link previews carry a title, a fixed description and one static image; never data.</div>

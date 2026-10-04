@@ -68,6 +68,7 @@
 </div>
 </div>
 {% endif %}
+{% if members.pending > 0 %}<p class="pending" data-pending="{{ members.pending }}" role="status">{{ members.pending }} {% if members.pending == 1 %}account on this page is{% else %}accounts on this page are{% endif %} still being verified and will appear here shortly.</p>{% endif %}
 {{ members.pager|safe }}
 </section>
 {% endif %}
@@ -108,6 +109,7 @@
 </div>
 </div>
 {% endif %}
+{% if blockers.pending > 0 %}<p class="pending" data-pending="{{ blockers.pending }}" role="status">{{ blockers.pending }} {% if blockers.pending == 1 %}account on this page is{% else %}accounts on this page are{% endif %} still being verified and will appear here shortly.</p>{% endif %}
 {{ blockers.pager|safe }}
 </section>
 

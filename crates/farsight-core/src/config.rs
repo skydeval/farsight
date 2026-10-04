@@ -481,6 +481,8 @@ impl ThemeDefault {
 
 /// Most entries `public_ui.excluded_dids` may hold.
 pub const MAX_EXCLUDED_DIDS: usize = 10_000;
+/// Upper bound of `public_ui.handle_rps`.
+pub const MAX_HANDLE_RPS: u32 = 200;
 /// Longest `public_ui.instance_description`, in characters.
 pub const MAX_INSTANCE_DESCRIPTION: usize = 2_000;
 /// Longest `public_ui.contact`, in characters.
@@ -536,9 +538,18 @@ pub struct PublicUiConfig {
     /// had to show as bare DIDs, so that a later view shows the handle.
     /// Governs the admin pages too, and works with the public UI off.
     pub handle_warming_enabled: bool,
+    /// Handle verifications the process starts per second, for pages,
+    /// cards and the background worker together; 1 to
+    /// [`MAX_HANDLE_RPS`]. Each one is up to two outbound requests.
+    pub handle_rps: u32,
 }
 
 impl PublicUiConfig {
+    /// Burst of the handle budget: the rate, and never under 10.
+    pub fn handle_burst(&self) -> u32 {
+        self.handle_rps.max(10)
+    }
+
     /// `card_burst`, raised to `card_rps` when it was set lower (the
     /// loader warns).
     pub fn effective_card_burst(&self) -> u32 {
@@ -566,6 +577,7 @@ impl Default for PublicUiConfig {
             card_rps: 4,
             card_burst: 8,
             handle_warming_enabled: true,
+            handle_rps: 20,
         }
     }
 }
@@ -1388,6 +1400,9 @@ impl Config {
         if p.card_burst == 0 {
             return Err(invalid("public_ui.card_burst", "must be positive"));
         }
+        if p.handle_rps == 0 || p.handle_rps > MAX_HANDLE_RPS {
+            return Err(invalid("public_ui.handle_rps", "must be between 1 and 200"));
+        }
         if !p.record_viewer_url.is_empty() {
             validate_record_viewer_url(&p.record_viewer_url)
                 .map_err(|r| invalid("public_ui.record_viewer_url", r))?;
@@ -1583,6 +1598,7 @@ mod tests {
         assert!(p.show_history.is_none() && p.record_viewer_url.is_empty());
         assert_eq!((p.card_rps, p.card_burst), (4, 8));
         assert!(p.handle_warming_enabled);
+        assert_eq!((p.handle_rps, p.handle_burst()), (20, 20));
         assert!(!p.crawlable && p.excluded_dids.is_empty());
         assert_eq!(p.dark_mode_default, ThemeDefault::System);
         assert_eq!((p.rate_limit_rps, p.rate_limit_burst), (5, 20));

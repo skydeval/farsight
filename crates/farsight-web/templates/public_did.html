@@ -54,6 +54,7 @@
 </div>
 </div>
 {% endif %}
+{% if blockers.pending > 0 %}<p class="pending" data-pending="{{ blockers.pending }}" role="status">{{ blockers.pending }} {% if blockers.pending == 1 %}account on this page is{% else %}accounts on this page are{% endif %} still being verified and will appear here shortly.</p>{% endif %}
 {{ blockers.pager|safe }}
 </section>
 
@@ -103,6 +104,7 @@
 </div>
 </div>
 {% endif %}
+{% if lists.pending > 0 %}<p class="pending" data-pending="{{ lists.pending }}" role="status">{{ lists.pending }} {% if lists.pending == 1 %}account on this page is{% else %}accounts on this page are{% endif %} still being verified and will appear here shortly.</p>{% endif %}
 {{ lists.pager|safe }}
 </section>
 
@@ -143,6 +145,7 @@
 </div>
 </div>
 {% endif %}
+{% if outgoing.pending > 0 %}<p class="pending" data-pending="{{ outgoing.pending }}" role="status">{{ outgoing.pending }} {% if outgoing.pending == 1 %}account on this page is{% else %}accounts on this page are{% endif %} still being verified and will appear here shortly.</p>{% endif %}
 {{ outgoing.pager|safe }}
 </section>
 {% endif %}

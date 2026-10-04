@@ -501,6 +501,13 @@ button.danger:hover {
   opacity: 0.9;
 }
 
+/* Rows held back for a handle check. */
+p.pending {
+  margin: 0.75rem 0 0;
+  font-size: 0.86rem;
+  color: var(--muted);
+}
+
 /* Page controls of a table: ← 1 2 3 … 21 → */
 nav.pager {
   margin: 0.85rem 0 0;

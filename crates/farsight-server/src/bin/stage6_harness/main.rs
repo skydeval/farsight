@@ -117,6 +117,7 @@ admin_did = "{ADMIN_DID}"
 
 [public_ui]
 handle_warming_enabled = false
+handle_rps = 2
 {public_ui}
 
 [auth]

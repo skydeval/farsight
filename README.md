@@ -234,21 +234,23 @@ nothing else in a browser.
   1,000 rows; a longer one has no last page in its controls, and the
   next arrow works for as long as rows follow. Links made by an
   earlier version (`?bc=…` and the like) lead to the first page.
-- **Handles.** A row shows `@handle` once Farsight has verified it in
-  both directions, the DID until then. A background worker verifies
-  the accounts that pages had to show as DIDs (`handle_warming_enabled`,
-  on by default), at no more than the two lookups per second the
-  instance already allowed itself: the first view of a page nobody has
-  opened shows DIDs, a later one shows handles. A verified handle is
-  stored (table `handle_cache`) and survives a restart. One verified
-  more than seven days ago is still shown and is verified again in the
-  background the next time a page reads it; if that fails, the old
-  handle stays. To start over, `DELETE FROM handle_cache;`. With
-  `handle_warming_enabled = false` nothing does that background work:
-  a stored handle is never checked again, so an account that changes
-  its handle keeps showing the old one, and an account not seen before
-  shows as a DID (unless its own page or card is opened) until the key
-  is switched back on.
+- **Handles.** A row shows `@handle` only once Farsight has verified
+  it in both directions. A background worker checks the accounts a
+  page is about to show (`handle_warming_enabled`, on by default) at
+  `handle_rps` checks a second (20 by default; each is up to two
+  requests, to the PLC directory and to the handle's own host). A
+  public table leaves out an account that has not been checked yet,
+  says how many it left out, and adds them in place as they pass: at
+  20 a second a page of 50 accounts nobody has seen is complete in
+  about three seconds. An account whose check finds no valid handle is
+  shown as its DID. The result of every check is stored (table
+  `handle_cache`) and survives a restart. A handle verified more than
+  seven days ago is still shown and is verified again in the
+  background; if that fails, the old handle stays. To start over,
+  `DELETE FROM handle_cache;`. With `handle_warming_enabled = false`
+  nothing does that background work: no row is held back, an account
+  not seen before shows as a DID (unless its own page or card is
+  opened), and a stored handle is never checked again.
 - **No coverage detail.** A public page prints no coverage level. It
   says "None on record at this instance" for an empty section, says so
   when a list is not indexed, and ends with one "Last updated" line.
@@ -309,6 +311,7 @@ rate_limit_burst = 20
 query_concurrency = 8             # concurrent page renders
 handle_cache_ttl = "1h"           # in memory; the stored copy refills it
 handle_warming_enabled = true     # verify handles of shown accounts in the background
+handle_rps = 20                   # handle checks per second, whole instance; 1-200
 excluded_dids = []                # at most 10,000
 ```
 

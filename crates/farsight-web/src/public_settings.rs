@@ -63,6 +63,8 @@ pub struct Settings {
     pub burst_raised: bool,
     /// `handle_warming_enabled`.
     pub handle_warming_enabled: bool,
+    /// `handle_rps`.
+    pub handle_rps: u32,
     /// `dark_mode_default`: `light`, `dark` or `system`.
     pub dark_mode_default: String,
     /// `crawlable`.
@@ -103,6 +105,8 @@ pub struct View {
     pub card_burst: String,
     /// Handles verified in the background.
     pub handle_warming_enabled: bool,
+    /// Handle verifications per second.
+    pub handle_rps: String,
     /// Theme default.
     pub dark_mode_default: String,
     /// Crawlers.
@@ -136,6 +140,7 @@ impl View {
             card_rps: p.card_rps.to_string(),
             card_burst: p.effective_card_burst().to_string(),
             handle_warming_enabled: p.handle_warming_enabled,
+            handle_rps: p.handle_rps.to_string(),
             dark_mode_default: p.dark_mode_default.as_str().to_owned(),
             crawlable: p.crawlable,
             rate_limit_rps: p.rate_limit_rps.to_string(),
@@ -162,6 +167,11 @@ impl View {
             card_rps: s("card_rps"),
             card_burst: s("card_burst"),
             handle_warming_enabled: b("handle_warming_enabled"),
+            // A form from before the field existed keeps the rate in force.
+            handle_rps: form
+                .get("handle_rps")
+                .cloned()
+                .unwrap_or_else(|| c.public_ui.handle_rps.to_string()),
             dark_mode_default: s("dark_mode_default"),
             crawlable: b("crawlable"),
             rate_limit_rps: s("rate_limit_rps"),
@@ -251,6 +261,12 @@ impl Settings {
             card_burst: card_burst.max(card_rps),
             burst_raised: card_burst < card_rps,
             handle_warming_enabled: v.handle_warming_enabled,
+            handle_rps: number(
+                "Handle checks per second",
+                &v.handle_rps,
+                1,
+                farsight_core::config::MAX_HANDLE_RPS,
+            )?,
             enabled: v.enabled,
             instance_description: v.instance_description.replace("\r\n", "\n"),
             contact: v.contact.trim().to_owned(),
@@ -303,6 +319,7 @@ impl Settings {
             "handle_warming_enabled".into(),
             self.handle_warming_enabled.into(),
         );
+        p.insert("handle_rps".into(), i64::from(self.handle_rps).into());
         p.insert(
             "show_opengraph_image".into(),
             self.show_opengraph_image.into(),

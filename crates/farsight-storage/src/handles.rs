@@ -6,10 +6,11 @@
 //! that failed), so that a page view does not repeat a lookup that just
 //! failed.
 //!
-//! In the database: the `handle_cache` table holds the verified handle of
-//! every DID a verification succeeded for, with the time of the
-//! verification, so that a restart loses nothing. Failures are not
-//! stored. The memory layer stays in front of it.
+//! In the database: the `handle_cache` table holds, for every DID that
+//! was checked, the verified handle and the time of the check, so that a
+//! restart loses nothing. A check that found no handle to show is stored
+//! as an empty handle, and never replaces a verified one. The memory
+//! layer stays in front of it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -26,8 +27,8 @@ pub const DEFAULT_CAPACITY: usize = 50_000;
 #[derive(Debug)]
 struct Entry {
     handle: Option<String>,
-    // The handle was verified too long ago: shown, and due a fresh
-    // verification.
+    // The answer is older than the caller trusts: used as it is, and due
+    // a fresh verification.
     stale: bool,
     expires: Instant,
     tick: u64,
@@ -118,11 +119,11 @@ impl HandleCache {
         self.insert_at(did, handle, false, ttl, Instant::now());
     }
 
-    /// Caches a `handle` that was verified longer ago than the caller
-    /// trusts: it is shown, and [`HandleCache::lookup_stale`] reports it
-    /// as due a fresh verification.
-    pub fn insert_stale(&self, did: &str, handle: String, ttl: Duration) {
-        self.insert_at(did, Some(handle), true, ttl, Instant::now());
+    /// Caches an answer that was checked longer ago than the caller
+    /// trusts: it is used as it is, and [`HandleCache::lookup_stale`]
+    /// reports it as due a fresh verification.
+    pub fn insert_stale(&self, did: &str, handle: Option<String>, ttl: Duration) {
+        self.insert_at(did, handle, true, ttl, Instant::now());
     }
 
     fn insert_at(
@@ -179,7 +180,8 @@ impl HandleCache {
 pub struct Stored {
     /// The DID.
     pub did: String,
-    /// Its handle, as last verified.
+    /// Its handle, as last verified; empty: the last check found none to
+    /// show.
     pub handle: String,
     /// When that was.
     pub resolved_at: DateTime<Utc>,
@@ -220,6 +222,20 @@ pub async fn store(conn: &mut PgConnection, did: &str, handle: &str) -> Result<(
     Ok(())
 }
 
+/// Records that a check of `did`, made now, found no handle to show.
+/// A verified handle already stored for the DID is left as it is.
+pub async fn store_none(conn: &mut PgConnection, did: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, '', now())
+         ON CONFLICT (did) DO UPDATE SET resolved_at = EXCLUDED.resolved_at
+           WHERE handle_cache.handle = ''",
+    )
+    .bind(did)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +263,7 @@ mod tests {
     #[test]
     fn a_stale_handle_is_shown_and_reported_until_replaced() {
         let c = HandleCache::new(10);
-        c.insert_stale("did:plc:a", "old.example".into(), TTL);
+        c.insert_stale("did:plc:a", Some("old.example".into()), TTL);
         assert_eq!(
             c.lookup_stale("did:plc:a"),
             Some((Cached::Handle("old.example".into()), true))

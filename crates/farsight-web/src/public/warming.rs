@@ -46,8 +46,9 @@ pub const RESERVE: f64 = 5.0;
 pub const BUDGET_WAIT: Duration = Duration::from_millis(500);
 /// Deadline of one verification.
 pub const VERIFY_DEADLINE: Duration = Duration::from_secs(5);
-/// Verifications in flight at once.
-pub const IN_FLIGHT: usize = 2;
+/// Most verifications in flight at once. The handle budget sets the pace;
+/// this bounds what slow hosts can pile up.
+pub const IN_FLIGHT: usize = 64;
 /// How often an idle or switched-off worker looks at the setting.
 pub const IDLE_POLL: Duration = Duration::from_secs(5);
 
@@ -220,13 +221,24 @@ impl WarmQueue {
 }
 
 /// Whether a row showing `did` asks the worker for it: the cache has no
-/// live entry, or a stale handle. A live negative entry is left alone.
+/// live entry, or a stale one. A live answer is left alone, also when it
+/// is "nothing to show".
 pub fn due(entry: Option<&(Cached, bool)>) -> bool {
     match entry {
         None => true,
-        Some((Cached::Handle(_), stale)) => *stale,
-        Some((Cached::None, _)) => false,
+        Some((_, stale)) => *stale,
     }
+}
+
+/// What a page knows about an account it is about to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Known {
+    /// Its verified handle.
+    Handle(String),
+    /// It was checked and has no handle to show: its DID is the answer.
+    NoHandle,
+    /// Not checked yet. The worker has been asked.
+    Pending,
 }
 
 /// The DIDs one page render asks the worker for, in row order.
@@ -257,6 +269,22 @@ impl Asked {
         match entry {
             Some((Cached::Handle(h), _)) => Some(h),
             _ => None,
+        }
+    }
+
+    /// What is known about an account a public row would show. Asks the
+    /// worker as [`Asked::handle`] does. With warming off nothing would
+    /// ever check the account, so it is never [`Known::Pending`].
+    pub fn known(&mut self, st: &WebState, did: &str) -> Known {
+        let entry = st.public.handles.lookup_stale(did);
+        if self.enabled && due(entry.as_ref()) {
+            self.dids.push(did.to_owned());
+        }
+        match entry {
+            Some((Cached::Handle(h), _)) => Known::Handle(h),
+            Some((Cached::None, _)) => Known::NoHandle,
+            None if self.enabled => Known::Pending,
+            None => Known::NoHandle,
         }
     }
 
@@ -429,9 +457,10 @@ mod tests {
         assert!(!due(Some(&fresh)));
         let stale = (Cached::Handle("a.example".into()), true);
         assert!(due(Some(&stale)));
-        // "Nothing to show" is left alone until it expires.
+        // "Nothing to show" is left alone until it is stale.
         let none = (Cached::None, false);
         assert!(!due(Some(&none)));
+        assert!(due(Some(&(Cached::None, true))));
     }
 
     #[test]

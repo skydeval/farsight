@@ -13,12 +13,18 @@
 //! as DIDs. A profile card ([`super::card`]) verifies the handle of its
 //! account under the card budget and writes the same cache.
 //!
-//! A verified handle is kept in two places: the memory cache, and the
-//! `handle_cache` table, which a restart does not empty. A read looks in
-//! memory, then in the table ([`recall`]); a verification that succeeds
-//! writes both ([`settle`]), one that fails writes neither. A stored
-//! handle verified more than [`STALE_AFTER`] ago is still shown, and is
-//! verified again in the background; if that fails, it stays.
+//! The answer of a check is kept in two places: the memory cache, and
+//! the `handle_cache` table, which a restart does not empty. A read
+//! looks in memory, then in the table ([`recall`]); a check writes both
+//! ([`settle`]). A stored handle verified more than [`STALE_AFTER`] ago
+//! is still shown, and is verified again in the background; if that
+//! fails, it stays. A stored "no handle to show" is checked again after
+//! [`NONE_STALE_AFTER`].
+//!
+//! With warming on, a public table leaves out an account that has no
+//! answer yet and says how many it left out; the page's script reads
+//! the page again until they are there. The account then shows with its
+//! verified handle, or as its DID if the check found none.
 
 use std::time::Duration;
 
@@ -40,6 +46,9 @@ pub const NEGATIVE_TTL: Duration = Duration::from_secs(600);
 /// A stored handle verified longer ago than this is verified again in the
 /// background the next time it is read.
 pub const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
+/// A stored "no handle to show" older than this is checked again in the
+/// background the next time it is read.
+pub const NONE_STALE_AFTER: Duration = Duration::from_secs(3600);
 /// Bucket key of the process-wide resolution budget.
 pub const BUDGET_KEY: &str = "process";
 
@@ -80,8 +89,8 @@ impl Outcome {
     }
 }
 
-/// Takes one resolution from the process-wide budget (§3.6: 2 per second,
-/// burst 10, not per client). Search resolves handles from the same
+/// Takes one resolution from the process-wide budget (§3.6:
+/// `public_ui.handle_rps`, not per client). Search resolves handles from the same
 /// budget.
 pub fn take_budget(st: &WebState, cfg: &Config) -> bool {
     let limit = Class::PublicHandle.limit(cfg, None);
@@ -138,11 +147,16 @@ pub(crate) async fn verify(
     }
 }
 
-/// Whether a handle verified at `resolved_at` is due a fresh verification.
-pub fn is_stale(resolved_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+/// Whether an answer checked at `resolved_at` is older than `after`.
+fn older_than(resolved_at: DateTime<Utc>, now: DateTime<Utc>, after: Duration) -> bool {
     now.signed_duration_since(resolved_at)
         .to_std()
-        .is_ok_and(|age| age > STALE_AFTER)
+        .is_ok_and(|age| age > after)
+}
+
+/// Whether a handle verified at `resolved_at` is due a fresh verification.
+pub fn is_stale(resolved_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    older_than(resolved_at, now, STALE_AFTER)
 }
 
 /// Fills the memory cache from `handle_cache` for those of `dids` it has
@@ -174,10 +188,17 @@ pub async fn recall(st: &WebState, cfg: &Config, dids: &[String]) {
     let ttl = cfg.public_ui.handle_cache_ttl.get();
     let now = Utc::now();
     for r in rows {
-        if is_stale(r.resolved_at, now) {
-            cache.insert_stale(&r.did, r.handle, ttl);
+        // An empty handle: the last check found none to show.
+        let (handle, stale) = if r.handle.is_empty() {
+            (None, older_than(r.resolved_at, now, NONE_STALE_AFTER))
         } else {
-            cache.insert(&r.did, Some(r.handle), ttl);
+            let stale = is_stale(r.resolved_at, now);
+            (Some(r.handle), stale)
+        };
+        if stale {
+            cache.insert_stale(&r.did, handle, ttl);
+        } else {
+            cache.insert(&r.did, handle, ttl);
         }
     }
 }
@@ -198,9 +219,11 @@ pub(crate) async fn cached(st: &WebState, cfg: &Config, did: &Did) -> Option<Cac
 
 /// Records how a verification of `did` ended and returns the handle to
 /// show. A verified handle goes to the memory cache and to the table. A
-/// failure is remembered in memory only, for [`NEGATIVE_TTL`]: as the
-/// handle shown until now if there is one (a stale handle is better than
-/// the DID), as "nothing to show" otherwise.
+/// failure is remembered in memory for [`NEGATIVE_TTL`]: as the handle
+/// shown until now if there is one (a stale handle is better than the
+/// DID), as "nothing to show" otherwise — and then in the table too, so
+/// that the account's rows show its DID from now on instead of waiting
+/// for a check on every view.
 pub(crate) async fn settle(
     st: &WebState,
     cfg: &Config,
@@ -211,6 +234,17 @@ pub(crate) async fn settle(
     let Some(handle) = handle else {
         let kept = cache.get(did.as_str());
         cache.insert(did.as_str(), kept.clone(), NEGATIVE_TTL);
+        if kept.is_none() {
+            let written = match st.api.pool.acquire().await {
+                Ok(mut conn) => {
+                    farsight_storage::handles::store_none(&mut conn, did.as_str()).await
+                }
+                Err(e) => Err(e.into()),
+            };
+            if let Err(e) = written {
+                tracing::warn!(error = %e, "a handle check could not be stored");
+            }
+        }
         return kept;
     };
     cache.insert(

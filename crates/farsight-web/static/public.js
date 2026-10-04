@@ -559,7 +559,47 @@
     shortcuts();
     interactiveActions();
     scrollSpy();
+    pending();
   });
+
+  // Rows held back until their account's handle is checked (a table says
+  // how many in [data-pending]): read the page again until they are
+  // there, and put each table that was waiting in place. Quick at first,
+  // then every three seconds, for about a minute; after that the line
+  // stays and a reload shows the rest.
+  function pending() {
+    var tries = 0;
+    function again() {
+      if (tries >= 20 || !document.querySelector("section[id] [data-pending]")) {
+        return;
+      }
+      tries++;
+      setTimeout(function () {
+        fetch(location.href, { credentials: "same-origin", cache: "no-store" })
+          .then(function (r) {
+            if (r.status !== 200 || r.redirected) {
+              throw new Error("not the page");
+            }
+            return r.text();
+          })
+          .then(function (html) {
+            var doc = new DOMParser().parseFromString(html, "text/html");
+            var sections = document.querySelectorAll("section[id]");
+            for (var i = 0; i < sections.length; i++) {
+              var here = sections[i];
+              var fresh = doc.getElementById(here.id);
+              if (here.querySelector("[data-pending]") && fresh && fresh.tagName === "SECTION") {
+                here.innerHTML = fresh.innerHTML;
+                times(here);
+              }
+            }
+            again();
+          })
+          .catch(again);
+      }, tries <= 4 ? 1200 : 3000);
+    }
+    again();
+  }
 
   // A section swapped in by htmx carries new times.
   document.addEventListener("htmx:afterSwap", function (event) {

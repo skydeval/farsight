@@ -38,7 +38,7 @@ use super::handles::{page_handle, recall, take_budget};
 use super::paging::{self, Pager, Total};
 use super::search::{self, Authority, Target};
 use super::text::{Stamp, card_href, clean, did_href, list_href, list_uri, paragraphs, thousands};
-use super::warming::Asked;
+use super::warming::{Asked, Known};
 use super::{
     COUNT_CAP, Cache, Chrome, Fail, OG_ACCOUNT, OG_INSTANCE, OG_LIST, PAGE_ROWS, Req, Withheld,
     chrome, metrics as m, page, redirect,
@@ -57,9 +57,8 @@ pub const DEFAULT_DESCRIPTION: &str = "Farsight is an independent index of publi
 // ---------------------------------------------------------------------------
 // Shared pieces
 
-/// An account as a row names it: `@handle` when a verified handle is
-/// already cached (in memory, or stored and read with the page's other
-/// accounts), the DID otherwise. Either way a link to the account's
+/// An account as a row names it: `@handle` when its handle is verified,
+/// the DID when the check found none. Either way a link to the account's
 /// page whose `title` is the DID, and on which the script opens the
 /// profile card. Rendering a row never waits for an outbound request: an
 /// account shown as a DID is handed to the warming worker.
@@ -76,13 +75,20 @@ pub struct Who {
     pub handle: Option<String>,
 }
 
-fn who(r: &Req<'_>, asked: &mut Asked, did: &str) -> Who {
-    Who {
+/// `None`: the account has not been checked yet and the worker has been
+/// asked; its row is held back until it has (see [`Section::pending`]).
+fn who(r: &Req<'_>, asked: &mut Asked, did: &str) -> Option<Who> {
+    let handle = match asked.known(r.st, did) {
+        Known::Handle(h) => Some(clean(&h)),
+        Known::NoHandle => None,
+        Known::Pending => return None,
+    };
+    Some(Who {
         did: did.to_owned(),
         href: did_href(did),
         card: card_href(did),
-        handle: asked.handle(r.st, did).map(|h| clean(&h)),
-    }
+        handle,
+    })
 }
 
 /// An account row with one author-stated time.
@@ -102,6 +108,10 @@ pub struct Section<R> {
     pub count: Option<String>,
     /// Rows shown.
     pub rows: Vec<R>,
+    /// Rows of this page held back because their account's handle has
+    /// not been checked yet. The page's script reads the page again
+    /// until there are none.
+    pub pending: usize,
     /// Page controls.
     pub pager: Pager,
     /// Empty-state line: only on a first page with nothing after it.
@@ -134,8 +144,8 @@ fn total_of(n: Option<i64>) -> Total {
     }
 }
 
-fn empty_line<R>(rows: &[R], more: bool, number: i64) -> Option<&'static str> {
-    (rows.is_empty() && !more && number == 1).then_some(EMPTY)
+fn empty_line<R>(rows: &[R], pending: usize, more: bool, number: i64) -> Option<&'static str> {
+    (rows.is_empty() && pending == 0 && !more && number == 1).then_some(EMPTY)
 }
 
 pub(crate) fn purpose_words(p: &str) -> &'static str {
@@ -224,6 +234,16 @@ fn freshness_params(pairs: &[(&str, &str)]) -> Params {
     Params::from_pairs(p)
 }
 
+/// A complete page may be kept for half a minute. One that held rows
+/// back is about to change and is not kept at all.
+fn cache_for(held: usize) -> Cache {
+    if held == 0 {
+        Cache::Public(30)
+    } else {
+        Cache::NoStore
+    }
+}
+
 /// The withheld rule as the row queries apply it.
 fn row_filter(w: &Withheld) -> Filter<'_> {
     Filter {
@@ -232,15 +252,30 @@ fn row_filter(w: &Withheld) -> Filter<'_> {
     }
 }
 
-/// The rows of a section that may be shown, as the tables render them.
-fn party_rows(r: &Req<'_>, asked: &mut Asked, shown: &Shown<'_>, rows: &[Row]) -> Vec<PartyRow> {
-    rows.iter()
+/// The rows of a section that may be shown, as the tables render them,
+/// and how many were held back for a handle check.
+fn party_rows(
+    r: &Req<'_>,
+    asked: &mut Asked,
+    shown: &Shown<'_>,
+    rows: &[Row],
+) -> (Vec<PartyRow>, usize) {
+    let mut pending = 0;
+    let out = rows
+        .iter()
         .filter(|b| shown.ok(&b.did))
-        .map(|b| PartyRow {
-            who: who(r, asked, &b.did),
-            when: b.created_at.map(Stamp::of),
+        .filter_map(|b| match who(r, asked, &b.did) {
+            Some(who) => Some(PartyRow {
+                who,
+                when: b.created_at.map(Stamp::of),
+            }),
+            None => {
+                pending += 1;
+                None
+            }
         })
-        .collect()
+        .collect();
+    (out, pending)
 }
 
 // ---------------------------------------------------------------------------
@@ -502,11 +537,12 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         Some(a) => total(r, Counted::IncomingBlocks, a.id, &withheld).await,
         None => Total::Rows(0),
     };
-    let b_rows = party_rows(r, &mut asked, &shown, &block_page.rows);
+    let (b_rows, b_pending) = party_rows(r, &mut asked, &shown, &block_page.rows);
     let blockers = Section {
         count: count_words(b_total),
-        empty: empty_line(&b_rows, block_page.more, b_page),
+        empty: empty_line(&b_rows, b_pending, block_page.more, b_page),
         rows: b_rows,
+        pending: b_pending,
         pager: pager(
             "blockers",
             "Blocked by",
@@ -521,23 +557,31 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         Some(a) => naming_total(r, a.id, &withheld).await,
         None => Total::Rows(0),
     };
+    let mut l_pending = 0;
     let l_rows: Vec<ListRow> = naming_page
         .rows
         .iter()
         .filter(|l| shown.ok(&l.owner_did))
-        .map(|l| ListRow {
-            uri: list_uri(&l.owner_did, &l.rkey),
-            href: list_href(&l.owner_did, &l.rkey),
-            name: l.name.as_deref().map(clean).filter(|n| !n.is_empty()),
-            owner: who(r, &mut asked, &l.owner_did),
-            listblocks: l.listblock_count.to_string(),
-            added: l.added_at.map(Stamp::of),
+        .filter_map(|l| {
+            let Some(owner) = who(r, &mut asked, &l.owner_did) else {
+                l_pending += 1;
+                return None;
+            };
+            Some(ListRow {
+                uri: list_uri(&l.owner_did, &l.rkey),
+                href: list_href(&l.owner_did, &l.rkey),
+                name: l.name.as_deref().map(clean).filter(|n| !n.is_empty()),
+                owner,
+                listblocks: l.listblock_count.to_string(),
+                added: l.added_at.map(Stamp::of),
+            })
         })
         .collect();
     let lists = Section {
         count: None,
-        empty: empty_line(&l_rows, naming_page.more, l_page),
+        empty: empty_line(&l_rows, l_pending, naming_page.more, l_page),
         rows: l_rows,
+        pending: l_pending,
         pager: pager(
             "lists",
             "On lists",
@@ -556,12 +600,13 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
                 Some(a) => total(r, Counted::OutgoingBlocks, a.id, &withheld).await,
                 None => Total::Rows(0),
             };
-            let rows = party_rows(r, &mut asked, &shown, &out_page.rows);
+            let (rows, pending) = party_rows(r, &mut asked, &shown, &out_page.rows);
             fresh.push(f);
             Some(Section {
                 count: count_words(o_total),
-                empty: empty_line(&rows, out_page.more, o_page),
+                empty: empty_line(&rows, pending, out_page.more, o_page),
                 rows,
+                pending,
                 pager: pager(
                     "outgoing",
                     "Blocks by this account",
@@ -580,6 +625,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         Some(h) => format!("@{h} ({did})"),
         None => did.to_string(),
     };
+    let held = blockers.pending + lists.pending + outgoing.as_ref().map_or(0, |o| o.pending);
     let t = DidPage {
         c: chrome(cfg, did.as_str(), &og_title, OG_ACCOUNT, &base),
         did: did.to_string(),
@@ -589,7 +635,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         outgoing,
         updated: last_updated(&fresh),
     };
-    Ok(page(&t, StatusCode::OK, cfg, Cache::Public(30), true))
+    Ok(page(&t, StatusCode::OK, cfg, cache_for(held), true))
 }
 
 // ---------------------------------------------------------------------------
@@ -720,12 +766,13 @@ pub async fn list(
     let mut fresh: Vec<&Value> = Vec::new();
     let members = if show_members {
         let m_total = total(r, Counted::ListMembers, info.id, &withheld).await;
-        let rows = party_rows(r, &mut asked, &shown, &member_page.rows);
+        let (rows, pending) = party_rows(r, &mut asked, &shown, &member_page.rows);
         fresh.push(&listing["freshness"]);
         Some(Section {
             count: None,
-            empty: empty_line(&rows, member_page.more, m_page),
+            empty: empty_line(&rows, pending, member_page.more, m_page),
             rows,
+            pending,
             pager: pager(
                 "members",
                 "Members",
@@ -740,13 +787,14 @@ pub async fn list(
     };
 
     let k_total = total(r, Counted::ListBlockers, info.id, &withheld).await;
-    let rows = party_rows(r, &mut asked, &shown, &blocker_page.rows);
+    let (rows, pending) = party_rows(r, &mut asked, &shown, &blocker_page.rows);
     asked.submit(r.st);
     fresh.push(&blockers_fresh);
     let blockers = Section {
         count: count_words(k_total),
-        empty: empty_line(&rows, blocker_page.more, k_page),
+        empty: empty_line(&rows, pending, blocker_page.more, k_page),
         rows,
+        pending,
         pager: pager(
             "listblockers",
             "Blocked by",
@@ -765,6 +813,7 @@ pub async fn list(
         Some(n) => format!("{n} ({uri})"),
         None => uri.clone(),
     };
+    let held = blockers.pending + members.as_ref().map_or(0, |m| m.pending);
     let t = ListPage {
         c: chrome(cfg, &uri, &og_title, OG_LIST, &base),
         name,
@@ -783,7 +832,7 @@ pub async fn list(
         updated: last_updated(&fresh),
         uri,
     };
-    Ok(page(&t, StatusCode::OK, cfg, Cache::Public(30), true))
+    Ok(page(&t, StatusCode::OK, cfg, cache_for(held), true))
 }
 
 #[cfg(test)]
