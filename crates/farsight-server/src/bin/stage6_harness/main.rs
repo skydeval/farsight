@@ -1610,10 +1610,12 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let page = h.get(&path_did(&w.s)).await?;
     let navs = section_navs(&page.text);
     c.check(
-        "the account page's header is the DID and its copy button: no stat tiles, no section nav",
+        "the account page's header is the DID and its copy button: no stat tiles, no section nav, no status pill, no avatar",
         navs.is_empty()
             && !page.text.contains("stat-card")
             && !page.text.contains("section-pill")
+            && !page.text.contains("status-pill")
+            && !page.text.contains("avatar-badge")
             && page.text.contains(&format!("data-copy=\"{}\"", w.s)),
         format!("{navs:?}"),
     );
@@ -1646,7 +1648,7 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     c.check(
         "row times on the account page are marked to read as the instant alone (no relative part)",
         sec.matches("<time ").count() == row_dids(sec).len()
-            && sec.matches("class=\"time-badge\" data-abs>").count() == row_dids(sec).len(),
+            && sec.matches(" data-abs>").count() == row_dids(sec).len(),
         format!("{} times", sec.matches("<time ").count()),
     );
     c.check(
@@ -1724,7 +1726,9 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
         "list page header: at-uri, name (as text), purpose, owner, state in words, the stored-members counter",
         lp.text.contains(&format!("at://{}/app.bsky.graph.list/{LIST}", w.o1))
             && lp.text.contains("&lt;script&gt;alert(1)&lt;/script&gt;")
-            && lp.text.contains("<span class=\"pill list-purpose-pill\">moderation list</span>")
+            && lp.text.contains(">moderation list</span>")
+            && !lp.text.contains("status-pill")
+            && !lp.text.contains("avatar-badge")
             && lp.text.contains(&format!("href=\"{}\"", path_did(&w.o1)))
             && lp.text.contains("State: Indexed.")
             && lp.text.contains(&format!("{stored} stored members")),
@@ -1752,10 +1756,24 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
         ok && want.len() == 62,
         format!("{d}; {pages} pages"),
     );
+    let sec = section(&lp.text, "members").unwrap_or("");
     c.check(
-        "the withheld rule runs in the section's query, so it shortens no page: 50 rows while more follow, two pages for 62 members",
-        short == 0 && pages == 2,
+        "Members holds 200 rows a page and grows in place: 62 members are one page, whose table body and empty \"Load more\" paragraph are there for a later page to fill, with no link",
+        short == 0
+            && pages == 1
+            && sec.contains("<tbody id=\"members-rows\">")
+            && sec.contains("<p class=\"pager\" id=\"members-more\"></p>")
+            && !sec.contains("Load more"),
         format!("{short} short pages with a next link; {pages} pages"),
+    );
+    let times = |sec: &str| {
+        sec.matches("<time ").count() == row_dids(sec).len()
+            && sec.matches(" data-abs>").count() == row_dids(sec).len()
+    };
+    c.check(
+        "row times on the list page are marked to read as the instant alone (no relative part), in both tables",
+        times(sec) && times(section(&lp.text, "listblockers").unwrap_or("")),
+        format!("{} times in Members", sec.matches("<time ").count()),
     );
     let want = h
         .strings(&format!(
@@ -3676,6 +3694,18 @@ async fn check_handles(c: &mut Checks, h: &H, live: Option<&H>, w: &World) -> Re
                     total(&m, "resolved") >= 1.0
                         && meta(&r.text, "og:title") == Some(format!("@{LIVE_HANDLE} ({LIVE_DID})").as_str()),
                     format!("resolved {}", total(&m, "resolved")),
+                );
+                let stored: Vec<(String,)> = sqlx::query_as(
+                    "SELECT handle FROM handle_cache WHERE did = $1 AND resolved_at > now() - interval '5 minutes'",
+                )
+                .bind(LIVE_DID)
+                .fetch_all(&l.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                c.check(
+                    "the verified handle is stored: handle_cache holds one row for the DID, with the handle and the time of the verification",
+                    stored.len() == 1 && stored[0].0 == LIVE_HANDLE,
+                    format!("{stored:?}"),
                 );
                 let again = l.get(&path_did(LIVE_DID)).await?;
                 let m2 = l.metrics_text().await?;

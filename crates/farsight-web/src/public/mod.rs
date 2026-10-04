@@ -66,6 +66,8 @@ pub const PAGE_ROWS: i64 = 50;
 /// Rows per page of an account's "Blocked by" section, which grows in
 /// place ("Load more").
 pub const BLOCKER_ROWS: i64 = 200;
+/// Rows per page of a list's "Members" section, which grows the same way.
+pub const MEMBER_ROWS: i64 = 200;
 /// A section's count stops here: "more than 1,000" beyond it.
 pub const COUNT_CAP: i64 = 1_000;
 /// Longest a page waits for a render slot before `503`.
@@ -237,7 +239,7 @@ pub struct PendingEnable {
 /// State of the public UI.
 #[derive(Debug, Default)]
 pub struct PublicState {
-    /// Verified handles.
+    /// Verified handles: the memory layer in front of `handle_cache`.
     pub handles: HandleCache,
     /// Accounts whose handles the warming worker is asked to verify.
     pub warm: warming::WarmQueue,

@@ -515,7 +515,8 @@ pub struct PublicUiConfig {
     /// Concurrent public page renders; at most
     /// `rate_limit.query_concurrency`.
     pub query_concurrency: u32,
-    /// How long a verified handle is cached.
+    /// How long a verified handle stays in the memory cache. The stored
+    /// copy outlives it and refills it.
     pub handle_cache_ttl: ConfigDuration,
     /// DIDs the public pages withhold; at most [`MAX_EXCLUDED_DIDS`].
     pub excluded_dids: Vec<String>,

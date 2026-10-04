@@ -1,6 +1,5 @@
-//! Handles on public pages (design §3.6, §8.6). Farsight stores no
-//! handles; a page shows one only when it has been verified in both
-//! directions:
+//! Handles on public pages (design §3.6, §8.6). A page shows a handle
+//! only when it has been verified in both directions:
 //!
 //! 1. read the DID document — did:plc from `backfill.plc_url`, did:web
 //!    from its host — through the safe client (§11.3);
@@ -13,8 +12,17 @@
 //! the warming worker ([`super::warming`]) for the accounts it had to show
 //! as DIDs. A profile card ([`super::card`]) verifies the handle of its
 //! account under the card budget and writes the same cache.
+//!
+//! A verified handle is kept in two places: the memory cache, and the
+//! `handle_cache` table, which a restart does not empty. A read looks in
+//! memory, then in the table ([`recall`]); a verification that succeeds
+//! writes both ([`settle`]), one that fails writes neither. A stored
+//! handle verified more than [`STALE_AFTER`] ago is still shown, and is
+//! verified again in the background; if that fails, it stays.
 
 use std::time::Duration;
+
+use chrono::{DateTime, Utc};
 
 use farsight_api::ratelimit::Class;
 use farsight_core::config::Config;
@@ -29,6 +37,9 @@ use crate::pages::{WebState, resolve_handle};
 pub const RESOLVE_WAIT: Duration = Duration::from_secs(2);
 /// How long a failure or "no handle" is remembered.
 pub const NEGATIVE_TTL: Duration = Duration::from_secs(600);
+/// A stored handle verified longer ago than this is verified again in the
+/// background the next time it is read.
+pub const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Bucket key of the process-wide resolution budget.
 pub const BUDGET_KEY: &str = "process";
 
@@ -127,13 +138,102 @@ pub(crate) async fn verify(
     }
 }
 
+/// Whether a handle verified at `resolved_at` is due a fresh verification.
+pub fn is_stale(resolved_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(resolved_at)
+        .to_std()
+        .is_ok_and(|age| age > STALE_AFTER)
+}
+
+/// Fills the memory cache from `handle_cache` for those of `dids` it has
+/// no live entry for. One query for a page's accounts; nothing is fetched
+/// from outside. If the table cannot be read the accounts show as DIDs.
+pub async fn recall(st: &WebState, cfg: &Config, dids: &[String]) {
+    let cache = &st.public.handles;
+    let mut missing: Vec<String> = dids
+        .iter()
+        .filter(|d| cache.lookup(d).is_none())
+        .cloned()
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    if missing.is_empty() {
+        return;
+    }
+    let found = match st.api.pool.acquire().await {
+        Ok(mut conn) => farsight_storage::handles::stored(&mut conn, &missing).await,
+        Err(e) => Err(e.into()),
+    };
+    let rows = match found {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "stored handles could not be read");
+            return;
+        }
+    };
+    let ttl = cfg.public_ui.handle_cache_ttl.get();
+    let now = Utc::now();
+    for r in rows {
+        if is_stale(r.resolved_at, now) {
+            cache.insert_stale(&r.did, r.handle, ttl);
+        } else {
+            cache.insert(&r.did, Some(r.handle), ttl);
+        }
+    }
+}
+
+/// What the cache holds for one account: memory, then the stored handle.
+/// A stale handle is returned as it is and handed to the warming worker.
+pub(crate) async fn cached(st: &WebState, cfg: &Config, did: &Did) -> Option<Cached> {
+    let cache = &st.public.handles;
+    if cache.lookup(did.as_str()).is_none() {
+        recall(st, cfg, &[did.to_string()]).await;
+    }
+    let (found, stale) = cache.lookup_stale(did.as_str())?;
+    if stale && cfg.public_ui.handle_warming_enabled {
+        st.public.warm.push_page(vec![did.to_string()]);
+    }
+    Some(found)
+}
+
+/// Records how a verification of `did` ended and returns the handle to
+/// show. A verified handle goes to the memory cache and to the table. A
+/// failure is remembered in memory only, for [`NEGATIVE_TTL`]: as the
+/// handle shown until now if there is one (a stale handle is better than
+/// the DID), as "nothing to show" otherwise.
+pub(crate) async fn settle(
+    st: &WebState,
+    cfg: &Config,
+    did: &Did,
+    handle: Option<String>,
+) -> Option<String> {
+    let cache = &st.public.handles;
+    let Some(handle) = handle else {
+        let kept = cache.get(did.as_str());
+        cache.insert(did.as_str(), kept.clone(), NEGATIVE_TTL);
+        return kept;
+    };
+    cache.insert(
+        did.as_str(),
+        Some(handle.clone()),
+        cfg.public_ui.handle_cache_ttl.get(),
+    );
+    let written = match st.api.pool.acquire().await {
+        Ok(mut conn) => farsight_storage::handles::store(&mut conn, did.as_str(), &handle).await,
+        Err(e) => Err(e.into()),
+    };
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "a verified handle could not be stored");
+    }
+    Some(handle)
+}
+
 /// The verified handle of a page's subject or list owner, resolving it if
 /// it is not cached and the budget allows. The caller has checked that
 /// the DID has an `actors` row and is not withheld, and calls this before
 /// taking a render slot, so a slow host holds no slot.
 pub async fn page_handle(st: &WebState, cfg: &Config, did: &Did) -> Option<String> {
-    let cache = &st.public.handles;
-    if let Some(c) = cache.lookup(did.as_str()) {
+    if let Some(c) = cached(st, cfg, did).await {
         m::handle_resolution(Outcome::Cached);
         return match c {
             Cached::Handle(h) => Some(h),
@@ -147,13 +247,7 @@ pub async fn page_handle(st: &WebState, cfg: &Config, did: &Did) -> Option<Strin
     match tokio::time::timeout(RESOLVE_WAIT, verify(&st.safe, cfg, did)).await {
         Ok((outcome, handle)) => {
             m::handle_resolution(outcome);
-            let ttl = if handle.is_some() {
-                cfg.public_ui.handle_cache_ttl.get()
-            } else {
-                NEGATIVE_TTL
-            };
-            cache.insert(did.as_str(), handle.clone(), ttl);
-            handle
+            settle(st, cfg, did, handle).await
         }
         // Too slow: the page renders with the DID alone and nothing is
         // cached.
@@ -181,6 +275,17 @@ mod tests {
             claimed_handle(&json!({"alsoKnownAs": ["at://<script>"]})),
             None
         );
+    }
+
+    #[test]
+    fn a_handle_is_stale_after_seven_days() {
+        let now = Utc::now();
+        let day = chrono::Duration::days(1);
+        assert!(!is_stale(now, now));
+        assert!(!is_stale(now - day * 7 + chrono::Duration::seconds(1), now));
+        assert!(is_stale(now - day * 7 - chrono::Duration::seconds(1), now));
+        // A clock that went backwards makes nothing stale.
+        assert!(!is_stale(now + day, now));
     }
 
     #[test]

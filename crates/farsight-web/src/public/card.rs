@@ -53,7 +53,7 @@ use farsight_storage::queries;
 use serde_json::Value;
 use url::Url;
 
-use super::handles::{self, NEGATIVE_TTL, claimed_handle};
+use super::handles::{self, claimed_handle};
 use super::metrics::{self as m, Page};
 use super::text::{Stamp, clean};
 use super::{Cache, client_key, finish, parse_did};
@@ -298,8 +298,7 @@ async fn handle(
     claim: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> Result<Option<String>, ()> {
-    let cache = &st.public.handles;
-    if let Some(c) = cache.lookup(did.as_str()) {
+    if let Some(c) = handles::cached(st, cfg, did).await {
         m::handle_resolution(handles::Outcome::Cached);
         return Ok(match c {
             Cached::Handle(h) => Some(h),
@@ -308,23 +307,16 @@ async fn handle(
     }
     let Some(claim) = claim else {
         m::handle_resolution(handles::Outcome::Failed);
-        cache.insert(did.as_str(), None, NEGATIVE_TTL);
-        return Ok(None);
+        return Ok(handles::settle(st, cfg, did, None).await);
     };
     match tokio::time::timeout_at(deadline, resolve_handle(&st.safe, claim)).await {
         Ok(Ok(back)) if back == *did => {
             m::handle_resolution(handles::Outcome::Resolved);
-            cache.insert(
-                did.as_str(),
-                Some(claim.to_owned()),
-                cfg.public_ui.handle_cache_ttl.get(),
-            );
-            Ok(Some(claim.to_owned()))
+            Ok(handles::settle(st, cfg, did, Some(claim.to_owned())).await)
         }
         Ok(_) => {
             m::handle_resolution(handles::Outcome::Unverified);
-            cache.insert(did.as_str(), None, NEGATIVE_TTL);
-            Ok(None)
+            Ok(handles::settle(st, cfg, did, None).await)
         }
         Err(_) => {
             m::handle_resolution(handles::Outcome::Failed);

@@ -1,14 +1,24 @@
-//! The public UI's handle cache (design §8.6): in memory, bounded, least
-//! recently used evicted. Farsight stores no handles; this holds what the
-//! public pages verified, for as long as the caller says.
+//! The UI's handle cache (design §8.6), in two layers.
 //!
-//! An entry is either a verified handle or the fact that the DID has none
-//! worth showing (no handle, or a resolution that failed), so that a page
-//! view does not repeat a lookup that just failed.
+//! In memory: bounded, least recently used evicted, each entry living as
+//! long as the caller says. An entry is either a verified handle or the
+//! fact that the DID has none worth showing (no handle, or a resolution
+//! that failed), so that a page view does not repeat a lookup that just
+//! failed.
+//!
+//! In the database: the `handle_cache` table holds the verified handle of
+//! every DID a verification succeeded for, with the time of the
+//! verification, so that a restart loses nothing. Failures are not
+//! stored. The memory layer stays in front of it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use sqlx::PgConnection;
+
+use crate::error::Result;
 
 /// Default capacity.
 pub const DEFAULT_CAPACITY: usize = 50_000;
@@ -16,6 +26,9 @@ pub const DEFAULT_CAPACITY: usize = 50_000;
 #[derive(Debug)]
 struct Entry {
     handle: Option<String>,
+    // The handle was verified too long ago: shown, and due a fresh
+    // verification.
+    stale: bool,
     expires: Instant,
     tick: u64,
 }
@@ -64,14 +77,13 @@ impl HandleCache {
         self.lookup_at(did, Instant::now()).map(|(c, _)| c)
     }
 
-    /// The live entry for `did` and how long it still lives; marks it
-    /// used. A handle about to expire can be refreshed before a page that
-    /// keeps being viewed loses it.
-    pub fn lookup_remaining(&self, did: &str) -> Option<(Cached, Duration)> {
+    /// The live entry for `did` and whether it is a stale handle (see
+    /// [`HandleCache::insert_stale`]); marks it used.
+    pub fn lookup_stale(&self, did: &str) -> Option<(Cached, bool)> {
         self.lookup_at(did, Instant::now())
     }
 
-    fn lookup_at(&self, did: &str, now: Instant) -> Option<(Cached, Duration)> {
+    fn lookup_at(&self, did: &str, now: Instant) -> Option<(Cached, bool)> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let inner = &mut *g;
         let e = inner.entries.get_mut(did)?;
@@ -89,7 +101,7 @@ impl HandleCache {
             Some(h) => Cached::Handle(h.clone()),
             None => Cached::None,
         };
-        Some((cached, e.expires.saturating_duration_since(now)))
+        Some((cached, e.stale))
     }
 
     /// The verified handle of `did`, if one is cached.
@@ -103,10 +115,24 @@ impl HandleCache {
     /// Caches a verified `handle` for `did`, or `None` for "nothing to
     /// show", for `ttl`.
     pub fn insert(&self, did: &str, handle: Option<String>, ttl: Duration) {
-        self.insert_at(did, handle, ttl, Instant::now());
+        self.insert_at(did, handle, false, ttl, Instant::now());
     }
 
-    fn insert_at(&self, did: &str, handle: Option<String>, ttl: Duration, now: Instant) {
+    /// Caches a `handle` that was verified longer ago than the caller
+    /// trusts: it is shown, and [`HandleCache::lookup_stale`] reports it
+    /// as due a fresh verification.
+    pub fn insert_stale(&self, did: &str, handle: String, ttl: Duration) {
+        self.insert_at(did, Some(handle), true, ttl, Instant::now());
+    }
+
+    fn insert_at(
+        &self,
+        did: &str,
+        handle: Option<String>,
+        stale: bool,
+        ttl: Duration,
+        now: Instant,
+    ) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let inner = &mut *g;
         if let Some(old) = inner.entries.remove(did) {
@@ -125,6 +151,7 @@ impl HandleCache {
             did.to_owned(),
             Entry {
                 handle,
+                stale,
                 expires: now + ttl,
                 tick,
             },
@@ -147,6 +174,52 @@ impl HandleCache {
     }
 }
 
+/// A row of `handle_cache`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    /// The DID.
+    pub did: String,
+    /// Its handle, as last verified.
+    pub handle: String,
+    /// When that was.
+    pub resolved_at: DateTime<Utc>,
+}
+
+/// The stored handles of those of `dids` that have one.
+pub async fn stored(conn: &mut PgConnection, dids: &[String]) -> Result<Vec<Stored>> {
+    if dids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(String, String, DateTime<Utc>)> =
+        sqlx::query_as("SELECT did, handle, resolved_at FROM handle_cache WHERE did = ANY($1)")
+            .bind(dids)
+            .fetch_all(conn)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(did, handle, resolved_at)| Stored {
+            did,
+            handle,
+            resolved_at,
+        })
+        .collect())
+}
+
+/// Stores `handle` as the handle of `did`, verified now. Replaces what
+/// was stored for the DID.
+pub async fn store(conn: &mut PgConnection, did: &str, handle: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, $2, now())
+         ON CONFLICT (did) DO UPDATE
+           SET handle = EXCLUDED.handle, resolved_at = EXCLUDED.resolved_at",
+    )
+    .bind(did)
+    .bind(handle)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,18 +231,13 @@ mod tests {
         let c = HandleCache::new(10);
         let t0 = Instant::now();
         assert_eq!(c.lookup_at("did:plc:a", t0), None);
-        c.insert_at("did:plc:a", Some("a.example".into()), TTL, t0);
-        c.insert_at("did:plc:b", None, TTL, t0);
+        c.insert_at("did:plc:a", Some("a.example".into()), false, TTL, t0);
+        c.insert_at("did:plc:b", None, false, TTL, t0);
         assert_eq!(
             c.lookup_at("did:plc:a", t0),
-            Some((Cached::Handle("a.example".into()), TTL))
+            Some((Cached::Handle("a.example".into()), false))
         );
-        assert_eq!(c.lookup_at("did:plc:b", t0), Some((Cached::None, TTL)));
-        // The remaining lifetime shrinks with the clock.
-        assert_eq!(
-            c.lookup_at("did:plc:b", t0 + TTL / 4).map(|(_, left)| left),
-            Some(TTL - TTL / 4)
-        );
+        assert_eq!(c.lookup_at("did:plc:b", t0), Some((Cached::None, false)));
         assert_eq!(c.get("did:plc:b"), None);
         // Expired entries are gone, not returned.
         assert_eq!(c.lookup_at("did:plc:a", t0 + TTL), None);
@@ -177,20 +245,36 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_handle_is_shown_and_reported_until_replaced() {
+        let c = HandleCache::new(10);
+        c.insert_stale("did:plc:a", "old.example".into(), TTL);
+        assert_eq!(
+            c.lookup_stale("did:plc:a"),
+            Some((Cached::Handle("old.example".into()), true))
+        );
+        assert_eq!(c.get("did:plc:a").as_deref(), Some("old.example"));
+        c.insert("did:plc:a", Some("new.example".into()), TTL);
+        assert_eq!(
+            c.lookup_stale("did:plc:a"),
+            Some((Cached::Handle("new.example".into()), false))
+        );
+    }
+
+    #[test]
     fn least_recently_used_goes_first() {
         let c = HandleCache::new(2);
         let t0 = Instant::now();
-        c.insert_at("a", Some("a.example".into()), TTL, t0);
-        c.insert_at("b", Some("b.example".into()), TTL, t0);
+        c.insert_at("a", Some("a.example".into()), false, TTL, t0);
+        c.insert_at("b", Some("b.example".into()), false, TTL, t0);
         // Using `a` makes `b` the eviction candidate.
         assert!(c.lookup_at("a", t0).is_some());
-        c.insert_at("c", Some("c.example".into()), TTL, t0);
+        c.insert_at("c", Some("c.example".into()), false, TTL, t0);
         assert_eq!(c.len(), 2);
         assert!(c.lookup_at("b", t0).is_none());
         assert!(c.lookup_at("a", t0).is_some());
         assert!(c.lookup_at("c", t0).is_some());
         // Re-inserting a key replaces it without growing.
-        c.insert_at("a", None, TTL, t0);
+        c.insert_at("a", None, false, TTL, t0);
         assert_eq!(c.len(), 2);
         assert_eq!(c.lookup_at("a", t0).map(|(c, _)| c), Some(Cached::None));
     }

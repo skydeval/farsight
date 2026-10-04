@@ -914,15 +914,6 @@ footer {
   margin-bottom: 1.25rem;
 }
 
-.status-pill {
-  font-weight: 600;
-  font-size: 0.78rem;
-  letter-spacing: 0.02em;
-  background: var(--accent-subtle);
-  border-color: var(--accent-glow);
-  color: var(--fg-strong);
-}
-
 .profile-actions {
   display: flex;
   align-items: center;
@@ -986,27 +977,9 @@ footer {
   margin-bottom: 0;
 }
 
-.profile-avatar-badge {
-  width: 58px;
-  height: 58px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, var(--accent-subtle), var(--card-hover));
-  border: 2px solid var(--accent);
-  box-shadow: 0 0 16px -2px var(--accent-glow);
-  display: grid;
-  place-items: center;
+/* The account page's copy button sits beside the name. */
+.profile-main-row > .profile-actions {
   flex-shrink: 0;
-}
-.avatar-letter {
-  font-size: 1.5rem;
-  font-weight: 800;
-  font-family: var(--font-sans);
-  color: var(--accent);
-}
-.list-avatar-badge {
-  color: var(--aurora-violet);
-  border-color: var(--aurora-violet);
-  box-shadow: 0 0 16px -2px rgba(168, 85, 247, 0.25);
 }
 
 .profile-id-block {
@@ -1278,12 +1251,14 @@ footer {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  padding: 0.75rem 1rem;
+  padding: 0.55rem 1rem;
   border-bottom: 1px solid var(--line);
   text-align: left;
+  white-space: nowrap;
 }
+/* Dense rows: 41px with text alone, 44px with a time or count badge. */
 .data-table td {
-  padding: 0.85rem 1rem;
+  padding: 0.55rem 1rem;
   border-bottom: 1px solid var(--line);
   color: var(--fg);
   vertical-align: middle;
@@ -1307,6 +1282,12 @@ footer {
 .data-table .td-owner {
   min-width: 10rem;
 }
+/* An account and a time stay on one line; the column widens instead, and
+   the table scrolls sideways where the screen is too narrow for it. */
+.data-table a.who, .data-table a.who code, .data-table .td-date, .data-table .td-num {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
 
 .time-badge {
   display: inline-block;
@@ -1314,7 +1295,7 @@ footer {
   font-family: var(--font-mono);
   color: var(--muted);
   background: var(--pill);
-  padding: 0.2rem 0.55rem;
+  padding: 0.1rem 0.5rem;
   border-radius: var(--radius-sm);
   border: 1px solid var(--line);
   white-space: nowrap;
@@ -1328,7 +1309,7 @@ footer {
   background: var(--accent-subtle);
   color: var(--accent);
   border: 1px solid var(--accent-glow);
-  padding: 0.2rem 0.6rem;
+  padding: 0.1rem 0.6rem;
   border-radius: var(--radius-sm);
 }
 

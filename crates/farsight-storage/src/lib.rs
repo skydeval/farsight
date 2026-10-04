@@ -43,7 +43,7 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// The schema version this build expects: the number of the last
 /// migration, which each migration writes into `schema_version`.
 /// `farsight-backfill` polls for it before starting work (design §2).
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// How often `farsight-backfill` polls `schema_version` (design §2).
 pub const SCHEMA_POLL: Duration = Duration::from_secs(5);
@@ -139,6 +139,7 @@ mod tests {
             ("history.rs", include_str!("history.rs")),
             ("auth.rs", include_str!("auth.rs")),
             ("backfill_api.rs", include_str!("backfill_api.rs")),
+            ("handles.rs", include_str!("handles.rs")),
         ] {
             let lower = src.to_ascii_lowercase();
             assert!(

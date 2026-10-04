@@ -11,7 +11,8 @@
 //! - 9–15: admin pages (sticky header and cards in a browser, handles,
 //!   `/admin/card/{did}` with and without a session, record cells, "First seen",
 //!   the shared card budget);
-//! - 16–20: handle warming (queue, drain, cap, toggle, no duplicates);
+//! - 16–20: handle warming (queue, drain, cap, toggle, no duplicates),
+//!   and 20b: handles stored in `handle_cache`;
 //! - 21–23: the index build (in the background, held by the storage
 //!   budget, released);
 //! - 24: what a v2 Jetstream's `time` field is (reported, never a
@@ -564,6 +565,7 @@ struct World {
     w18_id: i64,
     w19: String,
     w20: String,
+    w21: String,
     /// An author of 3,000 blocks; a list with 20,000 members and listblocks.
     dense_author_id: i64,
     filler_list_id: i64,
@@ -720,6 +722,20 @@ async fn seed_world(pool: &PgPool) -> Result<World, String> {
     seed_blockers(pool, "wxc", 20, w19_id, &recent, &recent).await?;
     let (w20, w20_id) = actor(did("wsx", 20)).await?;
     seed_blockers(pool, "wxd", 10, w20_id, &recent, &recent).await?;
+    // Stored handles: one verified today, one verified eight days ago.
+    let (w21, w21_id) = actor(did("wsx", 21)).await?;
+    seed_blockers(pool, "wxe", 3, w21_id, &recent, &recent).await?;
+    seed::exec(
+        pool,
+        &format!(
+            "INSERT INTO handle_cache (did, handle, resolved_at) VALUES
+             ('{}', 'stored-fresh.example', now() - interval '1 day'),
+             ('{}', 'stored-stale.example', now() - interval '8 days')",
+            did("wxe", 1),
+            did("wxe", 2)
+        ),
+    )
+    .await?;
     // The same account twice on one page.
     seed::exec(
         pool,
@@ -823,6 +839,7 @@ async fn seed_world(pool: &PgPool) -> Result<World, String> {
         w18_id,
         w19,
         w20,
+        w21,
         dense_author_id,
         filler_list_id,
         sparse_id,
@@ -1066,7 +1083,7 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
             "members",
             Section::ListMembers,
             w.l4_id,
-            3,
+            1,
         ),
         (
             "Blocked by (list)",
@@ -1644,9 +1661,22 @@ async fn set_warming(a: &Srv, cookie: &str, on: bool) -> Result<Resp, String> {
         .await
 }
 
+/// What the row naming `did` shows inside its link.
+fn shown_as<'a>(sec: &'a str, did: &str) -> &'a str {
+    let Some(i) = sec.find(&format!("title=\"{did}\"")) else {
+        return "";
+    };
+    let rest = &sec[i..];
+    match (rest.find('>'), rest.find("</a>")) {
+        (Some(a), Some(b)) if a < b => &rest[a + 1..b],
+        _ => "",
+    }
+}
+
 async fn check_warming(
     c: &mut Checks,
     a: &Srv,
+    pool: &PgPool,
     cookie: &str,
     plc: &Plc,
     w: &World,
@@ -1728,6 +1758,58 @@ async fn check_warming(
             && rows.len() == 11
             && counts.iter().all(|n| *n == 1),
         format!("{counts:?}"),
+    );
+
+    c.section("20b. handles stored in handle_cache");
+    let (fresh, stale, none) = (did("wxe", 1), did("wxe", 2), did("wxe", 3));
+    let first = a.get(&public_did(&w.w21)).await?;
+    let sec = section(&first.text, "blockers").unwrap_or("");
+    c.check(
+        "a page nobody has rendered since the server started shows the stored handles at once — the one verified a day ago and the one verified eight days ago — and the DID of the account that has none",
+        first.status == 200
+            && shown_as(sec, &fresh) == "@stored-fresh.example"
+            && shown_as(sec, &stale) == "@stored-stale.example"
+            && shown_as(sec, &none) == format!("<code>{none}</code>"),
+        format!(
+            "{:?} {:?} {:?}",
+            shown_as(sec, &fresh),
+            shown_as(sec, &stale),
+            support::truncate(shown_as(sec, &none), 60)
+        ),
+    );
+    let started = Instant::now();
+    while (plc.documents(&stale) == 0 || plc.documents(&none) == 0)
+        && started.elapsed() < Duration::from_secs(30)
+    {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let again = a.get(&public_did(&w.w21)).await?;
+    let sec = section(&again.text, "blockers").unwrap_or("");
+    let kept = n(
+        pool,
+        &format!(
+            "SELECT count(*) FROM handle_cache WHERE (did = '{fresh}' AND handle = 'stored-fresh.example')
+                OR (did = '{stale}' AND handle = 'stored-stale.example' AND resolved_at < now() - interval '7 days')"
+        ),
+    )
+    .await?;
+    let rows = n(pool, "SELECT count(*) FROM handle_cache").await?;
+    c.check(
+        "only the handle older than seven days is verified again, in the background (its document is requested once, the fresh one's never); the verification fails here (the stand-in names no handle), so the old handle stays on the page and in the table, and a failure writes no row",
+        plc.documents(&fresh) == 0
+            && plc.documents(&stale) == 1
+            && plc.documents(&none) == 1
+            && shown_as(sec, &fresh) == "@stored-fresh.example"
+            && shown_as(sec, &stale) == "@stored-stale.example"
+            && kept == 2
+            && rows == 2,
+        format!(
+            "documents: fresh {}, stale {}, none {}; {kept} of 2 rows unchanged, {rows} rows",
+            plc.documents(&fresh),
+            plc.documents(&stale),
+            plc.documents(&none)
+        ),
     );
 
     c.section("18. the queue is capped");
@@ -1845,11 +1927,11 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let building = log.find("sort index: building");
     let migrations: i64 = n(&pool, "SELECT count(*) FROM _sqlx_migrations").await?;
     c.check(
-        "a fresh database: the server is live in its normal start-up time, the eight migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
+        "a fresh database: the server is live in its normal start-up time, the nine migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
         have == 4
             && health.status == 200
             && e.came_up < Duration::from_secs(60)
-            && migrations == 8
+            && migrations == 9
             && serving.is_some()
             && building.is_some()
             && serving < building
@@ -2419,7 +2501,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     check_admin_card(c, &a, &b, &cookie, &plc, &w).await?;
     check_admin_columns(c, &a, &b, &cookie, &w).await?;
     check_shared_budget(c, &b, &cookie, &plc).await?;
-    check_warming(c, &a, &cookie, &plc, &w).await?;
+    check_warming(c, &a, &pool, &cookie, &plc, &w).await?;
     check_representative(c, &pool, &w).await?;
     drop(b);
     drop(a);

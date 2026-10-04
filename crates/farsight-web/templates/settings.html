@@ -112,7 +112,7 @@ advisory; scrapers that ignore it are bounded only by the rate limit. Some link-
 
 <label for="handle_cache_ttl">Handle cache lifetime</label>
 <input type="text" id="handle_cache_ttl" name="handle_cache_ttl" value="{{ p.handle_cache_ttl }}">
-<div class="hint">How long a verified handle is shown before it is checked again, e.g. <code>1h</code>.</div>
+<div class="hint">How long a verified handle stays in memory before it is read from the database again, e.g. <code>1h</code>. Verified handles are stored, and checked again once they are a week old.</div>
 
 <label for="excluded_dids">Excluded accounts</label>
 <textarea id="excluded_dids" name="excluded_dids" spellcheck="false" placeholder="did:plc:…">{{ p.excluded_dids }}</textarea>

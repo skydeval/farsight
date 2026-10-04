@@ -232,8 +232,11 @@ nothing else in a browser.
   the accounts that pages had to show as DIDs (`handle_warming_enabled`,
   on by default), at no more than the two lookups per second the
   instance already allowed itself: the first view of a page nobody has
-  opened shows DIDs, a later one shows handles. Handles are kept in
-  memory only; after a restart they fill in again.
+  opened shows DIDs, a later one shows handles. A verified handle is
+  stored (table `handle_cache`) and survives a restart. One verified
+  more than seven days ago is still shown and is verified again in the
+  background the next time a page reads it; if that fails, the old
+  handle stays. To start over, `DELETE FROM handle_cache;`.
 - **No coverage detail.** A public page prints no coverage level. It
   says "None on record at this instance" for an empty section, says so
   when a list is not indexed, and ends with one "Last updated" line.
@@ -292,7 +295,7 @@ crawlable = false
 rate_limit_rps = 5                # page views per second per address
 rate_limit_burst = 20
 query_concurrency = 8             # concurrent page renders
-handle_cache_ttl = "1h"
+handle_cache_ttl = "1h"           # in memory; the stored copy refills it
 handle_warming_enabled = true     # verify handles of shown accounts in the background
 excluded_dids = []                # at most 10,000
 ```
@@ -318,6 +321,15 @@ warning; the value does nothing, and the key is removed the next time
 you save the Public UI settings.
 
 ### Upgrading from an earlier version
+
+From a version that kept handles in memory only:
+
+- **One new table**, `handle_cache` (schema version 9), created by the
+  server at start. It holds one row per account whose handle a page
+  has verified. Nothing has to be edited.
+- **Rolling back.** An older binary does not start on schema version 9:
+  `DROP TABLE handle_cache; UPDATE schema_version SET version = 8;
+  DELETE FROM _sqlx_migrations WHERE version = 9;` first.
 
 From a version with `access.ui` and the public UI under `/public`:
 

@@ -40,8 +40,9 @@ pub struct Account {
     pub handle: Option<String>,
 }
 
-/// The cell for `did`. Never fetches anything: an account shown as a DID
-/// is handed to the warming worker.
+/// The cell for `did`. Never fetches anything and reads the memory cache
+/// alone (the page has read the stored handles of its accounts into it):
+/// an account shown as a DID is handed to the warming worker.
 pub fn account(st: &WebState, asked: &mut Asked, did: &str) -> Account {
     Account {
         did: did.to_owned(),

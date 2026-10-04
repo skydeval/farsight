@@ -3,9 +3,10 @@
 //! later view shows the handle.
 //!
 //! Rendering a row never waits for an outbound request. A row whose
-//! account has no live cache entry — or a verified handle about to expire
-//! — is put on the **warming queue**; one worker takes DIDs from it and
-//! verifies them as a page verifies its own subject.
+//! account has no cache entry, in memory or stored — or a stored handle
+//! verified more than a week ago ([`handles::STALE_AFTER`]), which the row
+//! shows meanwhile — is put on the **warming queue**; one worker takes
+//! DIDs from it and verifies them as a page verifies its own subject.
 //!
 //! - The queue is memory: at most [`QUEUE_CAP`] DIDs, no duplicates. The
 //!   newest request is served first (the page someone is looking at now
@@ -15,12 +16,14 @@
 //! - The worker draws on the process-wide handle budget and takes a token
 //!   only while the bucket holds more than [`RESERVE`], so requests always
 //!   find some. It cannot raise the server's outbound rate.
-//! - No table is scanned and nothing is read from the database.
+//! - No table is scanned. The worker reads nothing from the database and
+//!   writes one `handle_cache` row for each handle it verifies.
 //! - `public_ui.handle_warming_enabled = false`: pages queue nothing, the
 //!   queue is emptied, the worker idles.
 //!
 //! What it cannot do: the first view of a page nobody has rendered still
-//! shows DIDs, and a restart empties the cache and the queue.
+//! shows DIDs. A restart empties the queue and the memory cache; the
+//! stored handles stay.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -32,7 +35,7 @@ use farsight_core::config::Config;
 use farsight_storage::handles::Cached;
 use tokio::sync::{Notify, Semaphore, watch};
 
-use super::handles::{self, BUDGET_KEY, NEGATIVE_TTL};
+use super::handles::{self, BUDGET_KEY};
 use crate::pages::WebState;
 
 /// Most DIDs the queue holds.
@@ -217,14 +220,11 @@ impl WarmQueue {
 }
 
 /// Whether a row showing `did` asks the worker for it: the cache has no
-/// live entry, or a verified handle that expires within a quarter of
-/// `ttl` (refreshed before expiry, so a handle on a page that keeps being
-/// viewed does not blink back to a DID). A live negative entry is left
-/// alone.
-pub fn due(entry: Option<&(Cached, Duration)>, ttl: Duration) -> bool {
+/// live entry, or a stale handle. A live negative entry is left alone.
+pub fn due(entry: Option<&(Cached, bool)>) -> bool {
     match entry {
         None => true,
-        Some((Cached::Handle(_), left)) => *left < ttl / 4,
+        Some((Cached::Handle(_), stale)) => *stale,
         Some((Cached::None, _)) => false,
     }
 }
@@ -233,7 +233,6 @@ pub fn due(entry: Option<&(Cached, Duration)>, ttl: Duration) -> bool {
 #[derive(Debug)]
 pub struct Asked {
     enabled: bool,
-    ttl: Duration,
     dids: Vec<String>,
 }
 
@@ -242,17 +241,17 @@ impl Asked {
     pub fn new(cfg: &Config) -> Asked {
         Asked {
             enabled: cfg.public_ui.handle_warming_enabled,
-            ttl: cfg.public_ui.handle_cache_ttl.get(),
             dids: Vec::new(),
         }
     }
 
     /// The cached handle of an account a cell shows, if there is one.
     /// Asks for the account when the cell has to show its DID, or its
-    /// handle is about to expire. Never fetches anything.
+    /// handle is stale. Never fetches anything and reads memory alone:
+    /// the page calls [`handles::recall`] for its accounts first.
     pub fn handle(&mut self, st: &WebState, did: &str) -> Option<String> {
-        let entry = st.public.handles.lookup_remaining(did);
-        if self.enabled && due(entry.as_ref(), self.ttl) {
+        let entry = st.public.handles.lookup_stale(did);
+        if self.enabled && due(entry.as_ref()) {
             self.dids.push(did.to_owned());
         }
         match entry {
@@ -278,12 +277,7 @@ async fn verify_one(st: Arc<WebState>, did: Did) {
     };
     // A failure is remembered too, so that the next render does not queue
     // the account again at once.
-    let ttl = if handle.is_some() {
-        cfg.public_ui.handle_cache_ttl.get()
-    } else {
-        NEGATIVE_TTL
-    };
-    st.public.handles.insert(did.as_str(), handle, ttl);
+    handles::settle(&st, cfg, &did, handle).await;
     count(outcome, 1);
 }
 
@@ -325,8 +319,8 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
             queue.finished(&raw);
             continue;
         };
-        let entry = st.public.handles.lookup_remaining(did.as_str());
-        if !due(entry.as_ref(), cfg.config.public_ui.handle_cache_ttl.get()) {
+        let entry = st.public.handles.lookup_stale(did.as_str());
+        if !due(entry.as_ref()) {
             queue.finished(&raw);
             count(Outcome::Cached, 1);
             continue;
@@ -430,15 +424,14 @@ mod tests {
 
     #[test]
     fn what_is_due() {
-        let ttl = Duration::from_secs(3600);
-        assert!(due(None, ttl));
-        let fresh = (Cached::Handle("a.example".into()), ttl);
-        assert!(!due(Some(&fresh), ttl));
-        let stale = (Cached::Handle("a.example".into()), Duration::from_secs(899));
-        assert!(due(Some(&stale), ttl));
+        assert!(due(None));
+        let fresh = (Cached::Handle("a.example".into()), false);
+        assert!(!due(Some(&fresh)));
+        let stale = (Cached::Handle("a.example".into()), true);
+        assert!(due(Some(&stale)));
         // "Nothing to show" is left alone until it expires.
-        let none = (Cached::None, Duration::from_secs(1));
-        assert!(!due(Some(&none), ttl));
+        let none = (Cached::None, false);
+        assert!(!due(Some(&none)));
     }
 
     #[test]

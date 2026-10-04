@@ -11,9 +11,10 @@
 //! page's DIDs, so a page can hold fewer rows than its size while more
 //! follow; the cursor is still offered.
 //!
-//! An account's "Blocked by" section holds [`BLOCKER_ROWS`] rows a page
-//! and grows in place: its "Load more" link appends the next page's rows.
-//! Every other section holds [`PAGE_ROWS`] and replaces itself.
+//! An account's "Blocked by" section and a list's "Members" section hold
+//! [`BLOCKER_ROWS`] and [`MEMBER_ROWS`] rows a page and grow in place:
+//! their "Load more" link appends the next page's rows. Every other
+//! section holds [`PAGE_ROWS`] and replaces itself.
 //!
 //! A page prints no coverage level. It ends with one "Last updated" line
 //! (see [`super::coverage`]); removed records are an admin page
@@ -35,13 +36,13 @@ use farsight_storage::ui_rows::{Filter, Row, Section as Rows};
 use serde_json::Value;
 
 use super::coverage::{EMPTY, last_updated};
-use super::handles::{page_handle, take_budget};
+use super::handles::{page_handle, recall, take_budget};
 use super::search::{self, Authority, Target};
 use super::text::{Stamp, card_href, clean, did_href, list_href, list_uri, paragraphs, thousands};
 use super::warming::Asked;
 use super::{
-    BLOCKER_ROWS, COUNT_CAP, Cache, Chrome, Fail, OG_ACCOUNT, OG_INSTANCE, OG_LIST, PAGE_ROWS, Req,
-    Withheld, chrome, metrics as m, page, redirect,
+    BLOCKER_ROWS, COUNT_CAP, Cache, Chrome, Fail, MEMBER_ROWS, OG_ACCOUNT, OG_INSTANCE, OG_LIST,
+    PAGE_ROWS, Req, Withheld, chrome, metrics as m, page, redirect,
 };
 use crate::pages::resolve_handle;
 
@@ -58,7 +59,8 @@ pub const DEFAULT_DESCRIPTION: &str = "Farsight is an independent index of publi
 // Shared pieces
 
 /// An account as a row names it: `@handle` when a verified handle is
-/// already cached, the DID otherwise. Either way a link to the account's
+/// already cached (in memory, or stored and read with the page's other
+/// accounts), the DID otherwise. Either way a link to the account's
 /// page whose `title` is the DID, and on which the script opens the
 /// profile card. Rendering a row never waits for an outbound request: an
 /// account shown as a DID is handed to the warming worker.
@@ -513,6 +515,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let mut dids: Vec<String> = block_page.rows.iter().map(|b| b.did.clone()).collect();
     dids.extend(naming_page.rows.iter().map(|l| l.owner_did.clone()));
     dids.extend(out_page.rows.iter().map(|o| o.did.clone()));
+    recall(r.st, cfg, &dids).await;
     let shown = Shown::load(r, &withheld, dids).await?;
     let mut asked = Asked::new(cfg);
 
@@ -704,7 +707,7 @@ pub async fn list(
             info.id,
             row_filter(&withheld),
             q.get("mc"),
-            PAGE_ROWS,
+            MEMBER_ROWS,
         )
         .await
         .map_err(|e| or_first_page(e.into(), &base))?
@@ -725,6 +728,7 @@ pub async fn list(
 
     let mut dids: Vec<String> = member_page.rows.iter().map(|m| m.did.clone()).collect();
     dids.extend(blocker_page.rows.iter().map(|b| b.did.clone()));
+    recall(r.st, cfg, &dids).await;
     let shown = Shown::load(r, &withheld, dids).await?;
     let mut asked = Asked::new(cfg);
 
@@ -743,7 +747,7 @@ pub async fn list(
             pager: Pager {
                 section: "members",
                 next,
-                more: false,
+                more: true,
             },
         })
     } else {

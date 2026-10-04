@@ -541,6 +541,14 @@ async fn serve(
         }
     };
     let nav = nav(&admin);
+    let parties: Vec<String> = data
+        .first
+        .iter()
+        .chain(&data.second)
+        .filter(|h| !h.party.is_empty())
+        .map(|h| h.party.clone())
+        .collect();
+    crate::public::handles::recall(st, cfg, &parties).await;
     let mut asked = Asked::new(cfg);
     let page = match subject {
         Subject::Did(did) => {

@@ -928,8 +928,9 @@ fn time_columns(who: &str, record: &str, time: &str) -> Vec<String> {
 }
 
 /// The rows of such a section. `authority` is the account whose repo
-/// holds the records; `None`: the row's own account.
-fn time_rows(
+/// holds the records; `None`: the row's own account. Reads the stored
+/// handles of the rows' accounts first.
+async fn time_rows(
     st: &WebState,
     asked: &mut Asked,
     viewer: &str,
@@ -937,6 +938,8 @@ fn time_rows(
     authority: Option<&str>,
     rows: &[farsight_storage::ui_rows::Row],
 ) -> Vec<Vec<Cell>> {
+    let dids: Vec<String> = rows.iter().map(|b| b.did.clone()).collect();
+    crate::public::handles::recall(st, &st.api.config.current().config, &dids).await;
     rows.iter()
         .map(|b| {
             vec![
@@ -1065,7 +1068,7 @@ async fn lookup_did(
         .await
         {
             Ok(p) => {
-                sec.rows = time_rows(&st, &mut asked, viewer, BLOCK, None, &p.rows);
+                sec.rows = time_rows(&st, &mut asked, viewer, BLOCK, None, &p.rows).await;
                 sec.next = p.next.as_deref().map(|c| base_pairs(("bc", c)));
             }
             Err(e) => sec.error = Some(section_error(e)),
@@ -1085,7 +1088,13 @@ async fn lookup_did(
     };
     match handlers::get_incoming_list_blocks(&st.api, &params(Some("lc"))).await {
         Ok(r) => {
-            for i in r.body["items"].as_array().cloned().unwrap_or_default() {
+            let items = r.body["items"].as_array().cloned().unwrap_or_default();
+            let dids: Vec<String> = items
+                .iter()
+                .filter_map(|i| i["blocker"].as_str().map(str::to_owned))
+                .collect();
+            crate::public::handles::recall(&st, &cfg.config, &dids).await;
+            for i in items {
                 sec.rows.push(vec![
                     text_cell(&i["list"]),
                     text_cell(&i["listPurpose"]),
@@ -1318,7 +1327,8 @@ async fn lookup_list(
                         LISTITEM,
                         Some(owner.as_str()),
                         &p.rows,
-                    );
+                    )
+                    .await;
                     members.next = p.next.as_deref().map(|c| {
                         link_with("/admin/lookup/list", &[("q", uri.as_str()), ("mc", c)])
                     });
@@ -1337,7 +1347,7 @@ async fn lookup_list(
         .await
         {
             Ok(p) => {
-                blockers.rows = time_rows(&st, &mut asked, viewer, LISTBLOCK, None, &p.rows);
+                blockers.rows = time_rows(&st, &mut asked, viewer, LISTBLOCK, None, &p.rows).await;
                 blockers.next = p
                     .next
                     .as_deref()

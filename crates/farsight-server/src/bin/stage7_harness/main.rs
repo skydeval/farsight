@@ -961,8 +961,8 @@ async fn check_loopback_flow(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<Strin
         .await?;
     let migrations = ctx.n("SELECT max(version) FROM _sqlx_migrations").await?;
     c.check(
-        "no schema change: admin_sessions still has six columns and the newest migration is 8",
-        schema == 6 && migrations == 8,
+        "no schema change for the sign-in: admin_sessions still has six columns; the newest migration is 9 (the handle cache, which touches no auth table)",
+        schema == 6 && migrations == 9,
         format!("{schema} columns, migration {migrations}"),
     );
     Ok(admin_cookie)
@@ -2360,15 +2360,21 @@ fn check_rollback(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         restored == old && !out_old.contains("invalid configuration") && !out_old.contains("unknown field"),
         format!("exit {code_old:?}: {}", support::truncate(&out_old, 200)),
     );
-    let migrations = std::fs::read_dir(
+    let mut migrations: Vec<String> = std::fs::read_dir(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../farsight-storage/migrations"),
     )
-    .map(|d| d.count())
-    .unwrap_or(0);
+    .map(|d| {
+        d.filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    })
+    .unwrap_or_default();
+    migrations.sort();
     c.check(
-        "and of the database: this build ships the same eight migrations as before (a pre-r22 binary refuses a database with one it does not know)",
-        migrations == 8,
-        format!("{migrations} files"),
+        "and of the database: this build ships the eight migrations a pre-r22 binary knows and one more, the handle cache — a binary that does not know it refuses the database until the table and its migration row are removed (README, rolling back)",
+        migrations.len() == 9
+            && migrations.last().map(String::as_str) == Some("0009_handle_cache.sql"),
+        format!("{} files, last {:?}", migrations.len(), migrations.last()),
     );
     let _ = ctx;
     Ok(())

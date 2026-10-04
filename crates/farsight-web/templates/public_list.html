@@ -4,7 +4,6 @@
 <div class="profile-meta-bar">
 <div class="list-badges">
 {% if let Some(p) = purpose %}<span class="pill list-purpose-pill">{{ p }}</span>{% endif %}
-<span class="pill status-pill"><span class="pulse-dot" aria-hidden="true"></span> ATProto List</span>
 </div>
 <div class="profile-actions">
 <button type="button" class="action-btn copy-btn" data-copy="{{ uri }}" title="Copy AT URI to clipboard">
@@ -16,9 +15,6 @@
 </div>
 
 <div class="profile-main-row">
-<div class="profile-avatar-badge list-avatar-badge" aria-hidden="true">
-<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
-</div>
 <div class="profile-id-block">
 <h1 class="subject">
 {% if let Some(n) = name %}<span class="handle">{{ n }}</span>{% endif %}
@@ -80,7 +76,7 @@
 <h2>Members <span class="count">{{ stored_members }} stored members</span></h2>
 <p class="muted">The stored count is this instance's own counter; it does not apply this page's filters, so it can exceed the rows below.</p>
 </div>
-{% if !members.rows.is_empty() %}
+{% if !members.rows.is_empty() || members.pager.next.is_some() %}
 <div class="table-responsive">
 <table class="data-table">
 <thead>
@@ -89,11 +85,11 @@
 <th scope="col" class="th-date">Added (Owner Claim)</th>
 </tr>
 </thead>
-<tbody>
+<tbody id="members-rows">
 {% for r in members.rows %}
 <tr class="data-row">
 <td class="td-account">{{ r.who|safe }}</td>
-<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge">{{ t.text }}</time>{% endif %}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.text }}</time>{% endif %}</td>
 </tr>
 {% endfor %}
 </tbody>
@@ -133,7 +129,7 @@
 {% for r in blockers.rows %}
 <tr class="data-row">
 <td class="td-account">{{ r.who|safe }}</td>
-<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge">{{ t.text }}</time>{% endif %}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.text }}</time>{% endif %}</td>
 </tr>
 {% endfor %}
 </tbody>
