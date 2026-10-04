@@ -40,6 +40,9 @@ pub struct Stamp {
     pub iso: String,
     /// Visible text.
     pub text: String,
+    /// The same without the zone, for a table whose page states the zone
+    /// once.
+    pub bare: String,
 }
 
 impl Stamp {
@@ -48,6 +51,7 @@ impl Stamp {
         Stamp {
             iso: t.to_rfc3339_opts(SecondsFormat::Secs, true),
             text: t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            bare: t.format("%Y-%m-%d %H:%M:%S").to_string(),
         }
     }
 

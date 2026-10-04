@@ -20,6 +20,9 @@ use super::Fail;
 /// The highest page number an address may name. A page past a section's
 /// end is an empty table; this bound only keeps the offset a sane number.
 pub const MAX_PAGE: i64 = 1_000_000;
+/// The parameter that names the table in view when it is not the page's
+/// first one.
+pub const TAB: &str = "tab";
 /// Pages linked on each side of the current one.
 pub const NEIGHBOURS: i64 = 2;
 
@@ -40,8 +43,11 @@ pub fn number(q: &Params, key: &str, base: &str) -> Result<i64, Fail> {
 /// The query string of a page of this address: the sections in `keys`
 /// that are past their first page, in that order, with `key` set to
 /// `page`. Empty when every section is on page 1.
-fn query(q: &Params, keys: &[&str], set: Option<(&str, i64)>) -> String {
+fn query(q: &Params, keys: &[&str], set: Option<(&str, i64)>, tab: Option<&str>) -> String {
     let mut s = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(t) = tab {
+        s.append_pair(TAB, t);
+    }
     for k in keys {
         let value = match set {
             Some((key, page)) if key == *k => Some(page.to_string()),
@@ -58,16 +64,41 @@ fn query(q: &Params, keys: &[&str], set: Option<(&str, i64)>) -> String {
 /// canonical one: it carries a cursor parameter of an earlier version
 /// (`retired`), or names page 1 of a section outright. The other
 /// sections keep their pages; a retired cursor's section starts over.
-pub fn canonical(q: &Params, keys: &[&str], retired: &[&str]) -> Option<String> {
+///
+/// `tabs` are the page's tables, the first being the one shown without a
+/// `tab` parameter: naming it, or a table the page does not have, is
+/// not canonical either.
+pub fn canonical(q: &Params, keys: &[&str], retired: &[&str], tabs: &[&str]) -> Option<String> {
     let stale = retired.iter().any(|k| q.get(k).is_some());
     let first = keys.iter().any(|k| q.get(k) == Some("1"));
-    (stale || first).then(|| query(q, keys, None))
+    let tab = q.get(TAB);
+    let kept = tab.filter(|t| tabs.iter().skip(1).any(|k| k == t));
+    (stale || first || tab != kept).then(|| query(q, keys, None, kept))
+}
+
+/// `base?…` for the table `tab` (`None`: the page's first), keeping every
+/// section's page.
+pub fn tab_link(base: &str, q: &Params, keys: &[&str], tab: Option<&str>) -> String {
+    let query = query(q, keys, None, tab);
+    if query.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{query}")
+    }
 }
 
 /// `base?…` for page `page` of the section `key`, keeping the pages of
-/// the other sections.
-pub fn link(base: &str, q: &Params, keys: &[&str], key: &str, page: i64) -> String {
-    let query = query(q, keys, Some((key, page)));
+/// the other sections. `tab` names the section's table when it is not
+/// the page's first.
+pub fn link(
+    base: &str,
+    q: &Params,
+    keys: &[&str],
+    key: &str,
+    page: i64,
+    tab: Option<&str>,
+) -> String {
+    let query = query(q, keys, Some((key, page)), tab);
     if query.is_empty() {
         base.to_owned()
     } else {
@@ -176,6 +207,7 @@ impl Pager {
         q: &Params,
         keys: &[&str],
         key: &str,
+        tab: Option<&str>,
         current: i64,
         total: Total,
         more: bool,
@@ -190,7 +222,7 @@ impl Pager {
             })
             .max()
             .unwrap_or(1);
-        let to = |p: i64| link(base, q, keys, key, p);
+        let to = |p: i64| link(base, q, keys, key, p, tab);
         Pager {
             section,
             label,
@@ -297,26 +329,34 @@ mod tests {
         let keys = ["page", "lists", "out"];
         let q = Params::parse("lists=3&utm=x");
         assert_eq!(
-            link("/did/x", &q, &keys, "page", 2),
+            link("/did/x", &q, &keys, "page", 2, None),
             "/did/x?page=2&lists=3"
         );
-        assert_eq!(link("/did/x", &q, &keys, "lists", 1), "/did/x");
-        assert_eq!(link("/did/x", &q, &keys, "lists", 4), "/did/x?lists=4");
+        assert_eq!(link("/did/x", &q, &keys, "lists", 1, None), "/did/x");
+        // A page of a table that is not the first names its tab.
+        assert_eq!(
+            link("/did/x", &q, &keys, "lists", 4, Some("lists")),
+            "/did/x?tab=lists&lists=4"
+        );
+        assert_eq!(
+            tab_link("/did/x", &q, &keys, Some("lists")),
+            "/did/x?tab=lists&lists=3"
+        );
+        assert_eq!(tab_link("/did/x", &q, &keys, None), "/did/x?lists=3");
         // Canonical: no `=1`, no cursor of an earlier version.
         let retired = ["bc", "nc", "oc"];
-        assert_eq!(canonical(&q, &keys, &retired), None);
-        assert_eq!(
-            canonical(&Params::parse("page=1&lists=3"), &keys, &retired).as_deref(),
-            Some("lists=3")
-        );
-        assert_eq!(
-            canonical(&Params::parse("bc=abc"), &keys, &retired).as_deref(),
-            Some("")
-        );
-        assert_eq!(
-            canonical(&Params::parse("page=2&nc=abc"), &keys, &retired).as_deref(),
-            Some("page=2")
-        );
+        let tabs = ["blockers", "lists", "outgoing"];
+        let c = |s: &str| canonical(&Params::parse(s), &keys, &retired, &tabs);
+        assert_eq!(c("lists=3&utm=x"), None);
+        assert_eq!(c("page=1&lists=3").as_deref(), Some("lists=3"));
+        assert_eq!(c("bc=abc").as_deref(), Some(""));
+        assert_eq!(c("page=2&nc=abc").as_deref(), Some("page=2"));
+        // The tab: kept when it names another table, dropped when it
+        // names the first or none.
+        assert_eq!(c("tab=lists&lists=2"), None);
+        assert_eq!(c("tab=blockers&page=2").as_deref(), Some("page=2"));
+        assert_eq!(c("tab=nope").as_deref(), Some(""));
+        assert_eq!(c("tab=lists&bc=x").as_deref(), Some("tab=lists"));
     }
 
     #[test]
@@ -341,7 +381,9 @@ mod tests {
         let q = Params::default();
         let keys = ["page"];
         let p = |current, total, more| {
-            Pager::new("s", "x", "/b", &q, &keys, "page", current, total, more, 50)
+            Pager::new(
+                "s", "x", "/b", &q, &keys, "page", None, current, total, more, 50,
+            )
         };
         let first = p(1, Total::Rows(120), true);
         assert!(first.prev.is_none() && first.next.as_deref() == Some("/b?page=2"));

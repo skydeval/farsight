@@ -122,13 +122,35 @@
     return "";
   }
 
-  // YYYY-MM-DD HH:MM:SS TZ, in the visitor's timezone, 24-hour.
-  function local(date) {
+  // YYYY-MM-DD HH:MM:SS TZ, in the visitor's timezone, 24-hour. `bare`:
+  // without the zone, for a table whose page names the zone once.
+  function local(date, bare) {
     var text =
       date.getFullYear() + "-" + two(date.getMonth() + 1) + "-" + two(date.getDate()) + " " +
       two(date.getHours()) + ":" + two(date.getMinutes()) + ":" + two(date.getSeconds());
-    var tz = zone(date);
+    var tz = bare ? "" : zone(date);
     return tz ? text + " " + tz : text;
+  }
+
+  // "All times are in …": the server says UTC; once the row times read in
+  // the visitor's timezone the line names that timezone.
+  function zoneNote() {
+    var list = document.querySelectorAll("[data-zone]");
+    if (!list.length) {
+      return;
+    }
+    var name = "";
+    try {
+      name = new Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+    } catch (e) {
+      name = "";
+    }
+    name = name ? name.replace(/_/g, " ") : zone(new Date());
+    for (var i = 0; i < list.length; i++) {
+      if (name) {
+        list[i].textContent = name;
+      }
+    }
   }
 
   // What a processed element reads at `now`. `abs` is the local instant,
@@ -161,12 +183,14 @@
         if (isNaN(then)) {
           continue;
         }
-        var t = { el: el, then: then, abs: local(new Date(then)), updated: !!el.closest(".updated") };
-        // A card states the age on its own line; a time marked data-abs
-        // reads as the instant alone.
+        // A time marked data-abs is a table row's: the instant alone,
+        // without the zone the page states once.
+        var bare = el.hasAttribute("data-abs") && !el.closest(".pc");
+        var t = { el: el, then: then, abs: local(new Date(then), bare), updated: !!el.closest(".updated") };
+        // A card states the age on its own line.
         var fixed = !!el.closest(".pc") || el.hasAttribute("data-abs");
         var text = fixed ? t.abs : reading(t, now);
-        var utc = el.textContent;
+        var utc = bare ? el.textContent + " UTC" : el.textContent;
         el.setAttribute("title", utc);
         el.textContent = text;
         el.setAttribute("data-local", "1");
@@ -559,8 +583,48 @@
     shortcuts();
     interactiveActions();
     scrollSpy();
+    zoneNote();
+    tabs();
     pending();
   });
+
+  // Tabs of a data page: each brings one table into view. The link is a
+  // real address (the server marks the table for a browser without this
+  // script); here it switches in place and the address follows.
+  function tabs() {
+    var box = document.querySelector(".tabbed");
+    var nav = document.querySelector("nav.tabs");
+    if (!box || !nav) {
+      return;
+    }
+    function show(id) {
+      box.setAttribute("data-active", id);
+      var all = nav.querySelectorAll("a.tab");
+      for (var i = 0; i < all.length; i++) {
+        var on = all[i].getAttribute("data-tab") === id;
+        all[i].classList.toggle("active", on);
+        all[i].setAttribute("aria-selected", on ? "true" : "false");
+      }
+    }
+    nav.addEventListener("click", function (event) {
+      var a = event.target.closest ? event.target.closest("a.tab") : null;
+      if (!a || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button) {
+        return;
+      }
+      event.preventDefault();
+      show(a.getAttribute("data-tab"));
+      try {
+        history.replaceState(null, "", a.getAttribute("href"));
+      } catch (e) {
+        // The table is in view either way.
+      }
+    });
+    // An address that points into a table (#lists) shows that table.
+    var hash = location.hash.slice(1);
+    if (/^[a-z]+$/.test(hash) && nav.querySelector('a.tab[data-tab="' + hash + '"]')) {
+      show(hash);
+    }
+  }
 
   // Rows held back until their account's handle is checked (a table says
   // how many in [data-pending]): read the page again until they are

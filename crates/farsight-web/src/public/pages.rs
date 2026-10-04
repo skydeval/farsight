@@ -123,10 +123,65 @@ pub struct Section<R> {
 const DID_PAGES: [&str; 3] = ["page", "lists", "out"];
 /// Of the list page's: "Members", "Blocked by".
 const LIST_PAGES: [&str; 2] = ["page", "blockers"];
+/// The tables of the account page, as its tabs name them; the first is
+/// the one in view without a `tab` parameter.
+const DID_TABS: [&str; 3] = ["blockers", "lists", "outgoing"];
+/// Of the list page.
+const LIST_TABS: [&str; 2] = ["members", "listblockers"];
 /// The cursor parameters of earlier versions. An address that still
 /// carries one is redirected to the first page of its section.
 const DID_CURSORS: [&str; 3] = ["bc", "nc", "oc"];
 const LIST_CURSORS: [&str; 2] = ["mc", "lc"];
+
+/// A tab of a data page: a link that brings one of the page's tables
+/// into view. The script switches in place; without it the link is
+/// followed and the server marks the table.
+#[derive(Debug, Clone)]
+pub struct Tab {
+    /// The table's section id.
+    pub id: &'static str,
+    /// What the tab says.
+    pub label: &'static str,
+    /// The page with this table in view, every table on its own page.
+    pub href: String,
+    /// The table in view.
+    pub active: bool,
+}
+
+/// The tabs for the tables a page has (`shown`, in order), and the id of
+/// the one in view: the one `tab` names if the page has it, else the
+/// first. `all` is the page's full list, whose first needs no parameter.
+fn tabs(
+    base: &str,
+    q: &Params,
+    keys: &[&str],
+    all: &[&'static str],
+    shown: &[(&'static str, &'static str)],
+) -> (Vec<Tab>, &'static str) {
+    let asked = q.get(paging::TAB).unwrap_or(all[0]);
+    let active = shown
+        .iter()
+        .map(|(id, _)| *id)
+        .find(|id| *id == asked)
+        .or_else(|| shown.first().map(|(id, _)| *id))
+        .unwrap_or(all[0]);
+    let tabs = shown
+        .iter()
+        .map(|(id, label)| Tab {
+            id,
+            label,
+            href: paging::tab_link(base, q, keys, (*id != all[0]).then_some(*id)),
+            active: *id == active,
+        })
+        .collect();
+    (tabs, active)
+}
+
+/// The `tab` a link into `section` carries: none for the page's first
+/// table.
+fn tab_of(all: &[&'static str], section: &'static str) -> Option<&'static str> {
+    (section != all[0]).then_some(section)
+}
 
 fn count_words(total: Total) -> Option<String> {
     match total {
@@ -460,6 +515,9 @@ struct DidPage {
     c: Chrome,
     did: String,
     handle: Option<String>,
+    tabs: Vec<Tab>,
+    /// The id of the table in view.
+    active: &'static str,
     blockers: Section<PartyRow>,
     lists: Section<ListRow>,
     outgoing: Option<Section<PartyRow>>,
@@ -470,7 +528,7 @@ struct DidPage {
 pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let cfg = r.config();
     let base = did_href(did.as_str());
-    if let Some(query) = paging::canonical(q, &DID_PAGES, &DID_CURSORS) {
+    if let Some(query) = paging::canonical(q, &DID_PAGES, &DID_CURSORS, &DID_TABS) {
         return Ok(crate::common::moved(&base, Some(&query)));
     }
     let b_page = paging::number(q, "page", &base)?;
@@ -531,7 +589,17 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let mut asked = Asked::new(cfg);
     let pager = |section, label, key, number, total, more| {
         Pager::new(
-            section, label, &base, q, &DID_PAGES, key, number, total, more, PAGE_ROWS,
+            section,
+            label,
+            &base,
+            q,
+            &DID_PAGES,
+            key,
+            tab_of(&DID_TABS, section),
+            number,
+            total,
+            more,
+            PAGE_ROWS,
         )
     };
 
@@ -628,7 +696,14 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         None => did.to_string(),
     };
     let held = blockers.pending + lists.pending + outgoing.as_ref().map_or(0, |o| o.pending);
+    let mut shown_tabs = vec![("blockers", "Blocked By"), ("lists", "Blocked By Lists")];
+    if outgoing.is_some() {
+        shown_tabs.push(("outgoing", "Blocking"));
+    }
+    let (tabs, active) = tabs(&base, q, &DID_PAGES, &DID_TABS, &shown_tabs);
     let t = DidPage {
+        tabs,
+        active,
         c: chrome(cfg, did.as_str(), &og_title, OG_ACCOUNT, &base),
         did: did.to_string(),
         handle,
@@ -688,6 +763,9 @@ struct ListPage {
     capped: bool,
     /// `lists.item_count`: stored, not filtered.
     stored_members: String,
+    tabs: Vec<Tab>,
+    /// The id of the table in view.
+    active: &'static str,
     members: Option<Section<PartyRow>>,
     blockers: Section<PartyRow>,
     updated: Option<Stamp>,
@@ -703,7 +781,7 @@ pub async fn list(
     let cfg = r.config();
     let base = list_href(owner.as_str(), rkey.as_str());
     let uri = list_uri(owner.as_str(), rkey.as_str());
-    if let Some(query) = paging::canonical(q, &LIST_PAGES, &LIST_CURSORS) {
+    if let Some(query) = paging::canonical(q, &LIST_PAGES, &LIST_CURSORS, &LIST_TABS) {
         return Ok(crate::common::moved(&base, Some(&query)));
     }
     let m_page = paging::number(q, "page", &base)?;
@@ -758,6 +836,7 @@ pub async fn list(
             q,
             &LIST_PAGES,
             key,
+            tab_of(&LIST_TABS, section),
             number,
             total,
             more,
@@ -816,7 +895,15 @@ pub async fn list(
         None => uri.clone(),
     };
     let held = blockers.pending + members.as_ref().map_or(0, |m| m.pending);
+    let mut shown_tabs = Vec::new();
+    if members.is_some() {
+        shown_tabs.push(("members", "Members"));
+    }
+    shown_tabs.push(("listblockers", "Blocked By"));
+    let (tabs, active) = tabs(&base, q, &LIST_PAGES, &LIST_TABS, &shown_tabs);
     let t = ListPage {
+        tabs,
+        active,
         c: chrome(cfg, &uri, &og_title, OG_LIST, &base),
         name,
         purpose: listing["purpose"].as_str().map(purpose_words),

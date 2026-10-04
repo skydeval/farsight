@@ -167,7 +167,7 @@ await probe("a stored \"system\" overrides the operator's default and follows pr
   };
 });
 
-await probe("every <time> is rewritten once, in the visitor's timezone, with the UTC text kept in title", async () => {
+await probe("every <time> is rewritten once, in the visitor's timezone, with the UTC text kept in title; table rows carry no zone and the page names it once", async () => {
   const times = await page.evaluate(() =>
     [...document.querySelectorAll("time[datetime]")].map((t) => ({
       iso: t.getAttribute("datetime"),
@@ -192,17 +192,19 @@ await probe("every <time> is rewritten once, in the visitor's timezone, with the
       continue;
     }
     rows += 1;
-    const m = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (\S+)( \(\d+ (second|minute|hour|day)s? ago\))?$/.exec(t.text);
-    // A time marked data-abs (the account page's tables) reads as the
-    // instant alone.
+    const m = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)( \S+)?( \(\d+ (second|minute|hour|day)s? ago\))?$/.exec(t.text);
+    // A time marked data-abs (the tables of the data pages) reads as the
+    // instant alone, without the zone: the page states the zone once.
     abs += t.abs ? 1 : 0;
-    if (!(utc && t.done === "1" && m && m[1] === wallClock(t.iso) && /^(EDT|EST|GMT-[45])$/.test(m[2]) && !(t.abs && m[3]))) {
+    const zoned = m && m[2] && /^ (EDT|EST|GMT-[45])$/.test(m[2]);
+    if (!(utc && t.done === "1" && m && m[1] === wallClock(t.iso) && (t.abs ? !m[2] && !m[3] : zoned))) {
       bad.push(t);
     }
   }
+  const note = await page.evaluate(() => (document.querySelector(".tz-note") || {}).textContent || "");
   return {
-    ok: bad.length === 0 && rows >= 10 && footer === 1 && abs >= 10,
-    detail: `${rows} row times, ${footer} footer; first: ${JSON.stringify(times[0])}; bad: ${JSON.stringify(bad.slice(0, 2))}`,
+    ok: bad.length === 0 && rows >= 10 && footer === 1 && abs >= 10 && note.trim() === "All times are in America/New York.",
+    detail: `${rows} row times, ${footer} footer; note: ${note.trim()}; first: ${JSON.stringify(times[0])}; bad: ${JSON.stringify(bad.slice(0, 2))}`,
   };
 });
 
@@ -353,7 +355,8 @@ await probe("without JavaScript the page reads the same: UTC times, working link
   const c = await browser.newContext({ javaScriptEnabled: false, timezoneId: ZONE });
   const p = await c.newPage();
   await p.goto(base + accountPath);
-  const texts = await p.locator("time[datetime]").allInnerTexts();
+  const texts = await p.locator("time[datetime]").allTextContents();
+  const zone = await p.locator(".tz-note").textContent();
   const toggle = await p.locator(".theme-toggle").isVisible();
   const links = await p.locator("#blockers a.who").count();
   const action = await p.locator("nav.public-nav form").getAttribute("action");
@@ -364,7 +367,9 @@ await probe("without JavaScript the page reads the same: UTC times, working link
   return {
     ok:
       texts.length >= 10 &&
-      texts.every((t) => /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC$/.test(t)) &&
+      // Row times leave the zone to the line that states it once.
+      texts.every((t) => /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d( UTC)?$/.test(t)) &&
+      zone.trim() === "All times are in UTC." &&
       !toggle &&
       links >= 10 &&
       action === "/search" &&

@@ -24,8 +24,13 @@
 
 </div>
 
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+{% if tabs.len() > 1 %}<nav class="tabs" role="tablist" aria-label="Tables">
+{% for t in tabs %}<a class="tab{% if t.active %} active{% endif %}" role="tab" href="{{ t.href }}" data-tab="{{ t.id }}" aria-controls="{{ t.id }}" aria-selected="{% if t.active %}true{% else %}false{% endif %}">{{ t.label }}</a>
+{% endfor %}</nav>{% endif %}
+<div class="tabbed" data-active="{{ active }}">
 {% if let Some(members) = members %}
-<section id="members" class="card data-section">
+<section id="members" class="card data-section tab-panel">
 <div class="section-header">
 <h2>Members <span class="count">{{ stored_members }} stored members</span></h2>
 <p class="muted">The stored count is this instance's own counter; it does not apply this page's filters, so it can exceed the rows below.</p>
@@ -43,7 +48,7 @@
 {% for r in members.rows %}
 <tr class="data-row">
 <td class="td-account">{{ r.who|safe }}</td>
-<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.text }}</time>{% endif %}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time>{% endif %}</td>
 </tr>
 {% endfor %}
 </tbody>
@@ -66,7 +71,7 @@
 </section>
 {% endif %}
 
-<section id="listblockers" class="card data-section">
+<section id="listblockers" class="card data-section tab-panel">
 <div class="section-header">
 <h2>Blocked by{% if let Some(n) = blockers.count %} <span class="count">{{ n }}</span>{% endif %}</h2>
 <p class="muted">Accounts with a listblock on this list.</p>
@@ -84,7 +89,7 @@
 {% for r in blockers.rows %}
 <tr class="data-row">
 <td class="td-account">{{ r.who|safe }}</td>
-<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.text }}</time>{% endif %}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time>{% endif %}</td>
 </tr>
 {% endfor %}
 </tbody>
@@ -105,6 +110,8 @@
 {% if blockers.pending > 0 %}<p class="pending" data-pending="{{ blockers.pending }}" role="status">{{ blockers.pending }} {% if blockers.pending == 1 %}account on this page is{% else %}accounts on this page are{% endif %} still being verified and will appear here shortly.</p>{% endif %}
 {{ blockers.pager|safe }}
 </section>
+
+</div>
 
 {% if let Some(t) = updated %}<div class="telemetry-bar updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}
 {% endblock %}

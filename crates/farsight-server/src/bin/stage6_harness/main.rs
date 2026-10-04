@@ -4073,7 +4073,12 @@ fn check_page_rules(c: &mut Checks, h: &H) {
                 .and_then(|x| x.split_once('"'))
                 .and_then(|(iso, rest)| rest.split_once('>').map(|(_, text)| (iso, text)))
                 .is_some_and(|(iso, text)| {
-                    is_utc_instant(iso) && text == format!("{} {} UTC", &iso[..10], &iso[11..19])
+                    // A table row's time (data-abs) leaves the zone to
+                    // the page's "All times are in UTC" line.
+                    let bare = format!("{} {}", &iso[..10], &iso[11..19]);
+                    is_utc_instant(iso)
+                        && (text == format!("{bare} UTC")
+                            || (t.contains(" data-abs") && text == bare))
                 });
             if !ok {
                 bad.push(format!("{path}: {t}"));
