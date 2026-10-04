@@ -587,8 +587,27 @@ nav.tabs a.tab.active {
 .tabbed[data-active="lists"] > #lists,
 .tabbed[data-active="outgoing"] > #outgoing,
 .tabbed[data-active="members"] > #members,
-.tabbed[data-active="listblockers"] > #listblockers {
+.tabbed[data-active="listblockers"] > #listblockers,
+.tabbed[data-active="history"] > #history {
   display: block;
+}
+/* The History tab stands apart, at the right end of the strip. */
+nav.tabs a.tab[data-tab="history"] {
+  margin-left: auto;
+}
+.history-title {
+  margin: 1.1rem 0 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--fg-strong);
+}
+.data-table .held {
+  font-weight: 600;
+}
+.acct-tag.acct-current {
+  border-color: var(--ok-border);
+  background: var(--ok-bg);
+  color: var(--ok);
 }
 /* The table in view hangs from the tab strip. */
 nav.tabs + .tabbed > .tab-panel {
@@ -1778,8 +1797,9 @@ footer {
     border-right: 0;
     border-radius: 0;
   }
-  nav.tabs { margin: 0 -1rem; padding: 0 0.5rem; }
-  nav.tabs a.tab { padding: 0.5rem 0.8rem; font-size: 0.88rem; }
+  /* Four tabs on one line of a narrow screen. */
+  nav.tabs { margin: 0 -1rem; padding: 0 0.4rem; gap: 0.1rem; }
+  nav.tabs a.tab { padding: 0.5rem 0.5rem; font-size: 0.8rem; }
   p.tz-note { position: static; text-align: right; margin-bottom: 0.25rem; }
   .section-header h2 .count.count-big { font-size: 1.7rem; }
   .profile-id-block h1.subject .handle { font-size: 1.15rem; letter-spacing: 0; }

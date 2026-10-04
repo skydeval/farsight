@@ -155,13 +155,72 @@ const DID_PAGES: [&str; 3] = ["page", "lists", "out"];
 const LIST_PAGES: [&str; 2] = ["page", "blockers"];
 /// The tables of the account page, as its tabs name them; the first is
 /// the one in view without a `tab` parameter.
-const DID_TABS: [&str; 3] = ["blockers", "lists", "outgoing"];
+const DID_TABS: [&str; 4] = ["blockers", "lists", "outgoing", "history"];
 /// Of the list page.
 const LIST_TABS: [&str; 2] = ["members", "listblockers"];
 /// The cursor parameters of earlier versions. An address that still
 /// carries one is redirected to the first page of its section.
 const DID_CURSORS: [&str; 3] = ["bc", "nc", "oc"];
 const LIST_CURSORS: [&str; 2] = ["mc", "lc"];
+
+/// A handle or host on the History tab.
+#[derive(Debug, Clone)]
+pub struct HeldRow {
+    /// The handle or host.
+    pub value: String,
+    /// When the account took it.
+    pub since: Stamp,
+    /// It is the one the account has now.
+    pub current: bool,
+}
+
+/// The History tab of an account page: what the PLC directory's log says
+/// the account's handles and hosts have been, newest first.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryView {
+    /// Handles, as the account claimed them; not verified.
+    pub handles: Vec<HeldRow>,
+    /// Hosts.
+    pub hosts: Vec<HeldRow>,
+    /// Why there is nothing to list, if there is not.
+    pub note: Option<&'static str>,
+}
+
+fn held_rows(list: &[super::card::Held]) -> Vec<HeldRow> {
+    let last = list.len().saturating_sub(1);
+    list.iter()
+        .enumerate()
+        .rev()
+        .map(|(i, h)| HeldRow {
+            value: clean(&h.value),
+            since: Stamp::of(h.since),
+            current: i == last,
+        })
+        .collect()
+}
+
+fn history_view(h: super::card::History) -> HistoryView {
+    use super::card::History;
+    match h {
+        History::Log(log) => HistoryView {
+            handles: held_rows(&log.handles),
+            hosts: held_rows(&log.hosts),
+            note: None,
+        },
+        History::NoLog => HistoryView {
+            note: Some(
+                "This account's DID is not registered in the PLC directory, which is where this history is read from.",
+            ),
+            ..HistoryView::default()
+        },
+        History::Unavailable => HistoryView {
+            note: Some(
+                "The history could not be read from the PLC directory right now. Try again in a moment.",
+            ),
+            ..HistoryView::default()
+        },
+    }
+}
 
 /// A tab of a data page: a link that brings one of the page's tables
 /// into view. The script switches in place; without it the link is
@@ -638,6 +697,9 @@ struct DidPage {
     blockers: Section<PartyRow>,
     lists: Section<ListRow>,
     outgoing: Option<Section<PartyRow>>,
+    /// The History tab's content: read, and rendered, only when that tab
+    /// is the one asked for.
+    history: Option<HistoryView>,
     updated: Option<Stamp>,
 }
 
@@ -662,6 +724,13 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let handle = match actor {
         Some(_) => page_handle(r.st, cfg, did).await.map(|h| clean(&h)),
         None => None,
+    };
+    // The History tab reads the PLC directory: only when it is the tab
+    // asked for, only for a known subject, and before the render slot.
+    let history = if actor.is_some() && q.get(paging::TAB) == Some("history") {
+        Some(history_view(super::card::history(r.st, cfg, did).await))
+    } else {
+        None
     };
     let (_slot, _permit) = r.render_slots().await?;
     let api = &r.st.api;
@@ -862,11 +931,15 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     if outgoing.is_some() {
         shown_tabs.push(("outgoing", "Blocking"));
     }
+    if actor.is_some() {
+        shown_tabs.push(("history", "History"));
+    }
     let (tabs, active) = tabs(&base, q, &DID_PAGES, &DID_TABS, &shown_tabs);
     let t = DidPage {
         tabs,
         active,
         card: actor.map(|_| card_href(did.as_str())),
+        history,
         c: chrome(cfg, did.as_str(), &og_title, OG_ACCOUNT, &base),
         did: did.to_string(),
         handle,

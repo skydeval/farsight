@@ -255,6 +255,12 @@ nothing else in a browser.
   page's script takes all three from the account's profile card (the
   avatar only with `show_avatars`); the visitor's browser fetches the
   image from the account's own server.
+- **History.** A "History" tab, at the right end of an account page's
+  tabs, lists the handles and hosts the account has had, as the PLC
+  directory's log records them, newest first. The handles are what
+  the account claimed at the time; they are not verified. The log is
+  read only when the tab is opened (`?tab=history`): one request to
+  the PLC directory, under the profile-card budget.
 - **Headings.** A table's heading is its count: accounts that block
   the account, accounts it blocks, and, for "Blocked By Lists", the
   listblock records on the lists that name it, added up (an account

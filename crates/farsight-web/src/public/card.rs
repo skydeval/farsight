@@ -159,7 +159,38 @@ pub fn read_audit_log(body: &[u8]) -> Option<Identity> {
         .rev()
         .find(|e| e["nullified"].as_bool() != Some(true))?
         .get("operation")?;
-    let (claim, pds) = match op["type"].as_str()? {
+    let (claim, pds) = op_claims(op)?;
+    Some(Identity {
+        created: Some(created),
+        claim,
+        pds,
+    })
+}
+
+/// One handle or host an account's PLC log has held, and since when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    /// The handle, or the host of the PDS endpoint.
+    pub value: String,
+    /// `createdAt` of the log entry that set it.
+    pub since: DateTime<Utc>,
+}
+
+/// The handles and hosts of a PLC audit log, each in the order the
+/// account took them: the last is the one it has now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogHistory {
+    /// Handles the log's operations named. They are the account's claims
+    /// at the time; nothing here was verified.
+    pub handles: Vec<Held>,
+    /// Hosts of the PDS endpoints the operations named.
+    pub hosts: Vec<Held>,
+}
+
+/// The handle claim and PDS endpoint of one PLC operation; `None` for a
+/// tombstone or an operation of an unknown shape.
+fn op_claims(op: &Value) -> Option<(Option<String>, Option<String>)> {
+    Some(match op["type"].as_str()? {
         "plc_tombstone" => return None,
         // The legacy operation carries a bare handle and a service URL.
         "create" => (
@@ -175,12 +206,84 @@ pub fn read_audit_log(body: &[u8]) -> Option<Identity> {
                 .as_str()
                 .map(str::to_owned),
         ),
-    };
-    Some(Identity {
-        created: Some(created),
-        claim,
-        pds,
     })
+}
+
+/// Reads a PLC audit log as a history: every change of handle and of
+/// host among the entries that are not nullified, oldest first. An entry
+/// that repeats the value before it adds nothing. `None` when the log
+/// cannot be read.
+pub fn read_history(body: &[u8]) -> Option<LogHistory> {
+    let log: Value = serde_json::from_slice(body).ok()?;
+    let mut out = LogHistory::default();
+    for e in log.as_array()? {
+        if e["nullified"].as_bool() == Some(true) {
+            continue;
+        }
+        let Some(since) = e["createdAt"]
+            .as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        let Some((claim, pds)) = op_claims(&e["operation"]) else {
+            continue;
+        };
+        let host = pds
+            .as_deref()
+            .and_then(|p| Url::parse(p).ok())
+            .and_then(|u| u.host_str().map(str::to_owned));
+        for (list, value) in [(&mut out.handles, claim), (&mut out.hosts, host)] {
+            if let Some(value) = value {
+                if list.last().is_none_or(|h| h.value != value) {
+                    list.push(Held { value, since });
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// What the History tab of an account page can show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum History {
+    /// The log, read.
+    Log(LogHistory),
+    /// The account is not a did:plc: there is no log to read.
+    NoLog,
+    /// The budget had nothing left, or the directory did not answer.
+    Unavailable,
+}
+
+/// Reads the account's PLC audit log for its History tab: one request,
+/// through the safe client, under the card budget and the card deadline.
+pub async fn history(st: &WebState, cfg: &Config, did: &Did) -> History {
+    if did.method() != DidMethod::Plc {
+        return History::NoLog;
+    }
+    let budget = Class::PublicCardBudget.limit(cfg, None);
+    if st
+        .api
+        .limiter
+        .check(Class::PublicCardBudget, BUDGET_KEY, budget)
+        .is_err()
+    {
+        return History::Unavailable;
+    }
+    let Ok(url) = Url::parse(&format!(
+        "{}/{}/log/audit",
+        cfg.backfill.plc_url.trim_end_matches('/'),
+        did.as_str()
+    )) else {
+        return History::Unavailable;
+    };
+    match tokio::time::timeout(CARD_DEADLINE, st.safe.get(&url)).await {
+        Ok(Ok(r)) if r.status == 200 => {
+            read_history(&r.body).map_or(History::Unavailable, History::Log)
+        }
+        _ => History::Unavailable,
+    }
 }
 
 /// Reads a did:web document. There is no creation time to read.
@@ -663,6 +766,45 @@ mod tests {
         assert_eq!(i.created, None);
         assert_eq!(i.claim.as_deref(), Some("alice.example"));
         assert_eq!(i.pds.as_deref(), Some("https://pds.example"));
+    }
+
+    #[test]
+    fn the_log_read_as_a_history() {
+        let log = json!([
+            {"createdAt": "2023-01-01T00:00:00Z", "nullified": false, "operation": {
+                "type": "create", "handle": "First.Example", "service": "https://old.example"}},
+            // The same handle and host again: no change.
+            {"createdAt": "2023-02-01T00:00:00Z", "nullified": false, "operation": {
+                "type": "plc_operation", "alsoKnownAs": ["at://first.example"],
+                "services": {"atproto_pds": {"endpoint": "https://old.example"}}}},
+            {"createdAt": "2023-03-01T00:00:00Z", "nullified": false, "operation": {
+                "type": "plc_operation", "alsoKnownAs": ["at://second.example"],
+                "services": {"atproto_pds": {"endpoint": "https://old.example"}}}},
+            // Nullified: it never took effect.
+            {"createdAt": "2023-04-01T00:00:00Z", "nullified": true, "operation": {
+                "type": "plc_operation", "alsoKnownAs": ["at://evil.example"],
+                "services": {"atproto_pds": {"endpoint": "https://evil.example"}}}},
+            {"createdAt": "2023-05-01T00:00:00Z", "nullified": false, "operation": {
+                "type": "plc_operation", "alsoKnownAs": ["at://first.example"],
+                "services": {"atproto_pds": {"endpoint": "https://new.example:8443"}}}}
+        ]);
+        let h = read_history(log.to_string().as_bytes()).unwrap();
+        let names = |v: &[Held]| v.iter().map(|x| x.value.clone()).collect::<Vec<_>>();
+        // A handle taken again is listed again; oldest first.
+        assert_eq!(
+            names(&h.handles),
+            ["first.example", "second.example", "first.example"]
+        );
+        assert_eq!(names(&h.hosts), ["old.example", "new.example"]);
+        assert_eq!(h.handles[1].since.to_rfc3339(), "2023-03-01T00:00:00+00:00");
+        // A log with nothing to list, and one that is not a log.
+        let empty = json!([{"createdAt": "2023-01-01T00:00:00Z", "operation": {
+            "type": "plc_operation", "alsoKnownAs": [], "services": {}}}]);
+        assert_eq!(
+            read_history(empty.to_string().as_bytes()),
+            Some(LogHistory::default())
+        );
+        assert_eq!(read_history(b"{}"), None);
     }
 
     #[test]

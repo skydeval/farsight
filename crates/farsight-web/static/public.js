@@ -623,6 +623,11 @@
       if (!a || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button) {
         return;
       }
+      // A tab whose table is not in the page (History, which the server
+      // reads only when asked) is followed as the link it is.
+      if (!document.getElementById(a.getAttribute("data-tab"))) {
+        return;
+      }
       event.preventDefault();
       show(a.getAttribute("data-tab"));
       try {

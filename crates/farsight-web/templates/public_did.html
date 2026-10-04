@@ -155,6 +155,59 @@
 </section>
 {% endif %}
 
+{% if let Some(hist) = history %}
+<section id="history" class="card data-section tab-panel">
+<div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<h2>History</h2>
+<p class="muted">The handles and hosts this account has had, as the PLC directory records them. The handles are what the account claimed at the time; they are not verified here.</p>
+</div>
+{% if let Some(n) = hist.note %}<p class="empty">{{ n }}</p>{% else %}
+<h3 class="history-title">Handles</h3>
+{% if hist.handles.is_empty() %}<p class="muted">None recorded.</p>{% else %}
+<div class="table-responsive">
+<table class="data-table">
+<thead>
+<tr>
+<th scope="col" class="th-account">Handle</th>
+<th scope="col" class="th-date">Since</th>
+</tr>
+</thead>
+<tbody>
+{% for r in hist.handles %}
+<tr class="data-row">
+<td class="td-account"><span class="held">{{ r.value }}</span>{% if r.current %} <span class="acct-tag acct-current">current</span>{% endif %}</td>
+<td class="td-date"><time datetime="{{ r.since.iso }}" class="time-badge" data-abs>{{ r.since.bare }}</time></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+<h3 class="history-title">Hosts</h3>
+{% if hist.hosts.is_empty() %}<p class="muted">None recorded.</p>{% else %}
+<div class="table-responsive">
+<table class="data-table">
+<thead>
+<tr>
+<th scope="col" class="th-account">Host</th>
+<th scope="col" class="th-date">Since</th>
+</tr>
+</thead>
+<tbody>
+{% for r in hist.hosts %}
+<tr class="data-row">
+<td class="td-account"><span class="held">{{ r.value }}</span>{% if r.current %} <span class="acct-tag acct-current">current</span>{% endif %}</td>
+<td class="td-date"><time datetime="{{ r.since.iso }}" class="time-badge" data-abs>{{ r.since.bare }}</time></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+{% endif %}
+</section>
+{% endif %}
 </div>
 
 {% if let Some(t) = updated %}<div class="telemetry-bar updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}

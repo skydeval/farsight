@@ -1287,6 +1287,45 @@ async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Resu
     Ok(())
 }
 
+// ------------------------------------------------- 7b. the History tab
+
+async fn check_history_tab(c: &mut Checks, a: &Srv, plc: &Plc, w: &World) -> Result<(), String> {
+    c.section("7b. the History tab reads the PLC log only when asked");
+    let before = plc.audit_total();
+    let plain = a.get(&public_did(&w.s)).await?;
+    let after_plain = plc.audit_total();
+    let asked = a.get(&format!("{}?tab=history", public_did(&w.s))).await?;
+    let after_asked = plc.audit_total();
+    let unknown = a
+        .get(&format!("{}?tab=history", public_did(&did("unk", 404))))
+        .await?;
+    let sec = section(&asked.text, "history").unwrap_or("");
+    c.check(
+        "the account page offers a History tab as a link (?tab=history) and reads nothing for it; asked for, the page reads the account's PLC audit log once and shows the History table with the tab marked — here a log that names no handle and no host; an account this instance does not hold has no such tab and causes no request",
+        plain.status == 200
+            && plain.text.contains(&format!(
+                "href=\"{}?tab=history\" data-tab=\"history\"",
+                public_did(&w.s)
+            ))
+            && section(&plain.text, "history").is_none()
+            && after_plain == before
+            && asked.status == 200
+            && asked.text.contains("<div class=\"tabbed\" data-active=\"history\">")
+            && sec.contains("<h2>History</h2>")
+            && sec.matches("None recorded.").count() == 2
+            && after_asked == before + 1
+            && unknown.status == 200
+            && section(&unknown.text, "history").is_none()
+            && !unknown.text.contains("data-tab=\"history\"")
+            && plc.audit_total() == after_asked,
+        format!(
+            "audit requests: {before} → {after_plain} → {after_asked} → {}",
+            plc.audit_total()
+        ),
+    );
+    Ok(())
+}
+
 // --------------------------------------------------------- 7. public pages
 
 async fn check_public_columns(c: &mut Checks, a: &Srv, w: &World) -> Result<(), String> {
@@ -2596,6 +2635,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     check_plans(c, &pool, &w).await?;
     check_cursors(c, &a, &cookie, &w).await?;
     check_public_columns(c, &a, &w).await?;
+    check_history_tab(c, &a, &plc, &w).await?;
     check_live(c, pg, args.skip_live).await?;
     if args.browser {
         check_browser(c, &a, &cookie, &w)?;
