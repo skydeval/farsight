@@ -726,14 +726,21 @@
   // then every three seconds, for about a minute; after that the line
   // stays and a reload shows the rest.
   function pending() {
+    // One reader at a time: a call made after the tables changed (the
+    // banned switch) retires the reader before it.
+    var run = ++pendingRun;
     var tries = 0;
     function again() {
-      if (tries >= 20 || !document.querySelector("section[id] [data-pending]")) {
+      if (run !== pendingRun || tries >= 20 || !document.querySelector("section[id] [data-pending]")) {
         return;
       }
       tries++;
       setTimeout(function () {
-        fetch(location.href, { credentials: "same-origin", cache: "no-store" })
+        if (run !== pendingRun) {
+          return;
+        }
+        var asked = location.href;
+        fetch(asked, { credentials: "same-origin", cache: "no-store" })
           .then(function (r) {
             if (r.status !== 200 || r.redirected) {
               throw new Error("not the page");
@@ -741,6 +748,12 @@
             return r.text();
           })
           .then(function (html) {
+            // An answer for an address the page has since left (the
+            // switch was used meanwhile) is not put in place.
+            if (run !== pendingRun || location.href !== asked) {
+              again();
+              return;
+            }
             var doc = new DOMParser().parseFromString(html, "text/html");
             var sections = document.querySelectorAll("section[id]");
             for (var i = 0; i < sections.length; i++) {
@@ -758,6 +771,7 @@
     }
     again();
   }
+  var pendingRun = 0;
 
   // A section swapped in by htmx carries new times.
   document.addEventListener("htmx:afterSwap", function (event) {

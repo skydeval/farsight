@@ -133,8 +133,8 @@ pub struct Section<R> {
     pub count: Option<String>,
     /// The count with taken-down accounts included, when that is more.
     pub count_all: Option<String>,
-    /// The switch that adds taken-down accounts to the rows; offered when
-    /// the table has any, or while it is on.
+    /// The switch that adds taken-down accounts to the rows; `None` on a
+    /// table that does not list accounts by status (the lists).
     pub toggle: Option<Toggle>,
     /// Rows shown.
     pub rows: Vec<R>,
@@ -354,7 +354,9 @@ async fn counts(
         // second number needs it.
         count: count_words(rest).or_else(|| more.then(|| "0".to_owned())),
         count_all: more.then(|| count_words(all)).flatten(),
-        toggle: (more || banned).then(|| Toggle {
+        // Offered on every table of accounts, also where it would add
+        // nothing: a switch that comes and goes reads as a fault.
+        toggle: Some(Toggle {
             href: paging::banned_link(base, tab, !banned),
             on: banned,
         }),

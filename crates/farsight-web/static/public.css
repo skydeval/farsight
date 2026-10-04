@@ -572,8 +572,16 @@ nav.pager {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: center;
   gap: 0.3rem;
+}
+/* The controls span the table: back at the left edge, forward at the
+   right edge, the page numbers in the middle. */
+nav.pager > .pager-step:first-child {
+  margin-right: auto;
+}
+nav.pager > .pager-step:last-child {
+  margin-left: auto;
 }
 
 /* "Show banned accounts": a link that reads as a checkbox. */
@@ -1725,7 +1733,6 @@ footer {
     border-radius: 0;
   }
   nav.tabs { margin: 0 -1rem; padding: 0 0.5rem; }
-  nav.pager { justify-content: flex-start; }
   nav.tabs a.tab { padding: 0.5rem 0.8rem; font-size: 0.88rem; }
   p.tz-note { margin-top: -1.25rem; }
   .profile-id-block h1.subject .handle { font-size: 1.15rem; letter-spacing: 0; }
