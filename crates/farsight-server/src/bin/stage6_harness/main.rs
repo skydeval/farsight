@@ -1692,13 +1692,15 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let page = h.get(&path_did(&w.s)).await?;
     let navs = section_navs(&page.text);
     c.check(
-        "the account page's header is the DID and its copy button: no stat tiles, no section nav, no status pill, no avatar",
+        "the account page's header is the DID alone: no copy button (copying an account's DID takes selecting it), no stat tiles, no section nav, no status pill, no avatar",
         navs.is_empty()
             && !page.text.contains("stat-card")
             && !page.text.contains("section-pill")
             && !page.text.contains("status-pill")
             && !page.text.contains("avatar-badge")
-            && page.text.contains(&format!("data-copy=\"{}\"", w.s)),
+            && !page.text.contains("data-copy")
+            && !page.text.contains("copy-btn")
+            && page.text.contains(&format!("<code class=\"did-code\">{}</code>", w.s)),
         format!("{navs:?}"),
     );
     let ids: Vec<&str> = between(&page.text, "<section id=\"", "\"");
@@ -1822,12 +1824,14 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
         ))
         .await?;
     c.check(
-        "list page header: at-uri, name (as text), purpose, owner, state in words, the stored-members counter",
+        "list page header: at-uri, name (as text), purpose, owner, state in words, the stored-members counter; no copy button",
         lp.text.contains(&format!("at://{}/app.bsky.graph.list/{LIST}", w.o1))
             && lp.text.contains("&lt;script&gt;alert(1)&lt;/script&gt;")
             && lp.text.contains(">moderation list</span>")
             && !lp.text.contains("status-pill")
             && !lp.text.contains("avatar-badge")
+            && !lp.text.contains("data-copy")
+            && !lp.text.contains("copy-btn")
             && lp.text.contains(&format!("href=\"{}\"", path_did(&w.o1)))
             && lp.text.contains("State: Indexed.")
             && lp.text.contains(&format!("{stored} stored members")),

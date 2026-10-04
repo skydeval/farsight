@@ -195,7 +195,9 @@ impl Shown<'_> {
     }
 }
 
-/// A section's length with its filters, counted up to [`COUNT_CAP`].
+/// A section's length with its filters: the real number of rows (up to
+/// [`COUNT_CAP`]). It scans the section's index, so it costs what the
+/// section's size costs: about a tenth of a second for 40,000 rows.
 /// [`Total::Unknown`] when the query fails or times out; the section
 /// still renders.
 async fn total(r: &Req<'_>, what: Counted, key: i64, w: &Withheld) -> Total {
@@ -863,10 +865,15 @@ mod tests {
 
     #[test]
     fn counts_in_words() {
-        assert_eq!(count_words(total_of(Some(1_000))).as_deref(), Some("1,000"));
+        // The real number, also past a thousand.
+        assert_eq!(count_words(total_of(Some(1_001))).as_deref(), Some("1,001"));
         assert_eq!(
-            count_words(total_of(Some(1_001))).as_deref(),
-            Some("more than 1,000")
+            count_words(total_of(Some(COUNT_CAP))).as_deref(),
+            Some("5,000,000")
+        );
+        assert_eq!(
+            count_words(total_of(Some(COUNT_CAP + 1))).as_deref(),
+            Some("more than 5,000,000")
         );
         // An empty section's heading shows no count; nor does a failed one.
         assert_eq!(count_words(total_of(Some(0))), None);

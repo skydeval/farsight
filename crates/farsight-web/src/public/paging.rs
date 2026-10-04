@@ -7,9 +7,10 @@
 //! `?page=1` and the cursor parameters of earlier versions redirect to
 //! the address without them.
 //!
-//! The last page is known while the section's count is within
-//! [`COUNT_CAP`](super::COUNT_CAP). Beyond it the controls end in an
-//! ellipsis and the next arrow, which works for as long as rows follow.
+//! The last page comes from the section's count, which is exact up to
+//! [`COUNT_CAP`](super::COUNT_CAP). Beyond it, or when the count could
+//! not be read in time, the controls end in an ellipsis and the next
+//! arrow, which works for as long as rows follow.
 
 use askama::Template;
 use farsight_api::params::Params;

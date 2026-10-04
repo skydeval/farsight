@@ -1568,8 +1568,35 @@ footer {
   main { padding: 1.25rem 1rem; }
   h1 { font-size: 1.4rem; }
   .hero h1 { font-size: 1.85rem; }
-  .profile-hero-card { padding: 1.25rem; }
   .profile-main-row { flex-direction: column; align-items: flex-start; gap: 0.75rem; }
+  /* The boxes of an account or list page reach both edges of a narrow
+     screen, and their tables reach the edges of the box: the width goes
+     to the rows. */
+  .profile-hero-card, .data-section {
+    margin-left: -1rem;
+    margin-right: -1rem;
+    padding: 1rem 0.75rem;
+    border-left: 0;
+    border-right: 0;
+    border-radius: 0;
+  }
+  .data-section .table-responsive {
+    margin-left: -0.75rem;
+    margin-right: -0.75rem;
+    width: auto;
+    border-left: 0;
+    border-right: 0;
+    border-radius: 0;
+  }
+  .profile-id-block h1.subject .handle { font-size: 1.15rem; letter-spacing: 0; }
+  .profile-id-block h1.subject .did-code { font-size: 0.76rem; }
+  .data-table { font-size: 0.82rem; }
+  .data-table th, .data-table td { padding-left: 0.6rem; padding-right: 0.6rem; }
+  /* A long column title wraps instead of widening its column. */
+  .data-table th { white-space: normal; }
+  .data-table .td-list, .data-table .list-link { white-space: nowrap; }
+  .data-table th:first-child, .data-table td:first-child, .data-table .td-owner { min-width: 0; }
+  .time-badge { font-size: 0.72rem; padding: 0 0.35rem; }
   .stats-ribbon { grid-template-columns: 1fr; }
   table { font-size: 0.86rem; }
   th, td { padding: 0.55rem 0.75rem; }

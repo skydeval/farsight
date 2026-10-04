@@ -230,9 +230,10 @@ nothing else in a browser.
 - **Pages.** Every table shows 50 rows and ends with numbered page
   controls (`← 1 2 3 … 21 →`). They are plain links with the page in
   the address (`?page=2`, and `lists`, `out`, `blockers` for a page's
-  other tables). A table's last page is shown while it has at most
-  1,000 rows; a longer one has no last page in its controls, and the
-  next arrow works for as long as rows follow. Links made by an
+  other tables). The count in a table's heading and its last page are
+  the real numbers, counted with the page's filters on every view; if
+  that count cannot be read in time the heading shows none and the
+  controls end in the next arrow. Links made by an
   earlier version (`?bc=…` and the like) lead to the first page.
 - **Handles.** A row shows `@handle` only once Farsight has verified
   it in both directions. A background worker checks the accounts a

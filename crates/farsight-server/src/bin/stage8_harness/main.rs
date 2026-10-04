@@ -945,9 +945,9 @@ async fn check_order(
         section(&deep.text, "members").unwrap_or(""),
     );
     c.check(
-        "a section longer than the count's cap of 1,000 has no last page in its controls: on page 20 of a 20,000-member list they end in a gap and the next arrow, and every row stays reachable — page 400 holds the last 50 and closes the list",
+        "a long section shows its real last page and stays reachable to the end: on page 20 of a 20,000-member list the controls name page 400, and page 400 holds the last 50 rows and closes the list",
         row_dids(dense_sec).len() == 50
-            && controls_of(dense_sec) == "← 1 … 18 19 [20] 21 … →"
+            && controls_of(dense_sec) == "← 1 … 18 19 [20] 21 22 … 400 →"
             && row_dids(deep_sec).len() == 50
             && controls_of(deep_sec) == "← 1 … 398 399 [400] (→)",
         format!("{:?} / {:?}", controls_of(dense_sec), controls_of(deep_sec)),

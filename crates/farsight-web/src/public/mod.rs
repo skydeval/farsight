@@ -64,9 +64,11 @@ use crate::pages::WebState;
 
 /// Rows per page of every public table. There is no `limit` parameter.
 pub const PAGE_ROWS: i64 = 50;
-/// A section's count stops here: "more than 1,000" beyond it, and page
-/// controls without a last page.
-pub const COUNT_CAP: i64 = 1_000;
+/// A section's count is exact up to here. The bound is far above any
+/// section an instance holds today; it only keeps a runaway count from
+/// running to the query timeout. Beyond it: "more than 5,000,000", and
+/// page controls without a last page.
+pub const COUNT_CAP: i64 = 5_000_000;
 /// Longest a page waits for a render slot before `503`.
 pub const RENDER_WAIT: Duration = Duration::from_secs(2);
 /// How long the ids of `public_ui.excluded_dids` are reused before they
