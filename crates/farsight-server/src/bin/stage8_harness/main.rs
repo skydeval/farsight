@@ -1179,6 +1179,8 @@ async fn check_plans(c: &mut Checks, pool: &PgPool, w: &World) -> Result<(), Str
     ] {
         let filter = Filter {
             hide_inactive: true,
+            show_suspended: false,
+            show_banned: false,
             excluded: &[],
         };
         let first = ui_rows::rows(&mut conn, section_, key, Order::Shown, filter, None, 50)
@@ -1367,9 +1369,9 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
     let first = l.get(&public_did(&subject)).await?;
     let took = started.elapsed();
     let sec = section(&first.text, "blockers").unwrap_or("").to_owned();
-    let held = LIVE
-        .iter()
-        .all(|(d, h)| !sec.contains(&format!("title=\"{d}\"")) && !sec.contains(&format!("@{h}")));
+    let held = LIVE.iter().all(|(d, h)| {
+        !sec.contains(&format!("title=\"{d}\"")) && !sec.contains(&format!(">{h}</a>"))
+    });
     c.check(
         "a new instance with an empty cache renders the page at once, waiting for no outbound request, and shows no account it has not checked: every row is held back and the table says how many",
         first.status == 200
@@ -1390,7 +1392,7 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
         let s = section(&second.text, "blockers").unwrap_or("");
         shown = LIVE
             .iter()
-            .filter(|(_, h)| s.contains(&format!(">@{h}</a>")))
+            .filter(|(_, h)| s.contains(&format!(">{h}</a>")))
             .count();
         ghost_as_did = shown_as(s, &ghost) == format!("<code>{ghost}</code>");
         left = pending_of(s);
@@ -1436,7 +1438,7 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
     let sec = admin_section(&admin.text, "Incoming blocks").unwrap_or("");
     let handles = LIVE.iter().filter(|(d, h)| {
         sec.contains(&format!(
-            "<a class=\"who\" href=\"/admin/lookup/did?q={}\" title=\"{d}\" data-card=\"/admin/card/{d}\" data-card-session>@{h}</a>",
+            "<a class=\"who\" href=\"/admin/lookup/did?q={}\" title=\"{d}\" data-card=\"/admin/card/{d}\" data-card-session>{h}</a>",
             enc(d)
         ))
     }).count();
@@ -1459,7 +1461,7 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
             && anon.header("location").as_deref() == Some("/enter")
             && !anon.text.contains("data-card")
             && !anon.text.contains("did:plc:")
-            && !anon.text.contains(&format!("@{}", LIVE[0].1)),
+            && !anon.text.contains(LIVE[0].1),
         format!("{} → {:?}", anon.status, anon.header("location")),
     );
     Ok(())
@@ -1850,8 +1852,8 @@ async fn check_warming(
     c.check(
         "a page nobody has rendered since the server started shows the stored handles at once — the one verified a day ago and the one verified eight days ago — and holds back the one account that has never been checked",
         first.status == 200
-            && shown_as(sec, &fresh) == "@stored-fresh.example"
-            && shown_as(sec, &stale) == "@stored-stale.example"
+            && shown_as(sec, &fresh) == "stored-fresh.example"
+            && shown_as(sec, &stale) == "stored-stale.example"
             && shown_as(sec, &none).is_empty()
             && pending_of(sec) == 1,
         format!(
@@ -1889,8 +1891,8 @@ async fn check_warming(
         plc.documents(&fresh) == 0
             && plc.documents(&stale) == 1
             && plc.documents(&none) == 1
-            && shown_as(sec, &fresh) == "@stored-fresh.example"
-            && shown_as(sec, &stale) == "@stored-stale.example"
+            && shown_as(sec, &fresh) == "stored-fresh.example"
+            && shown_as(sec, &stale) == "stored-stale.example"
             && shown_as(sec, &none) == format!("<code>{none}</code>")
             && pending_of(sec) == 0
             && kept == 2
@@ -2404,6 +2406,8 @@ async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Resul
     .map_err(|e| e.to_string())?;
     let shown = Filter {
         hide_inactive: true,
+        show_suspended: false,
+        show_banned: false,
         excluded: &[],
     };
     let deep = ui_rows::rows(
@@ -2453,6 +2457,8 @@ async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Resul
             w.w18_id,
             Filter {
                 hide_inactive: true,
+                show_suspended: false,
+                show_banned: false,
                 excluded: &excluded,
             },
             None,

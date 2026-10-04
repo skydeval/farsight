@@ -15,7 +15,7 @@
 </h1>
 <div class="list-owner-row">
 <span class="owner-label">Owner:</span>
-{% if let Some(h) = owner.handle %}<span class="handle">@{{ h }}</span>{% endif %}
+{% if let Some(h) = owner.handle %}<span class="handle">{{ h }}</span>{% endif %}
 <a href="{{ owner.href }}" class="owner-link"><code>{{ owner.did }}</code></a>
 <span class="list-state-pill">State: {{ state }}{% if capped %} <span class="muted">This instance stores only part of this list.</span>{% endif %}</span>
 </div>
@@ -32,10 +32,12 @@
 {% if let Some(members) = members %}
 <section id="members" class="card data-section tab-panel">
 <div class="section-header">
-<h2>Members <span class="count">{{ stored_members }} stored members</span></h2>
+<h2>Members <span class="count">{{ stored_members }} stored members</span>{% if let Some(n) = members.count_all %} <span class="count-all">({{ n }} counting banned accounts)</span>{% endif %}</h2>
 <p class="muted">The stored count is this instance's own counter; it does not apply this page's filters, so it can exceed the rows below.</p>
 </div>
+{% if let Some(t) = members.toggle %}<p class="table-options"><a class="toggle{% if t.on %} on{% endif %}" role="checkbox" aria-checked="{% if t.on %}true{% else %}false{% endif %}" href="{{ t.href }}#members" rel="nofollow" data-swap><span class="box" aria-hidden="true"></span>Show banned accounts</a></p>{% endif %}
 {% if !members.rows.is_empty() %}
+{{ members.pager|safe }}
 <div class="table-responsive">
 <table class="data-table">
 <thead>
@@ -46,7 +48,7 @@
 </thead>
 <tbody>
 {% for r in members.rows %}
-<tr class="data-row">
+<tr class="data-row{% if r.who.tag.is_some() %} tagged{% endif %}">
 <td class="td-account">{{ r.who|safe }}</td>
 <td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time>{% endif %}</td>
 </tr>
@@ -73,10 +75,12 @@
 
 <section id="listblockers" class="card data-section tab-panel">
 <div class="section-header">
-<h2>Blocked by{% if let Some(n) = blockers.count %} <span class="count">{{ n }}</span>{% endif %}</h2>
+<h2>Blocked by{% if let Some(n) = blockers.count %} <span class="count">{{ n }}</span>{% endif %}{% if let Some(n) = blockers.count_all %} <span class="count-all">({{ n }} counting banned accounts)</span>{% endif %}</h2>
 <p class="muted">Accounts with a listblock on this list.</p>
 </div>
+{% if let Some(t) = blockers.toggle %}<p class="table-options"><a class="toggle{% if t.on %} on{% endif %}" role="checkbox" aria-checked="{% if t.on %}true{% else %}false{% endif %}" href="{{ t.href }}#listblockers" rel="nofollow" data-swap><span class="box" aria-hidden="true"></span>Show banned accounts</a></p>{% endif %}
 {% if !blockers.rows.is_empty() %}
+{{ blockers.pager|safe }}
 <div class="table-responsive">
 <table class="data-table">
 <thead>
@@ -87,7 +91,7 @@
 </thead>
 <tbody>
 {% for r in blockers.rows %}
-<tr class="data-row">
+<tr class="data-row{% if r.who.tag.is_some() %} tagged{% endif %}">
 <td class="td-account">{{ r.who|safe }}</td>
 <td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time>{% endif %}</td>
 </tr>

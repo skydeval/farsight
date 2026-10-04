@@ -235,7 +235,22 @@ nothing else in a browser.
   that count cannot be read in time the heading shows none and the
   controls end in the next arrow. Links made by an
   earlier version (`?bc=…` and the like) lead to the first page.
-- **Handles.** A row shows `@handle` only once Farsight has verified
+- **Tabs and times.** An account or list page shows one table at a
+  time, chosen with tabs under its header (`?tab=…`). Row times carry
+  no zone; one line under the header names it ("All times are in
+  EDT."; UTC without the page's script).
+- **Inactive accounts.** A table leaves out accounts that are
+  deactivated or deleted. An account its host has **suspended** is
+  shown, tagged "suspended". An account its host has **taken down**
+  ("banned") is left out until the visitor ticks "Show banned accounts"
+  (`?banned=1`); the heading gives both numbers, "4,114 (6,234 counting
+  banned accounts)". The page of a suspended or taken-down account
+  itself stays withheld.
+- **Avatar.** The account page's header shows the account's avatar,
+  which the page's script takes from the account's profile card
+  (`show_avatars`); the visitor's browser fetches the image from the
+  account's own server.
+- **Handles.** A row shows the handle only once Farsight has verified
   it in both directions. A background worker checks the accounts a
   page is about to show (`handle_warming_enabled`, on by default) at
   `handle_rps` checks a second (20 by default; each is up to two

@@ -1055,6 +1055,8 @@ async fn lookup_did(
     if let Some(a) = subject {
         let filter = Filter {
             hide_inactive: true,
+            show_suspended: false,
+            show_banned: false,
             excluded: &[],
         };
         match rows::page(

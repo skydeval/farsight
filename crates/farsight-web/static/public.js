@@ -139,13 +139,16 @@
     if (!list.length) {
       return;
     }
-    var name = "";
-    try {
-      name = new Intl.DateTimeFormat().resolvedOptions().timeZone || "";
-    } catch (e) {
-      name = "";
+    // The zone's short name today ("EDT"; in locales without one,
+    // "GMT-4"); the region's name if the browser gives no short one.
+    var name = zone(new Date());
+    if (!name) {
+      try {
+        name = (new Intl.DateTimeFormat().resolvedOptions().timeZone || "").replace(/_/g, " ");
+      } catch (e) {
+        name = "";
+      }
     }
-    name = name ? name.replace(/_/g, " ") : zone(new Date());
     for (var i = 0; i < list.length; i++) {
       if (name) {
         list[i].textContent = name;
@@ -586,6 +589,8 @@
     zoneNote();
     tabs();
     pending();
+    swaps();
+    heroAvatar();
   });
 
   // Tabs of a data page: each brings one table into view. The link is a
@@ -624,6 +629,95 @@
     if (/^[a-z]+$/.test(hash) && nav.querySelector('a.tab[data-tab="' + hash + '"]')) {
       show(hash);
     }
+  }
+
+  // The account page's header shows the account's avatar. The server
+  // does not know it; the profile card does (and says nothing where
+  // avatars are switched off), so the image is taken from the card.
+  function heroAvatar() {
+    var row = document.querySelector("[data-hero-card]");
+    if (!row || !window.fetch) {
+      return;
+    }
+    fetch(row.getAttribute("data-hero-card"), { credentials: "same-origin" })
+      .then(function (r) {
+        if (r.status !== 200 || r.redirected) {
+          throw new Error("no card");
+        }
+        return r.text();
+      })
+      .then(function (html) {
+        var found = new DOMParser().parseFromString(html, "text/html").querySelector("img.pc-avatar");
+        if (!found) {
+          return;
+        }
+        var img = document.createElement("img");
+        img.className = "hero-avatar";
+        img.alt = "";
+        img.width = 56;
+        img.height = 56;
+        img.referrerPolicy = "no-referrer";
+        img.onerror = function () {
+          if (img.parentNode) {
+            img.parentNode.removeChild(img);
+          }
+        };
+        img.src = found.getAttribute("src");
+        row.insertBefore(img, row.firstChild);
+      })
+      .catch(function () {
+        // No avatar: the header is complete without one.
+      });
+  }
+
+  // A link marked data-swap (the "Show banned accounts" switch) changes
+  // what the tables hold: the page at its address is read and the tabs
+  // and tables are put in place, without a page load. Without this
+  // script the link is followed.
+  function swaps() {
+    document.addEventListener("click", function (event) {
+      var a = event.target.closest ? event.target.closest("a[data-swap]") : null;
+      if (!a || !window.fetch || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button) {
+        return;
+      }
+      var box = document.querySelector(".tabbed");
+      if (!box) {
+        return;
+      }
+      event.preventDefault();
+      var href = a.getAttribute("href");
+      fetch(href, { credentials: "same-origin", cache: "no-store" })
+        .then(function (r) {
+          if (r.status !== 200 || r.redirected) {
+            throw new Error("not the page");
+          }
+          return r.text();
+        })
+        .then(function (html) {
+          var doc = new DOMParser().parseFromString(html, "text/html");
+          var fresh = doc.querySelector(".tabbed");
+          if (!fresh) {
+            throw new Error("not the page");
+          }
+          box.innerHTML = fresh.innerHTML;
+          box.setAttribute("data-active", fresh.getAttribute("data-active"));
+          var nav = document.querySelector("nav.tabs");
+          var freshNav = doc.querySelector("nav.tabs");
+          if (nav && freshNav) {
+            nav.innerHTML = freshNav.innerHTML;
+          }
+          times(box);
+          try {
+            history.replaceState(null, "", href);
+          } catch (e) {
+            // The tables are in place either way.
+          }
+          pending();
+        })
+        .catch(function () {
+          location.href = href;
+        });
+    });
   }
 
   // Rows held back until their account's handle is checked (a table says

@@ -437,11 +437,16 @@ pub enum Counted {
 /// Counts the records of a section with the section's filters, scanning
 /// its own index and stopping after `cap + 1` rows: a result above `cap`
 /// means "more than `cap`". Counts records, not accounts.
+///
+/// Counts with the public tables' rule: suspended accounts count;
+/// accounts a host has taken down count only with `banned`; deactivated
+/// and deleted accounts never do.
 pub async fn bounded_count(
     conn: &mut PgConnection,
     what: Counted,
     key: i64,
     excluded: &[i64],
+    banned: bool,
     cap: i64,
 ) -> Result<i64> {
     let (from, on, col) = match what {
@@ -453,8 +458,9 @@ pub async fn bounded_count(
     Ok(sqlx::query_scalar(&format!(
         "SELECT count(*) FROM (
            SELECT 1 FROM {from} r JOIN actors a ON a.id = {on}
-           WHERE {col} = $1 AND a.status NOT IN {HIDDEN} AND NOT (a.id = ANY($2))
-           LIMIT $3) x"
+           WHERE {col} = $1 AND a.status NOT IN {} AND NOT (a.id = ANY($2))
+           LIMIT $3) x",
+        crate::ui_rows::hidden_statuses(true, banned)
     ))
     .bind(key)
     .bind(excluded)

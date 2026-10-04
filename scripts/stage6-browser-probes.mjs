@@ -11,6 +11,7 @@
 import { chromium } from "playwright";
 
 const [base, accountPath, operatorDefault, livePath, liveDid, liveHandle] = process.argv.slice(2);
+const ownCard = "/card/" + accountPath.split("/did/")[1];
 const DARK_BG = "rgb(9, 12, 21)";
 const LIGHT_BG = "rgb(248, 250, 252)";
 const ZONE = "America/New_York";
@@ -203,7 +204,7 @@ await probe("every <time> is rewritten once, in the visitor's timezone, with the
   }
   const note = await page.evaluate(() => (document.querySelector(".tz-note") || {}).textContent || "");
   return {
-    ok: bad.length === 0 && rows >= 10 && footer === 1 && abs >= 10 && note.trim() === "All times are in America/New York.",
+    ok: bad.length === 0 && rows >= 10 && footer === 1 && abs >= 10 && /^All times are in (EDT|EST|GMT-[45])\.$/.test(note.trim()),
     detail: `${rows} row times, ${footer} footer; note: ${note.trim()}; first: ${JSON.stringify(times[0])}; bad: ${JSON.stringify(bad.slice(0, 2))}`,
   };
 });
@@ -243,7 +244,9 @@ await probe("a card opens after the pointer rests on a row's link, is requested 
   await page.goto(base + accountPath);
   const requests = [];
   page.on("request", (r) => {
-    if (r.url().includes("/card/")) {
+    // The page asks for its own account's card once, for the avatar in
+    // its header; these probes count the cards of rows.
+    if (r.url().includes("/card/") && !r.url().endsWith(ownCard)) {
       requests.push(r.url());
     }
   });
@@ -319,7 +322,7 @@ if (livePath) {
         new URL(image.src).origin !== new URL(base).origin &&
         image.src.includes("/xrpc/com.atproto.sync.getBlob?did=") &&
         image.ref === "no-referrer" &&
-        d.handle === "@" + liveHandle &&
+        d.handle === liveHandle &&
         d.did === liveDid &&
         /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \S+$/.test(d.time || "") &&
         / UTC$/.test(d.title || "") &&
@@ -379,7 +382,7 @@ await probe("without JavaScript the page reads the same: UTC times, working link
 });
 
 // ---- A touch device ------------------------------------------------------
-await probe("on a touch device (hover: none) there are no cards: no request, no card element, and the rule is under @media (hover: hover)", async () => {
+await probe("on a touch device (hover: none) there are no cards: no request for a row's card, no card element, and the rule is under @media (hover: hover)", async () => {
   const c = await browser.newContext({
     hasTouch: true,
     isMobile: true,
@@ -390,7 +393,9 @@ await probe("on a touch device (hover: none) there are no cards: no request, no 
   watch(p);
   let requests = 0;
   p.on("request", (r) => {
-    if (r.url().includes("/card/")) {
+    // The page asks for its own account's card once, for the avatar in
+    // its header; these probes count the cards of rows.
+    if (r.url().includes("/card/") && !r.url().endsWith(ownCard)) {
       requests += 1;
     }
   });

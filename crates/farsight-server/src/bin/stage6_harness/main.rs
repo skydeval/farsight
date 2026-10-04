@@ -1688,7 +1688,9 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let sid = h
         .n(&format!("SELECT id FROM actors WHERE did = '{}'", w.s))
         .await?;
-    let shown = "a.status NOT IN (1, 2, 3, 4)";
+    // The public tables leave out deactivated (1), taken-down (2) and
+    // deleted (4) accounts; a suspended one (3) is shown, tagged.
+    let shown = "a.status NOT IN (1, 2, 4)";
     let page = h.get(&path_did(&w.s)).await?;
     let navs = section_navs(&page.text);
     c.check(
@@ -1718,16 +1720,16 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let (ok, d) = exactly_once(&rows, &want);
     c.check(
         "Blocked by: paging through the section returns every blocker with an active account exactly once, 50 a page",
-        ok && pages == 2 && want.len() == 61,
+        ok && pages == 2 && want.len() == 62,
         format!("{d}; {pages} pages"),
     );
     let sec = section(&page.text, "blockers").unwrap_or("");
     let second = h.get(&format!("{}?page=2", path_did(&w.s))).await?;
     let sec2 = section(&second.text, "blockers").unwrap_or("");
     c.check(
-        "Blocked by holds 50 rows a page with numbered page controls: 61 blockers are two pages; the controls are plain links (no htmx) that carry the page in the query and the section as the fragment, the current page is marked, and an arrow that leads nowhere is not a link",
+        "Blocked by holds 50 rows a page with numbered page controls: 62 blockers are two pages; the controls are plain links (no htmx) that carry the page in the query and the section as the fragment, the current page is marked, and an arrow that leads nowhere is not a link",
         row_dids(sec).len() == 50
-            && row_dids(sec2).len() == 11
+            && row_dids(sec2).len() == 12
             && controls_of(sec) == "(←) [1] 2 →"
             && controls_of(sec2) == "← 1 [2] (→)"
             && sec.contains(&format!(
@@ -1757,7 +1759,11 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
         sec.contains(&format!("<span class=\"count\">{}</span>", want.len())),
         support::truncate(sec, 120),
     );
-    let first = row_dids(sec).first().cloned().unwrap_or_default();
+    // An ordinary account's row (a suspended one carries a tag as well).
+    let first = row_dids(sec)
+        .into_iter()
+        .find(|d| d.starts_with("did:plc:blk"))
+        .unwrap_or_default();
     c.check(
         "a row names the account as a link to its page whose title is the DID and which carries its card address; with no handle cached it shows the DID",
         sec.contains(&format!(
@@ -1856,12 +1862,12 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let (ok, d) = exactly_once(&rows, &want);
     c.check(
         "Members: every active member exactly once across pages; inactive members are left out",
-        ok && want.len() == 62,
+        ok && want.len() == 63,
         format!("{d}; {pages} pages"),
     );
     let sec = section(&lp.text, "members").unwrap_or("");
     c.check(
-        "the withheld rule runs in the section's query, so it shortens no page and the page count is that of the rows shown: 50 rows while more follow, two pages for 62 members",
+        "the withheld rule runs in the section's query, so it shortens no page and the page count is that of the rows shown: 50 rows while more follow, two pages for 63 members",
         short == 0 && pages == 2 && controls_of(sec) == "(←) [1] 2 →" && !sec.contains("hx-"),
         format!("{short} short pages with a next link; {pages} pages; {:?}", controls_of(sec)),
     );
@@ -1884,7 +1890,7 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let sec = section(&lp.text, "listblockers").unwrap_or("");
     c.check(
         "Blocked by (list): every active listblocker exactly once, and the bounded count",
-        ok && want.len() == 4
+        ok && want.len() == 5
             && sec.contains(&format!("<span class=\"count\">{}</span>", want.len())),
         d,
     );
@@ -2556,11 +2562,62 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
     h.set(&[("show_outgoing_blocks", Some("on"))]).await?;
     let text = all_text(h, &pages).await?;
     let seen = dids_in(&text);
-    let leaked: Vec<&String> = w.hidden.iter().filter(|d| seen.contains(*d)).collect();
+    // w.hidden is one account per status 1–4: deactivated, taken down,
+    // suspended, deleted.
+    let (suspended, taken_down) = (&w.hidden[2], &w.hidden[1]);
+    let leaked: Vec<&String> = w
+        .hidden
+        .iter()
+        .filter(|d| *d != suspended && seen.contains(*d))
+        .collect();
     c.check(
-        "accounts with each hidden status (deactivated, takendown, suspended, deleted) appear in no row of any section of any page — as author, member, owner or target",
-        leaked.is_empty() && seen.contains(&w.e) && seen.len() > 120,
+        "deactivated, taken-down and deleted accounts appear in no row of any section of any page — as author, member, owner or target; the suspended account is shown, with a \"suspended\" tag",
+        leaked.is_empty()
+            && seen.contains(&w.e)
+            && seen.contains(suspended)
+            && text.contains("<span class=\"acct-tag acct-suspended\">suspended</span>")
+            && !text.contains("acct-banned")
+            && seen.len() > 120,
         format!("{} DIDs on the pages; leaked: {leaked:?}", seen.len()),
+    );
+    // "Show banned accounts": taken-down accounts, on request.
+    let rest = h.get(&path_did(&w.s)).await?;
+    let on = h.get(&format!("{}?banned=1", path_did(&w.s))).await?;
+    let odd = h
+        .get(&format!("{}?banned=yes&page=2", path_did(&w.s)))
+        .await?;
+    let (rsec, osec) = (
+        section(&rest.text, "blockers").unwrap_or(""),
+        section(&on.text, "blockers").unwrap_or(""),
+    );
+    let lon = h.get(&format!("{}?banned=1", w.list)).await?;
+    let lrest = h.get(&w.list).await?;
+    c.check(
+        "the heading states both numbers — the blockers shown, and the number counting banned (taken-down) accounts — and offers the switch; with ?banned=1 the taken-down blocker is a row with a \"banned\" tag, the deactivated and deleted ones still are not, the page links keep the switch and the switch leads back; any other value of the parameter is redirected away",
+        rsec.contains("<span class=\"count\">62</span> <span class=\"count-all\">(63 counting banned accounts)</span>")
+            && rsec.contains(&format!("href=\"{}?banned=1#blockers\"", path_did(&w.s)))
+            && rsec.contains("role=\"checkbox\" aria-checked=\"false\"")
+            && !row_dids(rsec).contains(taken_down)
+            && osec.contains("<span class=\"count\">62</span> <span class=\"count-all\">(63 counting banned accounts)</span>")
+            && osec.contains("aria-checked=\"true\"")
+            && osec.contains(&format!("href=\"{}#blockers\"", path_did(&w.s)))
+            && osec.contains("<span class=\"acct-tag acct-banned\">banned</span>")
+            && step_of(osec, "next") == Some(format!("{}?banned=1&page=2", path_did(&w.s)))
+            && {
+                let two = h.get(&format!("{}?banned=1&page=2", path_did(&w.s))).await?;
+                let mut all = row_dids(osec);
+                all.extend(row_dids(section(&two.text, "blockers").unwrap_or("")));
+                all.len() == 63
+                    && all.contains(taken_down)
+                    && !all.contains(&w.hidden[0])
+                    && !all.contains(&w.hidden[3])
+            }
+            && odd.status == 301
+            && odd.header("location").as_deref() == Some(format!("{}?page=2", path_did(&w.s)).as_str())
+            && section(&lrest.text, "listblockers").is_some_and(|s| s.contains("(6 counting banned accounts)") && !row_dids(s).contains(taken_down))
+            && section(&lrest.text, "members").is_some_and(|s| s.contains("(64 counting banned accounts)"))
+            && section(&lon.text, "listblockers").is_some_and(|s| row_dids(s).contains(taken_down) && s.contains("acct-banned")),
+        support::truncate(rsec, 300),
     );
     c.check(
         "…while the API still returns rows naming them (the UI is stricter than the API)",
@@ -3435,7 +3492,7 @@ async fn check_cards_live(c: &mut Checks, l: &mut H, w: &World) -> Result<(), St
     c.check(
         "a did:plc account's card: the verified handle, the DID, and the creation date — the createdAt of the first entry of its PLC audit log, as the harness reads it from the directory",
         r.status == 200
-            && r.text.contains(&format!("<p class=\"handle\">@{LIVE_HANDLE}</p>"))
+            && r.text.contains(&format!("<p class=\"handle\">{LIVE_HANDLE}</p>"))
             && r.text.contains(&format!("<code class=\"pc-did\">{LIVE_DID}</code>"))
             && r.text.contains(&format!("<dt>DID created</dt><dd><time datetime=\"{created}\">"))
             && r.text.contains(" UTC</time></dd>")
@@ -3481,7 +3538,7 @@ async fn check_cards_live(c: &mut Checks, l: &mut H, w: &World) -> Result<(), St
     c.check(
         "the card's verification filled the handle cache: the row now shows @handle alone, as a link whose title is the DID",
         row_page.text.contains(&format!(
-            "<a class=\"who\" href=\"/did/{LIVE_DID}\" title=\"{LIVE_DID}\" data-card=\"/card/{LIVE_DID}\">@{LIVE_HANDLE}</a>"
+            "<a class=\"who\" href=\"/did/{LIVE_DID}\" title=\"{LIVE_DID}\" data-card=\"/card/{LIVE_DID}\">{LIVE_HANDLE}</a>"
         )),
         "row",
     );
@@ -3493,7 +3550,7 @@ async fn check_cards_live(c: &mut Checks, l: &mut H, w: &World) -> Result<(), St
         off.status == 200
             && !off.text.contains("<img")
             && !off.text.contains("pc-avatar")
-            && off.text.contains(&format!("@{LIVE_HANDLE}"))
+            && off.text.contains(LIVE_HANDLE)
             && off.text.contains(&format!("<time datetime=\"{created}\">"))
             && off.header("content-security-policy").as_deref() == Some(CSP)
             && off.header("cache-control").as_deref() == Some("public, max-age=300")
@@ -3780,14 +3837,14 @@ async fn check_handles(c: &mut Checks, h: &H, live: Option<&H>, w: &World) -> Re
             let r = l.get(&path_did(LIVE_DID)).await?;
             let m = l.metrics_text().await?;
             if r.text
-                .contains(&format!("<span class=\"handle\">@{LIVE_HANDLE}</span>"))
+                .contains(&format!("<span class=\"handle\">{LIVE_HANDLE}</span>"))
                 && r.text
                     .contains(&format!("<code class=\"did-code\">{LIVE_DID}</code>"))
             {
                 c.check(
                     "a handle verified in both directions (DID document, then forward resolution) is shown beside the DID, and in og:title",
                     total(&m, "resolved") >= 1.0
-                        && meta(&r.text, "og:title") == Some(format!("@{LIVE_HANDLE} ({LIVE_DID})").as_str()),
+                        && meta(&r.text, "og:title") == Some(format!("{LIVE_HANDLE} ({LIVE_DID})").as_str()),
                     format!("resolved {}", total(&m, "resolved")),
                 );
                 let stored: Vec<(String,)> = sqlx::query_as(
@@ -3806,7 +3863,7 @@ async fn check_handles(c: &mut Checks, h: &H, live: Option<&H>, w: &World) -> Re
                 let m2 = l.metrics_text().await?;
                 c.check(
                     "the verified handle is served from the cache on the next view",
-                    again.text.contains(&format!("@{LIVE_HANDLE}"))
+                    again.text.contains(LIVE_HANDLE)
                         && total(&m2, "cached") > total(&m, "cached")
                         && total(&m2, "resolved") == total(&m, "resolved"),
                     format!("cached {}", total(&m2, "cached")),

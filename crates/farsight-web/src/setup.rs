@@ -419,7 +419,7 @@ impl SetupPage {
                 "{}, hosted at {}",
                 i.handle
                     .as_ref()
-                    .map_or_else(|| "no handle".to_owned(), |h| format!("@{h}")),
+                    .map_or_else(|| "no handle".to_owned(), |h| h.to_string()),
                 i.pds.as_deref().unwrap_or("no PDS named in its document")
             )),
             _ => None,

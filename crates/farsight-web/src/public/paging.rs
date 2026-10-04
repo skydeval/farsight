@@ -23,6 +23,8 @@ pub const MAX_PAGE: i64 = 1_000_000;
 /// The parameter that names the table in view when it is not the page's
 /// first one.
 pub const TAB: &str = "tab";
+/// The parameter that adds taken-down accounts to the tables: `banned=1`.
+pub const BANNED: &str = "banned";
 /// Pages linked on each side of the current one.
 pub const NEIGHBOURS: i64 = 2;
 
@@ -48,6 +50,9 @@ fn query(q: &Params, keys: &[&str], set: Option<(&str, i64)>, tab: Option<&str>)
     if let Some(t) = tab {
         s.append_pair(TAB, t);
     }
+    if banned(q) {
+        s.append_pair(BANNED, "1");
+    }
     for k in keys {
         let value = match set {
             Some((key, page)) if key == *k => Some(page.to_string()),
@@ -58,6 +63,29 @@ fn query(q: &Params, keys: &[&str], set: Option<(&str, i64)>, tab: Option<&str>)
         }
     }
     s.finish()
+}
+
+/// Whether the address asks for taken-down accounts too.
+pub fn banned(q: &Params) -> bool {
+    q.get(BANNED) == Some("1")
+}
+
+/// `base?…` with the banned switch set to `on`, the table `tab` in view
+/// and every section back on its first page (the rows change).
+pub fn banned_link(base: &str, tab: Option<&str>, on: bool) -> String {
+    let mut s = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(t) = tab {
+        s.append_pair(TAB, t);
+    }
+    if on {
+        s.append_pair(BANNED, "1");
+    }
+    let query = s.finish();
+    if query.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{query}")
+    }
 }
 
 /// Where a request should have gone instead, if its address is not the
@@ -73,7 +101,9 @@ pub fn canonical(q: &Params, keys: &[&str], retired: &[&str], tabs: &[&str]) -> 
     let first = keys.iter().any(|k| q.get(k) == Some("1"));
     let tab = q.get(TAB);
     let kept = tab.filter(|t| tabs.iter().skip(1).any(|k| k == t));
-    (stale || first || tab != kept).then(|| query(q, keys, None, kept))
+    // `banned` has one spelling: `1`.
+    let odd = q.get(BANNED).is_some_and(|v| v != "1");
+    (stale || first || tab != kept || odd).then(|| query(q, keys, None, kept))
 }
 
 /// `base?…` for the table `tab` (`None`: the page's first), keeping every
@@ -357,6 +387,23 @@ mod tests {
         assert_eq!(c("tab=blockers&page=2").as_deref(), Some("page=2"));
         assert_eq!(c("tab=nope").as_deref(), Some(""));
         assert_eq!(c("tab=lists&bc=x").as_deref(), Some("tab=lists"));
+        // The banned switch travels with every link and has one spelling.
+        assert_eq!(c("banned=1&page=2"), None);
+        assert_eq!(c("banned=yes&page=2").as_deref(), Some("page=2"));
+        let b = Params::parse("banned=1&lists=3");
+        assert_eq!(
+            link("/did/x", &b, &keys, "page", 2, None),
+            "/did/x?banned=1&page=2&lists=3"
+        );
+        assert_eq!(
+            tab_link("/did/x", &b, &keys, Some("lists")),
+            "/did/x?tab=lists&banned=1&lists=3"
+        );
+        assert_eq!(banned_link("/did/x", None, true), "/did/x?banned=1");
+        assert_eq!(
+            banned_link("/did/x", Some("outgoing"), false),
+            "/did/x?tab=outgoing"
+        );
     }
 
     #[test]

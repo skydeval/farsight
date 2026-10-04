@@ -165,7 +165,7 @@ mod tests {
         let full = a(true, Some("alice.example"));
         assert!(full.contains("data-card=\"/admin/card/did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\""));
         assert!(full.contains("data-card-session"));
-        assert!(full.contains(">@alice.example</a>"));
+        assert!(full.contains(">alice.example</a>"));
         // The script names no admin path: the page carries it.
         assert!(!crate::public::PUBLIC_JS.contains("/admin/"));
     }

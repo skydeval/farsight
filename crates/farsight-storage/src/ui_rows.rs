@@ -46,6 +46,18 @@ const SHOWN_B: &str = "COALESCE(LEAST(b.created_at, b.first_seen), '-infinity'::
 /// SQL fragment: status codes hidden by default (§3.1, §7.4).
 const HIDDEN: &str = "(1, 2, 3, 4)";
 
+/// The statuses a table leaves out, as an SQL list: deactivated (1) and
+/// deleted (4) always; taken down (2) unless `banned`; suspended (3)
+/// unless `suspended`. With neither, the API's hidden set (§3.1).
+pub fn hidden_statuses(suspended: bool, banned: bool) -> &'static str {
+    match (suspended, banned) {
+        (false, false) => HIDDEN,
+        (true, false) => "(1, 2, 4)",
+        (false, true) => "(1, 3, 4)",
+        (true, true) => "(1, 4)",
+    }
+}
+
 /// Bytes one index entry is estimated at before a build (§7.6).
 pub const ENTRY_BYTES: u64 = 62;
 
@@ -250,6 +262,12 @@ pub struct Position {
 pub struct Filter<'a> {
     /// Rows whose listed account has a hidden status (§3.1, §7.4).
     pub hide_inactive: bool,
+    /// With `hide_inactive`: keep suspended accounts (a suspension is
+    /// temporary; the public tables show them).
+    pub show_suspended: bool,
+    /// With `hide_inactive`: keep the accounts a host has taken down
+    /// ("banned"). Deactivated and deleted accounts always stay out.
+    pub show_banned: bool,
     /// Rows whose listed account is one of these `actors.id` values
     /// (`public_ui.excluded_dids`).
     pub excluded: &'a [i64],
@@ -281,7 +299,10 @@ fn build<'a>(
     ));
     q.push_bind(key);
     if filter.hide_inactive {
-        q.push(format!(" AND a.status NOT IN {HIDDEN}"));
+        q.push(format!(
+            " AND a.status NOT IN {}",
+            hidden_statuses(filter.show_suspended, filter.show_banned)
+        ));
     }
     if !filter.excluded.is_empty() {
         q.push(" AND NOT (a.id = ANY(");
@@ -429,7 +450,8 @@ fn naming_from() -> String {
         "JOIN lists l ON l.id = x.list_id
          JOIN actors o ON o.id = l.owner_id
          WHERE l.track_state IN (2, 3) AND l.record_state = 1
-           AND o.status NOT IN {HIDDEN} AND NOT (o.id = ANY($2))"
+           AND o.status NOT IN {} AND NOT (o.id = ANY($2))",
+        hidden_statuses(true, false)
     )
 }
 
@@ -746,6 +768,8 @@ mod tests {
         let ids = [7i64];
         let f = Filter {
             hide_inactive: true,
+            show_suspended: false,
+            show_banned: false,
             excluded: &ids,
         };
         let q = sql(Section::ListBlockers, Order::Shown, false, f);

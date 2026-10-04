@@ -73,22 +73,47 @@ pub struct Who {
     pub card: String,
     /// A verified handle, if cached.
     pub handle: Option<String>,
+    /// What a host has done to the account, if anything: `banned` (taken
+    /// down) or `suspended`.
+    pub tag: Option<&'static str>,
 }
 
 /// `None`: the account has not been checked yet and the worker has been
 /// asked; its row is held back until it has (see [`Section::pending`]).
-fn who(r: &Req<'_>, asked: &mut Asked, did: &str) -> Option<Who> {
-    let handle = match asked.known(r.st, did) {
-        Known::Handle(h) => Some(clean(&h)),
-        Known::NoHandle => None,
-        Known::Pending => return None,
+fn who(r: &Req<'_>, asked: &mut Asked, shown: &Shown<'_>, did: &str) -> Option<Who> {
+    let tag = shown.tag(did);
+    let handle = if tag == Some(BANNED) {
+        // A taken-down account's host no longer answers for it: nothing
+        // to check, so the row waits for nothing and shows what is known.
+        r.st.public.handles.get(did).map(|h| clean(&h))
+    } else {
+        match asked.known(r.st, did) {
+            Known::Handle(h) => Some(clean(&h)),
+            Known::NoHandle => None,
+            Known::Pending => return None,
+        }
     };
     Some(Who {
         did: did.to_owned(),
         href: did_href(did),
         card: card_href(did),
         handle,
+        tag,
     })
+}
+
+/// The tag of an account its host has taken down.
+const BANNED: &str = "banned";
+/// The tag of an account its host has suspended.
+const SUSPENDED: &str = "suspended";
+
+/// The "Show banned accounts" switch of a table.
+#[derive(Debug, Clone)]
+pub struct Toggle {
+    /// The page with the switch the other way.
+    pub href: String,
+    /// Taken-down accounts are in the tables now.
+    pub on: bool,
 }
 
 /// An account row with one author-stated time.
@@ -106,6 +131,11 @@ pub struct Section<R> {
     /// Bounded record count, shown from 1 up; `None` when it is zero or
     /// was not available.
     pub count: Option<String>,
+    /// The count with taken-down accounts included, when that is more.
+    pub count_all: Option<String>,
+    /// The switch that adds taken-down accounts to the rows; offered when
+    /// the table has any, or while it is on.
+    pub toggle: Option<Toggle>,
     /// Rows shown.
     pub rows: Vec<R>,
     /// Rows of this page held back because their account's handle has
@@ -221,6 +251,8 @@ async fn actor_row(r: &Req<'_>, did: &Did) -> Result<Option<ActorRef>, Fail> {
 struct Shown<'a> {
     withheld: &'a Withheld,
     status: HashMap<String, ActorRef>,
+    /// Taken-down accounts are shown (the page's switch is on).
+    banned: bool,
 }
 
 impl Shown<'_> {
@@ -228,6 +260,7 @@ impl Shown<'_> {
         r: &Req<'_>,
         withheld: &'a Withheld,
         dids: Vec<String>,
+        banned: bool,
     ) -> Result<Shown<'a>, Fail> {
         let status = if dids.is_empty() {
             HashMap::new()
@@ -237,16 +270,35 @@ impl Shown<'_> {
             tx.rollback().await?;
             s
         };
-        Ok(Shown { withheld, status })
+        Ok(Shown {
+            withheld,
+            status,
+            banned,
+        })
     }
 
-    /// Whether a row naming `did`, in any role, may be shown.
+    /// Whether a row naming `did`, in any role, may be shown: never an
+    /// excluded, deactivated or deleted account; a suspended one always;
+    /// a taken-down one while the switch is on.
     fn ok(&self, did: &str) -> bool {
-        !self.withheld.excluded(did)
-            && !self
-                .status
-                .get(did)
-                .is_some_and(|a| actor_status::is_hidden(a.status))
+        if self.withheld.excluded(did) {
+            return false;
+        }
+        match self.status.get(did).map(|a| a.status) {
+            Some(actor_status::TAKENDOWN) => self.banned,
+            Some(actor_status::SUSPENDED) => true,
+            Some(s) => !actor_status::is_hidden(s),
+            None => true,
+        }
+    }
+
+    /// The tag a row naming `did` carries.
+    fn tag(&self, did: &str) -> Option<&'static str> {
+        match self.status.get(did).map(|a| a.status) {
+            Some(actor_status::TAKENDOWN) => Some(BANNED),
+            Some(actor_status::SUSPENDED) => Some(SUSPENDED),
+            _ => None,
+        }
     }
 }
 
@@ -255,16 +307,59 @@ impl Shown<'_> {
 /// section's size costs: about a tenth of a second for 40,000 rows.
 /// [`Total::Unknown`] when the query fails or times out; the section
 /// still renders.
-async fn total(r: &Req<'_>, what: Counted, key: i64, w: &Withheld) -> Total {
+async fn total(r: &Req<'_>, what: Counted, key: i64, w: &Withheld, banned: bool) -> Total {
     let n = async {
         let mut tx = r.st.api.read_tx().await.ok()?;
-        let n = store::bounded_count(&mut tx, what, key, &w.ids, COUNT_CAP)
+        let n = store::bounded_count(&mut tx, what, key, &w.ids, banned, COUNT_CAP)
             .await
             .ok()?;
         let _ = tx.rollback().await;
         Some(n)
     };
     total_of(n.await)
+}
+
+/// What a table of accounts says about its length: the count of the rows
+/// shown at rest, the count with taken-down accounts when that is more,
+/// the switch, and the length the page controls go by.
+struct Counts {
+    count: Option<String>,
+    count_all: Option<String>,
+    toggle: Option<Toggle>,
+    pages: Total,
+}
+
+async fn counts(
+    r: &Req<'_>,
+    key: Option<(Counted, i64)>,
+    w: &Withheld,
+    banned: bool,
+    base: &str,
+    tab: Option<&str>,
+) -> Counts {
+    let (rest, all) = match key {
+        Some((what, key)) => (
+            total(r, what, key, w, false).await,
+            total(r, what, key, w, true).await,
+        ),
+        None => (Total::Rows(0), Total::Rows(0)),
+    };
+    let more = match (rest, all) {
+        (Total::Rows(a), Total::Rows(b)) => b > a,
+        (Total::Rows(_), Total::MoreThan(_)) => true,
+        _ => false,
+    };
+    Counts {
+        // "0 (3 counting banned accounts)": the zero is said when the
+        // second number needs it.
+        count: count_words(rest).or_else(|| more.then(|| "0".to_owned())),
+        count_all: more.then(|| count_words(all)).flatten(),
+        toggle: (more || banned).then(|| Toggle {
+            href: paging::banned_link(base, tab, !banned),
+            on: banned,
+        }),
+        pages: if banned { all } else { rest },
+    }
 }
 
 /// The same for the lists naming an account.
@@ -302,9 +397,11 @@ fn cache_for(held: usize) -> Cache {
 }
 
 /// The withheld rule as the row queries apply it.
-fn row_filter(w: &Withheld) -> Filter<'_> {
+fn row_filter(w: &Withheld, banned: bool) -> Filter<'_> {
     Filter {
         hide_inactive: true,
+        show_suspended: true,
+        show_banned: banned,
         excluded: &w.ids,
     }
 }
@@ -321,7 +418,7 @@ fn party_rows(
     let out = rows
         .iter()
         .filter(|b| shown.ok(&b.did))
-        .filter_map(|b| match who(r, asked, &b.did) {
+        .filter_map(|b| match who(r, asked, shown, &b.did) {
             Some(who) => Some(PartyRow {
                 who,
                 when: b.created_at.map(Stamp::of),
@@ -515,6 +612,10 @@ struct DidPage {
     c: Chrome,
     did: String,
     handle: Option<String>,
+    /// The account's profile card, from which the script takes the
+    /// avatar for the header; `None` for an account this instance has no
+    /// row for.
+    card: Option<String>,
     tabs: Vec<Tab>,
     /// The id of the table in view.
     active: &'static str,
@@ -548,7 +649,8 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     };
     let (_slot, _permit) = r.render_slots().await?;
     let api = &r.st.api;
-    let filter = row_filter(&withheld);
+    let banned = paging::banned(q);
+    let filter = row_filter(&withheld, banned);
     let numbered =
         |section, key, number| crate::rows::numbered(r.st, section, key, filter, number, PAGE_ROWS);
 
@@ -585,7 +687,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     dids.extend(naming_page.rows.iter().map(|l| l.owner_did.clone()));
     dids.extend(out_page.rows.iter().map(|o| o.did.clone()));
     recall(r.st, cfg, &dids).await;
-    let shown = Shown::load(r, &withheld, dids).await?;
+    let shown = Shown::load(r, &withheld, dids, banned).await?;
     let mut asked = Asked::new(cfg);
     let pager = |section, label, key, number, total, more| {
         Pager::new(
@@ -603,13 +705,21 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         )
     };
 
-    let b_total = match actor {
-        Some(a) => total(r, Counted::IncomingBlocks, a.id, &withheld).await,
-        None => Total::Rows(0),
-    };
+    let b = counts(
+        r,
+        actor.map(|a| (Counted::IncomingBlocks, a.id)),
+        &withheld,
+        banned,
+        &base,
+        None,
+    )
+    .await;
+    let b_total = b.pages;
     let (b_rows, b_pending) = party_rows(r, &mut asked, &shown, &block_page.rows);
     let blockers = Section {
-        count: count_words(b_total),
+        count: b.count,
+        count_all: b.count_all,
+        toggle: b.toggle,
         empty: empty_line(&b_rows, b_pending, block_page.more, b_page),
         rows: b_rows,
         pending: b_pending,
@@ -633,7 +743,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         .iter()
         .filter(|l| shown.ok(&l.owner_did))
         .filter_map(|l| {
-            let Some(owner) = who(r, &mut asked, &l.owner_did) else {
+            let Some(owner) = who(r, &mut asked, &shown, &l.owner_did) else {
                 l_pending += 1;
                 return None;
             };
@@ -649,6 +759,8 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         .collect();
     let lists = Section {
         count: None,
+        count_all: None,
+        toggle: None,
         empty: empty_line(&l_rows, l_pending, naming_page.more, l_page),
         rows: l_rows,
         pending: l_pending,
@@ -666,14 +778,22 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let mut fresh: Vec<&Value> = vec![&blocks["freshness"], &naming["freshness"]];
     let outgoing = match &out_fresh {
         Some(f) => {
-            let o_total = match actor {
-                Some(a) => total(r, Counted::OutgoingBlocks, a.id, &withheld).await,
-                None => Total::Rows(0),
-            };
+            let o = counts(
+                r,
+                actor.map(|a| (Counted::OutgoingBlocks, a.id)),
+                &withheld,
+                banned,
+                &base,
+                Some("outgoing"),
+            )
+            .await;
+            let o_total = o.pages;
             let (rows, pending) = party_rows(r, &mut asked, &shown, &out_page.rows);
             fresh.push(f);
             Some(Section {
-                count: count_words(o_total),
+                count: o.count,
+                count_all: o.count_all,
+                toggle: o.toggle,
                 empty: empty_line(&rows, pending, out_page.more, o_page),
                 rows,
                 pending,
@@ -692,7 +812,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
 
     asked.submit(r.st);
     let og_title = match &handle {
-        Some(h) => format!("@{h} ({did})"),
+        Some(h) => format!("{h} ({did})"),
         None => did.to_string(),
     };
     let held = blockers.pending + lists.pending + outgoing.as_ref().map_or(0, |o| o.pending);
@@ -704,6 +824,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let t = DidPage {
         tabs,
         active,
+        card: actor.map(|_| card_href(did.as_str())),
         c: chrome(cfg, did.as_str(), &og_title, OG_ACCOUNT, &base),
         did: did.to_string(),
         handle,
@@ -813,7 +934,8 @@ pub async fn list(
         .await?
         .body;
     let (state, show_members) = state_words(listing["state"].as_str().unwrap_or(""));
-    let filter = row_filter(&withheld);
+    let banned = paging::banned(q);
+    let filter = row_filter(&withheld, banned);
     let member_page = if show_members {
         crate::rows::numbered(r.st, Rows::ListMembers, info.id, filter, m_page, PAGE_ROWS).await?
     } else {
@@ -826,7 +948,7 @@ pub async fn list(
     let mut dids: Vec<String> = member_page.rows.iter().map(|m| m.did.clone()).collect();
     dids.extend(blocker_page.rows.iter().map(|b| b.did.clone()));
     recall(r.st, cfg, &dids).await;
-    let shown = Shown::load(r, &withheld, dids).await?;
+    let shown = Shown::load(r, &withheld, dids, banned).await?;
     let mut asked = Asked::new(cfg);
     let pager = |section, label, key, number, total, more| {
         Pager::new(
@@ -846,11 +968,23 @@ pub async fn list(
 
     let mut fresh: Vec<&Value> = Vec::new();
     let members = if show_members {
-        let m_total = total(r, Counted::ListMembers, info.id, &withheld).await;
+        let m = counts(
+            r,
+            Some((Counted::ListMembers, info.id)),
+            &withheld,
+            banned,
+            &base,
+            None,
+        )
+        .await;
+        let m_total = m.pages;
         let (rows, pending) = party_rows(r, &mut asked, &shown, &member_page.rows);
         fresh.push(&listing["freshness"]);
         Some(Section {
+            // The heading states the stored-members counter instead.
             count: None,
+            count_all: m.count_all,
+            toggle: m.toggle,
             empty: empty_line(&rows, pending, member_page.more, m_page),
             rows,
             pending,
@@ -867,12 +1001,23 @@ pub async fn list(
         None
     };
 
-    let k_total = total(r, Counted::ListBlockers, info.id, &withheld).await;
+    let k = counts(
+        r,
+        Some((Counted::ListBlockers, info.id)),
+        &withheld,
+        banned,
+        &base,
+        Some("listblockers"),
+    )
+    .await;
+    let k_total = k.pages;
     let (rows, pending) = party_rows(r, &mut asked, &shown, &blocker_page.rows);
     asked.submit(r.st);
     fresh.push(&blockers_fresh);
     let blockers = Section {
-        count: count_words(k_total),
+        count: k.count,
+        count_all: k.count_all,
+        toggle: k.toggle,
         empty: empty_line(&rows, pending, blocker_page.more, k_page),
         rows,
         pending,
@@ -912,6 +1057,7 @@ pub async fn list(
             href: did_href(owner.as_str()),
             card: card_href(owner.as_str()),
             handle,
+            tag: None,
         },
         state,
         capped: listing["capped"].as_bool().unwrap_or(false),

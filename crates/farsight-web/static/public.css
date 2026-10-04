@@ -515,12 +515,14 @@ nav.tabs {
   margin: 0;
   padding: 0 0.5rem;
   border-bottom: 1px solid var(--card-border);
-  overflow-x: auto;
-  white-space: nowrap;
+  flex-wrap: wrap;
 }
+/* Each tab sits on the strip's bottom line (a negative margin, not an
+   offset: an offset made the strip one pixel taller than its box and a
+   scroll bar appeared). */
 nav.tabs a.tab {
-  position: relative;
-  top: 1px;
+  margin-bottom: -1px;
+  white-space: nowrap;
   padding: 0.55rem 1.1rem;
   border: 1px solid transparent;
   border-bottom: 0;
@@ -566,11 +568,81 @@ p.pending {
 
 /* Page controls of a table: ← 1 2 3 … 21 → */
 nav.pager {
-  margin: 0.85rem 0 0;
+  margin: 0.7rem 0 0;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 0.3rem;
+}
+
+/* "Show banned accounts": a link that reads as a checkbox. */
+p.table-options {
+  margin: 0.6rem 0 0;
+}
+a.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.86rem;
+  color: var(--fg);
+  text-decoration: none;
+}
+a.toggle:hover {
+  color: var(--accent);
+  text-decoration: none;
+}
+a.toggle .box {
+  width: 0.95rem;
+  height: 0.95rem;
+  border: 1.5px solid var(--muted);
+  border-radius: 3px;
+  background: var(--card);
+}
+a.toggle.on .box {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: inset 0 0 0 2px var(--card);
+}
+
+/* What a host has done to an account in a row. */
+.acct-tag {
+  display: inline-block;
+  margin-left: 0.45rem;
+  padding: 0 0.35rem;
+  border: 1px solid var(--warn-border);
+  border-radius: 4px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1.4;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+.acct-tag.acct-banned {
+  border-color: var(--bad-border);
+  background: var(--bad-bg);
+  color: var(--bad);
+}
+.data-row.tagged a.who {
+  opacity: 0.7;
+}
+.section-header h2 .count-all {
+  font-size: 0.82rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+/* The account's avatar in the page header, put there by the script. */
+.hero-avatar {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  border: 1px solid var(--card-border);
 }
 nav.pager a, nav.pager span {
   display: inline-flex;
@@ -1337,16 +1409,16 @@ footer {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  padding: 0.4rem 0.85rem;
+  padding: 0.3rem 0.85rem;
   border-bottom: 1px solid var(--line);
   text-align: left;
   white-space: nowrap;
 }
-/* Compact rows, about 34px: one line of text at line-height 1.4 and
-   0.4rem above and below. A badge is no taller than that line, so a row
+/* Compact rows, about 28px: one line of text at line-height 1.4 and
+   0.2rem above and below. A badge is no taller than that line, so a row
    with a time is as high as one without. */
 .data-table td {
-  padding: 0.4rem 0.85rem;
+  padding: 0.2rem 0.85rem;
   line-height: 1.4;
   border-bottom: 1px solid var(--line);
   color: var(--fg);
@@ -1370,6 +1442,13 @@ footer {
 }
 .data-table .td-owner {
   min-width: 10rem;
+}
+/* The time and count columns take the width of their content, at the
+   right; the account gets the rest. */
+.data-table .th-date, .data-table .td-date,
+.data-table .th-num, .data-table .td-num {
+  width: 1%;
+  text-align: right;
 }
 /* An account and a time stay on one line; the column widens instead, and
    the table scrolls sideways where the screen is too narrow for it. */
@@ -1624,7 +1703,8 @@ footer {
   main { padding: 1.25rem 1rem; }
   h1 { font-size: 1.4rem; }
   .hero h1 { font-size: 1.85rem; }
-  .profile-main-row { flex-direction: column; align-items: flex-start; gap: 0.75rem; }
+  .profile-main-row { gap: 0.75rem; }
+  .hero-avatar { width: 40px; height: 40px; }
   /* The boxes of an account or list page reach both edges of a narrow
      screen, and their tables reach the edges of the box: the width goes
      to the rows. */
@@ -1645,6 +1725,7 @@ footer {
     border-radius: 0;
   }
   nav.tabs { margin: 0 -1rem; padding: 0 0.5rem; }
+  nav.pager { justify-content: flex-start; }
   nav.tabs a.tab { padding: 0.5rem 0.8rem; font-size: 0.88rem; }
   p.tz-note { margin-top: -1.25rem; }
   .profile-id-block h1.subject .handle { font-size: 1.15rem; letter-spacing: 0; }

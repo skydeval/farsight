@@ -141,7 +141,7 @@ password stops working once it is set.</p>
 {% else if admin_did.is_empty() %}
 <p class="muted">No admin DID is set.</p>
 {% else %}
-<p>Sign-in is as <code>{{ admin_did }}</code>{% if let Some(h) = admin_handle %} (@{{ h }}){% endif %}.</p>
+<p>Sign-in is as <code>{{ admin_did }}</code>{% if let Some(h) = admin_handle %} ({{ h }}){% endif %}.</p>
 {% endif %}
 <p class="muted">The admin DID cannot be changed here. Change it with <code>farsight set-admin-did &lt;did&gt;</code>
 in the container, then restart farsight; sessions of the previous DID end at that restart.</p>
