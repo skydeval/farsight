@@ -1,38 +1,212 @@
 {% extends "public_base.html" %}
 {% block content %}
-<h1 class="subject">{% if let Some(h) = handle %}<span class="handle">@{{ h }}</span> {% endif %}<code>{{ did }}</code></h1>
-<nav class="sections" aria-label="Sections"><a href="#blockers">Blocked by</a><a href="#lists">On lists</a>{% if outgoing.is_some() %}<a href="#outgoing">Blocks by this account</a>{% endif %}</nav>
+<div class="profile-hero-card card">
+<div class="profile-meta-bar">
+<span class="pill status-pill"><span class="pulse-dot" aria-hidden="true"></span> ATProto Subject Profile</span>
+<div class="profile-actions">
+<button type="button" class="action-btn copy-btn" data-copy="{{ did }}" title="Copy DID to clipboard">
+<svg class="copy-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+<svg class="check-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+<span>Copy DID</span>
+</button>
+</div>
+</div>
 
-<section id="blockers">
+<div class="profile-main-row">
+<div class="profile-avatar-badge" aria-hidden="true">
+<span class="avatar-letter">{% if let Some(h) = handle %}{{ h.chars().next().unwrap_or('@') }}{% else %}@{% endif %}</span>
+</div>
+<div class="profile-id-block">
+<h1 class="subject">
+{% if let Some(h) = handle %}<span class="handle">@{{ h }}</span>{% endif %}
+<code class="did-code">{{ did }}</code>
+</h1>
+</div>
+</div>
+
+<div class="stats-ribbon">
+<a href="#blockers" class="stat-card" data-jump="blockers">
+<div class="stat-icon blocker-icon" aria-hidden="true">
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+</div>
+<div class="stat-content">
+<div class="stat-num">{% if let Some(n) = blockers.count %}{{ n }}{% else %}<span class="muted" title="Count not available">—</span>{% endif %}</div>
+<div class="stat-title">Blocked by</div>
+<div class="stat-desc">Direct incoming blocks</div>
+</div>
+</a>
+<a href="#lists" class="stat-card" data-jump="lists">
+<div class="stat-icon list-icon" aria-hidden="true">
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+</div>
+<div class="stat-content">
+<div class="stat-num">Lists</div>
+<div class="stat-title">On Lists</div>
+<div class="stat-desc">List inclusions</div>
+</div>
+</a>
+{% if let Some(outgoing) = outgoing %}
+<a href="#outgoing" class="stat-card" data-jump="outgoing">
+<div class="stat-icon outgoing-icon" aria-hidden="true">
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+</div>
+<div class="stat-content">
+<div class="stat-num">{% if let Some(n) = outgoing.count %}{{ n }}{% else %}<span class="muted" title="Count not available">—</span>{% endif %}</div>
+<div class="stat-title">Blocks by account</div>
+<div class="stat-desc">Outgoing blocks recorded</div>
+</div>
+</a>
+{% endif %}
+</div>
+
+<nav class="sections sticky-sections" aria-label="Sections">
+<a href="#blockers" class="section-pill active">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+<span>Blocked by</span>
+{% if let Some(n) = blockers.count %}<span class="badge-count">{{ n }}</span>{% endif %}
+</a>
+<a href="#lists" class="section-pill">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+<span>On lists</span>
+</a>
+{% if outgoing.is_some() %}
+<a href="#outgoing" class="section-pill">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+<span>Blocks by this account</span>
+{% if let Some(out) = outgoing %}{% if let Some(n) = out.count %}<span class="badge-count">{{ n }}</span>{% endif %}{% endif %}
+</a>
+{% endif %}
+</nav>
+</div>
+
+<section id="blockers" class="card data-section">
+<div class="section-header">
 <h2>Blocked by{% if let Some(n) = blockers.count %} <span class="count">{{ n }}</span>{% endif %}</h2>
 <p class="muted">Direct blocks naming this account. One account can hold several block records; each is listed.</p>
-{% if !blockers.rows.is_empty() %}<table><thead><tr><th>Account</th><th>Created (as stated by the author)</th></tr></thead><tbody>
-{% for r in blockers.rows %}<tr><td>{{ r.who|safe }}</td><td>{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
-{% endfor %}</tbody></table>{% endif %}
-{% if let Some(e) = blockers.empty %}<p class="empty">{{ e }}</p>{% endif %}
+</div>
+{% if !blockers.rows.is_empty() %}
+<div class="table-responsive">
+<table class="data-table">
+<thead>
+<tr>
+<th scope="col" class="th-account">Account</th>
+<th scope="col" class="th-date">Created (Author Claim)</th>
+</tr>
+</thead>
+<tbody>
+{% for r in blockers.rows %}
+<tr class="data-row">
+<td class="td-account">{{ r.who|safe }}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge">{{ t.text }}</time>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+{% if let Some(e) = blockers.empty %}
+<div class="empty-state">
+<div class="empty-icon" aria-hidden="true">
+<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 1 10 10"/><path d="M12 12l7-7"/><circle cx="12" cy="12" r="2"/></svg>
+</div>
+<div class="empty-content">
+<h3>No Incoming Blocks Recorded</h3>
+<p class="empty">{{ e }}</p>
+</div>
+</div>
+{% endif %}
 {{ blockers.pager|safe }}
 </section>
 
-<section id="lists">
+<section id="lists" class="card data-section">
+<div class="section-header">
 <h2>On lists</h2>
 <p class="muted">Listblocked lists naming this account. An account that blocks a moderation list blocks everyone on it; whether a listblock on another kind of list has any effect is up to the app.</p>
-{% if !lists.rows.is_empty() %}<table><thead><tr><th>List</th><th>Owner</th><th>Blocked by</th><th>Added (as stated by the list's owner)</th></tr></thead><tbody>
-{% for r in lists.rows %}<tr><td><a href="{{ r.href }}">{% if let Some(n) = r.name %}{{ n }}{% else %}<code>{{ r.uri }}</code>{% endif %}</a></td><td>{{ r.owner|safe }}</td><td class="num" title="listblock records">{{ r.listblocks }}</td><td>{% if let Some(t) = r.added %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
-{% endfor %}</tbody></table>
-<p class="muted">Each list links to its page, where the accounts that block it are listed.</p>{% endif %}
-{% if let Some(e) = lists.empty %}<p class="empty">{{ e }}</p>{% endif %}
+</div>
+{% if !lists.rows.is_empty() %}
+<div class="table-responsive">
+<table class="data-table">
+<thead>
+<tr>
+<th scope="col" class="th-list">List</th>
+<th scope="col" class="th-owner">Owner</th>
+<th scope="col" class="th-num">Blocked by</th>
+<th scope="col" class="th-date">Added (Owner Claim)</th>
+</tr>
+</thead>
+<tbody>
+{% for r in lists.rows %}
+<tr class="data-row">
+<td class="td-list">
+<a href="{{ r.href }}" class="list-link">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+<span>{% if let Some(n) = r.name %}{{ n }}{% else %}<code>{{ r.uri }}</code>{% endif %}</span>
+</a>
+</td>
+<td class="td-owner">{{ r.owner|safe }}</td>
+<td class="td-num"><span class="listblock-badge" title="listblock records">{{ r.listblocks }}</span></td>
+<td class="td-date">{% if let Some(t) = r.added %}<time datetime="{{ t.iso }}" class="time-badge">{{ t.text }}</time>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<p class="muted table-footer-note">Each list links to its page, where the accounts that block it are listed.</p>
+{% endif %}
+{% if let Some(e) = lists.empty %}
+<div class="empty-state">
+<div class="empty-icon" aria-hidden="true">
+<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+</div>
+<div class="empty-content">
+<h3>Not On Any Lists</h3>
+<p class="empty">{{ e }}</p>
+</div>
+</div>
+{% endif %}
 {{ lists.pager|safe }}
 </section>
 
-{% if let Some(outgoing) = outgoing %}<section id="outgoing">
+{% if let Some(outgoing) = outgoing %}
+<section id="outgoing" class="card data-section">
+<div class="section-header">
 <h2>Blocks by this account{% if let Some(n) = outgoing.count %} <span class="count">{{ n }}</span>{% endif %}</h2>
 <p class="muted">Blocks this account has made.</p>
-{% if !outgoing.rows.is_empty() %}<table><thead><tr><th>Account</th><th>Created (as stated by the author)</th></tr></thead><tbody>
-{% for r in outgoing.rows %}<tr><td>{{ r.who|safe }}</td><td>{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}</td></tr>
-{% endfor %}</tbody></table>{% endif %}
-{% if let Some(e) = outgoing.empty %}<p class="empty">{{ e }}</p>{% endif %}
+</div>
+{% if !outgoing.rows.is_empty() %}
+<div class="table-responsive">
+<table class="data-table">
+<thead>
+<tr>
+<th scope="col" class="th-account">Account</th>
+<th scope="col" class="th-date">Created (Author Claim)</th>
+</tr>
+</thead>
+<tbody>
+{% for r in outgoing.rows %}
+<tr class="data-row">
+<td class="td-account">{{ r.who|safe }}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge">{{ t.text }}</time>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+{% if let Some(e) = outgoing.empty %}
+<div class="empty-state">
+<div class="empty-icon" aria-hidden="true">
+<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+</div>
+<div class="empty-content">
+<h3>No Outgoing Blocks Recorded</h3>
+<p class="empty">{{ e }}</p>
+</div>
+</div>
+{% endif %}
 {{ outgoing.pager|safe }}
-</section>{% endif %}
+</section>
+{% endif %}
 
-{% if let Some(t) = updated %}<p class="updated">Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</p>{% endif %}
+{% if let Some(t) = updated %}<div class="telemetry-bar updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}
 {% endblock %}

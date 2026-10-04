@@ -1,7 +1,17 @@
 {% extends "public_base.html" %}
 {% block content %}
-<h1>{{ title }}</h1>
-<div class="card"><p>{{ message }}</p>
-{% if let Some(l) = link %}<p><a href="{{ l.0 }}">{{ l.1 }}</a></p>{% endif %}
+<div class="search-error-container">
+<div class="search-error-hero card">
+<div class="error-badge-row">
+<span class="pill error-pill">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+<span>Notice</span>
+</span>
+</div>
+<h1 class="error-title">{{ title }}</h1>
+<p class="error-message">{{ message }}</p>
+{% if let Some(l) = link %}<p style="margin-top: 1.25rem;"><a href="{{ l.0 }}" class="action-btn"><span>{{ l.1 }}</span></a></p>{% endif %}
+</div>
 </div>
 {% endblock %}
+

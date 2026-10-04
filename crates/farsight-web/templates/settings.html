@@ -11,7 +11,10 @@
 <div class="banner">The configuration comes from the environment (FARSIGHT_SKIP_WIZARD); edit it there.</div>
 {% else %}
 <form class="card" method="post" action="/admin/settings">
-<h2>config.toml</h2>
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+<span>config.toml</span>
+</h2>
 <p class="muted">Secrets are shown as &lt;redacted&gt; and kept unless replaced. Access, auth,
 proxy, rate-limit (except the query concurrency) and backfill keys apply immediately; others
 need a restart. Writes are atomic and notify the backfill process.</p>
@@ -20,16 +23,19 @@ here that would change it is refused.</p>
 {% if !env_keys.is_empty() %}<p>Locked by environment variables: {% for k in env_keys %}<code>{{ k }}</code> {% endfor %}</p>{% endif %}
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <textarea class="mono" name="config" spellcheck="false">{{ text }}</textarea>
-<div class="row"><button type="submit">Save</button></div>
+<div class="row"><button type="submit">Save configuration</button></div>
 </form>
 
 <form class="stack card" method="post" action="/admin/settings/public-ui" id="public-ui">
-<h2>Public UI</h2>
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+<span>Public UI</span>
+</h2>
 <p class="muted">A public lookup site at this hostname's root (<code>/</code>): anyone can see who blocks an account,
 directly and through lists. Removed records are never shown there; they are on the history pages reached from the
 DID and list lookups, after login. Every setting here applies on save, without
 a restart; a cache in front of Farsight keeps serving its copies for up to a minute.
-<a href="/" target="_blank" rel="noopener">Open the public UI in a new tab</a>{% if !p.enabled %} (it answers 404 while switched off){% endif %}.</p>
+<a href="/" target="_blank" rel="noopener">Open the public UI in a new tab ↗</a>{% if !p.enabled %} (it answers 404 while switched off){% endif %}.</p>
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label><input type="checkbox" name="enabled"{% if p.enabled %} checked{% endif %}> Serve the public UI (<code>access.public_ui</code>)</label>
 <div class="hint">Needs <code>access.reads = "public"</code>. Turning it on asks for confirmation on a page that lists what becomes reachable without login.</div>
@@ -117,7 +123,10 @@ and <code>/xrpc/*</code> and the lookup pages here still return it.</div>
 </form>
 
 <div class="card" id="admin-did">
-<h2>Admin account</h2>
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+<span>Admin account</span>
+</h2>
 {% if migration %}
 <p>Admin sign-in is changing from a password to an ATProto account. <a href="/enter">Set the admin DID</a>; the
 password stops working once it is set.</p>
@@ -131,12 +140,15 @@ in the container, then restart farsight; sessions of the previous DID end at tha
 </div>
 
 <form class="card" method="post" action="/admin/settings/token">
-<h2>Admin token</h2>
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+<span>Admin token</span>
+</h2>
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <p class="muted">Rotating invalidates the current admin token and signs out every session.</p>
 <div class="row"><button class="danger" type="submit">Rotate admin token</button></div>
 </form>
 
-<div class="card"><h2>Reset</h2><p><a href="/admin/reset">Reset the configuration</a> (keeps the database).</p></div>
+<div class="card"><h2><span>Reset</span></h2><p><a href="/admin/reset">Reset the configuration</a> (keeps the database).</p></div>
 {% endif %}
 {% endblock %}

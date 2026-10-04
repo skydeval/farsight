@@ -1,22 +1,69 @@
 <div id="dash" hx-get="/admin/dashboard/fragment" hx-trigger="every 10s" hx-swap="outerHTML">
 {% if let Some(e) = error %}<div class="banner bad">Could not load: {{ e }}</div>{% endif %}
 {% for w in d.warnings %}<div class="banner {{ w.class }}">{{ w.text }}</div>{% endfor %}
-<div class="card"><strong>Coverage:</strong> {{ d.coverage }}</div>
-<div class="grid">
-<div class="card"><h2>Index</h2>{% for s in d.counts %}<div class="stat"><div class="n">{{ s.value }}</div><div class="l">{{ s.label }}</div></div>{% endfor %}</div>
-<div class="card"><h2>Firehose</h2><table>{% for s in d.firehose %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table>
-{% if !d.gaps.is_empty() %}<h2>Unrepaired gaps</h2><ul>{% for g in d.gaps %}<li>{{ g }}</li>{% endfor %}</ul>{% endif %}</div>
-<div class="card"><h2>Backfill</h2><table>{% for s in d.backfill %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table></div>
-<div class="card"><h2>Storage</h2>{% if d.storage.is_empty() %}<p class="muted">Not measured yet.</p>{% endif %}<table>{% for s in d.storage %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table></div>
+<div class="card" style="display:flex; align-items:center; gap:0.6rem; border-left: 4px solid var(--accent);">
+<span class="pulse-dot" aria-hidden="true"></span>
+<div><strong>Coverage:</strong> {{ d.coverage }}</div>
 </div>
 <div class="grid">
-<div class="card"><h2>Exceptions</h2><table>{% for s in d.exceptions %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table></div>
-<div class="card"><h2>Lists by state</h2><table>{% for s in d.lists %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table></div>
+<div class="card">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+<span>Index</span>
+</h2>
+{% for s in d.counts %}<div class="stat"><div class="n">{{ s.value }}</div><div class="l">{{ s.label }}</div></div>{% endfor %}
 </div>
-<div class="card"><h2>Oldest pending lists</h2>
-{% if d.pending.is_empty() %}<p class="muted">None.</p>{% else %}<table><tr><th>List</th><th>Pending for</th></tr>{% for p in d.pending %}<tr><td><a href="/admin/lookup/list?q={{ p.0|urlencode }}">{{ p.0 }}</a></td><td>{{ p.1 }}</td></tr>{% endfor %}</table>{% endif %}
+<div class="card">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+<span>Firehose</span>
+</h2>
+<table>{% for s in d.firehose %}<tr><th>{{ s.label }}</th><td>{% if s.label == "Connected" && s.value == "yes" %}<span class="ok"><span class="pulse-dot" aria-hidden="true"></span> yes</span>{% else %}{{ s.value }}{% endif %}</td></tr>{% endfor %}</table>
+{% if !d.gaps.is_empty() %}<h3 style="margin-top:1rem; color:var(--warn);">Unrepaired gaps</h3><ul>{% for g in d.gaps %}<li>{{ g }}</li>{% endfor %}</ul>{% endif %}
 </div>
-<div class="card"><h2>Host buckets by lifetime interning</h2>
-{% if d.buckets.is_empty() %}<p class="muted">None yet.</p>{% else %}<table><tr><th>Bucket</th><th>Interned</th><th>Stored</th><th></th></tr>{% for b in d.buckets %}<tr><td>{{ b.0 }}</td><td>{{ b.1 }}</td><td>{{ b.2 }}</td><td>{{ b.3 }}</td></tr>{% endfor %}</table>{% endif %}
+<div class="card">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+<span>Backfill</span>
+</h2>
+<table>{% for s in d.backfill %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table>
+</div>
+<div class="card">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+<span>Storage</span>
+</h2>
+{% if d.storage.is_empty() %}<p class="muted">Not measured yet.</p>{% endif %}<table>{% for s in d.storage %}<tr><th>{{ s.label }}</th><td class="num">{{ s.value }}</td></tr>{% endfor %}</table>
+</div>
+</div>
+<div class="grid">
+<div class="card">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+<span>Exceptions</span>
+</h2>
+<table>{% for s in d.exceptions %}<tr><th>{{ s.label }}</th><td class="num">{{ s.value }}</td></tr>{% endfor %}</table>
+</div>
+<div class="card">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+<span>Lists by state</span>
+</h2>
+<table>{% for s in d.lists %}<tr><th>{{ s.label }}</th><td class="num">{{ s.value }}</td></tr>{% endfor %}</table>
+</div>
+</div>
+<div class="card">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+<span>Oldest pending lists</span>
+</h2>
+{% if d.pending.is_empty() %}<p class="muted">None.</p>{% else %}<table><tr><th>List</th><th>Pending for</th></tr>{% for p in d.pending %}<tr><td><a href="/admin/lookup/list?q={{ p.0|urlencode }}"><code>{{ p.0 }}</code></a></td><td class="num">{{ p.1 }}</td></tr>{% endfor %}</table>{% endif %}
+</div>
+<div class="card">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>
+<span>Host buckets by lifetime interning</span>
+</h2>
+{% if d.buckets.is_empty() %}<p class="muted">None yet.</p>{% else %}<table><tr><th>Bucket</th><th>Interned</th><th>Stored</th><th></th></tr>{% for b in d.buckets %}<tr><td><code>{{ b.0 }}</code></td><td class="num">{{ b.1 }}</td><td class="num">{{ b.2 }}</td><td>{{ b.3 }}</td></tr>{% endfor %}</table>{% endif %}
 </div>
 </div>

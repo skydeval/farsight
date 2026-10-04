@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#090c15">
 <meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false}'>
 <title>{{ c.title }}</title>
 {{ c.og|safe }}
@@ -16,7 +17,17 @@
 {% block content %}{% endblock %}
 </main>
 <footer>
-<p>An independent index of public block records, run by its operator and not affiliated with Bluesky.</p>
+<div class="footer-inner">
+  <div class="footer-brand">
+    <div class="pill"><span class="pulse-dot" aria-hidden="true"></span> ATProto Block Graph Index</div>
+    <p>An independent index of public block records, run by its operator and not affiliated with Bluesky.</p>
+  </div>
+  <div class="footer-hints">
+    <span class="keyboard-hint"><kbd>/</kbd> Focus search</span>
+    <span class="keyboard-hint"><kbd>Esc</kbd> Close overlays</span>
+  </div>
+</div>
 </footer>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </body>
 </html>

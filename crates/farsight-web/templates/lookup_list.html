@@ -2,23 +2,25 @@
 {% block title %}Farsight — list lookup{% endblock %}
 {% block content %}
 <h1>List lookup</h1>
-<form class="card row" method="get" action="/admin/lookup/list">
-<input type="text" name="q" value="{{ q }}" placeholder="at://did:…/app.bsky.graph.list/… or https://bsky.app/profile/…/lists/…" autofocus>
+<form class="card row" method="get" action="/admin/lookup/list" style="gap: 0.6rem; align-items: center; margin-top: 0;">
+<input type="text" name="q" value="{{ q }}" placeholder="at://did:…/app.bsky.graph.list/… or https://bsky.app/profile/…/lists/…" autofocus style="flex: 1 1 20rem; max-width: none;">
 <button type="submit">Look up</button>
 </form>
 {% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if let Some(u) = uri %}
-<p><strong>{{ u }}</strong>{% if let Some(h) = history %} · <a href="{{ h }}">View history</a>{% endif %}</p>
+<div class="card" style="margin-bottom: 1.25rem;">
+<p style="margin: 0; font-size: 1.05rem;"><strong><code>{{ u }}</code></strong>{% if let Some(h) = history %} · <a href="{{ h }}" class="pill" style="font-size:0.85rem;">View history →</a>{% endif %}</p>
+</div>
 <div class="card"><table>{% for f in facts %}<tr><th>{{ f.label }}</th><td>{{ f.value }}</td></tr>{% endfor %}</table></div>
 {% for s in sections %}
 <div class="card">
 <h2>{{ s.title }}</h2>
 {% if let Some(e) = s.error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if !s.coverage.is_empty() %}<p class="muted">{{ s.coverage }}</p>{% endif %}
-{% if s.rows.is_empty() %}<p class="muted">None.</p>{% else %}
+{% if s.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
 <table><tr>{% for c in s.columns %}<th>{{ c }}</th>{% endfor %}</tr>
 {% for r in s.rows %}<tr>{% for v in r %}<td>{{ v.html|safe }}</td>{% endfor %}</tr>{% endfor %}</table>{% endif %}
-{% if let Some(n) = s.next %}<p><a href="{{ n }}">Next page</a></p>{% endif %}
+{% if let Some(n) = s.next %}<p class="pager"><a href="{{ n }}">Next page →</a></p>{% endif %}
 </div>
 {% endfor %}
 {% endif %}

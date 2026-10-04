@@ -1,10 +1,38 @@
 {% extends "public_base.html" %}
 {% block content %}
-<h1>Handle not found</h1>
-<div class="card"><p>{{ message }}</p></div>
+<div class="search-error-container">
+<div class="search-error-hero card">
+<div class="error-badge-row">
+<span class="pill error-pill">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+<span>Graph Lookup Diagnostic</span>
+</span>
+</div>
+<div class="error-icon-wrap" aria-hidden="true">
+<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+</div>
+<h1 class="error-title">Handle not found</h1>
+<p class="error-message">{{ message }}</p>
+</div>
+
+<div class="search-deck search-retry-deck">
 <form class="search home-search" method="get" action="/search" role="search">
-<label for="q">Look up an account or a list</label>
-<div class="row"><input type="search" id="q" name="q" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" value="{{ q }}" required>
-<button type="submit">Try again</button></div>
+<label for="q" class="search-label">Look up another account or a list</label>
+<div class="search-box">
+<span class="search-icon" aria-hidden="true">
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+</span>
+<input type="search" id="q" name="q" maxlength="512" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="handle, DID, at:// URI or bsky.app link" value="{{ q }}" required autofocus>
+<span class="search-kbd-hint" aria-hidden="true"><kbd>/</kbd></span>
+<button type="submit" class="search-submit">
+<span>Try again</span>
+<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+</button>
+</div>
+<div class="search-hints">
+<span class="hints-label">Accepts a handle, a DID, an at:// URI or a bsky.app link.</span>
+</div>
 </form>
+</div>
+</div>
 {% endblock %}
