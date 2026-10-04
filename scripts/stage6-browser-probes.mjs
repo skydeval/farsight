@@ -359,7 +359,7 @@ await probe("without JavaScript the page reads the same: UTC times, working link
   const p = await c.newPage();
   await p.goto(base + accountPath);
   const texts = await p.locator("time[datetime]").allTextContents();
-  const zone = await p.locator(".tz-note").textContent();
+  const zone = await p.locator(".tz-note").first().textContent();
   const toggle = await p.locator(".theme-toggle").isVisible();
   const links = await p.locator("#blockers a.who").count();
   const action = await p.locator("nav.public-nav form").getAttribute("action");

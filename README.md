@@ -246,12 +246,19 @@ nothing else in a browser.
   shown, tagged "suspended". An account its host has **taken down**
   ("banned") is left out until the visitor ticks "Show banned accounts"
   (`?banned=1`); the heading gives both numbers, "4,114 (6,234 counting
-  banned accounts)". The page of a suspended or taken-down account
+  banned accounts)". The switch keeps the page the table is on; an
+  address that names a page past a table's end is answered with its
+  last page. The page of a suspended or taken-down account
   itself stays withheld.
-- **Avatar.** The account page's header shows the account's avatar,
-  which the page's script takes from the account's profile card
-  (`show_avatars`); the visitor's browser fetches the image from the
-  account's own server.
+- **Header.** The account page's header shows the account's avatar,
+  when its DID was created and which host holds the account. The
+  page's script takes all three from the account's profile card (the
+  avatar only with `show_avatars`); the visitor's browser fetches the
+  image from the account's own server.
+- **Headings.** A table's heading is its count: accounts that block
+  the account, accounts it blocks, and, for "Blocked By Lists", the
+  listblock records on the lists that name it, added up (an account
+  that blocks two of the lists counts twice).
 - **Handles.** A row shows the handle only once Farsight has verified
   it in both directions. A background worker checks the accounts a
   page is about to show (`handle_warming_enabled`, on by default) at

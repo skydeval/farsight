@@ -501,11 +501,49 @@ button.danger:hover {
   opacity: 0.9;
 }
 
-/* "All times are in …", under the page header. */
+/* "All times are in …", at the top right of each table's block. */
+.section-header {
+  position: relative;
+}
 p.tz-note {
-  margin: -1.25rem 0 1rem;
+  position: absolute;
+  top: 0;
+  right: 0;
+  margin: 0;
   font-size: 0.8rem;
   color: var(--muted);
+}
+/* A table's count as its heading. */
+.section-header h2 .count.count-big {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: var(--font-sans);
+  font-size: 2.1rem;
+  font-weight: 800;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  color: var(--fg-strong);
+}
+.section-header h2 {
+  align-items: baseline;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+/* Created … · Hosted on …, under the DID in the page header. */
+p.hero-facts {
+  margin: 0.45rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+p.hero-facts time, p.hero-facts .host {
+  color: var(--fg);
 }
 
 /* Tabs: one table of the page in view at a time. */
@@ -1742,7 +1780,8 @@ footer {
   }
   nav.tabs { margin: 0 -1rem; padding: 0 0.5rem; }
   nav.tabs a.tab { padding: 0.5rem 0.8rem; font-size: 0.88rem; }
-  p.tz-note { margin-top: -1.25rem; }
+  p.tz-note { position: static; text-align: right; margin-bottom: 0.25rem; }
+  .section-header h2 .count.count-big { font-size: 1.7rem; }
   .profile-id-block h1.subject .handle { font-size: 1.15rem; letter-spacing: 0; }
   .profile-id-block h1.subject .did-code { font-size: 0.76rem; }
   .data-table { font-size: 0.82rem; }

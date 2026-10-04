@@ -329,12 +329,15 @@ struct Counts {
     pages: Total,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn counts(
     r: &Req<'_>,
     key: Option<(Counted, i64)>,
     w: &Withheld,
     banned: bool,
     base: &str,
+    q: &Params,
+    keys: &[&str],
     tab: Option<&str>,
 ) -> Counts {
     let (rest, all) = match key {
@@ -350,18 +353,32 @@ async fn counts(
         _ => false,
     };
     Counts {
-        // "0 (3 counting banned accounts)": the zero is said when the
-        // second number needs it.
-        count: count_words(rest).or_else(|| more.then(|| "0".to_owned())),
+        // The number is the table's heading: zero is said, and only a
+        // count that could not be read leaves it out.
+        count: match rest {
+            Total::Rows(n) => Some(thousands(n)),
+            other => count_words(other),
+        },
         count_all: more.then(|| count_words(all)).flatten(),
         // Offered on every table of accounts, also where it would add
         // nothing: a switch that comes and goes reads as a fault.
         toggle: Some(Toggle {
-            href: paging::banned_link(base, tab, !banned),
+            href: paging::banned_link(base, q, keys, tab, !banned),
             on: banned,
         }),
         pages: if banned { all } else { rest },
     }
+}
+
+/// The listblock records on the lists naming an account, added up;
+/// `None` when the query fails or times out.
+async fn naming_listblocks(r: &Req<'_>, subject: i64, w: &Withheld) -> Option<i64> {
+    let mut tx = r.st.api.read_tx().await.ok()?;
+    let n = farsight_storage::ui_rows::lists_naming_listblocks(&mut tx, subject, &w.ids)
+        .await
+        .ok()?;
+    let _ = tx.rollback().await;
+    Some(n)
 }
 
 /// The same for the lists naming an account.
@@ -601,9 +618,6 @@ pub struct ListRow {
     pub name: Option<String>,
     /// Owner.
     pub owner: Who,
-    /// The maintained listblock counter, as a bare number: it counts
-    /// listblock records and does not apply the page's filters.
-    pub listblocks: String,
     /// `addedAt`, as stated by the list's owner.
     pub added: Option<Stamp>,
 }
@@ -713,10 +727,18 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         &withheld,
         banned,
         &base,
+        q,
+        &DID_PAGES,
         None,
     )
     .await;
     let b_total = b.pages;
+    if let Some(last) = paging::past_end(b_total, b_page, PAGE_ROWS) {
+        return Ok(redirect(
+            cfg,
+            &paging::link(&base, q, &DID_PAGES, "page", last, None),
+        ));
+    }
     let (b_rows, b_pending) = party_rows(r, &mut asked, &shown, &block_page.rows);
     let blockers = Section {
         count: b.count,
@@ -754,13 +776,23 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
                 href: list_href(&l.owner_did, &l.rkey),
                 name: l.name.as_deref().map(clean).filter(|n| !n.is_empty()),
                 owner,
-                listblocks: l.listblock_count.to_string(),
                 added: l.added_at.map(Stamp::of),
             })
         })
         .collect();
+    if let Some(last) = paging::past_end(l_total, l_page, PAGE_ROWS) {
+        return Ok(redirect(
+            cfg,
+            &paging::link(&base, q, &DID_PAGES, "lists", last, Some("lists")),
+        ));
+    }
+    // The heading: the listblocks on the lists that name the account.
+    let l_blocks = match actor {
+        Some(a) => naming_listblocks(r, a.id, &withheld).await,
+        None => Some(0),
+    };
     let lists = Section {
-        count: None,
+        count: l_blocks.map(thousands),
         count_all: None,
         toggle: None,
         empty: empty_line(&l_rows, l_pending, naming_page.more, l_page),
@@ -786,10 +818,18 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
                 &withheld,
                 banned,
                 &base,
+                q,
+                &DID_PAGES,
                 Some("outgoing"),
             )
             .await;
             let o_total = o.pages;
+            if let Some(last) = paging::past_end(o_total, o_page, PAGE_ROWS) {
+                return Ok(redirect(
+                    cfg,
+                    &paging::link(&base, q, &DID_PAGES, "out", last, Some("outgoing")),
+                ));
+            }
             let (rows, pending) = party_rows(r, &mut asked, &shown, &out_page.rows);
             fresh.push(f);
             Some(Section {
@@ -976,10 +1016,18 @@ pub async fn list(
             &withheld,
             banned,
             &base,
+            q,
+            &LIST_PAGES,
             None,
         )
         .await;
         let m_total = m.pages;
+        if let Some(last) = paging::past_end(m_total, m_page, PAGE_ROWS) {
+            return Ok(redirect(
+                cfg,
+                &paging::link(&base, q, &LIST_PAGES, "page", last, None),
+            ));
+        }
         let (rows, pending) = party_rows(r, &mut asked, &shown, &member_page.rows);
         fresh.push(&listing["freshness"]);
         Some(Section {
@@ -1009,10 +1057,25 @@ pub async fn list(
         &withheld,
         banned,
         &base,
+        q,
+        &LIST_PAGES,
         Some("listblockers"),
     )
     .await;
     let k_total = k.pages;
+    if let Some(last) = paging::past_end(k_total, k_page, PAGE_ROWS) {
+        return Ok(redirect(
+            cfg,
+            &paging::link(
+                &base,
+                q,
+                &LIST_PAGES,
+                "blockers",
+                last,
+                Some("listblockers"),
+            ),
+        ));
+    }
     let (rows, pending) = party_rows(r, &mut asked, &shown, &blocker_page.rows);
     asked.submit(r.st);
     fresh.push(&blockers_fresh);

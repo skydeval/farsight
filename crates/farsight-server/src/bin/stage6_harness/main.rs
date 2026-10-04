@@ -1658,9 +1658,9 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
     let u = h.get(&path_did(&w.unknown)).await?;
     let actors_before = h.n("SELECT count(*) FROM actors").await?;
     c.check(
-        "an unknown DID renders its sections empty with the one empty-section string and no count (never 'not found'), and is not interned",
+        "an unknown DID renders its sections empty with the one empty-section string and a count of 0 (never 'not found'), and is not interned",
         u.status == 200
-            && section(&u.text, "blockers").is_some_and(|s| s.contains(&format!("<p class=\"empty\">{EMPTY}</p>")) && !s.contains("class=\"count\""))
+            && section(&u.text, "blockers").is_some_and(|s| s.contains(&format!("<p class=\"empty\">{EMPTY}</p>")) && s.contains("<span class=\"count count-big\">0</span>"))
             && section(&u.text, "lists").is_some_and(|s| s.contains(EMPTY))
             && !u.text.contains("None found")
             && !u.text.contains("No blockers")
@@ -1756,7 +1756,10 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     );
     c.check(
         "the bounded count equals the stored count with the page's filters",
-        sec.contains(&format!("<span class=\"count\">{}</span>", want.len())),
+        sec.contains(&format!(
+            "<span class=\"count count-big\">{}</span>",
+            want.len()
+        )),
         support::truncate(sec, 120),
     );
     // An ordinary account's row (a suspended one carries a tag as well).
@@ -1774,23 +1777,24 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     let lists = section(&page.text, "lists").unwrap_or("");
     let heads: Vec<&str> = heads_of(lists);
     c.check(
-        "On lists: the columns are List, Owner, Blocked by, Added — no Purpose column",
-        heads == ["List", "Owner", "Blocked by", "Added (Owner Claim)"]
+        "Blocked By Lists: the columns are List, Owner, Added — no Purpose column, no per-list count",
+        heads == ["List", "Owner", "Added"]
             && !lists.contains("Purpose")
             && !lists.contains("moderation list</td>"),
         format!("{heads:?}"),
     );
     let stored_count = h
         .n(&format!(
-            "SELECT l.listblock_count::bigint FROM lists l JOIN actors o ON o.id = l.owner_id WHERE o.did = '{}' AND l.rkey = '{LIST}'",
-            w.o1
+            "SELECT COALESCE(sum(l.listblock_count), 0)::bigint FROM lists l JOIN actors o ON o.id = l.owner_id
+             WHERE l.id IN (SELECT list_id FROM list_items WHERE subject_id = {sid})
+               AND l.track_state IN (2, 3) AND l.record_state = 1 AND o.status NOT IN (1, 2, 4)"
         ))
         .await?;
     c.check(
-        "On lists: \"Blocked by\" is the listblock counter as a bare number, titled as a count of records; the list links to its page; a hidden owner's list is left out",
-        lists.contains(&format!(
-            "<span class=\"listblock-badge\" title=\"listblock records\">{stored_count}</span>"
-        )) && !lists.contains("listblocks</td>")
+        "Blocked By Lists: the heading is the listblock records on the lists shown, added up, with the description under it; the list links to its page; a hidden owner's list is left out and not added in",
+        lists.contains(&format!("<span class=\"count count-big\" title=\"listblock records on the lists below\">{stored_count}</span>"))
+            && lists.contains("Moderation Lists which this user has been added to.")
+            && !lists.contains("listblock-badge")
             && lists.contains(&format!("href=\"{}\"", w.list))
             && lists.contains(&format!("data-card=\"/card/{}\"", w.o1))
             && !lists.contains("hiddenowned"),
@@ -2203,7 +2207,7 @@ async fn check_coverage(
             && !page.text.contains("Partial")
             && !page.text.contains("not complete")
             && sec.contains(&format!("<p class=\"empty\">{EMPTY}</p>"))
-            && !sec.contains("class=\"count\""),
+            && sec.contains("<span class=\"count count-big\">0</span>"),
         format!("api level {}", api["freshness"]["coverage"]["level"]),
     );
     h.sql("UPDATE sweep_cycles SET completed_at = now() - interval '1 day' WHERE kind = 1")
@@ -2215,7 +2219,8 @@ async fn check_coverage(
     let page = h.get(&path_did(&w.s)).await?;
     c.check(
         "the outgoing section is off by default",
-        section(&page.text, "outgoing").is_none() && !page.text.contains("Blocks by this account"),
+        section(&page.text, "outgoing").is_none()
+            && !page.text.contains("Accounts this user has blocked."),
         "absent",
     );
     h.set(&[("show_outgoing_blocks", Some("on"))]).await?;
@@ -2237,7 +2242,7 @@ async fn check_coverage(
         row_dids(out).into_iter().collect::<BTreeSet<_>>() == want
             && want.len() == 4
             && between(&page.text, "<section id=\"", "\"") == ["blockers", "lists", "outgoing"]
-            && out.contains("<h2>Blocks by this account"),
+            && out.contains("Accounts this user has blocked."),
         format!("{} rows, {} expected", row_dids(out).len(), want.len()),
     );
     c.check(
@@ -2594,11 +2599,11 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
     let lrest = h.get(&w.list).await?;
     c.check(
         "the heading states both numbers — the blockers shown, and the number counting banned (taken-down) accounts — and offers the switch; with ?banned=1 the taken-down blocker is a row with a \"banned\" tag, the deactivated and deleted ones still are not, the page links keep the switch and the switch leads back; any other value of the parameter is redirected away",
-        rsec.contains("<span class=\"count\">62</span> <span class=\"count-all\">(63 counting banned accounts)</span>")
+        rsec.contains("<span class=\"count count-big\">62</span> <span class=\"count-all\">(63 counting banned accounts)</span>")
             && rsec.contains(&format!("href=\"{}?banned=1#blockers\"", path_did(&w.s)))
             && rsec.contains("role=\"checkbox\" aria-checked=\"false\"")
             && !row_dids(rsec).contains(taken_down)
-            && osec.contains("<span class=\"count\">62</span> <span class=\"count-all\">(63 counting banned accounts)</span>")
+            && osec.contains("<span class=\"count count-big\">62</span> <span class=\"count-all\">(63 counting banned accounts)</span>")
             && osec.contains("aria-checked=\"true\"")
             && osec.contains(&format!("href=\"{}#blockers\"", path_did(&w.s)))
             && osec.contains("<span class=\"acct-tag acct-banned\">banned</span>")
@@ -3178,11 +3183,11 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
     };
     // No public table has a Record column, whatever the viewer setting.
     let public_clean = |page: &Resp, lp: &Resp| {
-        let block_heads = ["Account", "Created (Author Claim)"];
+        let block_heads = ["Account", "Created"];
         heads(&page.text, "blockers") == block_heads
             && heads(&page.text, "outgoing") == block_heads
             && heads(&lp.text, "listblockers") == block_heads
-            && heads(&lp.text, "members") == ["Account", "Added (Owner Claim)"]
+            && heads(&lp.text, "members") == ["Account", "Added"]
             && !heads(&page.text, "lists").contains(&"Record".to_owned())
             && [page, lp].iter().all(|r| {
                 !r.text.contains("class=\"record\"")

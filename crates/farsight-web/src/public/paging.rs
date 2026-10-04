@@ -74,8 +74,9 @@ pub fn banned(q: &Params) -> bool {
 }
 
 /// `base?…` with the banned switch set to `on`, the table `tab` in view
-/// and every section back on its first page (the rows change).
-pub fn banned_link(base: &str, tab: Option<&str>, on: bool) -> String {
+/// and every table on the page it is on. (A page that the change leaves
+/// past a table's end is answered with its last page.)
+pub fn banned_link(base: &str, q: &Params, keys: &[&str], tab: Option<&str>, on: bool) -> String {
     let mut s = url::form_urlencoded::Serializer::new(String::new());
     if let Some(t) = tab {
         s.append_pair(TAB, t);
@@ -83,11 +84,28 @@ pub fn banned_link(base: &str, tab: Option<&str>, on: bool) -> String {
     if on {
         s.append_pair(BANNED, "1");
     }
+    for k in keys {
+        if let Some(v) = q.get(k).filter(|v| *v != "1") {
+            s.append_pair(k, v);
+        }
+    }
     let query = s.finish();
     if query.is_empty() {
         base.to_owned()
     } else {
         format!("{base}?{query}")
+    }
+}
+
+/// The last page of a section of `total` rows, if `page` lies beyond it.
+/// Unknown and open-ended totals have no last page to go back to.
+pub fn past_end(total: Total, page: i64, size: i64) -> Option<i64> {
+    match total {
+        Total::Rows(n) => {
+            let last = ((n + size - 1) / size).max(1);
+            (page > last).then_some(last)
+        }
+        _ => None,
     }
 }
 
@@ -420,11 +438,31 @@ mod tests {
             tab_link("/did/x", &b, &keys, Some("lists")),
             "/did/x?tab=lists&banned=1&lists=3"
         );
-        assert_eq!(banned_link("/did/x", None, true), "/did/x?banned=1");
+        // The switch keeps the pages the tables are on.
         assert_eq!(
-            banned_link("/did/x", Some("outgoing"), false),
-            "/did/x?tab=outgoing"
+            banned_link("/did/x", &b, &keys, None, false),
+            "/did/x?lists=3"
         );
+        assert_eq!(
+            banned_link(
+                "/did/x",
+                &Params::parse("page=3"),
+                &keys,
+                Some("outgoing"),
+                true
+            ),
+            "/did/x?tab=outgoing&banned=1&page=3"
+        );
+        assert_eq!(
+            banned_link("/did/x", &Params::default(), &keys, None, true),
+            "/did/x?banned=1"
+        );
+        // A page past the end goes back to the last one.
+        assert_eq!(past_end(Total::Rows(120), 3, 50), None);
+        assert_eq!(past_end(Total::Rows(100), 3, 50), Some(2));
+        assert_eq!(past_end(Total::Rows(0), 2, 50), Some(1));
+        assert_eq!(past_end(Total::MoreThan(1_000), 99, 50), None);
+        assert_eq!(past_end(Total::Unknown, 99, 50), None);
     }
 
     #[test]

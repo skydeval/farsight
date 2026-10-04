@@ -536,6 +536,28 @@ pub async fn lists_naming_count(
     .await?)
 }
 
+/// The listblock counters of the lists [`lists_naming`] would return for
+/// `subject_id`, added up: how many listblock records there are on the
+/// lists that name the account. An account that blocks two of the lists
+/// counts twice.
+pub async fn lists_naming_listblocks(
+    conn: &mut PgConnection,
+    subject_id: i64,
+    excluded: &[i64],
+) -> Result<i64> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT COALESCE(sum(l.listblock_count), 0)::bigint
+         FROM (SELECT DISTINCT li.list_id FROM list_items li
+               WHERE li.subject_id = $1) x
+         {}",
+        naming_from()
+    ))
+    .bind(subject_id)
+    .bind(excluded)
+    .fetch_one(conn)
+    .await?)
+}
+
 /// The plan of the query [`rows`] runs, one line per plan node
 /// (`EXPLAIN (ANALYZE, COSTS OFF)`). The Phase B harness checks that each
 /// section's shown-time order runs on its index.

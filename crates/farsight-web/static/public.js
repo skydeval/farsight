@@ -702,6 +702,37 @@
     }
   }
 
+  // Under the DID in the account page's header: when the DID was created
+  // and which host holds the account, as the profile card knows them.
+  function heroFacts(card) {
+    var line = document.querySelector("[data-hero-facts]");
+    if (!line) {
+      return;
+    }
+    var made = card.querySelector(".pc-facts time[datetime]");
+    var pc = card.querySelector(".pc");
+    var host = pc ? pc.getAttribute("data-pds") : null;
+    if (made) {
+      line.appendChild(document.createTextNode("Created "));
+      var t = document.createElement("time");
+      t.setAttribute("datetime", made.getAttribute("datetime"));
+      t.setAttribute("data-abs", "");
+      t.textContent = made.textContent.replace(/ UTC$/, "");
+      line.appendChild(t);
+    }
+    if (host) {
+      line.appendChild(document.createTextNode(made ? " \u00b7 Hosted on " : "Hosted on "));
+      var h = document.createElement("span");
+      h.className = "host";
+      h.textContent = host;
+      line.appendChild(h);
+    }
+    if (made || host) {
+      line.hidden = false;
+      times(line);
+    }
+  }
+
   // The account page's header shows the account's avatar. The server
   // does not know it; the profile card does (and says nothing where
   // avatars are switched off), so the image is taken from the card.
@@ -718,7 +749,9 @@
         return r.text();
       })
       .then(function (html) {
-        var found = new DOMParser().parseFromString(html, "text/html").querySelector("img.pc-avatar");
+        var card = new DOMParser().parseFromString(html, "text/html");
+        heroFacts(card);
+        var found = card.querySelector("img.pc-avatar");
         if (!found) {
           return;
         }
@@ -759,8 +792,18 @@
       var href = a.getAttribute("href");
       fetch(href, { credentials: "same-origin", cache: "no-store" })
         .then(function (r) {
-          if (r.status !== 200 || r.redirected) {
+          if (r.status !== 200) {
             throw new Error("not the page");
+          }
+          // A table that got shorter answers with its last page: the
+          // address shown is the one the server settled on.
+          if (r.redirected) {
+            var to = new URL(r.url);
+            if (to.origin !== location.origin) {
+              throw new Error("not the page");
+            }
+            var hash = href.indexOf("#");
+            href = to.pathname + to.search + (hash < 0 ? "" : href.slice(hash));
           }
           return r.text();
         })
@@ -778,6 +821,7 @@
             nav.innerHTML = freshNav.innerHTML;
           }
           times(box);
+          zoneNote();
           fitPagers();
           try {
             history.replaceState(null, "", href);
@@ -834,6 +878,7 @@
               if (here.querySelector("[data-pending]") && fresh && fresh.tagName === "SECTION") {
                 here.innerHTML = fresh.innerHTML;
                 times(here);
+                zoneNote();
                 fitPagers();
               }
             }

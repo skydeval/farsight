@@ -125,6 +125,9 @@ struct CardView {
     /// `unknown` (did:web) or `unavailable` (the fetch failed).
     created_words: &'static str,
     note: Option<&'static str>,
+    /// The host of the account's PDS, as its identity names it. Not
+    /// printed in the card: the account page's header reads it.
+    pds_host: Option<String>,
 }
 
 /// What the identity fetch says about an account.
@@ -399,6 +402,7 @@ fn short_card(st: &WebState, did: &Did, created_unavailable: bool) -> CardView {
         created: None,
         created_words: "unavailable",
         note: Some("Profile not available right now."),
+        pds_host: None,
     }
 }
 
@@ -512,6 +516,11 @@ async fn card(
         created: ident.created.map(Stamp::of),
         created_words: "unknown",
         note: None,
+        pds_host: ident
+            .pds
+            .as_deref()
+            .and_then(|p| Url::parse(p).ok())
+            .and_then(|u| u.host_str().map(clean)),
     };
     if failed {
         m::card(Outcome::PdsFailed);

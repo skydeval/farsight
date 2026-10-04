@@ -922,7 +922,7 @@ async fn check_order(
         section(&past.text, "blockers").unwrap_or(""),
     );
     c.check(
-        "\"Blocked by\" is 50 rows a page with numbered page controls, plain links with the page in the query: 305 records are seven pages; the controls list the pages (a run of up to twenty-five around the current one, with the first and last page and a gap where pages are left out; the page's script hides what does not fit the row) and arrows that are not links at the ends; page 4 is rows 151–200 of the order; a page past the end is an empty table that still leads back",
+        "\"Blocked by\" is 50 rows a page with numbered page controls, plain links with the page in the query: 305 records are seven pages; the controls list the pages (a run of up to twenty-five around the current one, with the first and last page and a gap where pages are left out; the page's script hides what does not fit the row) and arrows that are not links at the ends; page 4 is rows 151–200 of the order; a page past the end is answered with the last page",
         pages == 7
             && row_dids(sec).len() == 50
             && controls_of(sec) == "(←) [1] 2 3 4 5 6 7 →"
@@ -931,9 +931,9 @@ async fn check_order(
             && row_dids(mid_sec) == want[150..200]
             && controls_of(last_sec) == "← 1 2 3 4 5 6 [7] (→)"
             && row_dids(last_sec).len() == 5
-            && past.status == 200
-            && row_dids(past_sec).is_empty()
-            && controls_of(past_sec).starts_with("← 1 ")
+            && past.status == 303
+            && past.header("location").as_deref() == Some(at(7).as_str())
+            && past_sec.is_empty()
             && !sec.contains("hx-")
             && !sec.contains("Load more"),
         format!("{pages} pages; {:?} / {:?} / {:?} / {:?}", controls_of(sec), controls_of(mid_sec), controls_of(last_sec), controls_of(past_sec)),
@@ -1294,7 +1294,7 @@ async fn check_public_columns(c: &mut Checks, a: &Srv, w: &World) -> Result<(), 
     let page = a.get(&public_did(&w.t4)).await?;
     let out = a.get(&public_did(&w.o4)).await?;
     let list = a.get(&w.l4_path).await?;
-    let two = ["Account", "Created (Author Claim)"];
+    let two = ["Account", "Created"];
     let clean = |r: &Resp| {
         !r.text.contains("class=\"record\"")
             && !r.text.contains("/app.bsky.graph.block/")
@@ -1307,7 +1307,7 @@ async fn check_public_columns(c: &mut Checks, a: &Srv, w: &World) -> Result<(), 
             && heads(section(&out.text, "outgoing").unwrap_or("")) == two
             && heads(section(&list.text, "listblockers").unwrap_or("")) == two
             && heads(section(&list.text, "members").unwrap_or(""))
-                == ["Account", "Added (Owner Claim)"]
+                == ["Account", "Added"]
             && [&page, &out, &list].iter().all(|r| r.status == 200 && clean(r)),
         format!("{:?}", heads(section(&page.text, "blockers").unwrap_or(""))),
     );

@@ -1,4 +1,4 @@
-<div class="pc">
+<div class="pc"{% if let Some(p) = pds_host %} data-pds="{{ p }}"{% endif %}>
 <div class="pc-header">
 {% if let Some(a) = avatar %}<img class="pc-avatar" src="{{ a }}" alt="" width="56" height="56" loading="lazy" referrerpolicy="no-referrer">{% else if placeholder %}<span class="pc-avatar pc-none" aria-hidden="true"></span>{% endif %}
 <div class="pc-identity">

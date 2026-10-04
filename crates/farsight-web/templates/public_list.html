@@ -24,7 +24,6 @@
 
 </div>
 
-<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
 {% if tabs.len() > 1 %}<nav class="tabs" role="tablist" aria-label="Tables">
 {% for t in tabs %}<a class="tab{% if t.active %} active{% endif %}" role="tab" href="{{ t.href }}" data-tab="{{ t.id }}" aria-controls="{{ t.id }}" aria-selected="{% if t.active %}true{% else %}false{% endif %}">{{ t.label }}</a>
 {% endfor %}</nav>{% endif %}
@@ -32,6 +31,7 @@
 {% if let Some(members) = members %}
 <section id="members" class="card data-section tab-panel">
 <div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
 <h2>Members <span class="count">{{ stored_members }} stored members</span>{% if let Some(n) = members.count_all %} <span class="count-all">({{ n }} counting banned accounts)</span>{% endif %}</h2>
 <p class="muted">The stored count is this instance's own counter; it does not apply this page's filters, so it can exceed the rows below.</p>
 </div>
@@ -43,7 +43,7 @@
 <thead>
 <tr>
 <th scope="col" class="th-account">Account</th>
-<th scope="col" class="th-date">Added (Owner Claim)</th>
+<th scope="col" class="th-date">Added</th>
 </tr>
 </thead>
 <tbody>
@@ -75,6 +75,7 @@
 
 <section id="listblockers" class="card data-section tab-panel">
 <div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
 <h2>Blocked by{% if let Some(n) = blockers.count %} <span class="count">{{ n }}</span>{% endif %}{% if let Some(n) = blockers.count_all %} <span class="count-all">({{ n }} counting banned accounts)</span>{% endif %}</h2>
 <p class="muted">Accounts with a listblock on this list.</p>
 </div>
@@ -86,7 +87,7 @@
 <thead>
 <tr>
 <th scope="col" class="th-account">Account</th>
-<th scope="col" class="th-date">Created (Author Claim)</th>
+<th scope="col" class="th-date">Created</th>
 </tr>
 </thead>
 <tbody>
