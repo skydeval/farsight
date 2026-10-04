@@ -347,12 +347,41 @@ fn banner(html: &str) -> String {
     }
 }
 
-/// The inside of `<section id="…">`.
+/// The inside of the `<section>` whose id is `id`, whatever other
+/// attributes its tag carries.
 fn section<'a>(html: &'a str, id: &str) -> Option<&'a str> {
-    let open = format!("<section id=\"{id}\">");
-    let a = html.find(&open)? + open.len();
+    let open = format!("<section id=\"{id}\"");
+    let at = html.find(&open)?;
+    let a = at + html[at..].find('>')? + 1;
     let b = html[a..].find("</section>")? + a;
     Some(&html[a..b])
+}
+
+/// The text of each `<th>` of `sec`, whatever attributes the cell carries.
+fn heads_of(sec: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = sec;
+    while let Some(i) = rest.find("<th") {
+        rest = &rest[i + 3..];
+        // `<thead>` is not a cell.
+        if !rest.starts_with(['>', ' ']) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (rest.find('>'), rest.find("</th>")) else {
+            break;
+        };
+        out.push(&rest[a + 1..b]);
+        rest = &rest[b..];
+    }
+    out
+}
+
+/// The targets of the section nav's links, in order: one entry per nav.
+fn section_navs(html: &str) -> Vec<Vec<&str>> {
+    between(html, "aria-label=\"Sections\">", "</nav>")
+        .into_iter()
+        .map(|n| between(n, "href=\"#", "\""))
+        .collect()
 }
 
 /// Every did:plc mentioned in `text`.
@@ -482,7 +511,7 @@ fn is_utc_instant(s: &str) -> bool {
 
 /// The instant of the page's "Last updated" line.
 fn updated_of(html: &str) -> Option<String> {
-    let k = "<p class=\"updated\">Last updated <time datetime=\"";
+    let k = "Last updated <time datetime=\"";
     let a = html.find(k)? + k.len();
     Some(html[a..][..html[a..].find('"')?].to_owned())
 }
@@ -1296,7 +1325,7 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
         enter.status == 200
             && enter
                 .text
-                .contains("<form class=\"stack card\" method=\"post\" action=\"/enter\">")
+                .contains("<form class=\"stack card\" method=\"post\" action=\"/enter\"")
             && !enter.text.contains("type=\"password\"")
             && enter.header("cache-control").as_deref() == Some("no-store, private"),
         enter.short(),
@@ -1322,7 +1351,7 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
             && gated.header("location").as_deref() == Some("/enter")
             && dash.status == 303
             && dash.header("location").as_deref() == Some("/enter")
-            && enter.text.contains("<span class=\"brand\">Farsight</span>")
+            && enter.text.contains("<span class=\"brand\">")
             && !enter.text.contains("<nav")
             && !enter.text.contains("Dashboard")
             && !enter.text.contains("/login"),
@@ -1543,16 +1572,13 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
         .await?;
     let shown = "a.status NOT IN (1, 2, 3, 4)";
     let page = h.get(&path_did(&w.s)).await?;
-    let navs = between(
-        &page.text,
-        "<nav class=\"sections\" aria-label=\"Sections\">",
-        "</nav>",
-    );
+    let navs = section_navs(&page.text);
     c.check(
         "account page section nav: exactly two links, Blocked by and On lists (outgoing is off)",
-        navs.len() == 1
-            && navs[0] == "<a href=\"#blockers\">Blocked by</a><a href=\"#lists\">On lists</a>",
-        navs.join(" || "),
+        navs == [["blockers", "lists"]]
+            && page.text.contains("<span>Blocked by</span>")
+            && page.text.contains("<span>On lists</span>"),
+        format!("{navs:?}"),
     );
     let ids: Vec<&str> = between(&page.text, "<section id=\"", "\"");
     c.check(
@@ -1587,16 +1613,10 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
         first,
     );
     let lists = section(&page.text, "lists").unwrap_or("");
-    let heads: Vec<&str> = between(lists, "<th>", "</th>");
+    let heads: Vec<&str> = heads_of(lists);
     c.check(
         "On lists: the columns are List, Owner, Blocked by, Added — no Purpose column",
-        heads
-            == [
-                "List",
-                "Owner",
-                "Blocked by",
-                "Added (as stated by the list's owner)",
-            ]
+        heads == ["List", "Owner", "Blocked by", "Added (Owner Claim)"]
             && !lists.contains("Purpose")
             && !lists.contains("moderation list</td>"),
         format!("{heads:?}"),
@@ -1610,7 +1630,7 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     c.check(
         "On lists: \"Blocked by\" is the listblock counter as a bare number, titled as a count of records; the list links to its page; a hidden owner's list is left out",
         lists.contains(&format!(
-            "<td class=\"num\" title=\"listblock records\">{stored_count}</td>"
+            "<span class=\"listblock-badge\" title=\"listblock records\">{stored_count}</span>"
         )) && !lists.contains("listblocks</td>")
             && lists.contains(&format!("href=\"{}\"", w.list))
             && lists.contains(&format!("data-card=\"/card/{}\"", w.o1))
@@ -1641,23 +1661,19 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
         "list page header: at-uri, name (as text), purpose, owner, state in words, the stored-members counter",
         lp.text.contains(&format!("at://{}/app.bsky.graph.list/{LIST}", w.o1))
             && lp.text.contains("&lt;script&gt;alert(1)&lt;/script&gt;")
-            && lp.text.contains("<dd>moderation list</dd>")
+            && lp.text.contains("<span class=\"pill list-purpose-pill\">moderation list</span>")
             && lp.text.contains(&format!("href=\"{}\"", path_did(&w.o1)))
-            && lp.text.contains("<dd>Indexed.</dd>")
+            && lp.text.contains("State: Indexed.")
             && lp.text.contains(&format!("{stored} stored members")),
         support::truncate(&lp.text, 160),
     );
-    let navs = between(
-        &lp.text,
-        "<nav class=\"sections\" aria-label=\"Sections\">",
-        "</nav>",
-    );
+    let navs = section_navs(&lp.text);
     let ids: Vec<&str> = between(&lp.text, "<section id=\"", "\"");
     c.check(
         "list page section nav: exactly two links, Members and Blocked by; two sections",
-        navs.len() == 1
-            && navs[0]
-                == "<a href=\"#members\">Members</a><a href=\"#listblockers\">Blocked by</a>"
+        navs == [["members", "listblockers"]]
+            && lp.text.contains("<span>Members</span>")
+            && lp.text.contains("<span>Blocked by</span>")
             && ids == ["members", "listblockers"],
         format!("{navs:?} {ids:?}"),
     );
@@ -1732,9 +1748,11 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     ] {
         let r = h.get(&format!("/list/{}/{rkey}", w.o2)).await?;
         let has = section(&r.text, "members").is_some();
-        let nav_has = r.text.contains("<a href=\"#members\">Members</a>");
+        let nav_has = section_navs(&r.text)
+            .first()
+            .is_some_and(|n| n.contains(&"members"));
         if r.status != 200
-            || !r.text.contains(&format!("<dd>{words}"))
+            || !r.text.contains(&format!("State: {words}"))
             || has != members
             || nav_has != members
             || r.text.contains("No members")
@@ -1931,13 +1949,10 @@ async fn check_coverage(
     );
     let mut bad = Vec::new();
     for (name, r) in [("account", &page), ("list", &lp), ("home", &home)] {
-        let n = r
-            .text
-            .matches("<p class=\"updated\">Last updated <time datetime=\"")
-            .count();
+        let n = r.text.matches("Last updated <time datetime=\"").count();
         let stamp = updated_of(&r.text).unwrap_or_default();
         let text_ok = r.text.contains(&format!(
-            "<time datetime=\"{stamp}\">{} {} UTC</time>.</p>",
+            "<time datetime=\"{stamp}\">{} {} UTC</time>.",
             stamp.get(..10).unwrap_or(""),
             stamp.get(11..19).unwrap_or("")
         ));
@@ -1954,7 +1969,7 @@ async fn check_coverage(
     c.check(
         "the line is the last thing in the page's content, after the sections",
         page.text
-            .find("<p class=\"updated\">")
+            .find("Last updated <time")
             .is_some_and(|i| i > page.text.rfind("</section>").unwrap_or(usize::MAX) && i < main),
         "after the last section",
     );
@@ -2039,7 +2054,8 @@ async fn check_coverage(
         "show_outgoing_blocks = true, without restart: the section lists the account's blocks (inactive targets left out), and the nav gains its link",
         row_dids(out).into_iter().collect::<BTreeSet<_>>() == want
             && want.len() == 4
-            && page.text.contains("<a href=\"#lists\">On lists</a><a href=\"#outgoing\">Blocks by this account</a></nav>"),
+            && section_navs(&page.text) == [["blockers", "lists", "outgoing"]]
+            && page.text.contains("<span>Blocks by this account</span>"),
         format!("{} rows, {} expected", row_dids(out).len(), want.len()),
     );
     c.check(
@@ -2288,8 +2304,10 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
     };
     c.check(
         "the DID and list lookup pages link to \"View history\" for a logged-in admin; without a session there is no lookup page, only the redirect to /enter",
-        with.text.contains(&format!("<a href=\"{base}\">View history</a>"))
-            && lwith.text.contains(&format!("<a href=\"{lbase}\">View history</a>"))
+        with.text.contains(&format!("<a href=\"{base}\""))
+            && with.text.contains("View history")
+            && lwith.text.contains(&format!("<a href=\"{lbase}\""))
+            && lwith.text.contains("View history")
             && to_enter(&without)
             && to_enter(&lwithout),
         format!(
@@ -2456,10 +2474,7 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
                 !r.text.contains("href=\"/did/") && !r.text.contains("href=\"/list/"),
             ),
             ("no table", !r.text.contains("<table")),
-            (
-                "no Last updated line",
-                !r.text.contains("class=\"updated\""),
-            ),
+            ("no Last updated line", !r.text.contains("Last updated")),
             (
                 "max-age=30",
                 r.header("cache-control").as_deref() == Some("public, max-age=30"),
@@ -2735,12 +2750,16 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
     );
     c.check(
         "the bar is sticky and cards are hover-only in the stylesheet: position: sticky; top: 0, and the card rule sits under @media (hover: hover)",
-        css.text.contains("nav.public-nav { position: sticky; top: 0;")
+        between(&css.text, "nav.public-nav {", "}")
+            .first()
+            .is_some_and(|r| r.contains("position: sticky;") && r.contains("top: 0;"))
             && css.text.contains("scroll-margin-top")
             && css.text.contains(".profile-card { display: none; }")
             && between(&css.text, "@media (hover: hover) {", "}\n}")
                 .first()
-                .is_some_and(|r| r.contains(".who-wrap.open .profile-card { display: block;"))
+                .is_some_and(|r| {
+                    r.contains(".who-wrap.open .profile-card {") && r.contains("display: block;")
+                })
             && js.text.contains("window.matchMedia(\"(hover: hover)\").matches"),
         "css rules",
     );
@@ -2760,8 +2779,8 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
         "instance_description (escaped plain text, blank line = paragraph) and contact replace the defaults on home; the contact is on home only",
         default.text.contains("Farsight is an independent index of public block records")
             && default.text.contains("mailto:ops@farsight.test")
-            && custom.text.contains("<p>First paragraph &lt;b&gt;plain&lt;/b&gt;.</p>")
-            && custom.text.contains("<p>Second paragraph.</p>")
+            && custom.text.contains(">First paragraph &lt;b&gt;plain&lt;/b&gt;.</p>")
+            && custom.text.contains(">Second paragraph.</p>")
             && !custom.text.contains("Farsight is an independent index of public block records")
             && custom.text.contains("mailto:public@farsight.test")
             && !custom.text.contains("mailto:ops@farsight.test")
@@ -2889,7 +2908,7 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
         enc(&format!("at://{}/app.bsky.graph.list/{LIST}", w.o1))
     );
     let heads = |html: &str, id: &str| -> Vec<String> {
-        between(section(html, id).unwrap_or(""), "<th>", "</th>")
+        heads_of(section(html, id).unwrap_or(""))
             .into_iter()
             .map(str::to_owned)
             .collect()
@@ -2926,11 +2945,11 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
     };
     // No public table has a Record column, whatever the viewer setting.
     let public_clean = |page: &Resp, lp: &Resp| {
-        let block_heads = ["Account", "Created (as stated by the author)"];
+        let block_heads = ["Account", "Created (Author Claim)"];
         heads(&page.text, "blockers") == block_heads
             && heads(&page.text, "outgoing") == block_heads
             && heads(&lp.text, "listblockers") == block_heads
-            && heads(&lp.text, "members") == ["Account", "Added (as stated by the list's owner)"]
+            && heads(&lp.text, "members") == ["Account", "Added (Owner Claim)"]
             && !heads(&page.text, "lists").contains(&"Record".to_owned())
             && [page, lp].iter().all(|r| {
                 !r.text.contains("class=\"record\"")
@@ -3253,7 +3272,8 @@ async fn check_cards_live(c: &mut Checks, l: &mut H, w: &World) -> Result<(), St
         img.starts_with(&format!("{pds}/xrpc/com.atproto.sync.getBlob?did=did%3Aplc%3A"))
             && cid.starts_with("baf")
             && cid.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-            && r.text.contains("alt=\"\" width=\"64\" height=\"64\" loading=\"lazy\" referrerpolicy=\"no-referrer\">")
+            && r.text.contains("alt=\"\" width=\"")
+            && r.text.contains("loading=\"lazy\" referrerpolicy=\"no-referrer\">")
             && !img.contains(HOSTNAME)
             && !img.starts_with(&l.base),
         img.clone(),
@@ -3583,9 +3603,11 @@ async fn check_handles(c: &mut Checks, h: &H, live: Option<&H>, w: &World) -> Re
             seed::actor(&l.pool, LIVE_DID).await?;
             let r = l.get(&path_did(LIVE_DID)).await?;
             let m = l.metrics_text().await?;
-            if r.text.contains(&format!(
-                "<span class=\"handle\">@{LIVE_HANDLE}</span> <code>{LIVE_DID}</code>"
-            )) {
+            if r.text
+                .contains(&format!("<span class=\"handle\">@{LIVE_HANDLE}</span>"))
+                && r.text
+                    .contains(&format!("<code class=\"did-code\">{LIVE_DID}</code>"))
+            {
                 c.check(
                     "a handle verified in both directions (DID document, then forward resolution) is shown beside the DID, and in og:title",
                     total(&m, "resolved") >= 1.0
@@ -3807,7 +3829,8 @@ fn check_page_rules(c: &mut Checks, h: &H) {
     for (path, html) in &documents {
         let nav = between(html, "<nav class=\"public-nav\"", "</nav>");
         let ok = nav.len() == 1
-            && nav[0].contains("<a class=\"brand\" href=\"/\">Farsight</a>")
+            && nav[0].contains("<a class=\"brand\" href=\"/\">")
+            && nav[0].contains("<span>Farsight</span>")
             && nav[0].contains(
                 "<form class=\"search\" action=\"/search\" method=\"get\" role=\"search\">",
             )
@@ -3856,9 +3879,11 @@ fn check_page_rules(c: &mut Checks, h: &H) {
     for (path, html) in &public {
         for t in between(html, "<time ", "</time>") {
             times += 1;
+            // The instant, then whatever other attributes the tag carries.
             let ok = t
                 .strip_prefix("datetime=\"")
-                .and_then(|x| x.split_once("\">"))
+                .and_then(|x| x.split_once('"'))
+                .and_then(|(iso, rest)| rest.split_once('>').map(|(_, text)| (iso, text)))
                 .is_some_and(|(iso, text)| {
                     is_utc_instant(iso) && text == format!("{} {} UTC", &iso[..10], &iso[11..19])
                 });

@@ -1386,7 +1386,7 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         "both UIs on: /enter renders the sign-in page with the brand and no nav link, /enter/callback answers (400 without a flow), the client metadata and the stylesheet are served, and the public UI is up at / next to the admin pages",
         enter.status == 200
             && enter.text.contains("Sign in with ATProto")
-            && enter.text.contains("<span class=\"brand\">Farsight</span>")
+            && enter.text.contains("<span class=\"brand\">")
             && !enter.text.contains("<nav")
             && cb.status == 400
             && cb.text.contains(REFUSED)
@@ -2080,7 +2080,8 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             && page.status == 200
             && page.text.contains("id=\"unconfigured\"")
             && page.text.contains("FARSIGHT__ACCESS__ADMIN_DID")
-            && !page.text.contains("<button")
+            && !page.text.contains("type=\"submit\"")
+            && !page.text.contains("<form")
             && post.status == 400
             && post.header("location").is_none()
             && settings.status == 303

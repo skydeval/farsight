@@ -11,8 +11,8 @@
 import { chromium } from "playwright";
 
 const [base, accountPath, operatorDefault, livePath, liveDid, liveHandle] = process.argv.slice(2);
-const DARK_BG = "rgb(21, 21, 23)";
-const LIGHT_BG = "rgb(247, 247, 245)";
+const DARK_BG = "rgb(9, 12, 21)";
+const LIGHT_BG = "rgb(248, 250, 252)";
 const ZONE = "America/New_York";
 
 function out(what, ok, detail = "") {

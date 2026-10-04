@@ -346,10 +346,12 @@ fn between<'a>(html: &'a str, open: &str, close: &str) -> Vec<&'a str> {
     out
 }
 
-/// The inside of `<section id="…">` of a public page.
+/// The inside of the `<section>` of a public page whose id is `id`,
+/// whatever other attributes its tag carries.
 fn section<'a>(html: &'a str, id: &str) -> Option<&'a str> {
-    let open = format!("<section id=\"{id}\">");
-    let a = html.find(&open)? + open.len();
+    let open = format!("<section id=\"{id}\"");
+    let at = html.find(&open)?;
+    let a = at + html[at..].find('>')? + 1;
     let b = html[a..].find("</section>")? + a;
     Some(&html[a..b])
 }
@@ -388,16 +390,28 @@ fn next_of(sec: &str) -> Option<String> {
 
 /// The "Next page" link of an admin section.
 fn admin_next(sec: &str) -> Option<String> {
-    let b = sec.find("\">Next page</a>")?;
+    let b = sec.find("\">Next page")?;
     let a = sec[..b].rfind("href=\"")? + 6;
     Some(sec[a..b].replace("&amp;", "&"))
 }
 
+/// The text of each `<th>` of `sec`, whatever attributes the cell carries.
 fn heads(sec: &str) -> Vec<String> {
-    between(sec, "<th>", "</th>")
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+    let mut out = Vec::new();
+    let mut rest = sec;
+    while let Some(i) = rest.find("<th") {
+        rest = &rest[i + 3..];
+        // `<thead>` is not a cell.
+        if !rest.starts_with(['>', ' ']) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (rest.find('>'), rest.find("</th>")) else {
+            break;
+        };
+        out.push(rest[a + 1..b].to_owned());
+        rest = &rest[b..];
+    }
+    out
 }
 
 /// The value of query parameter `key` of a relative link (cursors are
@@ -992,7 +1006,7 @@ async fn check_future_dates(
     let page = a.get(&public_did(&w.t2)).await?;
     c.check(
         "the Created cell still shows what the author stated (the year 9999): only the order is clamped",
-        section(&page.text, "blockers").is_some_and(|s| s.contains("<time datetime=\"9999-12-31T00:00:00Z\">")),
+        section(&page.text, "blockers").is_some_and(|s| s.contains("<time datetime=\"9999-12-31T00:00:00Z\"")),
         "stated value shown",
     );
     Ok(())
@@ -1171,7 +1185,7 @@ async fn check_public_columns(c: &mut Checks, a: &Srv, w: &World) -> Result<(), 
     let page = a.get(&public_did(&w.t4)).await?;
     let out = a.get(&public_did(&w.o4)).await?;
     let list = a.get(&w.l4_path).await?;
-    let two = ["Account", "Created (as stated by the author)"];
+    let two = ["Account", "Created (Author Claim)"];
     let clean = |r: &Resp| {
         !r.text.contains("class=\"record\"")
             && !r.text.contains("/app.bsky.graph.block/")
@@ -1184,7 +1198,7 @@ async fn check_public_columns(c: &mut Checks, a: &Srv, w: &World) -> Result<(), 
             && heads(section(&out.text, "outgoing").unwrap_or("")) == two
             && heads(section(&list.text, "listblockers").unwrap_or("")) == two
             && heads(section(&list.text, "members").unwrap_or(""))
-                == ["Account", "Added (as stated by the list's owner)"]
+                == ["Account", "Added (Owner Claim)"]
             && [&page, &out, &list].iter().all(|r| r.status == 200 && clean(r)),
         format!("{:?}", heads(section(&page.text, "blockers").unwrap_or(""))),
     );

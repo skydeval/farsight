@@ -34,8 +34,14 @@ async function header(page) {
   return page.evaluate(async () => {
     const h = document.querySelector("header.top");
     const style = getComputedStyle(h);
-    window.scrollTo(0, document.body.scrollHeight);
-    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    // The page may still be growing, and some engines move the window
+    // over several frames: scroll until the position stops changing.
+    let last = -1;
+    for (let i = 0; i < 100 && window.scrollY !== last; i++) {
+      last = window.scrollY;
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    }
     const box = h.getBoundingClientRect();
     return {
       position: style.position,
