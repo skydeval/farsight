@@ -900,12 +900,42 @@
         if (done) {
           done();
         }
+        release(box);
       })
       .catch(function () {
         if (run === swapRun) {
           fallback();
         }
       });
+  }
+
+  // A turned page can come back shorter than the one before it: rows
+  // whose accounts are still being checked are left out and arrive a
+  // moment later. A shorter page would pull the window up, and each
+  // arrival would push it down again. The tables' box keeps the height
+  // it had until its rows are all there and letting go moves nothing.
+  function hold(box) {
+    if (box) {
+      // As a flow root the box contains its last table's bottom margin,
+      // which otherwise reaches outside it and is lost when the box is
+      // taller than its content.
+      box.style.display = "flow-root";
+      box.style.minHeight = box.offsetHeight + "px";
+    }
+  }
+  function release(box) {
+    if (!box || !box.style.minHeight || box.querySelector("[data-pending]")) {
+      return;
+    }
+    var kept = box.style.minHeight;
+    box.style.minHeight = "";
+    var page = document.documentElement;
+    if (page.scrollHeight < window.scrollY + window.innerHeight - 1) {
+      // The window is below where the page would now end: keep the room.
+      box.style.minHeight = kept;
+    } else {
+      box.style.display = "";
+    }
   }
 
   // Page controls turn the table where it stands. Followed as links they
@@ -932,9 +962,18 @@
       var x = window.scrollX;
       var y = window.scrollY;
       section.setAttribute("aria-busy", "true");
+      hold(document.querySelector(".tabbed"));
       swapTo(
         href,
         function () {
+          // If the page is still too short for where the window was (a
+          // margin that no longer collapses is enough), give the tables'
+          // box the difference.
+          var box = document.querySelector(".tabbed");
+          var short = y + window.innerHeight - document.documentElement.scrollHeight;
+          if (short > 0 && box && box.style.minHeight) {
+            box.style.minHeight = parseFloat(box.style.minHeight) + short + "px";
+          }
           window.scrollTo(x, y);
           var again = document.getElementById(id);
           var controls = again ? again.querySelectorAll("nav.pager") : [];
