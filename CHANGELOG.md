@@ -74,6 +74,9 @@ Database schema version 11.
 
 ### Fixed
 
+- The handle pass does not wait when the checks that failed are mostly
+  handles under one domain: a single host that is down no longer holds
+  up every other account.
 - Outbound connections are closed ten seconds after their last request
   instead of ninety. Checking handles at a steady rate held one open
   connection per account checked, which reached the process's limit of

@@ -15,7 +15,9 @@
 //!   budget of pages and cards (`handle_rps`) is not drawn on.
 //! - **It backs off.** When more than half of a batch could not be
 //!   established (hosts refusing or timing out), the pass waits, a
-//!   minute at first and up to half an hour, before it goes on.
+//!   minute at first and up to half an hour, before it goes on. Not
+//!   when the failures are mostly handles under one domain: one host
+//!   that is down says nothing about the others.
 //! - A check that establishes nothing (no answer from the directory or
 //!   the handle's host, no address for it, a timeout) stores nothing the
 //!   first time: the account is checked once more after the batch, or
@@ -143,6 +145,27 @@ async fn check(st: &WebState, cfg: &Config, did: &Did) -> (Checked, Option<Strin
     }
 }
 
+/// The domain a handle that could not be resolved is under (`pds.example`
+/// for `alice.pds.example`), read from the resolution's error text.
+fn failed_under(why: &str) -> Option<String> {
+    let handle = why.strip_prefix("could not resolve ")?.split(':').next()?;
+    handle.split_once('.').map(|(_, parent)| parent.to_owned())
+}
+
+/// Whether the checks of a batch that established nothing point at one
+/// place: more than half of them are handles under the same domain. One
+/// host that is down says nothing about the rest, and the pass goes on.
+fn one_host(failed: &[Option<String>]) -> bool {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for under in failed.iter().flatten() {
+        *counts.entry(under.as_str()).or_default() += 1;
+    }
+    counts
+        .values()
+        .max()
+        .is_some_and(|most| most * 2 > failed.len())
+}
+
 /// Whether a failed handle resolution got an answer from the handle's
 /// host (an HTTP status, or a body that is not a DID), as opposed to no
 /// answer at all.
@@ -201,8 +224,9 @@ struct Item {
 
 /// Checks one account and stores the answer. Returns the account when
 /// nothing was established and nothing was stored: the caller checks it
-/// once more later.
-async fn check_one(st: Arc<WebState>, item: Item) -> Option<String> {
+/// once more later. With it comes the domain the unanswered handle is
+/// under, where the failure was the handle's host.
+async fn check_one(st: Arc<WebState>, item: Item) -> Option<(String, Option<String>)> {
     let cfg = st.api.config.current();
     let cfg = &cfg.config;
     let Ok(did) = Did::parse(&item.did) else {
@@ -211,6 +235,7 @@ async fn check_one(st: Arc<WebState>, item: Item) -> Option<String> {
     let (found, why) = tokio::time::timeout(CHECK_DEADLINE, check(&st, cfg, &did))
         .await
         .unwrap_or((Checked::Unknown, Some("deadline".into())));
+    let under = why.as_deref().and_then(failed_under);
     if let Some(why) = why {
         let n = UNESTABLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n % LOG_EVERY == 0 {
@@ -227,7 +252,7 @@ async fn check_one(st: Arc<WebState>, item: Item) -> Option<String> {
     // is as likely here (the resolver, the network) as there, and the
     // account is checked again after the pass has waited.
     if found == Checked::Unknown && !item.again && !item.queued {
-        return Some(item.did);
+        return Some((item.did, under));
     }
     if let Err(e) = record(&st, cfg, &did, &found).await {
         tracing::warn!(error = %e, "handle pass: an answer could not be stored");
@@ -399,17 +424,19 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
                 unsettled
             });
         }
-        let (mut all, mut unknown) = (0u32, 0u32);
+        let mut all = 0u32;
+        let mut failed: Vec<Option<String>> = Vec::new();
         while let Some(r) = checks.join_next().await {
             all += 1;
-            if let Ok(Some(did)) = r {
-                unknown += 1;
+            if let Ok(Some((did, under))) = r {
+                failed.push(under);
                 if retry.len() < RETRY_CAP {
                     retry.push_back(did);
                 }
             }
         }
-        if all >= 20 && unknown * 2 > all {
+        let unknown = failed.len() as u32;
+        if all >= 20 && unknown * 2 > all && !one_host(&failed) {
             backoff = backed_off(backoff);
             tracing::warn!(
                 failed = unknown,
@@ -510,6 +537,23 @@ mod tests {
             "could not resolve a.example: transport error: error sending request"
         ));
         assert!(!answered("could not resolve a.example: request timed out"));
+    }
+
+    #[test]
+    fn failures_under_one_domain_are_one_host() {
+        let under = |h: &str| failed_under(&format!("could not resolve {h}: request timed out"));
+        assert_eq!(under("a.pds.example").as_deref(), Some("pds.example"));
+        assert_eq!(failed_under("document: HTTP 429"), None);
+        let dead: Vec<_> = (0..30)
+            .map(|i| under(&format!("u{i}.pds.example")))
+            .collect();
+        assert!(one_host(&dead));
+        let mixed: Vec<_> = (0..30)
+            .map(|i| under(&format!("u.host{i}.example")))
+            .collect();
+        assert!(!one_host(&mixed));
+        // The directory failing names no handle at all.
+        assert!(!one_host(&vec![None; 30]));
     }
 
     #[test]
