@@ -12,8 +12,19 @@ import { chromium } from "playwright";
 
 const [base, accountPath, operatorDefault, livePath, liveDid, liveHandle] = process.argv.slice(2);
 const ownCard = "/card/" + accountPath.split("/did/")[1];
-const DARK_BG = "rgb(9, 12, 21)";
-const LIGHT_BG = "rgb(248, 250, 252)";
+// A theme is told by how light the page's background is, not by a
+// particular colour: the palettes may change.
+const lightness = (c) => {
+  const m = /rgba?\(([^)]+)\)/.exec(c || "");
+  if (!m) return NaN;
+  const [r, g, b] = m[1].split(",").map((v) => {
+    const x = parseFloat(v) / 255;
+    return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+const isDark = (c) => lightness(c) < 0.05;
+const isLight = (c) => lightness(c) > 0.7;
 const ZONE = "America/New_York";
 
 function out(what, ok, detail = "") {
@@ -83,12 +94,12 @@ await probe(
   async () => {
     const t = await theme(page);
     const color = await bg(page);
-    const want = operatorDefault === "dark" ? DARK_BG : LIGHT_BG;
+    const want = operatorDefault === "dark" ? isDark : isLight;
     return {
       ok:
         t.stored === null &&
         t.attr === (operatorDefault === "system" ? null : operatorDefault) &&
-        color === want &&
+        want(color) &&
         t.pressed.join() === operatorDefault,
       detail: `${JSON.stringify(t)} background ${color}`,
     };
@@ -143,11 +154,11 @@ await probe("the toggle switches light / dark / system, stores the choice under 
   await page.reload();
   steps.push([await theme(page), await bg(page)]);
   const ok =
-    steps[0][0].attr === "light" && steps[0][0].stored === "light" && steps[0][1] === LIGHT_BG &&
-    steps[1][0].attr === "light" && steps[1][0].stored === "light" && steps[1][1] === LIGHT_BG &&
+    steps[0][0].attr === "light" && steps[0][0].stored === "light" && isLight(steps[0][1]) &&
+    steps[1][0].attr === "light" && steps[1][0].stored === "light" && isLight(steps[1][1]) &&
     steps[1][0].pressed.join() === "light" &&
-    steps[2][0].attr === "dark" && steps[2][0].stored === "dark" && steps[2][1] === DARK_BG &&
-    steps[3][0].attr === "dark" && steps[3][1] === DARK_BG && steps[3][0].pressed.join() === "dark";
+    steps[2][0].attr === "dark" && steps[2][0].stored === "dark" && isDark(steps[2][1]) &&
+    steps[3][0].attr === "dark" && isDark(steps[3][1]) && steps[3][0].pressed.join() === "dark";
   return { ok, detail: JSON.stringify(steps) };
 });
 
@@ -161,9 +172,9 @@ await probe("a stored \"system\" overrides the operator's default and follows pr
   await page.emulateMedia({ colorScheme: "light" });
   return {
     ok:
-      a[0].attr === null && a[0].stored === "system" && a[1] === LIGHT_BG &&
-      b[0].attr === null && b[0].stored === "system" && b[1] === LIGHT_BG &&
-      b[0].pressed.join() === "system" && c === DARK_BG,
+      a[0].attr === null && a[0].stored === "system" && isLight(a[1]) &&
+      b[0].attr === null && b[0].stored === "system" && isLight(b[1]) &&
+      b[0].pressed.join() === "system" && isDark(c),
     detail: JSON.stringify([a, b, c]),
   };
 });

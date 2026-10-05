@@ -14,6 +14,16 @@ commits it covers.
 
 ## [Unreleased]
 
+### Changed
+
+- The dark theme uses the Carbon palette: background `#161616`, text
+  `#f4f4f4`, accent `#78a9ff`, on a flat background. The gradient rule
+  on the header card is a solid 1px line, coloured glows are gone,
+  hovers shift tone, and the status dot no longer pulses. The light
+  theme is unchanged.
+- The footer reads "An independent index of public block records.
+  Farsight is not affiliated with Bluesky."
+
 ## [0.5.0] - 2026-10-04
 
 Database schema version 12.
