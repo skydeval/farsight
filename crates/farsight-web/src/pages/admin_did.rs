@@ -29,7 +29,7 @@ use crate::cells;
 use crate::common::render_private;
 use crate::public::card;
 use crate::public::paging::{self, Item, Total};
-use crate::public::text::{BLOCK, Record, Stamp, clean, thousands};
+use crate::public::text::{BLOCK, LISTBLOCK, Record, Stamp, clean, thousands};
 use crate::public::warming::Asked;
 use crate::rows;
 
@@ -44,10 +44,11 @@ pub const BASE: &str = "/admin/lookup/did";
 
 /// The tables, in tab order: `(id, label, page parameter)`. The first is
 /// shown when the address names none.
-pub const TABLES: [(&str, &str, &str); 3] = [
+pub const TABLES: [(&str, &str, &str); 4] = [
     ("blocks", "Incoming blocks", "page"),
     ("listblocks", "Incoming listblocks", "lb"),
     ("lists", "Lists", "lists"),
+    ("blockinglists", "Blocking lists", "bl"),
 ];
 
 /// The History tab: read only when the address asks for it.
@@ -63,7 +64,7 @@ struct Ask {
     /// The filter text, trimmed; empty for none.
     find: String,
     /// The page of each table, in [`TABLES`] order.
-    pages: [i64; 3],
+    pages: [i64; 4],
 }
 
 impl Ask {
@@ -90,7 +91,12 @@ impl Ask {
             did: did.to_owned(),
             tab,
             find,
-            pages: [page(TABLES[0].2), page(TABLES[1].2), page(TABLES[2].2)],
+            pages: [
+                page(TABLES[0].2),
+                page(TABLES[1].2),
+                page(TABLES[2].2),
+                page(TABLES[3].2),
+            ],
         }
     }
 
@@ -263,6 +269,26 @@ pub struct ListRow {
     pub added: Option<Stamp>,
 }
 
+/// A row of "Blocking lists": a list the account subscribes to as a
+/// block list.
+#[derive(Debug, Clone)]
+pub struct BlockingRow {
+    /// The list's name, or its at-uri.
+    pub list: String,
+    /// The list's lookup page.
+    pub list_href: String,
+    /// Its purpose, in words; a dash where Farsight has no record of it.
+    pub purpose: &'static str,
+    /// The owner, rendered.
+    pub owner: String,
+    /// The at-uri of the account's listblock record.
+    pub uri: String,
+    /// The record viewer's page for it, when one is configured.
+    pub view: Option<String>,
+    /// The listblock's stated creation time.
+    pub when: Option<Stamp>,
+}
+
 /// One table.
 #[derive(Debug, Clone)]
 pub struct Table<R> {
@@ -356,6 +382,9 @@ pub struct Subject {
     pub listblocks: Table<ListBlockRow>,
     /// Lists naming the account.
     pub lists: Table<ListRow>,
+    /// Lists the account subscribes to as block lists. Always shown to
+    /// an admin; the public page shows it with `show_outgoing_blocks`.
+    pub blocking: Table<BlockingRow>,
 }
 
 /// The DID lookup page.
@@ -518,6 +547,7 @@ pub async fn lookup_did(
         Err(e) => listblocks.error = Some(e.message),
     }
     let mut lists = Table::<ListRow>::default();
+    let mut blocking = Table::<BlockingRow>::default();
     match handlers::get_lists_naming(&st.api, &coverage_params).await {
         Ok(r) => lists.coverage = coverage_words(&r.body["freshness"]),
         Err(e) => lists.error = Some(e.message),
@@ -683,10 +713,78 @@ pub async fn lookup_did(
             }
             Err(e) => lists.error = Some(e.message),
         }
+        // --- lists the account subscribes to: every listblock it has,
+        // whatever Farsight knows of the list
+        let got = match st.api.pool.acquire().await {
+            Ok(mut conn) => {
+                let n = ui_rows::lists_blocked_count(
+                    &mut conn,
+                    a.id,
+                    &[],
+                    find.as_ref(),
+                    true,
+                    COUNT_CAP,
+                )
+                .await
+                .ok();
+                let rows = ui_rows::lists_blocked(
+                    &mut conn,
+                    a.id,
+                    &[],
+                    find.as_ref(),
+                    true,
+                    (ask.pages[3] - 1) * PAGE_ROWS,
+                    PAGE_ROWS + 1,
+                )
+                .await;
+                Some((n, rows))
+            }
+            Err(_) => None,
+        };
+        match got {
+            Some((n, Ok(mut rows))) => {
+                let more = rows.len() as i64 > PAGE_ROWS;
+                rows.truncate(PAGE_ROWS as usize);
+                let dids: Vec<String> = rows.iter().map(|l| l.owner_did.clone()).collect();
+                crate::public::handles::recall(&st, &cfg.config, &dids).await;
+                blocking.count = n.map(count_words);
+                blocking.note = find_note(&ask.find, n, "lists");
+                blocking.rows = rows
+                    .iter()
+                    .map(|l| {
+                        let uri = list_uri(&l.owner_did, &l.rkey);
+                        let record = Record::of(viewer, did.as_str(), LISTBLOCK, &l.block_rkey);
+                        BlockingRow {
+                            list: l
+                                .name
+                                .as_deref()
+                                .map(clean)
+                                .filter(|n| !n.is_empty())
+                                .unwrap_or_else(|| uri.clone()),
+                            list_href: list_href(&uri),
+                            purpose: purpose_words(l.purpose),
+                            owner: cells::account(&st, &mut asked, &l.owner_did)
+                                .render()
+                                .unwrap_or_default(),
+                            uri: record.uri,
+                            view: record.href,
+                            when: l.created_at.map(Stamp::of),
+                        }
+                    })
+                    .collect();
+                let total = n.map_or(Total::Unknown, total_of);
+                blocking.pager = Pager::new(&ask, 3, total, more)
+                    .render()
+                    .unwrap_or_default();
+            }
+            Some((_, Err(e))) => blocking.error = Some(e.to_string()),
+            None => blocking.error = Some("The database did not answer.".into()),
+        }
     } else {
         blocks.count = Some("0".into());
         listblocks.count = Some("0".into());
         lists.count = Some("0".into());
+        blocking.count = Some("0".into());
     }
     asked.submit(&st);
 
@@ -775,6 +873,7 @@ pub async fn lookup_did(
         blocks,
         listblocks,
         lists,
+        blocking,
     });
     render_private(&page)
 }
@@ -794,7 +893,10 @@ mod tests {
     #[test]
     fn the_address_names_the_tab_the_filter_and_each_tables_page() {
         let a = ask(&[]);
-        assert_eq!((a.tab, a.pages, a.find.as_str()), ("blocks", [1, 1, 1], ""));
+        assert_eq!(
+            (a.tab, a.pages, a.find.as_str()),
+            ("blocks", [1, 1, 1, 1], "")
+        );
         assert_eq!(
             a.link("blocks", None),
             "/admin/lookup/did?q=did%3Aplc%3Aaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -807,7 +909,7 @@ mod tests {
         ]);
         assert_eq!(
             (a.tab, a.pages, a.find.as_str()),
-            ("lists", [3, 1, 2], "cat")
+            ("lists", [3, 1, 2, 1], "cat")
         );
         assert_eq!(
             a.link("lists", Some((2, 5))),
@@ -833,7 +935,7 @@ mod tests {
     #[test]
     fn what_is_not_a_tab_or_a_page_is_the_first() {
         let a = ask(&[("tab", "nope"), ("page", "0"), ("lb", "x"), ("lists", "-4")]);
-        assert_eq!((a.tab, a.pages), ("blocks", [1, 1, 1]));
+        assert_eq!((a.tab, a.pages), ("blocks", [1, 1, 1, 1]));
     }
 
     #[test]

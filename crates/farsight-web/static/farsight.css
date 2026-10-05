@@ -1297,7 +1297,8 @@ nav.pager .pager-gap {
 /* The table of the tab in view. */
 .tabbed[data-active="blocks"] > #blocks,
 .tabbed[data-active="listblocks"] > #listblocks,
-.tabbed[data-active="lists"] > #lists {
+.tabbed[data-active="lists"] > #lists,
+.tabbed[data-active="blockinglists"] > #blockinglists {
   display: block;
 }
 

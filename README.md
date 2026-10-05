@@ -368,7 +368,10 @@ nothing else in a browser.
   Farsight stored and later removed are on admin pages, reached from
   the DID and list lookups after login.
 - **Outgoing blocks** (`show_outgoing_blocks`, off by default): the
-  blocks an account has made.
+  blocks an account has made ("Blocking"), and the lists it subscribes
+  to as block lists ("Blocking Lists"; only lists this instance
+  serves). The admin DID lookup shows the subscriptions whatever this
+  is set to.
 - **Accounts that are not shown.** Deactivated, suspended, taken-down
   and deleted accounts have no page and appear in no row. You can
   withhold more accounts with `excluded_dids`; they get the same

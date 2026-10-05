@@ -49,7 +49,7 @@ how long, or how to reach you about their data, say it here.</div>
 <input type="text" id="pu_contact" name="contact" maxlength="200" value="{{ p.contact }}">
 <div class="hint">Kept with the settings; no public page shows it at present. Empty: <code>server.contact</code>.</div>
 
-<label><input type="checkbox" name="show_outgoing_blocks"{% if p.show_outgoing_blocks %} checked{% endif %}> Show the blocks an account has made (<code>show_outgoing_blocks</code>)</label>
+<label><input type="checkbox" name="show_outgoing_blocks"{% if p.show_outgoing_blocks %} checked{% endif %}> Show the blocks an account has made, and the lists it subscribes to as block lists (<code>show_outgoing_blocks</code>)</label>
 <div class="hint">Adds a "Blocks by this account" section to account pages.</div>
 
 <label for="record_viewer_url">Record viewer URL (<code>record_viewer_url</code>)</label>

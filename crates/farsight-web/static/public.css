@@ -652,6 +652,7 @@ nav.tabs a.tab.active {
 .tabbed[data-active="blockers"] > #blockers,
 .tabbed[data-active="lists"] > #lists,
 .tabbed[data-active="outgoing"] > #outgoing,
+.tabbed[data-active="blockinglists"] > #blockinglists,
 .tabbed[data-active="members"] > #members,
 .tabbed[data-active="subscribers"] > #subscribers,
 .tabbed[data-active="history"] > #history {

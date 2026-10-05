@@ -1444,7 +1444,7 @@ async fn check_admin_history_tab(
     );
     c.check(
         "the lookup page offers History as its last tab and reads nothing for it; asked for (&tab=history), the page reads the account's PLC audit log once and shows, in this order, Handle history, PDS history, Removed blocks and Removed lists — without the \"What this page covers\" block, which the account's own history page still has",
-        tabs == ["blocks", "listblocks", "lists", "history"]
+        tabs == ["blocks", "listblocks", "lists", "blockinglists", "history"]
             && section(&plain.text, "history").is_none()
             && after_plain == before
             && asked.status == 200
@@ -2012,6 +2012,82 @@ async fn set_pass(a: &Srv, cookie: &str, rps: u32) -> Result<Resp, String> {
             &pairs,
         )
         .await
+}
+
+/// The lists an account subscribes to as block lists: always a tab of the
+/// admin lookup; a tab of the public page with `show_outgoing_blocks`.
+async fn check_blocking_lists(
+    c: &mut Checks,
+    a: &Srv,
+    pool: &PgPool,
+    cookie: &str,
+    w: &World,
+) -> Result<(), String> {
+    c.section("19d. the lists an account subscribes to (Blocking lists)");
+    let owner = did("abo", 1);
+    let oid = n(
+        pool,
+        &format!("SELECT id FROM actors WHERE did = '{owner}'"),
+    )
+    .await?;
+    let sid = n(
+        pool,
+        &format!("SELECT id FROM actors WHERE did = '{}'", w.s),
+    )
+    .await?;
+    // One list Farsight serves, and one it only knows from the listblock.
+    let served = seed_list(pool, oid, "subscribed", 0).await?;
+    let unknown: i64 = sqlx::query_scalar(
+        "INSERT INTO lists (owner_id, rkey) VALUES ($1, 'unknownlist') RETURNING id",
+    )
+    .bind(oid)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    seed::exec(
+        pool,
+        &format!(
+            "INSERT INTO list_blocks (author_id, rkey, list_id, counted, created_at, rev, first_seen, last_seen)
+             VALUES ({sid}, '3ksubscr00001', {served}, true, '2026-01-02T03:04:05Z', 1, now(), now()),
+                    ({sid}, '3ksubscr00002', {unknown}, false, '2026-01-03T03:04:05Z', 1, now(), now())"
+        ),
+    )
+    .await?;
+    let admin = a
+        .admin_get(cookie, &format!("{}&tab=blockinglists", lookup_did(&w.s)))
+        .await?;
+    let asec = section(&admin.text, "blockinglists").unwrap_or("");
+    let copy = |rkey: &str| format!("data-copy=\"at://{}/app.bsky.graph.listblock/{rkey}\"", w.s);
+    c.check(
+        "the admin lookup always has a Blocking lists tab: every listblock the account has, newest first, each with the list (by name, or by address where Farsight has no record of it), its owner, a button holding the listblock's at-uri, and the date",
+        admin.status == 200
+            && admin.text.contains("<div class=\"tabbed\" data-active=\"blockinglists\">")
+            && heads(asec) == ["List", "Purpose", "Owner", "Record", "Subscribed"]
+            && asec.contains(&copy("3ksubscr00001"))
+            && asec.contains(&copy("3ksubscr00002"))
+            && asec.find(&copy("3ksubscr00002")) < asec.find(&copy("3ksubscr00001"))
+            && asec.contains(">subscribed</span>")
+            && asec.contains(&format!("at://{owner}/app.bsky.graph.list/unknownlist"))
+            && asec.contains("<span class=\"count count-big\">2</span>"),
+        format!("{:?}", heads(asec)),
+    );
+    // The main instance has show_outgoing_blocks on by now.
+    let public = a
+        .get(&format!("{}?tab=blockinglists", public_did(&w.s)))
+        .await?;
+    let psec = section(&public.text, "blockinglists").unwrap_or("");
+    c.check(
+        "the public page, with show_outgoing_blocks: a Blocking Lists tab after Blocking, listing only the lists the public pages serve (the list Farsight has no record of is left out), linked to the list's page, with no record address",
+        public.status == 200
+            && public.text.contains("data-tab=\"blockinglists\"")
+            && heads(psec) == ["List", "Owner", "Subscribed"]
+            && psec.contains(&format!("href=\"/list/{owner}/subscribed\""))
+            && !psec.contains("unknownlist")
+            && !psec.contains("app.bsky.graph.listblock")
+            && psec.contains("<span class=\"count count-big\">1</span>"),
+        format!("{:?}; {}", heads(psec), public.status),
+    );
+    Ok(())
 }
 
 /// `avatar_thumbnails`: cards and list pages name the image as a
@@ -3067,6 +3143,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     check_warming(c, &a, &pool, &cookie, &plc, &w).await?;
     check_pass(c, &a, &pool, &cookie, &plc).await?;
     check_thumbnails(c, &a, &pool, &cookie, &plc).await?;
+    check_blocking_lists(c, &a, &pool, &cookie, &w).await?;
     check_representative(c, &pool, &w).await?;
     drop(b);
     drop(a);

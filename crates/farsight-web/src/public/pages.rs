@@ -166,12 +166,12 @@ pub struct Section<R> {
 
 /// The page parameters of the account page's sections: "Blocked by", "On
 /// lists", "Blocks by this account".
-const DID_PAGES: [&str; 3] = ["page", "lists", "out"];
+const DID_PAGES: [&str; 4] = ["page", "lists", "out", "outlists"];
 /// Of the list page's: "Members", "Blocked by".
 const LIST_PAGES: [&str; 2] = ["page", "subscribers"];
 /// The tables of the account page, as its tabs name them; the first is
 /// the one in view without a `tab` parameter.
-const DID_TABS: [&str; 4] = ["blockers", "lists", "outgoing", "history"];
+const DID_TABS: [&str; 5] = ["blockers", "lists", "outgoing", "blockinglists", "history"];
 /// Of the list page.
 const LIST_TABS: [&str; 2] = ["members", "subscribers"];
 /// The cursor parameters of earlier versions. An address that still
@@ -844,6 +844,9 @@ struct DidPage {
     blockers: Section<PartyRow>,
     lists: Section<ListRow>,
     outgoing: Option<Section<PartyRow>>,
+    /// The lists the account subscribes to as block lists; with
+    /// `show_outgoing_blocks`, like `outgoing`.
+    blocking_lists: Option<Section<ListRow>>,
     /// The History tab's content: read, and rendered, only when that tab
     /// is the one asked for.
     history: Option<HistoryView>,
@@ -860,6 +863,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let b_page = paging::number(q, "page", &base)?;
     let l_page = paging::number(q, "lists", &base)?;
     let o_page = paging::number(q, "out", &base)?;
+    let ol_page = paging::number(q, "outlists", &base)?;
     let withheld = r.withheld().await?;
     let actor = actor_row(r, did).await?;
     if let Some(reason) = withheld.reason(did.as_str(), actor.map(|a| a.status)) {
@@ -918,10 +922,43 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     } else {
         (Default::default(), None)
     };
+    // The lists the account subscribes to as block lists: outgoing too,
+    // and shown with the same switch.
+    let (ol_rows, ol_more, ol_total) = match (show_outgoing, actor) {
+        (true, Some(a)) => {
+            let mut tx = api.read_tx().await?;
+            let mut rows = farsight_storage::ui_rows::lists_blocked(
+                &mut tx,
+                a.id,
+                &withheld.ids,
+                find,
+                false,
+                (ol_page - 1) * PAGE_ROWS,
+                PAGE_ROWS + 1,
+            )
+            .await?;
+            let n = farsight_storage::ui_rows::lists_blocked_count(
+                &mut tx,
+                a.id,
+                &withheld.ids,
+                find,
+                false,
+                COUNT_CAP,
+            )
+            .await
+            .ok();
+            let _ = tx.rollback().await;
+            let more = rows.len() as i64 > PAGE_ROWS;
+            rows.truncate(PAGE_ROWS as usize);
+            (rows, more, total_of(n))
+        }
+        _ => (Vec::new(), false, Total::Rows(0)),
+    };
 
     let mut dids: Vec<String> = block_page.rows.iter().map(|b| b.did.clone()).collect();
     dids.extend(naming_page.rows.iter().map(|l| l.owner_did.clone()));
     dids.extend(out_page.rows.iter().map(|o| o.did.clone()));
+    dids.extend(ol_rows.iter().map(|l| l.owner_did.clone()));
     recall(r.st, cfg, &dids).await;
     let shown = Shown::load(r, &withheld, dids, taken_down).await?;
     let mut asked = Asked::new(cfg);
@@ -1077,15 +1114,74 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         None => None,
     };
 
+    let blocking_lists = if show_outgoing {
+        if let Some(last) = paging::past_end(ol_total, ol_page, PAGE_ROWS) {
+            return Ok(redirect(
+                cfg,
+                &paging::link(
+                    &base,
+                    q,
+                    &DID_PAGES,
+                    "outlists",
+                    last,
+                    Some("blockinglists"),
+                ),
+            ));
+        }
+        let mut pending = 0;
+        let rows: Vec<ListRow> = ol_rows
+            .iter()
+            .filter(|l| shown.ok(&l.owner_did))
+            .filter_map(|l| {
+                let Some(owner) = who(r, &mut asked, &shown, &l.owner_did) else {
+                    pending += 1;
+                    return None;
+                };
+                Some(ListRow {
+                    uri: list_uri(&l.owner_did, &l.rkey),
+                    href: list_href(&l.owner_did, &l.rkey),
+                    name: l.name.as_deref().map(clean).filter(|n| !n.is_empty()),
+                    owner,
+                    added: l.created_at.map(Stamp::of),
+                })
+            })
+            .collect();
+        Some(Section {
+            count: count_words(ol_total).or_else(|| Some("0".to_owned())),
+            count_all: None,
+            toggle: None,
+            note: find_note(finder.as_ref(), ol_total),
+            empty: empty_unless(find.is_some(), &rows, pending, ol_more, ol_page),
+            rows,
+            pending,
+            pager: pager(
+                "blockinglists",
+                "Lists this account blocks",
+                "outlists",
+                ol_page,
+                ol_total,
+                ol_more,
+            ),
+        })
+    } else {
+        None
+    };
+
     asked.submit(r.st);
     let og_title = match &handle {
         Some(h) => format!("{h} ({did})"),
         None => did.to_string(),
     };
-    let held = blockers.pending + lists.pending + outgoing.as_ref().map_or(0, |o| o.pending);
+    let held = blockers.pending
+        + lists.pending
+        + outgoing.as_ref().map_or(0, |o| o.pending)
+        + blocking_lists.as_ref().map_or(0, |o| o.pending);
     let mut shown_tabs = vec![("blockers", "Blocked By"), ("lists", "Blocked By Lists")];
     if outgoing.is_some() {
         shown_tabs.push(("outgoing", "Blocking"));
+    }
+    if blocking_lists.is_some() {
+        shown_tabs.push(("blockinglists", "Blocking Lists"));
     }
     if actor.is_some() {
         shown_tabs.push(("history", "History"));
@@ -1105,6 +1201,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         blockers,
         lists,
         outgoing,
+        blocking_lists,
         updated: last_updated(&fresh),
     };
     Ok(page(&t, StatusCode::OK, cfg, cache_for(held), true))

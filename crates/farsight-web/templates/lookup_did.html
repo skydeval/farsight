@@ -141,6 +141,45 @@
 {% endif %}
 </section>
 
+<section id="blockinglists" class="card data-section tab-panel">
+<div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<form class="find" method="get" action="/admin/lookup/did#blockinglists" role="search"><input type="hidden" name="q" value="{{ s.did }}"><input type="hidden" name="tab" value="blockinglists"><input type="search" name="find" value="{{ s.find }}" placeholder="Filter by list or owner" aria-label="Filter this table" maxlength="100" autocomplete="off" spellcheck="false"></form>
+<h2><span class="sr-only">Blocking lists </span><span class="count count-big">{% if let Some(n) = s.blocking.count %}{{ n }}{% else %}—{% endif %}</span></h2>
+<p class="muted">Lists this account subscribes to as block lists: every listblock record it has. Mute subscriptions are private and are not shown.</p>
+</div>
+{% if let Some(e) = s.blocking.error %}<div class="banner bad">{{ e }}</div>{% endif %}
+{% if let Some(n) = s.blocking.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
+{% if s.blocking.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
+{{ s.blocking.pager|safe }}
+<div class="table-responsive free">
+<table class="data-table free heads-centered">
+<thead>
+<tr>
+<th scope="col" class="th-list">List</th>
+<th scope="col" class="th-purpose">Purpose</th>
+<th scope="col" class="th-account">Owner</th>
+<th scope="col" class="th-record">Record</th>
+<th scope="col" class="th-date">Subscribed</th>
+</tr>
+</thead>
+<tbody>
+{% for r in s.blocking.rows %}
+<tr class="data-row">
+<td class="td-list"><a href="{{ r.list_href }}" class="list-link"><span>{{ r.list }}</span></a></td>
+<td class="td-purpose">{{ r.purpose }}</td>
+<td class="td-account">{{ r.owner|safe }}</td>
+<td class="td-record"><button type="button" class="copy-uri" data-copy="{{ r.uri }}" title="{{ r.uri }}">Copy at:// URL</button>{% if let Some(v) = r.view %} <a class="record-view" href="{{ v }}" target="_blank" rel="noopener noreferrer nofollow">View</a>{% endif %}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time><span class="ago" data-ago></span>{% else %}<span class="time-none" aria-hidden="true">—</span><span class="ago"></span>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{{ s.blocking.pager|safe }}
+{% endif %}
+</section>
+
 {% if let Some(h) = s.history %}
 <section id="history" class="card data-section tab-panel">
 <div class="section-header">

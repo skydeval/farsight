@@ -606,6 +606,134 @@ pub async fn lists_naming_count(
     .await?)
 }
 
+/// A list an account subscribes to as a block list: one of the account's
+/// own listblock records and the list it points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedList {
+    /// `lists.id`.
+    pub list_id: i64,
+    /// The list owner's DID.
+    pub owner_did: String,
+    /// The list's record key.
+    pub rkey: String,
+    /// Its name, if Farsight holds its record and the record has one.
+    pub name: Option<String>,
+    /// Its `purpose` code, likewise.
+    pub purpose: Option<i16>,
+    /// The record key of the account's listblock.
+    pub block_rkey: String,
+    /// The listblock's stated `createdAt`.
+    pub created_at: Option<DateTime<Utc>>,
+    /// When Farsight first stored the listblock.
+    pub first_seen: Option<DateTime<Utc>>,
+}
+
+/// The `WHERE` of [`lists_blocked`] and its count. `$1` the author, `$2`
+/// excluded owners, `${all}` whether lists Farsight does not serve are
+/// included, then the filter's ids and pattern.
+fn blocked_where(all: u8, ids: u8, pattern: u8) -> String {
+    format!(
+        "WHERE b.author_id = $1 AND NOT (o.id = ANY($2))
+           AND (${all} OR (l.track_state IN (2, 3) AND l.record_state = 1
+                          AND o.status NOT IN {}))
+           AND (${ids}::bigint[] IS NULL OR o.id = ANY(${ids})
+                OR lower(l.name) LIKE ${pattern}::text OR o.did LIKE ${pattern}::text
+                OR EXISTS (SELECT 1 FROM handle_cache h
+                           WHERE h.did = o.did AND h.handle LIKE ${pattern}::text))",
+        hidden_statuses(true, false)
+    )
+}
+
+/// The lists `author_id` subscribes to as block lists, newest listblock
+/// first, `limit` from `offset`. An account's listblocks are few, so the
+/// order needs no index of its own. Without `all`, only the lists the
+/// public pages would show: indexed, their record present, their owner
+/// neither hidden nor excluded. With `all` (the admin lookup), every
+/// listblock the account has, whatever Farsight knows of the list.
+pub async fn lists_blocked(
+    conn: &mut PgConnection,
+    author_id: i64,
+    excluded: &[i64],
+    find: Option<&Find>,
+    all: bool,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<BlockedList>> {
+    type Raw = (
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<i16>,
+        String,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+    );
+    let rows: Vec<Raw> = sqlx::query_as(&format!(
+        "SELECT l.id, o.did, l.rkey, l.name, l.purpose, b.rkey, b.created_at, b.first_seen
+         FROM list_blocks b
+         JOIN lists l ON l.id = b.list_id
+         JOIN actors o ON o.id = l.owner_id
+         {}
+         ORDER BY {SHOWN_B} DESC, b.rkey DESC LIMIT $3 OFFSET $4",
+        blocked_where(5, 6, 7)
+    ))
+    .bind(author_id)
+    .bind(excluded)
+    .bind(limit)
+    .bind(offset)
+    .bind(all)
+    .bind(find.map(|f| &f.ids[..]))
+    .bind(find.and_then(|f| f.pattern.as_deref()))
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(list_id, owner_did, rkey, name, purpose, block_rkey, created_at, first_seen)| {
+                BlockedList {
+                    list_id,
+                    owner_did,
+                    rkey,
+                    name,
+                    purpose,
+                    block_rkey,
+                    created_at,
+                    first_seen,
+                }
+            },
+        )
+        .collect())
+}
+
+/// How many rows [`lists_blocked`] pages over, counted up to `cap + 1`.
+pub async fn lists_blocked_count(
+    conn: &mut PgConnection,
+    author_id: i64,
+    excluded: &[i64],
+    find: Option<&Find>,
+    all: bool,
+    cap: i64,
+) -> Result<i64> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM (
+           SELECT 1 FROM list_blocks b
+           JOIN lists l ON l.id = b.list_id
+           JOIN actors o ON o.id = l.owner_id
+           {}
+           LIMIT $3) y",
+        blocked_where(4, 5, 6)
+    ))
+    .bind(author_id)
+    .bind(excluded)
+    .bind(cap + 1)
+    .bind(all)
+    .bind(find.map(|f| &f.ids[..]))
+    .bind(find.and_then(|f| f.pattern.as_deref()))
+    .fetch_one(conn)
+    .await?)
+}
+
 /// The listblock counters of the lists [`lists_naming`] would return for
 /// `subject_id`, added up: how many listblock records there are on the
 /// lists that name the account. An account that blocks two of the lists

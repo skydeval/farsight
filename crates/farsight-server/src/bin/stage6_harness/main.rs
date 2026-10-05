@@ -2222,8 +2222,10 @@ async fn check_coverage(
     // Outgoing: off by default; on, a third section and a third nav link.
     let page = h.get(&path_did(&w.s)).await?;
     c.check(
-        "the outgoing section is off by default",
+        "the outgoing sections (the account's blocks, and the lists it subscribes to as block lists) are off by default",
         section(&page.text, "outgoing").is_none()
+            && section(&page.text, "blockinglists").is_none()
+            && !page.text.contains("data-tab=\"blockinglists\"")
             && !page.text.contains("Accounts this user has blocked."),
         "absent",
     );
@@ -2245,7 +2247,11 @@ async fn check_coverage(
         "show_outgoing_blocks = true, without restart: the section lists the account's blocks (inactive targets left out), after the other two",
         row_dids(out).into_iter().collect::<BTreeSet<_>>() == want
             && want.len() == 4
-            && between(&page.text, "<section id=\"", "\"") == ["blockers", "lists", "outgoing"]
+            && between(&page.text, "<section id=\"", "\"")
+                == ["blockers", "lists", "outgoing", "blockinglists"]
+            && page.text.contains("data-tab=\"blockinglists\"")
+            && section(&page.text, "blockinglists")
+                .is_some_and(|s| s.contains("Lists this user subscribes to as block lists."))
             && out.contains("Accounts this user has blocked."),
         format!("{} rows, {} expected", row_dids(out).len(), want.len()),
     );
@@ -2260,8 +2266,8 @@ async fn check_coverage(
     h.refresh().await?;
     let page = h.get(&path_did(&w.s)).await?;
     c.check(
-        "show_outgoing_blocks = false: the section disappears without restart",
-        section(&page.text, "outgoing").is_none(),
+        "show_outgoing_blocks = false: both sections disappear without restart",
+        section(&page.text, "outgoing").is_none() && section(&page.text, "blockinglists").is_none(),
         "absent",
     );
     Ok(())

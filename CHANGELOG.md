@@ -37,6 +37,11 @@ commits it covers.
   controls, a filter box on the blocks and lists tables, and a "Copy
   at:// URL" button for each block record.
 
+- A tab for the lists an account subscribes to as block lists (its own
+  listblock records). On the public account page it is "Blocking
+  Lists" (`?tab=blockinglists`) and appears with `show_outgoing_blocks`,
+  like "Blocking"; on the admin DID lookup it is always there and also
+  lists subscriptions to lists Farsight has no record of.
 - A History tab on the admin DID lookup page, at the right end of the
   tabs: the account's handle history and PDS history from the PLC
   directory, and the removed blocks and removed list entries that used

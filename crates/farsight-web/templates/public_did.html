@@ -161,6 +161,59 @@
 </section>
 {% endif %}
 
+{% if let Some(bl) = blocking_lists %}
+<section id="blockinglists" class="card data-section tab-panel">
+<div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<form class="find" method="get" action="{{ base }}#blockinglists" role="search"><input type="hidden" name="tab" value="blockinglists">{% if taken_down %}<input type="hidden" name="takendown" value="1">{% endif %}<input type="search" name="find" value="{{ find }}" placeholder="Filter by list or owner" aria-label="Filter this table" maxlength="100" autocomplete="off" spellcheck="false"></form>
+<h2><span class="sr-only">Blocking lists </span><span class="count count-big">{% if let Some(n) = bl.count %}{{ n }}{% else %}—{% endif %}</span></h2>
+<p class="muted">Lists this user subscribes to as block lists. Mute subscriptions are private and are not shown.</p>
+</div>
+{% if let Some(n) = bl.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
+{% if !bl.rows.is_empty() %}
+{{ bl.pager|safe }}
+<div class="table-responsive free">
+<table class="data-table free">
+<thead>
+<tr>
+<th scope="col" class="th-list">List</th>
+<th scope="col" class="th-owner">Owner</th>
+<th scope="col" class="th-date">Subscribed</th>
+</tr>
+</thead>
+<tbody>
+{% for r in bl.rows %}
+<tr class="data-row">
+<td class="td-list">
+<a href="{{ r.href }}" class="list-link">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+<span>{% if let Some(n) = r.name %}{{ n }}{% else %}<code>{{ r.uri }}</code>{% endif %}</span>
+</a>
+</td>
+<td class="td-owner">{{ r.owner|safe }}</td>
+<td class="td-date">{% if let Some(t) = r.added %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+{% if let Some(e) = bl.empty %}
+<div class="empty-state">
+<div class="empty-icon" aria-hidden="true">
+<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+</div>
+<div class="empty-content">
+<h3>No List Subscriptions Recorded</h3>
+<p class="empty">{{ e }}</p>
+</div>
+</div>
+{% endif %}
+{% if bl.pending > 0 %}<p class="pending" data-pending="{{ bl.pending }}" role="status">{{ bl.pending }} {% if bl.pending == 1 %}account on this page is{% else %}accounts on this page are{% endif %} still being verified and will appear here shortly.</p>{% endif %}
+{{ bl.pager|safe }}
+</section>
+{% endif %}
+
 {% if let Some(hist) = history %}
 <section id="history" class="card data-section tab-panel">
 <div class="section-header">
