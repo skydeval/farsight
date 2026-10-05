@@ -169,6 +169,8 @@
 <p class="muted">The handles and hosts this account has had, as the PLC directory records them. The handles are what the account claimed at the time; they are not verified here.</p>
 </div>
 {% if let Some(n) = hist.note %}<p class="empty">{{ n }}</p>{% else %}
+<div class="history-pair">
+<div class="history-part">
 <h3 class="history-title">Handles</h3>
 {% if hist.handles.is_empty() %}<p class="muted">None recorded.</p>{% else %}
 <div class="table-responsive">
@@ -190,6 +192,8 @@
 </table>
 </div>
 {% endif %}
+</div>
+<div class="history-part">
 <h3 class="history-title">Hosts</h3>
 {% if hist.hosts.is_empty() %}<p class="muted">None recorded.</p>{% else %}
 <div class="table-responsive">
@@ -211,6 +215,8 @@
 </table>
 </div>
 {% endif %}
+</div>
+</div>
 {% endif %}
 </section>
 {% endif %}

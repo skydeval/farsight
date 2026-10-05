@@ -149,6 +149,8 @@
 <p class="muted">The handles and hosts this account has had, as the PLC directory records them (claims at the time, not verified here), and the records naming it that this instance stored and later removed.</p>
 </div>
 
+<div class="history-pair">
+<div class="history-part">
 <h3 class="history-title">Handle history</h3>
 {% if let Some(n) = h.note %}<p class="empty">{{ n }}</p>{% else if h.handles.is_empty() %}<p class="muted">None recorded.</p>{% else %}
 <div class="table-responsive">
@@ -160,7 +162,8 @@
 </table>
 </div>
 {% endif %}
-
+</div>
+<div class="history-part">
 <h3 class="history-title">PDS history</h3>
 {% if h.note.is_some() %}<p class="muted">Not available.</p>{% else if h.hosts.is_empty() %}<p class="muted">None recorded.</p>{% else %}
 <div class="table-responsive">
@@ -172,6 +175,8 @@
 </table>
 </div>
 {% endif %}
+</div>
+</div>
 
 {% match h.removed %}{% when Err with (e) %}
 <h3 class="history-title">Removed blocks</h3>

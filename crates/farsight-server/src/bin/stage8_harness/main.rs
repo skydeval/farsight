@@ -1412,6 +1412,7 @@ async fn check_history_tab(c: &mut Checks, a: &Srv, plc: &Plc, w: &World) -> Res
 async fn check_admin_history_tab(
     c: &mut Checks,
     a: &Srv,
+    pool: &PgPool,
     cookie: &str,
     plc: &Plc,
     w: &World,
@@ -1430,6 +1431,27 @@ async fn check_admin_history_tab(
     let standalone = a
         .admin_get(cookie, &format!("/admin/did/{}/history", w.s))
         .await?;
+    // An account with a history in its log: two handles and two hosts.
+    let storied = did("abh", 1);
+    seed::exec(
+        pool,
+        &format!("INSERT INTO actors (did) VALUES ('{storied}') ON CONFLICT DO NOTHING"),
+    )
+    .await?;
+    plc.claim(&storied, "storied.example");
+    let told = a
+        .admin_get(cookie, &format!("{}&tab=history", lookup_did(&storied)))
+        .await?;
+    let tsec = section(&told.text, "history").unwrap_or("");
+    c.check(
+        "an account whose log has two operations: both handles and both hosts are listed, newest first, the newest marked current, the two tables in one pair so that they stand side by side",
+        tsec.contains("<div class=\"history-pair\">")
+            && tsec.matches("<div class=\"history-part\">").count() == 2
+            && tsec.find("storied.example").zip(tsec.find("earlier-storied.example")).is_some_and(|(new, old)| new < old)
+            && tsec.contains("earlier-host.example")
+            && tsec.matches("held-current").count() == 2,
+        format!("{} handles named", tsec.matches("storied.example").count()),
+    );
     c.check(
         "the lookup page offers History as its last tab and reads nothing for it; asked for (&tab=history), the page reads the account's PLC audit log once and shows, in this order, Handle history, PDS history, Removed blocks and Removed lists — without the \"What this page covers\" block, which the account's own history page still has",
         tabs == ["blocks", "listblocks", "lists", "history"]
@@ -3040,7 +3062,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     check_cursors(c, &a, &cookie, &w).await?;
     check_public_columns(c, &a, &w).await?;
     check_history_tab(c, &a, &plc, &w).await?;
-    check_admin_history_tab(c, &a, &cookie, &plc, &w).await?;
+    check_admin_history_tab(c, &a, &pool, &cookie, &plc, &w).await?;
     check_list_about(c, &a, &pool, &plc).await?;
     check_live(c, pg, args.skip_live).await?;
     if args.browser {

@@ -667,6 +667,19 @@ nav.tabs a.tab[data-tab="history"] {
   font-weight: 700;
   color: var(--fg-strong);
 }
+/* The History tab: handles and hosts side by side, one under the other
+   where the page is narrow. */
+.history-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 1.5rem;
+  align-items: start;
+}
+@media (max-width: 52rem) {
+  .history-pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 .data-table .held {
   font-weight: 600;
 }

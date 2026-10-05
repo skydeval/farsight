@@ -29,6 +29,9 @@ commits it covers.
 
 ### Changed
 
+- On the History tab, public and admin, the handle history and the
+  host history stand side by side, and one under the other on a narrow
+  screen.
 - The DID lookup page's "View history" link is replaced by the History
   tab. The account's separate history page, with its "What this page
   covers" section, still exists at its address; the tab leaves that

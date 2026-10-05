@@ -1270,11 +1270,24 @@ h3.history-title {
   font-weight: 700;
   color: var(--fg-strong);
 }
-.section-header + h3.history-title {
+.section-header + .history-pair h3.history-title {
   margin-top: 0.5rem;
 }
 .held {
   font-weight: 600;
+}
+/* The History tab: handles and hosts side by side, one under the other
+   where the page is narrow. */
+.history-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 1.5rem;
+  align-items: start;
+}
+@media (max-width: 52rem) {
+  .history-pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 .pill.held-current {
   margin-left: 0.4rem;
