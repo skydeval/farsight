@@ -330,6 +330,9 @@ pub struct Chrome {
     pub theme: &'static str,
     /// Preview tags.
     pub og: OpenGraph,
+    /// The home page: its bar has no search form and no guide button,
+    /// because the page itself has both.
+    pub home: bool,
 }
 
 /// Builds the layout data of a page at `path` (no query string).
@@ -354,6 +357,7 @@ pub fn chrome(
                 .show_opengraph_image
                 .then(|| format!("https://{host}{OG_IMAGE_PATH}")),
         },
+        home: false,
     }
 }
 

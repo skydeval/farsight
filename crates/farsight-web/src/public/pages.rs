@@ -55,8 +55,7 @@ pub const SEARCH_RESOLVE_WAIT: Duration = Duration::from_secs(10);
 /// The text a fresh instance shows on its home page.
 pub const DEFAULT_DESCRIPTION: &str = "Farsight is an independent index of public block records \
     on the AT Protocol network. This instance shows who blocks an account, directly and through \
-    listblocked lists, as far as it has indexed them. It is run by its operator and is not \
-    affiliated with Bluesky.";
+    lists, as far as it has indexed them. It is not affiliated with Bluesky.";
 
 // ---------------------------------------------------------------------------
 // Shared pieces
@@ -708,13 +707,16 @@ pub async fn home(r: &Req<'_>) -> Result<Response, Fail> {
     let host = &cfg.server.hostname;
     Ok(page(
         &HomePage {
-            c: chrome(
-                cfg,
-                "Block lookup",
-                &format!("Farsight at {host}"),
-                OG_INSTANCE,
-                "/",
-            ),
+            c: Chrome {
+                home: true,
+                ..chrome(
+                    cfg,
+                    "Block lookup",
+                    &format!("Farsight at {host}"),
+                    OG_INSTANCE,
+                    "/",
+                )
+            },
             description: if description.is_empty() {
                 vec![DEFAULT_DESCRIPTION.to_owned()]
             } else {

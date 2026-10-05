@@ -61,6 +61,9 @@ Database schema version 11.
   phone.
 - The bar shows Farsight's icon without the name, and the home page's
   heading is "Farsight" without the hostname.
+- The home page's bar has no search box and no guide button: the page
+  has both. "/" focuses the page's own search box where it has one.
+- The default description on the home page is shorter.
 - "Last updated" moved into the footer of every page that has one,
   where the "ATProto Block Graph Index" label was.
 - The workspace version is 0.5.0 (it was 0.1.0 since the first commit).

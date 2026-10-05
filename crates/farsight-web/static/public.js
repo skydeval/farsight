@@ -423,7 +423,10 @@
         var active = document.activeElement;
         var isInput = active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable);
         if (!isInput) {
-          var searchInput = document.querySelector("nav.public-nav form.search input, form.home-search input");
+          // The page's own search box where it has one, else the bar's.
+          var searchInput =
+            document.querySelector("form.home-search input") ||
+            document.querySelector("nav.public-nav form.search input");
           if (searchInput) {
             event.preventDefault();
             searchInput.focus();

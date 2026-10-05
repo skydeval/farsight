@@ -16,7 +16,10 @@
 //! - **It backs off.** When more than half of a batch could not be
 //!   established (hosts refusing or timing out), the pass waits, a
 //!   minute at first and up to half an hour, before it goes on.
-//! - A check that establishes nothing is stored as "nothing to show",
+//! - A check that establishes nothing (no answer from the directory or
+//!   the handle's host, no address for it, a timeout) stores nothing the
+//!   first time: the account is checked once more after the batch, or
+//!   after the wait. A second such check is stored as "nothing to show",
 //!   dated so that it is due again in a day.
 //!
 //! The position of the walk is memory: a restart begins at the first
@@ -39,7 +42,9 @@ use crate::pages::{WebState, resolve_handle};
 /// Ids one query of the walk looks at.
 pub const WINDOW: i64 = 20_000;
 /// Most accounts taken from one window at a time.
-pub const BATCH: i64 = 200;
+pub const BATCH: i64 = 50;
+/// Most accounts kept in memory for a second check.
+pub const RETRY_CAP: usize = 5_000;
 /// Most windows one step of the walk reads before it yields.
 pub const WINDOWS_PER_STEP: usize = 50;
 /// Most queued identity changes served in one batch.
@@ -106,31 +111,50 @@ pub fn register() {
 
 /// Checks the handle of `did`: its document, then the handle it names,
 /// resolved back.
-async fn check(st: &WebState, cfg: &Config, did: &Did) -> Checked {
+///
+/// With an answer that is not a verified handle comes why, for the log.
+async fn check(st: &WebState, cfg: &Config, did: &Did) -> (Checked, Option<String>) {
     let Some(url) = document_url(cfg, did) else {
-        return Checked::Gone;
+        return (Checked::Gone, None);
     };
     let r = match st.safe.get(&url).await {
         Ok(r) => r,
-        Err(_) => return Checked::Unknown,
+        Err(e) => return (Checked::Unknown, Some(format!("document: {e}"))),
     };
     let doc = match r.status {
         200 => serde_json::from_slice::<serde_json::Value>(&r.body).ok(),
-        404 | 410 => return Checked::Gone,
-        _ => return Checked::Unknown,
+        404 | 410 => return (Checked::Gone, None),
+        other => return (Checked::Unknown, Some(format!("document: HTTP {other}"))),
     };
     let Some(doc) = doc else {
-        return Checked::Unknown;
+        return (Checked::Unknown, Some("document: not JSON".into()));
     };
     let Some(claim) = claimed_handle(&doc) else {
-        return Checked::Gone;
+        return (Checked::Gone, None);
     };
     match resolve_handle(&st.safe, &claim).await {
-        Ok(back) if back == *did => Checked::Handle(claim),
-        Ok(_) => Checked::Gone,
-        Err(_) => Checked::Unresolved(claim),
+        Ok(back) if back == *did => (Checked::Handle(claim), None),
+        Ok(_) => (Checked::Gone, None),
+        // The handle's host answered, and not with this DID: the claim
+        // stands unproven. Anything else (no answer, no address, a
+        // timeout) proves nothing about the account.
+        Err(e) if answered(&e) => (Checked::Unresolved(claim), Some(e)),
+        Err(e) => (Checked::Unknown, Some(e)),
     }
 }
+
+/// Whether a failed handle resolution got an answer from the handle's
+/// host (an HTTP status, or a body that is not a DID), as opposed to no
+/// answer at all.
+fn answered(error: &str) -> bool {
+    error.contains(": HTTP ") || error.ends_with("did not resolve to a DID")
+}
+
+/// Checks that established nothing, counted: every [`LOG_EVERY`]th is
+/// logged with its reason.
+static UNESTABLISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// One in this many checks that established nothing is logged.
+pub const LOG_EVERY: u64 = 50;
 
 /// Stores what a check found. The memory cache is touched only where it
 /// already holds the account: the pass must not push the accounts pages
@@ -166,28 +190,48 @@ async fn record(
     Ok(())
 }
 
-/// One account to check; `queued` when it came from `handle_due`.
+/// One account to check; `queued` when it came from `handle_due`,
+/// `again` when an earlier check of it in this run established nothing.
 #[derive(Debug)]
 struct Item {
     did: String,
     queued: bool,
+    again: bool,
 }
 
-/// Checks one account and stores the answer. Returns whether anything
-/// was established.
-async fn check_one(st: Arc<WebState>, item: Item) -> bool {
+/// Checks one account and stores the answer. Returns the account when
+/// nothing was established and nothing was stored: the caller checks it
+/// once more later.
+async fn check_one(st: Arc<WebState>, item: Item) -> Option<String> {
     let cfg = st.api.config.current();
     let cfg = &cfg.config;
     let Ok(did) = Did::parse(&item.did) else {
-        return true;
+        return None;
     };
-    let found = tokio::time::timeout(CHECK_DEADLINE, check(&st, cfg, &did))
+    let (found, why) = tokio::time::timeout(CHECK_DEADLINE, check(&st, cfg, &did))
         .await
-        .unwrap_or(Checked::Unknown);
+        .unwrap_or((Checked::Unknown, Some("deadline".into())));
+    if let Some(why) = why {
+        let n = UNESTABLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % LOG_EVERY == 0 {
+            tracing::warn!(
+                outcome = found.label(),
+                why,
+                seen = n + 1,
+                "handle pass: a check established nothing (one in {LOG_EVERY} is logged)"
+            );
+        }
+    }
     ::metrics::counter!(PASS, "outcome" => found.label()).increment(1);
+    // A first check that established nothing stores nothing: the cause
+    // is as likely here (the resolver, the network) as there, and the
+    // account is checked again after the pass has waited.
+    if found == Checked::Unknown && !item.again && !item.queued {
+        return Some(item.did);
+    }
     if let Err(e) = record(&st, cfg, &did, &found).await {
         tracing::warn!(error = %e, "handle pass: an answer could not be stored");
-        return false;
+        return None;
     }
     if item.queued {
         let done = match st.api.pool.acquire().await {
@@ -201,7 +245,7 @@ async fn check_one(st: Arc<WebState>, item: Item) -> bool {
             tracing::warn!(error = %e, "handle pass: the queue could not be updated");
         }
     }
-    found != Checked::Unknown
+    None
 }
 
 /// Where the walk is.
@@ -221,7 +265,11 @@ async fn next_items(st: &WebState, walk: &mut Walk) -> farsight_storage::Result<
     if !due.is_empty() {
         return Ok(due
             .into_iter()
-            .map(|did| Item { did, queued: true })
+            .map(|did| Item {
+                did,
+                queued: true,
+                again: false,
+            })
             .collect());
     }
     if let Some(since) = walk.rested_since {
@@ -252,7 +300,11 @@ async fn next_items(st: &WebState, walk: &mut Walk) -> farsight_storage::Result<
         if !rows.is_empty() {
             return Ok(rows
                 .into_iter()
-                .map(|did| Item { did, queued: false })
+                .map(|did| Item {
+                    did,
+                    queued: false,
+                    again: false,
+                })
                 .collect());
         }
     }
@@ -279,6 +331,8 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
     let mut walk = Walk::default();
     let mut backoff = Duration::ZERO;
     let mut was_on = false;
+    // Accounts whose first check established nothing, for one more.
+    let mut retry: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     loop {
         if *stop.borrow() {
             return;
@@ -295,11 +349,25 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
             was_on = true;
             tracing::info!(rps, from = walk.cursor, "handle pass: running");
         }
-        let items = match next_items(&st, &mut walk).await {
-            Ok(items) => items,
-            Err(e) => {
-                tracing::warn!(error = %e, "handle pass: the next accounts could not be read");
-                Vec::new()
+        // Second checks come after the wait that followed their first,
+        // a batch at a time, before the walk goes on.
+        let items = if backoff.is_zero() && !retry.is_empty() {
+            let n = retry.len().min(BATCH as usize);
+            retry
+                .drain(..n)
+                .map(|did| Item {
+                    did,
+                    queued: false,
+                    again: true,
+                })
+                .collect()
+        } else {
+            match next_items(&st, &mut walk).await {
+                Ok(items) => items,
+                Err(e) => {
+                    tracing::warn!(error = %e, "handle pass: the next accounts could not be read");
+                    Vec::new()
+                }
             }
         };
         if items.is_empty() {
@@ -326,16 +394,19 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
             };
             let st2 = st.clone();
             checks.spawn(async move {
-                let established = check_one(st2, item).await;
+                let unsettled = check_one(st2, item).await;
                 drop(slot);
-                established
+                unsettled
             });
         }
         let (mut all, mut unknown) = (0u32, 0u32);
         while let Some(r) = checks.join_next().await {
             all += 1;
-            if !matches!(r, Ok(true)) {
+            if let Ok(Some(did)) = r {
                 unknown += 1;
+                if retry.len() < RETRY_CAP {
+                    retry.push_back(did);
+                }
             }
         }
         if all >= 20 && unknown * 2 > all {
@@ -349,7 +420,7 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
             if pause(&mut stop, backoff).await {
                 return;
             }
-        } else {
+        } else if all > 0 {
             backoff = Duration::ZERO;
         }
     }
@@ -430,6 +501,16 @@ pub async fn run_lists(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_answer_from_the_host_leaves_a_claim_unresolved() {
+        assert!(answered("could not resolve a.example: HTTP 404"));
+        assert!(answered("a.example did not resolve to a DID"));
+        assert!(!answered(
+            "could not resolve a.example: transport error: error sending request"
+        ));
+        assert!(!answered("could not resolve a.example: request timed out"));
+    }
 
     #[test]
     fn the_wait_doubles_between_a_minute_and_half_an_hour() {

@@ -317,7 +317,9 @@ nothing else in a browser.
   about twelve days, around the clock, and each check is up to two
   requests to servers Farsight does not run (the PLC directory and
   the handle's host). When most checks of a batch establish nothing
-  it waits, a minute at first and up to half an hour. A check that
+  it waits, a minute at first and up to half an hour; an account
+  whose check established nothing is checked once more afterwards
+  before "nothing to show" is stored for it. A check that
   shows the account's document no longer names the stored handle, or
   that the handle now belongs to another account, removes the stored
   handle; an unreachable host does not. Progress:

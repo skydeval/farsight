@@ -3043,7 +3043,7 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
             && custom.text.contains("<details class=\"guide home-guide\">")
             && custom.text.contains("<span>How to read a page</span></summary>")
             && custom.text.contains("acct-takendown\">taken down</span>")
-            && custom.text.matches("action=\"/search\"").count() == 2
+            && custom.text.matches("action=\"/search\"").count() == 1
             && updated_of(&custom.text).is_some()
             && !custom.text.contains("/about")
             && !custom.text.contains("Instance-wide"),
@@ -4107,6 +4107,21 @@ fn check_page_rules(c: &mut Checks, h: &H) {
     let mut bad = Vec::new();
     for (path, html) in &documents {
         let nav = between(html, "<nav class=\"public-nav\"", "</nav>");
+        // Home has its own search form and guide: its bar is the brand
+        // and the theme toggle.
+        if html.contains("<details class=\"guide home-guide\">") {
+            let ok = nav.len() == 1
+                && nav[0].contains(
+                    "<a class=\"brand\" href=\"/\" aria-label=\"Farsight\" title=\"Farsight\">",
+                )
+                && !nav[0].contains("<form")
+                && !nav[0].contains("nav-guide")
+                && nav[0].contains("class=\"theme-toggle\"");
+            if !ok {
+                bad.push(path.clone());
+            }
+            continue;
+        }
         let ok = nav.len() == 1
             && nav[0].contains(
                 "<a class=\"brand\" href=\"/\" aria-label=\"Farsight\" title=\"Farsight\">",
@@ -4125,7 +4140,7 @@ fn check_page_rules(c: &mut Checks, h: &H) {
         }
     }
     c.check(
-        "the bar is on every public page — data pages, the withheld notice, error pages: brand link to /, a GET search form to /search with one empty field q, the theme toggle",
+        "the bar is on every public page — data pages, the withheld notice, error pages: brand link to /, a GET search form to /search with one empty field q, the guide, the theme toggle; on home, which has its own search form and guide, the brand and the toggle alone",
         bad.is_empty() && documents.len() > 100,
         format!("{} pages scanned; offenders: {bad:?}", documents.len()),
     );

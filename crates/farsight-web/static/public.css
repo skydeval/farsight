@@ -900,11 +900,8 @@ details.nav-guide > .guide-panel {
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
   z-index: 60;
 }
-/* The home page has the guide in place. */
-body:has(details.home-guide) details.nav-guide {
-  display: none;
-}
-body:has(details.home-guide) nav.public-nav .theme-toggle {
+/* The home page's bar has neither the search form nor the guide. */
+nav.public-nav > .brand + .theme-toggle {
   margin-left: auto;
 }
 nav.pager a, nav.pager span {
@@ -1132,8 +1129,11 @@ dl.facts dd {
   font-size: 2.4rem;
   font-weight: 800;
   letter-spacing: -0.03em;
-  line-height: 1.2;
-  margin-bottom: 1rem;
+  /* Room for the descenders: the text is painted by its background,
+     which ends with the line box. */
+  line-height: 1.35;
+  padding-bottom: 0.08em;
+  margin-bottom: 1.25rem;
   background: linear-gradient(135deg, var(--fg-strong) 40%, var(--accent) 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
