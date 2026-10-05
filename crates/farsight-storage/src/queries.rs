@@ -484,6 +484,24 @@ pub async fn list_about(conn: &mut PgConnection, list_id: i64) -> Result<ListAbo
         .unwrap_or_default())
 }
 
+/// Present lists whose record has not been read for its description,
+/// after `after` in id order: `(id, owner DID, rkey)`.
+pub async fn lists_unread(
+    conn: &mut PgConnection,
+    after: i64,
+    limit: i64,
+) -> Result<Vec<(i64, String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT l.id, o.did, l.rkey FROM lists l JOIN actors o ON o.id = l.owner_id
+         WHERE l.id > $1 AND l.record_state = 1 AND NOT l.about_read
+         ORDER BY l.id LIMIT $2",
+    )
+    .bind(after)
+    .bind(limit)
+    .fetch_all(conn)
+    .await?)
+}
+
 /// Stores what a list's record says about itself, read for a row older
 /// than the columns. Only a present record that has not been read is
 /// written: a record applied in the meantime is newer than this read.

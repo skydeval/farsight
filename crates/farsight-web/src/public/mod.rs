@@ -34,6 +34,7 @@ pub mod handles;
 pub mod metrics;
 pub mod pages;
 pub mod paging;
+pub mod pass;
 pub mod search;
 pub mod text;
 pub mod warming;

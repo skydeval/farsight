@@ -16,9 +16,21 @@ commits it covers.
 
 ## [0.5.0] - 2026-10-04
 
-Database schema version 10.
+Database schema version 11.
 
 ### Added
+
+- The handle pass (`public_ui.handle_pass_rps`, off by default): a
+  background worker that checks the handle of every account Farsight
+  holds, so that a page's rows have their handles before anyone opens
+  it. It keeps its own pace, waits by itself when checks fail, and
+  reports its progress as metrics.
+- Identity events from the firehose queue the account for a handle
+  check ahead of everything else (new table `handle_due`), so a changed
+  handle is picked up without anyone viewing the account.
+- While the pass is on, lists stored by an earlier version have their
+  description and image read in the background, not only when their
+  page is opened.
 
 - List pages show the list's description (plain text, no links, at
   most 300 characters) and its image. Farsight stores the text and
@@ -52,6 +64,10 @@ Database schema version 10.
 - "Last updated" moved into the footer of every page that has one,
   where the "ATProto Block Graph Index" label was.
 - The workspace version is 0.5.0 (it was 0.1.0 since the first commit).
+- A handle check by the pass that shows the account's document no
+  longer names the stored handle, or that the handle now belongs to
+  another account, removes the stored handle. An unreachable host still
+  leaves it in place.
 
 ### Removed
 
@@ -61,6 +77,8 @@ Database schema version 10.
   setting; no public page shows it.
 - The line under the home page's search box that repeated the text
   inside it.
+- Unused script and styles left from the copy buttons, the section
+  links and the stat tiles.
 
 ## [0.4.0] - 2026-10-04
 

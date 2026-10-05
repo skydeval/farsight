@@ -542,6 +542,11 @@ pub struct PublicUiConfig {
     /// cards and the background worker together; 1 to
     /// [`MAX_HANDLE_RPS`]. Each one is up to two outbound requests.
     pub handle_rps: u32,
+    /// Handle checks a second by the handle pass, which works through
+    /// every account Farsight holds in the background; 0 (the default)
+    /// = off, at most [`MAX_HANDLE_RPS`]. Its own pace: `handle_rps` is
+    /// not drawn on. Each check is up to two outbound requests.
+    pub handle_pass_rps: u32,
 }
 
 impl PublicUiConfig {
@@ -578,6 +583,7 @@ impl Default for PublicUiConfig {
             card_burst: 8,
             handle_warming_enabled: true,
             handle_rps: 20,
+            handle_pass_rps: 0,
         }
     }
 }
@@ -1403,6 +1409,12 @@ impl Config {
         if p.handle_rps == 0 || p.handle_rps > MAX_HANDLE_RPS {
             return Err(invalid("public_ui.handle_rps", "must be between 1 and 200"));
         }
+        if p.handle_pass_rps > MAX_HANDLE_RPS {
+            return Err(invalid(
+                "public_ui.handle_pass_rps",
+                "must be between 0 and 200",
+            ));
+        }
         if !p.record_viewer_url.is_empty() {
             validate_record_viewer_url(&p.record_viewer_url)
                 .map_err(|r| invalid("public_ui.record_viewer_url", r))?;
@@ -1599,6 +1611,7 @@ mod tests {
         assert_eq!((p.card_rps, p.card_burst), (4, 8));
         assert!(p.handle_warming_enabled);
         assert_eq!((p.handle_rps, p.handle_burst()), (20, 20));
+        assert_eq!(p.handle_pass_rps, 0);
         assert!(!p.crawlable && p.excluded_dids.is_empty());
         assert_eq!(p.dark_mode_default, ThemeDefault::System);
         assert_eq!((p.rate_limit_rps, p.rate_limit_burst), (5, 20));

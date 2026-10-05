@@ -310,6 +310,17 @@ pub async fn list_about(
     {
         return None;
     }
+    list_about_unbudgeted(st, cfg, did, rkey).await
+}
+
+/// [`list_about`] without the card budget, for the background filler,
+/// which keeps its own pace.
+pub async fn list_about_unbudgeted(
+    st: &WebState,
+    cfg: &Config,
+    did: &Did,
+    rkey: &str,
+) -> Option<(Option<String>, Option<String>)> {
     let deadline = tokio::time::Instant::now() + LIST_ABOUT_DEADLINE;
     let ident = identity(&st.safe, cfg, did, deadline).await?;
     let base = ident.pds.as_deref().and_then(|p| Url::parse(p).ok())?;

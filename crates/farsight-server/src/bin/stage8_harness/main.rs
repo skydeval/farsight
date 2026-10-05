@@ -1907,6 +1907,106 @@ async fn set_warming(a: &Srv, cookie: &str, on: bool) -> Result<Resp, String> {
         .await
 }
 
+async fn set_pass(a: &Srv, cookie: &str, rps: u32) -> Result<Resp, String> {
+    let page = a.admin_get(cookie, "/admin/settings").await?;
+    let csrf = csrf_of(&page.text).ok_or("no csrf on /admin/settings")?;
+    let mut form = warming_form(&csrf, true);
+    form.push(("handle_pass_rps", rps.to_string()));
+    let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    a.admin
+        .post_form(
+            &format!("{}/admin/settings/public-ui", a.base),
+            &[("cookie", cookie)],
+            &pairs,
+        )
+        .await
+}
+
+/// The handle pass: off by default; switched on, it serves queued
+/// identity changes first, then walks the accounts; switched off, it
+/// stops.
+async fn check_pass(
+    c: &mut Checks,
+    a: &Srv,
+    pool: &PgPool,
+    cookie: &str,
+    plc: &Plc,
+) -> Result<(), String> {
+    c.section("19b. the handle pass (handle_pass_rps)");
+    let stored = "SELECT count(*) FROM handle_cache";
+    let before = n(pool, stored).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let settings = a.admin_get(cookie, "/admin/settings").await?;
+    c.check(
+        "off by default: Settings shows handle_pass_rps = 0 and nothing is checked in the background",
+        settings.text.contains("name=\"handle_pass_rps\" min=\"0\" max=\"200\" value=\"0\"")
+            && n(pool, stored).await? == before,
+        format!("{before} stored answers"),
+    );
+    seed::exec(
+        pool,
+        &format!(
+            "INSERT INTO actors (did) SELECT {} FROM generate_series(1, 30) g ON CONFLICT DO NOTHING",
+            did_sql("hpq", "g")
+        ),
+    )
+    .await?;
+    let (kept, queued_only) = (did("hpq", 1), "did LIKE 'did:plc:hpq%'");
+    seed::exec(
+        pool,
+        &format!("INSERT INTO handle_cache (did, handle, resolved_at) VALUES ('{kept}', 'old.example', now())"),
+    )
+    .await?;
+    seed::exec(
+        pool,
+        &format!("INSERT INTO handle_due (did) SELECT did FROM actors WHERE {queued_only}"),
+    )
+    .await?;
+    let saved = set_pass(a, cookie, 200).await?;
+    let waiting = format!("SELECT count(*) FROM handle_due WHERE {queued_only}");
+    let started = Instant::now();
+    while n(pool, &waiting).await? > 0 && started.elapsed() < Duration::from_secs(30) {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let left = n(pool, &waiting).await?;
+    let asked: Vec<u32> = (1..=30).map(|i| plc.documents(&did("hpq", i))).collect();
+    let answered = n(
+        pool,
+        &format!("SELECT count(*) FROM handle_cache WHERE {queued_only} AND handle = ''"),
+    )
+    .await?;
+    let m = a.metrics_text().await?;
+    let gone = metric(&m, "farsight_handle_pass_total", &[("outcome", "gone")]);
+    c.check(
+        "switched on (saved from Settings, no restart): accounts queued by identity changes are checked first — each one's document read once, the queue emptied, the answer stored; an account whose document no longer names the handle stored for it loses that handle",
+        saved.status < 400
+            && left == 0
+            && asked.iter().all(|k| *k == 1)
+            && answered == 30
+            && gone >= 30.0,
+        format!("{left} left in the queue, documents asked {asked:?}, {answered} stored as no handle, gone = {gone}"),
+    );
+    let n0 = n(pool, stored).await?;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let n1 = n(pool, stored).await?;
+    let position = metric(
+        &a.metrics_text().await?,
+        "farsight_handle_pass_position",
+        &[],
+    );
+    set_pass(a, cookie, 0).await?;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let n2 = n(pool, stored).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let n3 = n(pool, stored).await?;
+    c.check(
+        "then it walks the accounts in id order at its own rate, storing an answer for each (hundreds in five seconds at 200 a second); set back to 0 it stops",
+        n1 >= n0 + 300 && position > 0.0 && n3 == n2,
+        format!("stored answers {n0} → {n1} in 5 s, position {position}; after switching off {n2} → {n3}"),
+    );
+    Ok(())
+}
+
 /// How many rows a public section says it holds back for a handle check.
 fn pending_of(sec: &str) -> usize {
     between(sec, "data-pending=\"", "\"")
@@ -2199,11 +2299,11 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let building = log.find("sort index: building");
     let migrations: i64 = n(&pool, "SELECT count(*) FROM _sqlx_migrations").await?;
     c.check(
-        "a fresh database: the server is live in its normal start-up time, the ten migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
+        "a fresh database: the server is live in its normal start-up time, the eleven migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
         have == 4
             && health.status == 200
             && e.came_up < Duration::from_secs(60)
-            && migrations == 10
+            && migrations == 11
             && serving.is_some()
             && building.is_some()
             && serving < building
@@ -2787,6 +2887,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     check_admin_columns(c, &a, &b, &cookie, &w).await?;
     check_shared_budget(c, &b, &cookie, &plc).await?;
     check_warming(c, &a, &pool, &cookie, &plc, &w).await?;
+    check_pass(c, &a, &pool, &cookie, &plc).await?;
     check_representative(c, &pool, &w).await?;
     drop(b);
     drop(a);

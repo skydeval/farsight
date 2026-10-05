@@ -65,6 +65,8 @@ pub struct Settings {
     pub handle_warming_enabled: bool,
     /// `handle_rps`.
     pub handle_rps: u32,
+    /// `handle_pass_rps`.
+    pub handle_pass_rps: u32,
     /// `dark_mode_default`: `light`, `dark` or `system`.
     pub dark_mode_default: String,
     /// `crawlable`.
@@ -107,6 +109,8 @@ pub struct View {
     pub handle_warming_enabled: bool,
     /// Handle verifications per second.
     pub handle_rps: String,
+    /// Background handle checks per second; 0 = off.
+    pub handle_pass_rps: String,
     /// Theme default.
     pub dark_mode_default: String,
     /// Crawlers.
@@ -141,6 +145,7 @@ impl View {
             card_burst: p.effective_card_burst().to_string(),
             handle_warming_enabled: p.handle_warming_enabled,
             handle_rps: p.handle_rps.to_string(),
+            handle_pass_rps: p.handle_pass_rps.to_string(),
             dark_mode_default: p.dark_mode_default.as_str().to_owned(),
             crawlable: p.crawlable,
             rate_limit_rps: p.rate_limit_rps.to_string(),
@@ -172,6 +177,10 @@ impl View {
                 .get("handle_rps")
                 .cloned()
                 .unwrap_or_else(|| c.public_ui.handle_rps.to_string()),
+            handle_pass_rps: form
+                .get("handle_pass_rps")
+                .cloned()
+                .unwrap_or_else(|| c.public_ui.handle_pass_rps.to_string()),
             dark_mode_default: s("dark_mode_default"),
             crawlable: b("crawlable"),
             rate_limit_rps: s("rate_limit_rps"),
@@ -267,6 +276,12 @@ impl Settings {
                 1,
                 farsight_core::config::MAX_HANDLE_RPS,
             )?,
+            handle_pass_rps: number(
+                "Background handle checks per second",
+                &v.handle_pass_rps,
+                0,
+                farsight_core::config::MAX_HANDLE_RPS,
+            )?,
             enabled: v.enabled,
             instance_description: v.instance_description.replace("\r\n", "\n"),
             contact: v.contact.trim().to_owned(),
@@ -320,6 +335,10 @@ impl Settings {
             self.handle_warming_enabled.into(),
         );
         p.insert("handle_rps".into(), i64::from(self.handle_rps).into());
+        p.insert(
+            "handle_pass_rps".into(),
+            i64::from(self.handle_pass_rps).into(),
+        );
         p.insert(
             "show_opengraph_image".into(),
             self.show_opengraph_image.into(),

@@ -236,6 +236,131 @@ pub async fn store_none(conn: &mut PgConnection, did: &str) -> Result<()> {
     Ok(())
 }
 
+/// Records that `did` definitely has no handle to show, as of now. A
+/// handle stored for it is replaced: its document no longer names it, or
+/// the handle now belongs to another account.
+pub async fn store_gone(conn: &mut PgConnection, did: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, '', now())
+         ON CONFLICT (did) DO UPDATE SET handle = '', resolved_at = EXCLUDED.resolved_at",
+    )
+    .bind(did)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// How far back an answer that established nothing is dated: it is due
+/// for the handle pass again a day later.
+const UNKNOWN_AGE: &str = "interval '6 days'";
+
+/// Records that the document of `did` names `claim` and the handle could
+/// not be resolved back. A stored handle equal to the claim is kept as
+/// it is (the host may only be unreachable); any other stored handle is
+/// no longer the account's and is replaced by "nothing to show".
+pub async fn store_unresolved(conn: &mut PgConnection, did: &str, claim: &str) -> Result<()> {
+    sqlx::query(&format!(
+        "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, '', now() - {UNKNOWN_AGE})
+         ON CONFLICT (did) DO UPDATE SET handle = '', resolved_at = EXCLUDED.resolved_at
+           WHERE handle_cache.handle <> $2"
+    ))
+    .bind(did)
+    .bind(claim)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Records that a check of `did` established nothing. A stored handle is
+/// left as it is.
+pub async fn store_unknown(conn: &mut PgConnection, did: &str) -> Result<()> {
+    sqlx::query(&format!(
+        "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, '', now() - {UNKNOWN_AGE})
+         ON CONFLICT (did) DO UPDATE SET resolved_at = EXCLUDED.resolved_at
+           WHERE handle_cache.handle = ''"
+    ))
+    .bind(did)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// The accounts whose handle is to be checked first: the oldest entries
+/// of `handle_due` that may be served now.
+pub async fn due_take(conn: &mut PgConnection, limit: i64) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT did FROM handle_due WHERE asked_at <= now() ORDER BY asked_at LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(conn)
+    .await?)
+}
+
+/// A queued account was checked.
+pub async fn due_done(conn: &mut PgConnection, did: &str) -> Result<()> {
+    sqlx::query("DELETE FROM handle_due WHERE did = $1")
+        .bind(did)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// A queued account's check established nothing: not before `secs` from
+/// now.
+pub async fn due_later(conn: &mut PgConnection, did: &str, secs: i64) -> Result<()> {
+    sqlx::query("UPDATE handle_due SET asked_at = now() + $2 * interval '1 second' WHERE did = $1")
+        .bind(did)
+        .bind(secs)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// The highest `actors.id`, 0 for an empty table.
+pub async fn last_actor_id(conn: &mut PgConnection) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT COALESCE(max(id), 0) FROM actors")
+            .fetch_one(conn)
+            .await?,
+    )
+}
+
+/// One step of the handle pass's walk: of the accounts with `after < id
+/// <= after + window`, at most `limit` that no table hides for good
+/// (not deactivated, not deleted) and that have no stored answer, or a
+/// stored "nothing to show" older than `none_retry_secs`. Returns them in
+/// id order with the id the walk has reached: the last one returned when
+/// the window held more, else the window's end.
+pub async fn pass_batch(
+    conn: &mut PgConnection,
+    after: i64,
+    window: i64,
+    limit: i64,
+    none_retry_secs: i64,
+) -> Result<(Vec<String>, i64)> {
+    let end = after.saturating_add(window);
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT a.id, a.did FROM actors a
+         WHERE a.id > $1 AND a.id <= $2 AND a.status NOT IN (1, 4)
+           AND NOT EXISTS (
+             SELECT 1 FROM handle_cache h
+             WHERE h.did = a.did
+               AND (h.handle <> '' OR h.resolved_at > now() - $3 * interval '1 second'))
+         ORDER BY a.id LIMIT $4",
+    )
+    .bind(after)
+    .bind(end)
+    .bind(none_retry_secs)
+    .bind(limit)
+    .fetch_all(conn)
+    .await?;
+    let reached = match rows.last() {
+        Some((id, _)) if rows.len() as i64 == limit => *id,
+        _ => end,
+    };
+    Ok((rows.into_iter().map(|(_, did)| did).collect(), reached))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

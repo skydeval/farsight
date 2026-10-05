@@ -169,6 +169,7 @@ pub async fn run(
     farsight_storage::history::register_metrics();
     farsight_web::public::metrics::register();
     farsight_web::public::warming::register();
+    farsight_web::public::pass::register();
     // Which UI sections sort by shown time: read once before serving, then
     // kept by the index builder (§7.6).
     let sort = Arc::new(farsight_storage::ui_rows::SortIndexes::default());
@@ -309,6 +310,14 @@ pub async fn run(
         web.clone(),
         stop_rx.clone(),
     ));
+    let pass = tokio::spawn(farsight_web::public::pass::run(
+        web.clone(),
+        stop_rx.clone(),
+    ));
+    let list_filler = tokio::spawn(farsight_web::public::pass::run_lists(
+        web.clone(),
+        stop_rx.clone(),
+    ));
     let index_builder = tokio::spawn(
         sort_indexes::Builder {
             pool: tasks_pool.clone(),
@@ -346,6 +355,8 @@ pub async fn run(
     }
     housekeeping.abort();
     warming.abort();
+    pass.abort();
+    list_filler.abort();
     // An interrupted build leaves an invalid index; the next start drops
     // it and builds again.
     index_builder.abort();

@@ -306,6 +306,27 @@ nothing else in a browser.
   nothing does that background work: no row is held back, an account
   not seen before shows as a DID (unless its own page or card is
   opened), and a stored handle is never checked again.
+- **The handle pass.** With `handle_pass_rps` above 0 (off by
+  default) Farsight checks the handle of every account it holds, in
+  the background, so that a page's rows have their handles before
+  anyone opens it. Accounts the firehose reports an identity change
+  for are checked first (table `handle_due`); then the pass walks the
+  accounts in the order they were stored, skipping deactivated and
+  deleted ones and those already answered. It keeps its own pace,
+  apart from `handle_rps`: at 10 a second, ten million accounts take
+  about twelve days, around the clock, and each check is up to two
+  requests to servers Farsight does not run (the PLC directory and
+  the handle's host). When most checks of a batch establish nothing
+  it waits, a minute at first and up to half an hour. A check that
+  shows the account's document no longer names the stored handle, or
+  that the handle now belongs to another account, removes the stored
+  handle; an unreachable host does not. Progress:
+  `farsight_handle_pass_position` (the account id reached),
+  `farsight_handle_pass_total{outcome}` and
+  `farsight_handle_pass_laps_total` on the metrics listener. A restart
+  begins the walk again and passes over answered accounts without a
+  request. While the pass is on, lists stored before descriptions were
+  kept have their record read too, one a second.
 - **No coverage detail.** A public page prints no coverage level. It
   says "None on record at this instance" for an empty section, says so
   when a list is not indexed, and states "Last updated" once, in its
@@ -368,6 +389,7 @@ query_concurrency = 8             # concurrent page renders
 handle_cache_ttl = "1h"           # in memory; the stored copy refills it
 handle_warming_enabled = true     # verify handles of shown accounts in the background
 handle_rps = 20                   # handle checks per second, whole instance; 1-200
+handle_pass_rps = 0               # background checks of every account, per second; 0 = off, at most 200
 excluded_dids = []                # at most 10,000
 ```
 
@@ -392,6 +414,15 @@ warning; the value does nothing, and the key is removed the next time
 you save the Public UI settings.
 
 ### Upgrading from an earlier version
+
+From a version without the handle pass:
+
+- **One new table**, `handle_due` (schema version 11), created by the
+  server at start. Nothing has to be edited: the pass is off until
+  `handle_pass_rps` is set.
+- **Rolling back.** An older binary does not start on schema version
+  11: `DROP TABLE handle_due; UPDATE schema_version SET version = 10;
+  DELETE FROM _sqlx_migrations WHERE version = 11;` first.
 
 From a version whose list pages had no description:
 

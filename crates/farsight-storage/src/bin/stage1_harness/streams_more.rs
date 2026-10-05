@@ -1258,6 +1258,33 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
             .fetch_optional(&env.pool)
             .await?;
     c.eq("identity ⇒ PDS cache cleared", cleared, Some(true));
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM handle_due WHERE did = $1")
+        .bind(o.as_str())
+        .fetch_one(&env.pool)
+        .await?;
+    c.eq(
+        "identity ⇒ the account's handle is queued for a check",
+        queued,
+        1,
+    );
+    let stranger = farsight_core::Did::parse("did:plc:zzzzzzzzzzzzzzzzzzzzzzzz").expect("a DID");
+    events_batch(
+        env,
+        vec![E::Identity {
+            did: stranger.clone(),
+            witness: w,
+        }],
+    )
+    .await?;
+    let strangers: i64 = sqlx::query_scalar("SELECT count(*) FROM handle_due WHERE did = $1")
+        .bind(stranger.as_str())
+        .fetch_one(&env.pool)
+        .await?;
+    c.eq(
+        "identity of an account not held ⇒ nothing queued",
+        strangers,
+        0,
+    );
 
     // deleted ⇒ reported for purge; the purge removes authored rows and
     // fires RD on the account's lists.

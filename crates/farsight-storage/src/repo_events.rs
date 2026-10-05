@@ -105,10 +105,18 @@ impl Txn<'_> {
     pub async fn apply_repo_event(&mut self, ev: &RepoEvent, system_queue_cap: i64) -> Result<()> {
         match ev {
             RepoEvent::Identity { did, .. } => {
-                sqlx::query("UPDATE actors SET pds_resolved_at = NULL WHERE did = $1")
-                    .bind(did.as_str())
-                    .execute(&mut *self.conn)
-                    .await?;
+                // The account's handle may have changed: the handle pass
+                // checks it ahead of its walk. Only accounts Farsight
+                // holds are noted.
+                sqlx::query(
+                    "WITH a AS (UPDATE actors SET pds_resolved_at = NULL WHERE did = $1
+                                RETURNING did)
+                     INSERT INTO handle_due (did) SELECT did FROM a
+                     ON CONFLICT (did) DO UPDATE SET asked_at = now()",
+                )
+                .bind(did.as_str())
+                .execute(&mut *self.conn)
+                .await?;
                 self.report.repo_events += 1;
             }
             RepoEvent::Sync { did, witness } => {
