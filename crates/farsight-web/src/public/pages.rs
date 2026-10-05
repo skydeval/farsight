@@ -709,12 +709,7 @@ pub async fn home(r: &Req<'_>) -> Result<Response, Fail> {
         &HomePage {
             c: Chrome {
                 home: true,
-                ..chrome(
-                    cfg,
-                    &format!("Farsight at {host}"),
-                    OG_INSTANCE,
-                    "/",
-                )
+                ..chrome(cfg, &format!("Farsight at {host}"), OG_INSTANCE, "/")
             },
             description: if description.is_empty() {
                 vec![DEFAULT_DESCRIPTION.to_owned()]

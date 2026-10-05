@@ -4156,7 +4156,9 @@ fn check_page_rules(c: &mut Checks, h: &H) {
         .iter()
         .filter(|(_, html)| {
             !html.contains("<title>Farsight</title>")
-                || !html.contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/favicon.svg?v=")
+                || !html.contains(
+                    "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/favicon.svg?v=",
+                )
         })
         .map(|(path, _)| path)
         .collect();

@@ -336,12 +336,7 @@ pub struct Chrome {
 }
 
 /// Builds the layout data of a page at `path` (no query string).
-pub fn chrome(
-    cfg: &Config,
-    og_title: &str,
-    og_text: &'static str,
-    path: &str,
-) -> Chrome {
+pub fn chrome(cfg: &Config, og_title: &str, og_text: &'static str, path: &str) -> Chrome {
     let host = &cfg.server.hostname;
     Chrome {
         theme: cfg.public_ui.dark_mode_default.as_str(),
