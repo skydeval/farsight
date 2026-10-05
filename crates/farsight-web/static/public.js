@@ -285,7 +285,7 @@
       return;
     }
     var then = Date.parse(t.getAttribute("datetime"));
-    var words = isNaN(then) ? null : span(then, Date.now());
+    var words = isNaN(then) ? null : since(new Date(then), new Date());
     if (!words) {
       return;
     }
@@ -604,6 +604,7 @@
     finds();
     heroAvatar();
     listImage();
+    guide();
     fitPagers();
     var refit = null;
     window.addEventListener("resize", function () {
@@ -833,6 +834,26 @@
       .catch(function () {
         // No avatar: the header is complete without one.
       });
+  }
+
+  // The guide in the bar closes when something outside it is clicked
+  // or Escape is pressed. Its heading opens and closes it without this.
+  function guide() {
+    var box = document.querySelector("details.nav-guide");
+    if (!box) {
+      return;
+    }
+    document.addEventListener("click", function (event) {
+      if (box.open && !box.contains(event.target)) {
+        box.open = false;
+      }
+    });
+    document.addEventListener("keydown", function (event) {
+      if (box.open && (event.key === "Escape" || event.key === "Esc")) {
+        box.open = false;
+        box.querySelector("summary").focus();
+      }
+    });
   }
 
   // The list page's header shows the list's image. The server stores

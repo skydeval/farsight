@@ -2580,8 +2580,11 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
         leaked.is_empty()
             && seen.contains(&w.e)
             && seen.contains(suspended)
-            && text.contains("<span class=\"acct-tag acct-suspended\">suspended</span>")
-            && !text.contains("acct-takendown")
+            // Each page's guide names both tags once; any more are rows.
+            && text.matches("<span class=\"acct-tag acct-suspended\">suspended</span>").count()
+                > text.matches("<details class=\"guide").count()
+            && text.matches("acct-takendown").count()
+                == text.matches("<details class=\"guide").count()
             && seen.len() > 120,
         format!("{} DIDs on the pages; leaked: {leaked:?}", seen.len()),
     );
@@ -3032,7 +3035,8 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
             && ["Blocks indexed", "Lists tracked", "Accounts seen"]
                 .iter()
                 .all(|t| custom.text.contains(&format!("<dt>{t}</dt><dd>")))
-            && custom.text.contains("<section class=\"home-guide\"")
+            && custom.text.contains("<details class=\"guide home-guide\">")
+            && custom.text.contains("<span>How to read a page</span></summary>")
             && custom.text.contains("acct-takendown\">taken down</span>")
             && custom.text.matches("action=\"/search\"").count() == 2
             && updated_of(&custom.text).is_some()
@@ -4106,6 +4110,8 @@ fn check_page_rules(c: &mut Checks, h: &H) {
             )
             && nav[0].contains("<input type=\"search\" name=\"q\"")
             && !nav[0].contains(" value=\"")
+            && nav[0].contains("<details class=\"guide nav-guide\">")
+            && nav[0].contains("<dt>Blocked By</dt>")
             && nav[0].contains("class=\"theme-toggle\"");
         if !ok {
             bad.push(path.clone());

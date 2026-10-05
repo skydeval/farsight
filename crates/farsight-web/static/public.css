@@ -790,30 +790,122 @@ dl.home-totals dd {
   color: var(--fg-strong);
   font-variant-numeric: tabular-nums;
 }
-section.home-guide {
-  max-width: 44rem;
-  margin: 2.25rem auto 0;
-  text-align: left;
-}
-section.home-guide h2 {
-  margin: 0 0 0.75rem;
-  font-size: 1.05rem;
+/* The guide: a heading that opens and closes it, with an arrow that
+   turns. In place on the home page; in the bar on the other pages,
+   where it drops down over the page. */
+details.guide > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
   font-weight: 700;
   color: var(--fg-strong);
+  border: 1px solid var(--line);
+  background: var(--pill);
+  border-radius: var(--radius-full);
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
 }
-section.home-guide dt {
+details.guide > summary::-webkit-details-marker {
+  display: none;
+}
+details.guide > summary:hover, details.guide[open] > summary {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+details.guide .guide-arrow {
+  flex-shrink: 0;
+  color: var(--accent);
+  transition: transform 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+details.guide[open] .guide-arrow {
+  transform: rotate(90deg);
+}
+details.guide dl {
+  margin: 0;
+  text-align: left;
+}
+details.guide dt {
   margin-top: 0.8rem;
   font-weight: 700;
   color: var(--fg);
 }
-section.home-guide dt .acct-tag {
+details.guide dt:first-child {
+  margin-top: 0;
+}
+details.guide dt .acct-tag {
   margin-left: 0;
 }
-section.home-guide dd {
+details.guide dd {
   margin: 0.15rem 0 0;
   font-size: 0.92rem;
   line-height: 1.5;
   color: var(--muted);
+}
+details.guide[open] > dl, details.guide[open] > .guide-panel {
+  animation: guide-open 0.2s ease-out;
+}
+@keyframes guide-open {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  details.guide .guide-arrow { transition: none; }
+  details.guide[open] > dl, details.guide[open] > .guide-panel { animation: none; }
+}
+
+details.home-guide {
+  max-width: 44rem;
+  margin: 2.25rem auto 0;
+}
+details.home-guide > summary {
+  padding: 0.55rem 1.1rem;
+  font-size: 1.02rem;
+}
+details.home-guide > dl {
+  margin-top: 1rem;
+  padding: 1.1rem 1.25rem;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg, 14px);
+  background: var(--card);
+}
+
+details.nav-guide {
+  margin-left: auto;
+}
+details.nav-guide + .theme-toggle {
+  margin-left: 0;
+}
+details.nav-guide > summary {
+  padding: 0.32rem 0.8rem;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+details.nav-guide .guide-short {
+  display: none;
+}
+details.nav-guide > .guide-panel {
+  position: absolute;
+  top: 100%;
+  right: 1.5rem;
+  width: min(30rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 6rem);
+  overflow-y: auto;
+  margin-top: 0.4rem;
+  padding: 1.1rem 1.25rem;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg, 14px);
+  background: var(--card);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+  z-index: 60;
+}
+/* The home page has the guide in place. */
+body:has(details.home-guide) details.nav-guide {
+  display: none;
+}
+body:has(details.home-guide) nav.public-nav .theme-toggle {
+  margin-left: auto;
 }
 nav.pager a, nav.pager span {
   display: inline-flex;
@@ -1885,6 +1977,11 @@ footer {
 /* Responsive adjustments */
 @media (max-width: 44rem) {
   nav.public-nav { padding: 0.6rem 1rem; }
+  details.nav-guide .guide-label { display: none; }
+  details.nav-guide .guide-short { display: inline; }
+  details.nav-guide > summary { padding: 0.3rem 0.6rem; }
+  /* The bar is three rows high here. */
+  details.nav-guide > .guide-panel { right: 1rem; max-height: calc(100vh - 11rem); }
   main { padding: 1.25rem 1rem; }
   h1 { font-size: 1.4rem; }
   .hero h1 { font-size: 1.85rem; }

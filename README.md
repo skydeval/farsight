@@ -147,7 +147,9 @@ included) until the restart.
 `/` is the public UI's home page when the public UI is on: the
 instance's name and description, the search box, three totals (blocks
 indexed, lists tracked, accounts seen; the counts `getStats` gives) and
-a short guide to the tabs and the account tags. Otherwise it
+a short guide to the tabs and the account tags, which its heading
+("How to read a page") opens and closes. The other public pages have
+the same guide behind a button of that name in the bar. Otherwise it
 redirects to `/admin`, or, on an instance with neither interface, shows
 a few lines of text.
 

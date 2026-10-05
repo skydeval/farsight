@@ -329,7 +329,7 @@ if (livePath) {
         / UTC$/.test(d.title || "") &&
         d.age.length === 2 &&
         d.age.every((a) => a[0] === false) &&
-        /^\d+ days$/.test(d.age[1][1]) &&
+        /^(\d+ years?(, \d+ months?)?|\d+ months?(, \d+ days?)?|\d+ days?|less than a day)$/.test(d.age[1][1]) &&
         d.focusable === 0 &&
         described === id,
       detail: JSON.stringify({ image, ...d, described, id }),
