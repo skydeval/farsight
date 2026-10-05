@@ -456,6 +456,55 @@ pub async fn list_info(
     }))
 }
 
+/// What a list's record says about itself, for the list's page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListAbout {
+    /// The record's description, truncated.
+    pub description: Option<String>,
+    /// CID of the record's avatar blob.
+    pub avatar_cid: Option<String>,
+    /// Whether the record has been read for the two fields above (false
+    /// on rows older than the columns).
+    pub read: bool,
+}
+
+/// [`ListAbout`] of the list `list_id`.
+pub async fn list_about(conn: &mut PgConnection, list_id: i64) -> Result<ListAbout> {
+    let row: Option<(Option<String>, Option<String>, bool)> =
+        sqlx::query_as("SELECT description, avatar_cid, about_read FROM lists WHERE id = $1")
+            .bind(list_id)
+            .fetch_optional(conn)
+            .await?;
+    Ok(row
+        .map(|r| ListAbout {
+            description: r.0,
+            avatar_cid: r.1,
+            read: r.2,
+        })
+        .unwrap_or_default())
+}
+
+/// Stores what a list's record says about itself, read for a row older
+/// than the columns. Only a present record that has not been read is
+/// written: a record applied in the meantime is newer than this read.
+pub async fn list_about_fill(
+    conn: &mut PgConnection,
+    list_id: i64,
+    description: Option<&str>,
+    avatar_cid: Option<&str>,
+) -> Result<bool> {
+    let done = sqlx::query(
+        "UPDATE lists SET description = $2, avatar_cid = $3, about_read = true
+         WHERE id = $1 AND NOT about_read AND record_state = 1",
+    )
+    .bind(list_id)
+    .bind(description)
+    .bind(avatar_cid)
+    .execute(conn)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
 /// One list member (`getListMembers`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListMember {

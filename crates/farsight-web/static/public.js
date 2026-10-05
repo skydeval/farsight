@@ -603,6 +603,7 @@
     swaps();
     finds();
     heroAvatar();
+    listImage();
     fitPagers();
     var refit = null;
     window.addEventListener("resize", function () {
@@ -831,6 +832,58 @@
       })
       .catch(function () {
         // No avatar: the header is complete without one.
+      });
+  }
+
+  // The list page's header shows the list's image. The server stores
+  // which image (its CID) and never fetches it; the owner's profile card
+  // says which host holds the owner's data, and the image is named there.
+  function listImage() {
+    var row = document.querySelector("[data-list-image]");
+    if (!row || !window.fetch) {
+      return;
+    }
+    var cid = row.getAttribute("data-list-image");
+    var owner = row.getAttribute("data-owner");
+    if (!/^b[a-z2-7]{7,127}$/.test(cid) || !owner) {
+      return;
+    }
+    fetch(row.getAttribute("data-owner-card"), { credentials: "same-origin" })
+      .then(function (r) {
+        if (r.status !== 200 || r.redirected) {
+          throw new Error("no card");
+        }
+        return r.text();
+      })
+      .then(function (html) {
+        var card = new DOMParser().parseFromString(html, "text/html");
+        var pc = card.querySelector(".pc[data-pds]");
+        var host = pc && pc.getAttribute("data-pds");
+        if (!host || !/^[a-z0-9.-]+(:[0-9]+)?$/i.test(host)) {
+          return;
+        }
+        var img = document.createElement("img");
+        img.className = "hero-avatar";
+        img.alt = "";
+        img.width = 88;
+        img.height = 88;
+        img.referrerPolicy = "no-referrer";
+        img.onerror = function () {
+          if (img.parentNode) {
+            img.parentNode.removeChild(img);
+          }
+        };
+        img.src =
+          "https://" +
+          host +
+          "/xrpc/com.atproto.sync.getBlob?did=" +
+          encodeURIComponent(owner) +
+          "&cid=" +
+          encodeURIComponent(cid);
+        row.insertBefore(img, row.firstChild);
+      })
+      .catch(function () {
+        // No image: the header is complete without one.
       });
   }
 

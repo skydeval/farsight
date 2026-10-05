@@ -616,9 +616,10 @@ async fn n(pool: &PgPool, q: &str) -> Result<i64, String> {
 async fn seed_list(pool: &PgPool, owner_id: i64, rkey: &str, items: i64) -> Result<i64, String> {
     sqlx::query_scalar(
         "INSERT INTO lists (owner_id, rkey, record_state, purpose, name, listblock_count,
-                            track_state, item_count, admitted_at, fetched_at, fetched_witness)
+                            track_state, item_count, admitted_at, fetched_at, fetched_witness,
+                            about_read)
          VALUES ($1, $2, 1, 1, $2, $3, 2, $3, now() - interval '1 hour', now() - interval '1 hour',
-                 now() - interval '1 hour') RETURNING id",
+                 now() - interval '1 hour', true) RETURNING id",
     )
     .bind(owner_id)
     .bind(rkey)
@@ -1368,6 +1369,102 @@ async fn check_history_tab(c: &mut Checks, a: &Srv, plc: &Plc, w: &World) -> Res
 
 // --------------------------------------------------------- 7. public pages
 
+/// A list stored before its description was kept has its record read on
+/// the first view of its page, once.
+async fn check_list_about(c: &mut Checks, a: &Srv, pool: &PgPool, plc: &Plc) -> Result<(), String> {
+    c.section("7d. a list's description and image");
+    const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    let (owner, lost) = (did("abo", 1), did("abn", 1));
+    seed::exec(
+        pool,
+        &format!("INSERT INTO actors (did) VALUES ('{owner}'), ('{lost}') ON CONFLICT DO NOTHING"),
+    )
+    .await?;
+    let id_of = |d: &str| format!("SELECT id FROM actors WHERE did = '{d}'");
+    let (oid, lid) = (
+        n(pool, &id_of(&owner)).await?,
+        n(pool, &id_of(&lost)).await?,
+    );
+    let mut ids = Vec::new();
+    for (o, rkey) in [(oid, "told"), (oid, "blank"), (lid, "lost")] {
+        let id = seed_list(pool, o, rkey, 0).await?;
+        seed::exec(
+            pool,
+            &format!("UPDATE lists SET about_read = false WHERE id = {id}"),
+        )
+        .await?;
+        ids.push(id);
+    }
+    plc.host(&owner);
+    plc.set_list(
+        &owner,
+        "told",
+        serde_json::json!({
+            "$type": "app.bsky.graph.list",
+            "name": "told",
+            "purpose": "app.bsky.graph.defs#modlist",
+            "description": "First line <b>bold</b>\n\nhttps://example.com second\u{202e}",
+            "avatar": {"$type": "blob", "ref": {"$link": CID}, "mimeType": "image/png", "size": 1},
+            "createdAt": "2024-01-01T00:00:00Z"
+        }),
+    );
+    let page = |o: &str, rkey: &str| format!("/list/{o}/{rkey}");
+    let state = |id: i64| {
+        format!(
+            "SELECT (about_read::int * 4 + (description IS NOT NULL)::int * 2 + (avatar_cid IS NOT NULL)::int)::bigint FROM lists WHERE id = {id}"
+        )
+    };
+    let (r0, a0) = (plc.record_total(), plc.audit_total());
+    let first = a.get(&page(&owner, "told")).await?;
+    let (r1, a1) = (plc.record_total(), plc.audit_total());
+    let again = a.get(&page(&owner, "told")).await?;
+    let (r2, a2) = (plc.record_total(), plc.audit_total());
+    let want = "<p class=\"list-description\">First line &lt;b&gt;bold&lt;/b&gt;<br>https://example.com second</p>";
+    let image = format!("data-list-image=\"{CID}\" data-owner=\"{owner}\"");
+    c.check(
+        "a list whose record was never read for it: the first view of its page reads the record from the owner's server (one identity lookup, one getRecord), shows the description as escaped plain text, line by line, with no link made of an address in it, and names the image by its CID for the page's script; the row keeps both, and the next view asks nobody",
+        first.status == 200
+            && first.text.contains(want)
+            && first.text.contains(&image)
+            && !first.text.contains("href=\"https://example.com")
+            && (r1, a1) == (r0 + 1, a0 + 1)
+            && again.text.contains(want)
+            && again.text.contains(&image)
+            && (r2, a2) == (r1, a1)
+            && n(pool, &state(ids[0])).await? == 7,
+        format!(
+            "getRecord {r0} → {r1} → {r2}, audit {a0} → {a1} → {a2}, row {}",
+            n(pool, &state(ids[0])).await?
+        ),
+    );
+    let blank = a.get(&page(&owner, "blank")).await?;
+    let (r3, a3) = (plc.record_total(), plc.audit_total());
+    let unreachable = a.get(&page(&lost, "lost")).await?;
+    let a4 = plc.audit_total();
+    let unreachable_again = a.get(&page(&lost, "lost")).await?;
+    let (r5, a5) = (plc.record_total(), plc.audit_total());
+    c.check(
+        "a record the owner's server does not have settles the row with nothing to show (read, no description, no image); an owner whose server cannot be found leaves the row unread, the page complete without a description, and is not asked about again on the next view",
+        blank.status == 200
+            && !blank.text.contains("list-description")
+            && !blank.text.contains("data-list-image")
+            && (r3, a3) == (r2 + 1, a2 + 1)
+            && n(pool, &state(ids[1])).await? == 4
+            && unreachable.status == 200
+            && !unreachable.text.contains("list-description")
+            && a4 == a3 + 1
+            && unreachable_again.status == 200
+            && (r5, a5) == (r3, a4)
+            && n(pool, &state(ids[2])).await? == 0,
+        format!(
+            "getRecord {r2} → {r3} → {r5}, audit {a2} → {a3} → {a4} → {a5}, rows {} and {}",
+            n(pool, &state(ids[1])).await?,
+            n(pool, &state(ids[2])).await?
+        ),
+    );
+    Ok(())
+}
+
 async fn check_public_columns(c: &mut Checks, a: &Srv, w: &World) -> Result<(), String> {
     c.section("7. public tables have no Record column");
     let page = a.get(&public_did(&w.t4)).await?;
@@ -2102,11 +2199,11 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let building = log.find("sort index: building");
     let migrations: i64 = n(&pool, "SELECT count(*) FROM _sqlx_migrations").await?;
     c.check(
-        "a fresh database: the server is live in its normal start-up time, the nine migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
+        "a fresh database: the server is live in its normal start-up time, the ten migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
         have == 4
             && health.status == 200
             && e.came_up < Duration::from_secs(60)
-            && migrations == 9
+            && migrations == 10
             && serving.is_some()
             && building.is_some()
             && serving < building
@@ -2678,6 +2775,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     check_cursors(c, &a, &cookie, &w).await?;
     check_public_columns(c, &a, &w).await?;
     check_history_tab(c, &a, &plc, &w).await?;
+    check_list_about(c, &a, &pool, &plc).await?;
     check_live(c, pg, args.skip_live).await?;
     if args.browser {
         check_browser(c, &a, &cookie, &w)?;

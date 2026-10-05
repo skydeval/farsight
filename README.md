@@ -247,6 +247,11 @@ nothing else in a browser.
   A list page has "Members" and "Subscribers" (`?tab=subscribers`):
   the accounts that subscribe to the list as a block list. Mute
   subscriptions are private and never appear.
+- **A list's description and image.** A list page shows the
+  description its owner gave it, as plain text (no links, at most 300
+  characters), and its image. Farsight stores the text and which image
+  it is; the image itself is fetched by the visitor's browser from the
+  owner's server, and only with `show_avatars`.
 - **Avatars** are rounded squares (squircles where the browser draws
   them), in the header and on the cards.
 - **Inactive accounts.** A table leaves out accounts that are
@@ -384,6 +389,20 @@ warning; the value does nothing, and the key is removed the next time
 you save the Public UI settings.
 
 ### Upgrading from an earlier version
+
+From a version whose list pages had no description:
+
+- **Three new columns** on `lists` (schema version 10), added by the
+  server at start: the list's description, the CID of its image, and
+  whether its record has been read for them. New and changed lists
+  fill them from the network; a list stored earlier has its record
+  read once, the first time its page is opened (one request to the
+  PLC directory and one to the owner's server, under the profile-card
+  budget, waiting at most 1.5 s).
+- **Rolling back.** An older binary does not start on schema version
+  10: `ALTER TABLE lists DROP COLUMN description, DROP COLUMN
+  avatar_cid, DROP COLUMN about_read; UPDATE schema_version SET
+  version = 9; DELETE FROM _sqlx_migrations WHERE version = 10;` first.
 
 From a version that kept handles in memory only:
 

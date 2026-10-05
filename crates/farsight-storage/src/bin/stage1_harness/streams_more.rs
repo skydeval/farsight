@@ -26,7 +26,7 @@ async fn scalar(env: &Env, sql: &str) -> Result<i64> {
 }
 
 /// Independent (non-recount) consistency queries; each must return 0.
-const CONSISTENCY: [(&str, &str); 8] = [
+const CONSISTENCY: [(&str, &str); 9] = [
     (
         "listblock_count = counted rows",
         "SELECT count(*) FROM lists l WHERE l.listblock_count <>
@@ -60,6 +60,13 @@ const CONSISTENCY: [(&str, &str); 8] = [
     (
         "invariant: pending/ready/unavailable only while count > 0",
         "SELECT count(*) FROM lists WHERE track_state IN (1, 2, 4) AND listblock_count = 0",
+    ),
+    (
+        "a present list holds its record's description and image, read; any other holds neither",
+        "SELECT count(*) FROM lists WHERE
+           (record_state = 1 AND (NOT about_read OR avatar_cid IS NULL
+              OR description IS DISTINCT FROM 'about ' || rkey))
+           OR (record_state <> 1 AND (description IS NOT NULL OR avatar_cid IS NOT NULL))",
     ),
     (
         "lanes exist only for waiting lists and match counted rows",

@@ -1423,11 +1423,14 @@ async fn list_upsert(
         t.deltas.host(&author.buckets, CapKind::Lists, 1);
     }
     let list_id: i64 = sqlx::query_scalar(
-        "INSERT INTO lists (owner_id, rkey, record_state, purpose, name, created_at, rev)
-         VALUES ($1, $2, 1, $3, $4, $5, $6)
+        "INSERT INTO lists (owner_id, rkey, record_state, purpose, name, created_at, rev,
+                            description, avatar_cid, about_read)
+         VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, true)
          ON CONFLICT (owner_id, rkey) DO UPDATE SET record_state = 1,
            purpose = EXCLUDED.purpose, name = EXCLUDED.name,
-           created_at = EXCLUDED.created_at, rev = EXCLUDED.rev
+           created_at = EXCLUDED.created_at, rev = EXCLUDED.rev,
+           description = EXCLUDED.description, avatar_cid = EXCLUDED.avatar_cid,
+           about_read = true
          RETURNING id",
     )
     .bind(author.id)
@@ -1436,6 +1439,8 @@ async fn list_upsert(
     .bind(r.name.as_deref())
     .bind(r.created_at)
     .bind(w.stamp)
+    .bind(r.description.as_deref())
+    .bind(r.avatar.as_deref())
     .fetch_one(&mut *t.conn)
     .await?;
     t.report.applied += 1;
@@ -1457,6 +1462,7 @@ pub(crate) async fn list_mark_deleted(
 ) -> Result<()> {
     sqlx::query(
         "UPDATE lists SET record_state = 2, purpose = NULL, name = NULL, created_at = NULL,
+           description = NULL, avatar_cid = NULL,
            rev = GREATEST(COALESCE(rev, $2), $2)
          WHERE id = $1",
     )

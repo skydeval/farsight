@@ -19,7 +19,8 @@
 //! ([`crate::history`]).
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use askama::Template;
 use axum::http::StatusCode;
@@ -33,6 +34,7 @@ use farsight_storage::queries::{self, ActorRef};
 use farsight_storage::ui_rows::{Filter, Find, Row, Section as Rows};
 use serde_json::Value;
 
+use super::card;
 use super::coverage::{EMPTY, last_updated};
 use super::handles::{page_handle, recall, take_budget};
 use super::paging::{self, Pager, Total};
@@ -1163,12 +1165,108 @@ struct ListPage {
     capped: bool,
     /// `lists.item_count`: stored, not filtered.
     stored_members: String,
+    /// The record's description, line by line: plain text, never marked
+    /// up, no links.
+    description: Vec<String>,
+    /// CID of the record's image, with `public_ui.show_avatars`. The
+    /// page's script names the image on the owner's server.
+    image: Option<String>,
     tabs: Vec<Tab>,
     /// The id of the table in view.
     active: &'static str,
     members: Option<Section<PartyRow>>,
     blockers: Section<PartyRow>,
     updated: Option<Stamp>,
+}
+
+/// Most lines a list's description is shown on; the rest run on in the
+/// last.
+const DESCRIPTION_LINES: usize = 8;
+
+/// A list's description as lines of [`clean`]ed text: blank lines are
+/// dropped, and lines past [`DESCRIPTION_LINES`] join the last one.
+fn description_lines(s: &str) -> Vec<String> {
+    let mut lines: Vec<String> = s
+        .replace("\r\n", "\n")
+        .split(['\n', '\r'])
+        .map(|l| clean(l).trim().to_owned())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() > DESCRIPTION_LINES {
+        let rest = lines.split_off(DESCRIPTION_LINES - 1).join(" ");
+        lines.push(rest);
+    }
+    lines
+}
+
+/// How long a list whose record could not be read is left alone.
+const ABOUT_RETRY: Duration = Duration::from_secs(600);
+/// Lists whose record could not be read, and when. Memory only.
+static ABOUT_FAILED: Mutex<Option<HashMap<i64, Instant>>> = Mutex::new(None);
+
+/// Whether the record of `list` may be asked for now; `failed` notes an
+/// attempt that established nothing.
+fn about_due(list: i64, failed: bool) -> bool {
+    let mut g = ABOUT_FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    if failed {
+        if map.len() >= 10_000 {
+            map.clear();
+        }
+        map.insert(list, Instant::now());
+        return false;
+    }
+    match map.get(&list) {
+        Some(at) if at.elapsed() < ABOUT_RETRY => false,
+        _ => {
+            map.remove(&list);
+            true
+        }
+    }
+}
+
+/// What the list says about itself. A row older than the columns has its
+/// record read here, once, on the first view that can reach the owner's
+/// server; until then the page has no description.
+async fn list_about(
+    r: &Req<'_>,
+    owner: &Did,
+    rkey: &RecordKey,
+    info: &queries::ListInfo,
+) -> Result<queries::ListAbout, Fail> {
+    let about = {
+        let mut conn = r.st.api.pool.acquire().await?;
+        queries::list_about(&mut conn, info.id).await?
+    };
+    if about.read || info.record_state != 1 || !about_due(info.id, false) {
+        return Ok(about);
+    }
+    match card::list_about(r.st, r.config(), owner, rkey.as_str()).await {
+        Ok((description, avatar_cid)) => {
+            let mut conn = r.st.api.pool.acquire().await?;
+            let stored = queries::list_about_fill(
+                &mut conn,
+                info.id,
+                description.as_deref(),
+                avatar_cid.as_deref(),
+            )
+            .await?;
+            if stored {
+                Ok(queries::ListAbout {
+                    description,
+                    avatar_cid,
+                    read: true,
+                })
+            } else {
+                // Applied from the network in the meantime: that is newer.
+                Ok(queries::list_about(&mut conn, info.id).await?)
+            }
+        }
+        Err(()) => {
+            about_due(info.id, true);
+            Ok(about)
+        }
+    }
 }
 
 /// `/list/{did}/{rkey}`.
@@ -1204,6 +1302,7 @@ pub async fn list(
         });
     };
     let handle = page_handle(r.st, cfg, owner).await.map(|h| clean(&h));
+    let about = list_about(r, owner, rkey, &info).await?;
     let (_slot, _permit) = r.render_slots().await?;
     let api = &r.st.api;
 
@@ -1368,6 +1467,12 @@ pub async fn list(
         state,
         capped: listing["capped"].as_bool().unwrap_or(false),
         stored_members: thousands(i64::from(info.item_count)),
+        description: about
+            .description
+            .as_deref()
+            .map(description_lines)
+            .unwrap_or_default(),
+        image: about.avatar_cid.filter(|_| cfg.public_ui.show_avatars),
         members,
         blockers,
         updated: last_updated(&fresh),
@@ -1379,6 +1484,22 @@ pub async fn list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_description_is_plain_lines() {
+        assert_eq!(
+            description_lines("one\r\n\r\n  two\u{202E} \n\nthree\u{7}"),
+            ["one", "two", "three"]
+        );
+        let long = (1..=12)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let got = description_lines(&long);
+        assert_eq!(got.len(), DESCRIPTION_LINES);
+        assert_eq!(got.last().map(String::as_str), Some("8 9 10 11 12"));
+        assert!(description_lines(" \n ").is_empty());
+    }
 
     #[test]
     fn every_state_has_its_wording_and_only_two_show_members() {

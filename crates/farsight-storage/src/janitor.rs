@@ -385,7 +385,8 @@ pub async fn purge_account_batch(
         }
         for (list_id, _, record_state) in &own_lists {
             sqlx::query(
-                "UPDATE lists SET record_state = 2, purpose = NULL, name = NULL, created_at = NULL
+                "UPDATE lists SET record_state = 2, purpose = NULL, name = NULL, created_at = NULL,
+                   description = NULL, avatar_cid = NULL
                  WHERE id = $1",
             )
             .bind(*list_id)

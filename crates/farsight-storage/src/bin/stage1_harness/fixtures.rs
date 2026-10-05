@@ -304,6 +304,9 @@ pub fn listblock(author: &Did, rkey: &str, owner: &Did, list_rkey: &str, stamp: 
     }
 }
 
+/// The avatar CID every fixture list names.
+pub const LIST_AVATAR: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+
 pub fn list(owner: &Did, rkey: &str, stamp: i64) -> Write {
     Write {
         author: owner.clone(),
@@ -314,6 +317,8 @@ pub fn list(owner: &Did, rkey: &str, stamp: i64) -> Write {
         action: WriteAction::Upsert(Record::List(ListRecord {
             purpose: ListPurpose::Mod,
             name: Some(format!("list {rkey}")),
+            description: Some(format!("about {rkey}")),
+            avatar: Some(LIST_AVATAR.to_owned()),
             created_at: None,
         })),
     }

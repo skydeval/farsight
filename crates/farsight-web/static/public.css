@@ -573,6 +573,16 @@ p.hero-facts time, p.hero-facts .host {
   color: var(--fg);
 }
 
+/* A list's own description: its owner's words, as plain text. */
+p.list-description {
+  margin: 0.7rem 0 0;
+  max-width: 46rem;
+  font-size: 0.92rem;
+  line-height: 1.5;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
 /* Tabs: one table of the page in view at a time. */
 nav.tabs {
   display: flex;

@@ -4,6 +4,10 @@
 //! it ends as `failed` for every account without leaving the machine, and
 //! the counts show which accounts the server asked about, and how often.
 //!
+//! For the accounts a probe names it also stands in for their own server:
+//! their audit log names it as the PDS, and it answers `getRecord` for
+//! the list records it was given (404 for any other).
+//!
 //! It listens on a TEST-NET-2 address (a bridge the harness creates), an
 //! address the safe outbound client treats as public, so no rule of that
 //! client is bypassed.
@@ -12,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -22,6 +26,11 @@ use serde_json::json;
 struct Inner {
     documents: HashMap<String, u32>,
     audits: HashMap<String, u32>,
+    /// Accounts whose audit log names this stand-in as their PDS.
+    hosted: Vec<String>,
+    /// List records by (owner, rkey).
+    lists: HashMap<(String, String), serde_json::Value>,
+    records: u32,
 }
 
 /// The running stand-in.
@@ -46,6 +55,7 @@ impl Plc {
         let app = Router::new()
             .route("/{did}", get(document))
             .route("/{did}/log/audit", get(audit))
+            .route("/xrpc/com.atproto.repo.getRecord", get(record))
             .with_state(plc.clone());
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -57,6 +67,24 @@ impl Plc {
     pub fn documents(&self, did: &str) -> u32 {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.documents.get(did).copied().unwrap_or(0)
+    }
+
+    /// From now on the audit log of `did` names this stand-in as its PDS.
+    pub fn host(&self, did: &str) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.hosted.push(did.to_owned());
+    }
+
+    /// The list record `getRecord` answers with for `did`/`rkey`.
+    pub fn set_list(&self, did: &str, rkey: &str, value: serde_json::Value) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.lists.insert((did.to_owned(), rkey.to_owned()), value);
+    }
+
+    /// `getRecord` requests in total.
+    pub fn record_total(&self) -> u32 {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.records
     }
 
     /// Document requests in total.
@@ -88,15 +116,45 @@ async fn audit(State(p): State<Arc<Plc>>, Path(did): Path<String>) -> Response {
     if !did.starts_with("did:plc:") {
         return StatusCode::NOT_FOUND.into_response();
     }
-    {
+    let hosted = {
         let mut g = p.inner.lock().unwrap_or_else(|e| e.into_inner());
         *g.audits.entry(did.clone()).or_default() += 1;
-    }
+        g.hosted.contains(&did)
+    };
+    let services = if hosted {
+        json!({"atproto_pds": {"type": "AtprotoPersonalDataServer", "endpoint": p.base}})
+    } else {
+        json!({})
+    };
     axum::Json(json!([{
         "did": did,
         "createdAt": "2023-04-12T04:53:57.057Z",
         "nullified": false,
-        "operation": {"type": "plc_operation", "alsoKnownAs": [], "services": {}}
+        "operation": {"type": "plc_operation", "alsoKnownAs": [], "services": services}
     }]))
     .into_response()
+}
+
+async fn record(State(p): State<Arc<Plc>>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let get = |k: &str| q.get(k).cloned().unwrap_or_default();
+    let (repo, collection, rkey) = (get("repo"), get("collection"), get("rkey"));
+    let found = {
+        let mut g = p.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.records += 1;
+        (collection == "app.bsky.graph.list")
+            .then(|| g.lists.get(&(repo.clone(), rkey.clone())).cloned())
+            .flatten()
+    };
+    match found {
+        Some(value) => axum::Json(json!({
+            "uri": format!("at://{repo}/{collection}/{rkey}"),
+            "value": value
+        }))
+        .into_response(),
+        None => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "RecordNotFound"})),
+        )
+            .into_response(),
+    }
 }

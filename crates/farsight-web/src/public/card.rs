@@ -286,6 +286,61 @@ pub async fn history(st: &WebState, cfg: &Config, did: &Did) -> History {
     }
 }
 
+/// How long a list page waits for a list record it has not read yet.
+pub const LIST_ABOUT_DEADLINE: Duration = Duration::from_millis(1500);
+
+/// Reads a list's record from its owner's server for the description and
+/// the avatar CID (rows stored before those were kept): the identity
+/// lookup and one `getRecord`, through the safe client, under the card
+/// budget and [`LIST_ABOUT_DEADLINE`]. `Ok`: what the record says, or
+/// two `None`s where the server says there is no such record. `Err`:
+/// nothing could be established; the caller asks again later.
+pub async fn list_about(
+    st: &WebState,
+    cfg: &Config,
+    did: &Did,
+    rkey: &str,
+) -> Result<(Option<String>, Option<String>), ()> {
+    let budget = Class::PublicCardBudget.limit(cfg, None);
+    if st
+        .api
+        .limiter
+        .check(Class::PublicCardBudget, BUDGET_KEY, budget)
+        .is_err()
+    {
+        return Err(());
+    }
+    let deadline = tokio::time::Instant::now() + LIST_ABOUT_DEADLINE;
+    let ident = identity(&st.safe, cfg, did, deadline).await.ok_or(())?;
+    let base = ident
+        .pds
+        .as_deref()
+        .and_then(|p| Url::parse(p).ok())
+        .ok_or(())?;
+    let url = xrpc(
+        &base,
+        "com.atproto.repo.getRecord",
+        &[
+            ("repo", did.as_str()),
+            ("collection", "app.bsky.graph.list"),
+            ("rkey", rkey),
+        ],
+    )
+    .ok_or(())?;
+    let r = match tokio::time::timeout_at(deadline, st.safe.get(&url)).await {
+        Ok(Ok(r)) => r,
+        _ => return Err(()),
+    };
+    match r.status {
+        200 => {}
+        400 | 404 => return Ok((None, None)),
+        _ => return Err(()),
+    }
+    let v: Value = serde_json::from_slice(&r.body).map_err(|_| ())?;
+    let value = v.get("value").filter(|x| x.is_object()).ok_or(())?;
+    Ok(farsight_core::record::list_about(value))
+}
+
 /// Reads a did:web document. There is no creation time to read.
 pub fn read_did_document(body: &[u8]) -> Option<Identity> {
     let doc: Value = serde_json::from_slice(body).ok()?;

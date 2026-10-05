@@ -22,6 +22,11 @@ use crate::tid::Tid;
 
 /// Maximum stored list name length, in characters (design §1.1).
 pub const MAX_LIST_NAME_CHARS: usize = 128;
+/// Longest stored list description, in characters (the lexicon allows
+/// 300 graphemes).
+pub const MAX_LIST_DESCRIPTION_CHARS: usize = 300;
+/// Longest blob CID stored, in characters.
+pub const MAX_BLOB_CID_CHARS: usize = 128;
 
 /// Why a record or event was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -150,6 +155,12 @@ pub struct ListRecord {
     pub purpose: ListPurpose,
     /// Name, truncated to [`MAX_LIST_NAME_CHARS`].
     pub name: Option<String>,
+    /// Description, truncated to [`MAX_LIST_DESCRIPTION_CHARS`]; `None`
+    /// for a missing or blank one. Plain text.
+    pub description: Option<String>,
+    /// CID of the avatar blob, if the record names one of the usual
+    /// shape. The image is never fetched by Farsight.
+    pub avatar: Option<String>,
     /// Author-claimed creation time; display only.
     pub created_at: Option<DateTime<Utc>>,
 }
@@ -201,6 +212,36 @@ fn created_at(v: &Value) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|d| d.with_timezone(&Utc))
+}
+
+/// Whether `s` has the shape of a CID as records write it: base32
+/// multibase, at most [`MAX_BLOB_CID_CHARS`] characters.
+pub fn is_blob_cid(s: &str) -> bool {
+    (8..=MAX_BLOB_CID_CHARS).contains(&s.len())
+        && s.starts_with('b')
+        && s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
+}
+
+/// The description and avatar CID of a list record's JSON, as stored.
+pub fn list_about(value: &Value) -> (Option<String>, Option<String>) {
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .map(|d| {
+            truncate_chars(d.trim(), MAX_LIST_DESCRIPTION_CHARS)
+                .replace('\0', "")
+                .trim_end()
+                .to_owned()
+        })
+        .filter(|d| !d.is_empty());
+    let avatar = value
+        .get("avatar")
+        .and_then(|a| a.get("ref"))
+        .and_then(|r| r.get("$link"))
+        .and_then(Value::as_str)
+        .filter(|c| is_blob_cid(c))
+        .map(str::to_owned);
+    (description, avatar)
 }
 
 fn list_uri(s: &str) -> Result<AtUri, RecordError> {
@@ -264,9 +305,12 @@ pub fn parse_record(
                 .get("name")
                 .and_then(Value::as_str)
                 .map(|n| truncate_chars(n, MAX_LIST_NAME_CHARS).replace('\0', ""));
+            let (description, avatar) = list_about(value);
             Ok(Record::List(ListRecord {
                 purpose,
                 name,
+                description,
+                avatar,
                 created_at,
             }))
         }
@@ -539,6 +583,32 @@ mod tests {
         let Record::List(l) = r else { panic!() };
         assert_eq!(l.name.unwrap().chars().count(), MAX_LIST_NAME_CHARS);
         assert_eq!(l.purpose, ListPurpose::Mod);
+        assert_eq!((l.description, l.avatar), (None, None));
+        let cid = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+        let r = parse_record(
+            &did(A),
+            Collection::List,
+            &json!({
+                "name": "n",
+                "description": format!("  {}\n", "é".repeat(400)),
+                "avatar": {"$type": "blob", "ref": {"$link": cid}, "mimeType": "image/png", "size": 1}
+            }),
+        )
+        .unwrap();
+        let Record::List(l) = r else { panic!() };
+        assert_eq!(
+            l.description.as_deref().map(|d| d.chars().count()),
+            Some(300)
+        );
+        assert_eq!(l.avatar.as_deref(), Some(cid));
+        let r = parse_record(
+            &did(A),
+            Collection::List,
+            &json!({"description": "  \n ", "avatar": {"ref": {"$link": "x y"}}}),
+        )
+        .unwrap();
+        let Record::List(l) = r else { panic!() };
+        assert_eq!((l.description, l.avatar), (None, None));
         let r = parse_record(&did(A), Collection::List, &json!({"purpose": "x#y"})).unwrap();
         let Record::List(l) = r else { panic!() };
         assert_eq!(l.purpose, ListPurpose::Other);
