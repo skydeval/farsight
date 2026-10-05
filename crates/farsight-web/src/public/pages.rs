@@ -1242,7 +1242,7 @@ async fn list_about(
         return Ok(about);
     }
     match card::list_about(r.st, r.config(), owner, rkey.as_str()).await {
-        Ok((description, avatar_cid)) => {
+        Some((description, avatar_cid)) => {
             let mut conn = r.st.api.pool.acquire().await?;
             let stored = queries::list_about_fill(
                 &mut conn,
@@ -1262,7 +1262,7 @@ async fn list_about(
                 Ok(queries::list_about(&mut conn, info.id).await?)
             }
         }
-        Err(()) => {
+        None => {
             about_due(info.id, true);
             Ok(about)
         }
