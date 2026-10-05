@@ -465,6 +465,7 @@
     tabs();
     pending();
     swaps();
+    pagers();
     finds();
     heroAvatar();
     listImage();
@@ -840,7 +841,7 @@
   // shown, without a page load, and shows that address. `done` runs once
   // they are in place; `fallback` if the page could not be read.
   var swapRun = 0;
-  function swapTo(href, done, fallback) {
+  function swapTo(href, done, fallback, push) {
     var box = document.querySelector(".tabbed");
     if (!box || !window.fetch) {
       fallback();
@@ -885,7 +886,13 @@
         zoneNote();
         fitPagers();
         try {
-          history.replaceState(null, "", href.replace(/([?&])go=1(&|$)/, "$1").replace(/[?&]$/, ""));
+          var shown = href.replace(/([?&])go=1(&|$)/, "$1").replace(/[?&]$/, "");
+          // A turned page is a step Back returns from; a filter is not.
+          if (push) {
+            history.pushState({ swapped: true }, "", shown);
+          } else {
+            history.replaceState(history.state, "", shown);
+          }
         } catch (e) {
           // The tables are in place either way.
         }
@@ -899,6 +906,72 @@
           fallback();
         }
       });
+  }
+
+  // Page controls turn the table where it stands. Followed as links they
+  // load the whole page and the browser then scrolls to the table, which
+  // shows as a jump; here the tables are replaced in place and the window
+  // stays where it is. Without this script the links are followed.
+  function pagers() {
+    document.addEventListener("click", function (event) {
+      var a = event.target.closest ? event.target.closest("nav.pager a[href]") : null;
+      if (!a || !window.fetch || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button) {
+        return;
+      }
+      var section = a.closest(".tabbed > section");
+      if (!section) {
+        return;
+      }
+      event.preventDefault();
+      var href = a.getAttribute("href");
+      // Which of the table's two sets of controls was used, to put the
+      // keyboard's place back in it afterwards.
+      var navs = section.querySelectorAll("nav.pager");
+      var which = navs.length > 1 && navs[navs.length - 1].contains(a) ? navs.length - 1 : 0;
+      var id = section.id;
+      var x = window.scrollX;
+      var y = window.scrollY;
+      section.setAttribute("aria-busy", "true");
+      swapTo(
+        href,
+        function () {
+          window.scrollTo(x, y);
+          var again = document.getElementById(id);
+          var controls = again ? again.querySelectorAll("nav.pager") : [];
+          var here = controls[Math.min(which, controls.length - 1)];
+          var current = here ? here.querySelector(".current") : null;
+          if (current) {
+            current.setAttribute("tabindex", "-1");
+            try {
+              current.focus({ preventScroll: true });
+            } catch (e) {
+              // Focus is a convenience; the page is in place.
+            }
+          }
+        },
+        function () {
+          location.href = href;
+        },
+        true
+      );
+    });
+    // Back and Forward over pages turned this way.
+    window.addEventListener("popstate", function () {
+      if (!document.querySelector(".tabbed")) {
+        return;
+      }
+      var href = location.pathname + location.search + location.hash;
+      var y = window.scrollY;
+      swapTo(
+        href,
+        function () {
+          window.scrollTo(window.scrollX, y);
+        },
+        function () {
+          location.reload();
+        }
+      );
+    });
   }
 
   // A link marked data-swap (the "Show taken down accounts" switch) changes

@@ -14,6 +14,16 @@ commits it covers.
 
 ## [Unreleased]
 
+### Fixed
+
+- Turning a page of a table no longer makes the page jump. A page
+  number or arrow used to load the whole page, after which the browser
+  scrolled to the table; now the table is replaced where it stands and
+  the window does not move, on the public pages and on the admin DID
+  lookup. The address still names the page, and Back returns to the
+  one before. Without the page's script the controls are the links
+  they were.
+
 ### Added
 
 - The admin DID lookup page has the account header of the public page
