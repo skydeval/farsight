@@ -216,5 +216,5 @@
 {% endif %}
 </div>
 
-{% if let Some(t) = updated %}<div class="telemetry-bar updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}
 {% endblock %}
+{% block updated %}{% if let Some(t) = updated %}<div class="pill footer-updated updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}{% endblock %}

@@ -1,7 +1,7 @@
 {% extends "public_base.html" %}
 {% block content %}
 <div class="hero">
-<h1>Farsight at {{ hostname }}</h1>
+<h1>Farsight</h1>
 {% for p in description %}<p class="hero-desc">{{ p }}</p>
 {% endfor %}
 
@@ -19,9 +19,6 @@
 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
 </button>
 </div>
-<div class="search-hints">
-<span class="hints-label">Accepts a handle, a DID, an at:// URI or a bsky.app link.</span>
-</div>
 </form>
 </div>
 
@@ -34,6 +31,6 @@
 {% include "_guide.html" %}
 </details>
 
-{% if let Some(t) = updated %}<div class="telemetry-bar updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}
 </div>
 {% endblock %}
+{% block updated %}{% if let Some(t) = updated %}<div class="pill footer-updated updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}{% endblock %}

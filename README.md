@@ -145,7 +145,7 @@ saved from the running server (pausing the sweep over the API
 included) until the restart.
 
 `/` is the public UI's home page when the public UI is on: the
-instance's name and description, the search box, three totals (blocks
+instance's description, the search box, three totals (blocks
 indexed, lists tracked, accounts seen; the counts `getStats` gives) and
 a short guide to the tabs and the account tags, which its heading
 ("How to read a page") opens and closes. The other public pages have
@@ -308,7 +308,8 @@ nothing else in a browser.
   opened), and a stored handle is never checked again.
 - **No coverage detail.** A public page prints no coverage level. It
   says "None on record at this instance" for an empty section, says so
-  when a list is not indexed, and ends with one "Last updated" line.
+  when a list is not indexed, and states "Last updated" once, in its
+  footer.
   The dashboard and the lookup pages state coverage in full.
 - **Profile cards.** Resting the pointer on an account in a row (or
   focusing it with the keyboard) opens a card with its avatar, verified

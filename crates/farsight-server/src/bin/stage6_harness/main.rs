@@ -2151,13 +2151,17 @@ async fn check_coverage(
         bad.is_empty(),
         bad.join("; "),
     );
-    let main = page.text.find("</main>").unwrap_or(0);
+    let main = page.text.find("</main>").unwrap_or(usize::MAX);
+    let foot = page.text.find("</footer>").unwrap_or(0);
     c.check(
-        "the line is the last thing in the page's content, after the sections",
+        "the line is in the page's footer, where the index's label used to be; an error page's footer has none",
         page.text
             .find("Last updated <time")
-            .is_some_and(|i| i > page.text.rfind("</section>").unwrap_or(usize::MAX) && i < main),
-        "after the last section",
+            .is_some_and(|i| i > main && i < foot)
+            && [&page, &lp, &home]
+                .iter()
+                .all(|r| !r.text.contains("ATProto Block Graph Index")),
+        "in the footer",
     );
 
     // The time is the earliest indexedAt among the sections rendered.
@@ -3029,7 +3033,8 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
     );
     c.check(
         "home: instance name, the description, a search form, the totals, the guide and the Last updated line; no label above the name, no link to About",
-        custom.text.contains(&format!("<h1>Farsight at {HOSTNAME}</h1>"))
+        custom.text.contains("<h1>Farsight</h1>")
+            && !custom.text.contains("Accepts a handle")
             && !custom.text.contains("hero-badge")
             && custom.text.contains("<dl class=\"home-totals\">")
             && ["Blocks indexed", "Lists tracked", "Accounts seen"]
@@ -4103,8 +4108,10 @@ fn check_page_rules(c: &mut Checks, h: &H) {
     for (path, html) in &documents {
         let nav = between(html, "<nav class=\"public-nav\"", "</nav>");
         let ok = nav.len() == 1
-            && nav[0].contains("<a class=\"brand\" href=\"/\">")
-            && nav[0].contains("<span>Farsight</span>")
+            && nav[0].contains(
+                "<a class=\"brand\" href=\"/\" aria-label=\"Farsight\" title=\"Farsight\">",
+            )
+            && !nav[0].contains("<span>Farsight</span>")
             && nav[0].contains(
                 "<form class=\"search\" action=\"/search\" method=\"get\" role=\"search\">",
             )

@@ -690,7 +690,6 @@ fn withheld_page(r: &Req<'_>, subject: &str, what: &'static str, path: &str) -> 
 #[template(path = "public_home.html")]
 struct HomePage {
     c: Chrome,
-    hostname: String,
     description: Vec<String>,
     /// What this instance holds, as `getStats` counts it: block records,
     /// tracked lists, accounts seen.
@@ -716,7 +715,6 @@ pub async fn home(r: &Req<'_>) -> Result<Response, Fail> {
                 OG_INSTANCE,
                 "/",
             ),
-            hostname: host.clone(),
             description: if description.is_empty() {
                 vec![DEFAULT_DESCRIPTION.to_owned()]
             } else {

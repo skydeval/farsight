@@ -1255,6 +1255,11 @@ footer {
   flex-direction: column;
   gap: 0.5rem;
 }
+/* "Last updated", where a page has one: no wider than its words. */
+.footer-updated {
+  align-self: flex-start;
+  width: fit-content;
+}
 .footer-brand p {
   margin: 0;
   font-size: 0.84rem;
