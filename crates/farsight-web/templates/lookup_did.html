@@ -42,7 +42,7 @@
 {% if s.blocks.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
 {{ s.blocks.pager|safe }}
 <div class="table-responsive free">
-<table class="data-table free striped">
+<table class="data-table free heads-centered">
 <thead>
 <tr>
 <th scope="col" class="th-account">Blocker</th>
@@ -76,7 +76,7 @@
 {% if s.listblocks.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
 {{ s.listblocks.pager|safe }}
 <div class="table-responsive free">
-<table class="data-table free striped">
+<table class="data-table free heads-centered">
 <thead>
 <tr>
 <th scope="col" class="th-list">List</th>
@@ -114,7 +114,7 @@
 {% if s.lists.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
 {{ s.lists.pager|safe }}
 <div class="table-responsive free">
-<table class="data-table free striped">
+<table class="data-table free heads-centered">
 <thead>
 <tr>
 <th scope="col" class="th-list">List</th>
@@ -154,7 +154,7 @@
 <h3 class="history-title">Handle history</h3>
 {% if let Some(n) = h.note %}<p class="empty">{{ n }}</p>{% else if h.handles.is_empty() %}<p class="muted">None recorded.</p>{% else %}
 <div class="table-responsive free">
-<table class="data-table free striped">
+<table class="data-table free heads-centered">
 <thead><tr><th scope="col" class="th-account">Handle</th><th scope="col" class="th-date">Since</th></tr></thead>
 <tbody>
 {% for r in h.handles %}<tr class="data-row"><td class="td-account"><span class="held">{{ r.value }}</span>{% if r.current %} <span class="pill held-current">current</span>{% endif %}</td><td class="td-date"><time datetime="{{ r.since.iso }}" class="time-badge" data-abs>{{ r.since.bare }}</time><span class="ago" data-ago></span></td></tr>
@@ -167,7 +167,7 @@
 <h3 class="history-title">PDS history</h3>
 {% if h.note.is_some() %}<p class="muted">Not available.</p>{% else if h.hosts.is_empty() %}<p class="muted">None recorded.</p>{% else %}
 <div class="table-responsive free">
-<table class="data-table free striped">
+<table class="data-table free heads-centered">
 <thead><tr><th scope="col" class="th-account">Host</th><th scope="col" class="th-date">Since</th></tr></thead>
 <tbody>
 {% for r in h.hosts %}<tr class="data-row"><td class="td-account"><span class="held">{{ r.value }}</span>{% if r.current %} <span class="pill held-current">current</span>{% endif %}</td><td class="td-date"><time datetime="{{ r.since.iso }}" class="time-badge" data-abs>{{ r.since.bare }}</time><span class="ago" data-ago></span></td></tr>
@@ -187,7 +187,7 @@
 <p class="muted">Blocks naming this account that this instance stored and later removed, newest removal first.</p>
 {% if !rm.blocks.rows.is_empty() %}
 <div class="table-responsive free">
-<table class="data-table free striped removed-table">
+<table class="data-table free heads-centered removed-table">
 <thead><tr><th scope="col" class="th-account">Blocker</th><th scope="col" class="th-record">Record</th><th scope="col" class="th-date">Created</th><th scope="col" class="th-date">Seen</th><th scope="col" class="th-date">Removed</th><th scope="col" class="th-cause">How it ended</th></tr></thead>
 <tbody>
 {% for r in rm.blocks.rows %}<tr class="data-row">
@@ -211,7 +211,7 @@
 <p class="muted">List entries naming this account that this instance stored and later removed, newest removal first.</p>
 {% if !rm.memberships.rows.is_empty() %}
 <div class="table-responsive free">
-<table class="data-table free striped removed-table">
+<table class="data-table free heads-centered removed-table">
 <thead><tr><th scope="col" class="th-list">List</th><th scope="col" class="th-record">Record</th><th scope="col" class="th-date">Created</th><th scope="col" class="th-date">Seen</th><th scope="col" class="th-date">Removed</th><th scope="col" class="th-cause">How it ended</th></tr></thead>
 <tbody>
 {% for r in rm.memberships.rows %}<tr class="data-row">
