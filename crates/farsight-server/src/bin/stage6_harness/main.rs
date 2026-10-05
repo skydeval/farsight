@@ -3049,6 +3049,14 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
             && !custom.text.contains("Instance-wide"),
         "home",
     );
+    let icon = h.get("/static/favicon.svg").await?;
+    c.check(
+        "the tab icon is an SVG this instance serves",
+        icon.status == 200
+            && icon.header("content-type").as_deref() == Some("image/svg+xml")
+            && icon.text.starts_with("<svg "),
+        format!("{} {:?}", icon.status, icon.header("content-type")),
+    );
     h.set(&[("instance_description", Some("")), ("contact", Some(""))])
         .await?;
 
@@ -4143,6 +4151,19 @@ fn check_page_rules(c: &mut Checks, h: &H) {
         "the bar is on every public page — data pages, the withheld notice, error pages: brand link to /, a GET search form to /search with one empty field q, the guide, the theme toggle; on home, which has its own search form and guide, the brand and the toggle alone",
         bad.is_empty() && documents.len() > 100,
         format!("{} pages scanned; offenders: {bad:?}", documents.len()),
+    );
+    let untitled: Vec<&String> = documents
+        .iter()
+        .filter(|(_, html)| {
+            !html.contains("<title>Farsight</title>")
+                || !html.contains("<link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/favicon.svg?v=")
+        })
+        .map(|(path, _)| path)
+        .collect();
+    c.check(
+        "every public page's tab is titled \"Farsight\" and nothing else — not the account, the list or the hostname — and names the same icon",
+        untitled.is_empty(),
+        format!("offenders: {untitled:?}"),
     );
     let mut bad = Vec::new();
     for (path, html) in &public {

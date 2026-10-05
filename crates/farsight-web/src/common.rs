@@ -28,6 +28,7 @@ pub fn asset_version() -> &'static str {
             HTMX,
             crate::public::PUBLIC_CSS,
             crate::public::PUBLIC_JS,
+            crate::public::FAVICON,
         ] {
             h.update(file.as_bytes());
             h.update([0]);
@@ -101,6 +102,11 @@ pub async fn js() -> Response {
 /// `GET /static/htmx.min.js`.
 pub async fn htmx() -> Response {
     asset(HTMX, "text/javascript; charset=utf-8")
+}
+
+/// `GET /static/favicon.svg`: the icon of every page's browser tab.
+pub async fn favicon() -> Response {
+    asset(crate::public::FAVICON, "image/svg+xml")
 }
 
 /// `GET /static/og-default.png`.

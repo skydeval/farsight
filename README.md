@@ -254,6 +254,9 @@ nothing else in a browser.
   characters), and its image. Farsight stores the text and which image
   it is; the image itself is fetched by the visitor's browser from the
   owner's server, and only with `show_avatars`.
+- **Tabs.** Every page's browser tab is titled "Farsight" and carries
+  the same icon; the title does not name the account or list on
+  screen. The preview tags of a shared link still do.
 - **Avatar thumbnails** (`avatar_thumbnails`, off by default). By
   default a visitor's browser loads each avatar, and a list's image,
   as the original upload from the account's own server: about 300 kB

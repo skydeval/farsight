@@ -67,6 +67,10 @@ Database schema version 12.
 - Avatars are rounded squares (squircles where the browser draws them)
   instead of circles. The header avatar is larger: 88px, 64px on a
   phone.
+- Every page's browser tab reads "Farsight" and shows Farsight's icon,
+  whatever the page is: a tab or a task switcher no longer shows which
+  account or list is open. Link previews (`og:title`) still name the
+  page.
 - The bar shows Farsight's icon without the name, and the home page's
   heading is "Farsight" without the hostname.
 - The home page's bar has no search box and no guide button: the page

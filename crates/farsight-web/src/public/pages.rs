@@ -671,7 +671,7 @@ fn withheld_page(r: &Req<'_>, subject: &str, what: &'static str, path: &str) -> 
     page(
         &WithheldPage {
             // The title is the DID or at-uri alone.
-            c: chrome(cfg, subject, subject, og, path),
+            c: chrome(cfg, subject, og, path),
             subject: subject.to_owned(),
             what,
         },
@@ -711,7 +711,6 @@ pub async fn home(r: &Req<'_>) -> Result<Response, Fail> {
                 home: true,
                 ..chrome(
                     cfg,
-                    "Block lookup",
                     &format!("Farsight at {host}"),
                     OG_INSTANCE,
                     "/",
@@ -765,7 +764,6 @@ async fn resolve(r: &Req<'_>, handle: &str, typed: &str) -> Result<Did, Fail> {
             let t = SearchPage {
                 c: chrome(
                     cfg,
-                    "Handle not found",
                     &format!("Farsight at {}", cfg.server.hostname),
                     OG_INSTANCE,
                     "/search",
@@ -1106,7 +1104,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         find: finder.map(|f| f.text).unwrap_or_default(),
         taken_down,
         base: base.clone(),
-        c: chrome(cfg, did.as_str(), &og_title, OG_ACCOUNT, &base),
+        c: chrome(cfg, &og_title, OG_ACCOUNT, &base),
         did: did.to_string(),
         handle,
         blockers,
@@ -1457,7 +1455,7 @@ pub async fn list(
     let t = ListPage {
         tabs,
         active,
-        c: chrome(cfg, &uri, &og_title, OG_LIST, &base),
+        c: chrome(cfg, &og_title, OG_LIST, &base),
         name,
         purpose: listing["purpose"].as_str().map(purpose_words),
         owner: Who {

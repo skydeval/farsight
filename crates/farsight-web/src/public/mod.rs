@@ -105,6 +105,8 @@ pub const PUBLIC_CSS: &str = include_str!("../../static/public.css");
 pub const PUBLIC_JS: &str = include_str!("../../static/public.js");
 /// The one preview image, the same for every page (1200×630).
 pub const OG_IMAGE: &[u8] = include_bytes!("../../static/og-default.png");
+/// The icon of every page's browser tab: Farsight's mark.
+pub const FAVICON: &str = include_str!("../../static/favicon.svg");
 pub use crate::common::OG_IMAGE_PATH;
 
 // ---------------------------------------------------------------------------
@@ -324,8 +326,6 @@ pub const OG_INSTANCE: &str = "An independent index of public block records on t
 /// What the shared layout needs.
 #[derive(Debug, Clone)]
 pub struct Chrome {
-    /// `<title>`.
-    pub title: String,
     /// `public_ui.dark_mode_default`: `light`, `dark` or `system`.
     pub theme: &'static str,
     /// Preview tags.
@@ -338,14 +338,12 @@ pub struct Chrome {
 /// Builds the layout data of a page at `path` (no query string).
 pub fn chrome(
     cfg: &Config,
-    title: &str,
     og_title: &str,
     og_text: &'static str,
     path: &str,
 ) -> Chrome {
     let host = &cfg.server.hostname;
     Chrome {
-        title: format!("{title} — Farsight at {host}"),
         theme: cfg.public_ui.dark_mode_default.as_str(),
         og: OpenGraph {
             title: og_title.to_owned(),
@@ -507,7 +505,6 @@ fn message_page(
     let t = MessagePage {
         c: chrome(
             cfg,
-            title,
             &format!("Farsight at {}", cfg.server.hostname),
             OG_INSTANCE,
             "/",

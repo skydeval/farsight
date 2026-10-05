@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#090c15">
 <meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false}'>
-<title>{{ c.title }}</title>
+<title>Farsight</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{ crate::common::asset_version() }}">
 {{ c.og|safe }}
 <link rel="stylesheet" href="/static/public.css?v={{ crate::common::asset_version() }}">
 <script src="/static/public.js?v={{ crate::common::asset_version() }}"></script>

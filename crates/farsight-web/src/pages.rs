@@ -249,6 +249,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/static/public.js", get(common::js))
         .route("/static/htmx.min.js", get(common::htmx))
         .route(common::OG_IMAGE_PATH, get(common::og_image))
+        .route("/static/favicon.svg", get(common::favicon))
         // The admin pages' addresses before they moved under `/admin`:
         // redirected for one release, then gone.
         .route("/lookup/did", get(old_lookup_did))
