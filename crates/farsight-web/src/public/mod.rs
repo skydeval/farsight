@@ -331,16 +331,6 @@ pub struct Chrome {
     pub og: OpenGraph,
 }
 
-/// The contact shown on the public home page.
-pub fn contact(cfg: &Config) -> String {
-    let c = cfg.public_ui.contact.trim();
-    text::clean(if c.is_empty() {
-        cfg.server.contact.trim()
-    } else {
-        c
-    })
-}
-
 /// Builds the layout data of a page at `path` (no query string).
 pub fn chrome(
     cfg: &Config,

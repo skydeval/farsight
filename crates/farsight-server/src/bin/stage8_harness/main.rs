@@ -1140,7 +1140,7 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
         (
             "Blocked by (list)",
             w.l4_path.clone(),
-            "listblockers",
+            "subscribers",
             Section::ListBlockers,
             w.l4_id,
             3,
@@ -1182,7 +1182,7 @@ async fn check_plans(c: &mut Checks, pool: &PgPool, w: &World) -> Result<(), Str
         let filter = Filter {
             hide_inactive: true,
             show_suspended: false,
-            show_banned: false,
+            show_taken_down: false,
             find: None,
             excluded: &[],
         };
@@ -1384,7 +1384,7 @@ async fn check_public_columns(c: &mut Checks, a: &Srv, w: &World) -> Result<(), 
         "\"Blocked by\" and \"Blocks by this account\" on the account page and \"Blocked by\" on the list page are Account and Created; Members is Account and Added; no public page carries a block or listblock at-uri",
         heads(section(&page.text, "blockers").unwrap_or("")) == two
             && heads(section(&out.text, "outgoing").unwrap_or("")) == two
-            && heads(section(&list.text, "listblockers").unwrap_or("")) == two
+            && heads(section(&list.text, "subscribers").unwrap_or("")) == two
             && heads(section(&list.text, "members").unwrap_or(""))
                 == ["Account", "Added"]
             && [&page, &out, &list].iter().all(|r| r.status == 200 && clean(r)),
@@ -2488,7 +2488,7 @@ async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Resul
     let shown = Filter {
         hide_inactive: true,
         show_suspended: false,
-        show_banned: false,
+        show_taken_down: false,
         find: None,
         excluded: &[],
     };
@@ -2540,7 +2540,7 @@ async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Resul
             Filter {
                 hide_inactive: true,
                 show_suspended: false,
-                show_banned: false,
+                show_taken_down: false,
                 find: None,
                 excluded: &excluded,
             },

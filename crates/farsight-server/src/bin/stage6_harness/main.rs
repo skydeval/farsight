@@ -1330,7 +1330,7 @@ async fn check_enable_flow(c: &mut Checks, h: &mut H, w: &World) -> Result<(), S
     let lists_all = [
         HOSTNAME,
         "mailto:ops@",
-        "(shown on the home page)",
+        "the public pages do not show it",
         "Incoming blocks",
         "Lists naming any account",
         "List memberships",
@@ -1597,7 +1597,7 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
         format!("{}?page=0", path_did(&w.s)),
         format!("{}?lists=x", path_did(&w.s)),
         format!("{}?page=2&out=-1", path_did(&w.s)),
-        format!("{}?blockers=1000001", w.list),
+        format!("{}?subscribers=1000001", w.list),
         format!("/search?q={long}"),
         "/card/alice.example".to_owned(),
         "/card/did:plc:short".to_owned(),
@@ -1643,7 +1643,7 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
             format!("{}?page=2&lists=1", path_did(&w.s)),
             format!("{}?page=2", path_did(&w.s)),
         ),
-        (format!("{}?blockers=1", w.list), w.list.clone()),
+        (format!("{}?subscribers=1", w.list), w.list.clone()),
     ] {
         let r = h.get(&from).await?;
         if r.status != 301 || r.header("location").as_deref() != Some(to.as_str()) {
@@ -1854,7 +1854,7 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
         navs.is_empty()
             && !lp.text.contains("stat-card")
             && !lp.text.contains("section-pill")
-            && ids == ["members", "listblockers"],
+            && ids == ["members", "subscribers"],
         format!("{navs:?} {ids:?}"),
     );
     let want = h
@@ -1881,7 +1881,7 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     };
     c.check(
         "row times on the list page are marked to read as the instant alone (no relative part), in both tables",
-        times(sec) && times(section(&lp.text, "listblockers").unwrap_or("")),
+        times(sec) && times(section(&lp.text, "subscribers").unwrap_or("")),
         format!("{} times in Members", sec.matches("<time ").count()),
     );
     let want = h
@@ -1889,9 +1889,9 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
             "SELECT a.did FROM list_blocks b JOIN actors a ON a.id = b.author_id WHERE b.list_id = {lid} AND {shown}"
         ))
         .await?;
-    let (rows, _, _) = walk(h, &w.list, "listblockers").await?;
+    let (rows, _, _) = walk(h, &w.list, "subscribers").await?;
     let (ok, d) = exactly_once(&rows, &want);
-    let sec = section(&lp.text, "listblockers").unwrap_or("");
+    let sec = section(&lp.text, "subscribers").unwrap_or("");
     c.check(
         "Blocked by (list): every active listblocker exactly once, and the bounded count",
         ok && want.len() == 5
@@ -2544,7 +2544,7 @@ async fn all_text(h: &H, pages: &[String; 2]) -> Result<String, String> {
     let mut text = String::new();
     for (p, ids) in [
         (&pages[0], vec!["blockers", "lists", "outgoing"]),
-        (&pages[1], vec!["members", "listblockers"]),
+        (&pages[1], vec!["members", "subscribers"]),
     ] {
         for id in ids {
             let mut url = p.clone();
@@ -2581,35 +2581,35 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
             && seen.contains(&w.e)
             && seen.contains(suspended)
             && text.contains("<span class=\"acct-tag acct-suspended\">suspended</span>")
-            && !text.contains("acct-banned")
+            && !text.contains("acct-takendown")
             && seen.len() > 120,
         format!("{} DIDs on the pages; leaked: {leaked:?}", seen.len()),
     );
-    // "Show banned accounts": taken-down accounts, on request.
+    // "Show taken down accounts": taken-down accounts, on request.
     let rest = h.get(&path_did(&w.s)).await?;
-    let on = h.get(&format!("{}?banned=1", path_did(&w.s))).await?;
+    let on = h.get(&format!("{}?takendown=1", path_did(&w.s))).await?;
     let odd = h
-        .get(&format!("{}?banned=yes&page=2", path_did(&w.s)))
+        .get(&format!("{}?takendown=yes&page=2", path_did(&w.s)))
         .await?;
     let (rsec, osec) = (
         section(&rest.text, "blockers").unwrap_or(""),
         section(&on.text, "blockers").unwrap_or(""),
     );
-    let lon = h.get(&format!("{}?banned=1", w.list)).await?;
+    let lon = h.get(&format!("{}?takendown=1", w.list)).await?;
     let lrest = h.get(&w.list).await?;
     c.check(
-        "the heading states both numbers — the blockers shown, and the number counting banned (taken-down) accounts — and offers the switch; with ?banned=1 the taken-down blocker is a row with a \"banned\" tag, the deactivated and deleted ones still are not, the page links keep the switch and the switch leads back; any other value of the parameter is redirected away",
-        rsec.contains("<span class=\"count count-big\">62</span> <span class=\"count-all\">(63 counting banned accounts)</span>")
-            && rsec.contains(&format!("href=\"{}?banned=1#blockers\"", path_did(&w.s)))
+        "the heading states both numbers — the blockers shown, and the number counting taken-down accounts — and offers the switch; with ?takendown=1 the taken-down blocker is a row with a \"taken down\" tag, the deactivated and deleted ones still are not, the page links keep the switch and the switch leads back; any other value of the parameter is redirected away",
+        rsec.contains("<span class=\"count count-big\">62</span> <span class=\"count-all\">(63 counting taken down accounts)</span>")
+            && rsec.contains(&format!("href=\"{}?takendown=1#blockers\"", path_did(&w.s)))
             && rsec.contains("role=\"checkbox\" aria-checked=\"false\"")
             && !row_dids(rsec).contains(taken_down)
-            && osec.contains("<span class=\"count count-big\">62</span> <span class=\"count-all\">(63 counting banned accounts)</span>")
+            && osec.contains("<span class=\"count count-big\">62</span> <span class=\"count-all\">(63 counting taken down accounts)</span>")
             && osec.contains("aria-checked=\"true\"")
             && osec.contains(&format!("href=\"{}#blockers\"", path_did(&w.s)))
-            && osec.contains("<span class=\"acct-tag acct-banned\">banned</span>")
-            && step_of(osec, "next") == Some(format!("{}?banned=1&page=2", path_did(&w.s)))
+            && osec.contains("<span class=\"acct-tag acct-takendown\">taken down</span>")
+            && step_of(osec, "next") == Some(format!("{}?takendown=1&page=2", path_did(&w.s)))
             && {
-                let two = h.get(&format!("{}?banned=1&page=2", path_did(&w.s))).await?;
+                let two = h.get(&format!("{}?takendown=1&page=2", path_did(&w.s))).await?;
                 let mut all = row_dids(osec);
                 all.extend(row_dids(section(&two.text, "blockers").unwrap_or("")));
                 all.len() == 63
@@ -2619,9 +2619,9 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
             }
             && odd.status == 301
             && odd.header("location").as_deref() == Some(format!("{}?page=2", path_did(&w.s)).as_str())
-            && section(&lrest.text, "listblockers").is_some_and(|s| s.contains("(6 counting banned accounts)") && !row_dids(s).contains(taken_down))
-            && section(&lrest.text, "members").is_some_and(|s| s.contains("(64 counting banned accounts)"))
-            && section(&lon.text, "listblockers").is_some_and(|s| row_dids(s).contains(taken_down) && s.contains("acct-banned")),
+            && section(&lrest.text, "subscribers").is_some_and(|s| s.contains("(6 counting taken down accounts)") && !row_dids(s).contains(taken_down))
+            && section(&lrest.text, "members").is_some_and(|s| s.contains("(64 counting taken down accounts)"))
+            && section(&lon.text, "subscribers").is_some_and(|s| row_dids(s).contains(taken_down) && s.contains("acct-takendown")),
         support::truncate(rsec, 300),
     );
     c.check(
@@ -3014,20 +3014,26 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
     let custom = h.get("/").await?;
     let account = h.get(&path_did(&w.s)).await?;
     c.check(
-        "instance_description (escaped plain text, blank line = paragraph) and contact replace the defaults on home; the contact is on home only",
+        "instance_description (escaped plain text, blank line = paragraph) replaces the default on home; no public page shows the contact, set or not",
         default.text.contains("Farsight is an independent index of public block records")
-            && default.text.contains("mailto:ops@farsight.test")
+            && !default.text.contains("mailto:")
             && custom.text.contains(">First paragraph &lt;b&gt;plain&lt;/b&gt;.</p>")
             && custom.text.contains(">Second paragraph.</p>")
             && !custom.text.contains("Farsight is an independent index of public block records")
-            && custom.text.contains("mailto:public@farsight.test")
-            && !custom.text.contains("mailto:ops@farsight.test")
+            && !custom.text.contains("mailto:")
             && !account.text.contains("mailto:"),
         "home",
     );
     c.check(
-        "home: instance name, the description, the contact, a search form and the Last updated line; no link to About",
+        "home: instance name, the description, a search form, the totals, the guide and the Last updated line; no label above the name, no link to About",
         custom.text.contains(&format!("<h1>Farsight at {HOSTNAME}</h1>"))
+            && !custom.text.contains("hero-badge")
+            && custom.text.contains("<dl class=\"home-totals\">")
+            && ["Blocks indexed", "Lists tracked", "Accounts seen"]
+                .iter()
+                .all(|t| custom.text.contains(&format!("<dt>{t}</dt><dd>")))
+            && custom.text.contains("<section class=\"home-guide\"")
+            && custom.text.contains("acct-takendown\">taken down</span>")
             && custom.text.matches("action=\"/search\"").count() == 2
             && updated_of(&custom.text).is_some()
             && !custom.text.contains("/about")
@@ -3186,7 +3192,7 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
         let block_heads = ["Account", "Created"];
         heads(&page.text, "blockers") == block_heads
             && heads(&page.text, "outgoing") == block_heads
-            && heads(&lp.text, "listblockers") == block_heads
+            && heads(&lp.text, "subscribers") == block_heads
             && heads(&lp.text, "members") == ["Account", "Added"]
             && !heads(&page.text, "lists").contains(&"Record".to_owned())
             && [page, lp].iter().all(|r| {

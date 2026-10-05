@@ -374,8 +374,6 @@ pub struct Exposure {
     pub hostname: String,
     /// `server.contact`.
     pub server_contact: String,
-    /// The contact the pages will show.
-    pub shown_contact: String,
     /// Profile cards will carry avatars, fetched by visitors' browsers
     /// from the accounts' own servers.
     pub show_avatars: bool,
@@ -393,7 +391,6 @@ impl Exposure {
         Exposure {
             hostname: c.server.hostname.clone(),
             server_contact: c.server.contact.clone(),
-            shown_contact: crate::public::contact(c),
             show_avatars: c.public_ui.show_avatars,
             record_viewer: url::Url::parse(&c.public_ui.record_viewer_url.replace(['{', '}'], ""))
                 .ok()

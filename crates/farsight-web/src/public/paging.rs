@@ -23,8 +23,8 @@ pub const MAX_PAGE: i64 = 1_000_000;
 /// The parameter that names the table in view when it is not the page's
 /// first one.
 pub const TAB: &str = "tab";
-/// The parameter that adds taken-down accounts to the tables: `banned=1`.
-pub const BANNED: &str = "banned";
+/// The parameter that adds taken-down accounts to the tables: `takendown=1`.
+pub const TAKEN_DOWN: &str = "takendown";
 /// The parameter that holds what the filter box of an account page says.
 pub const FIND: &str = "find";
 /// Longest filter text.
@@ -63,8 +63,8 @@ fn query(q: &Params, keys: &[&str], set: Option<(&str, i64)>, tab: Option<&str>)
     if let Some(t) = tab {
         s.append_pair(TAB, t);
     }
-    if banned(q) {
-        s.append_pair(BANNED, "1");
+    if taken_down(q) {
+        s.append_pair(TAKEN_DOWN, "1");
     }
     if let Some(f) = find(q) {
         s.append_pair(FIND, f);
@@ -82,20 +82,26 @@ fn query(q: &Params, keys: &[&str], set: Option<(&str, i64)>, tab: Option<&str>)
 }
 
 /// Whether the address asks for taken-down accounts too.
-pub fn banned(q: &Params) -> bool {
-    q.get(BANNED) == Some("1")
+pub fn taken_down(q: &Params) -> bool {
+    q.get(TAKEN_DOWN) == Some("1")
 }
 
-/// `base?…` with the banned switch set to `on`, the table `tab` in view
+/// `base?…` with the taken-down switch set to `on`, the table `tab` in view
 /// and every table on the page it is on. (A page that the change leaves
 /// past a table's end is answered with its last page.)
-pub fn banned_link(base: &str, q: &Params, keys: &[&str], tab: Option<&str>, on: bool) -> String {
+pub fn taken_down_link(
+    base: &str,
+    q: &Params,
+    keys: &[&str],
+    tab: Option<&str>,
+    on: bool,
+) -> String {
     let mut s = url::form_urlencoded::Serializer::new(String::new());
     if let Some(t) = tab {
         s.append_pair(TAB, t);
     }
     if on {
-        s.append_pair(BANNED, "1");
+        s.append_pair(TAKEN_DOWN, "1");
     }
     if let Some(f) = find(q) {
         s.append_pair(FIND, f);
@@ -138,9 +144,9 @@ pub fn canonical(q: &Params, keys: &[&str], retired: &[&str], tabs: &[&str]) -> 
     let first = keys.iter().any(|k| q.get(k) == Some("1"));
     let tab = q.get(TAB);
     let kept = tab.filter(|t| tabs.iter().skip(1).any(|k| k == t));
-    // `banned` has one spelling: `1`.
+    // `takendown` has one spelling: `1`.
     // …and an empty filter is no filter.
-    let odd = q.get(BANNED).is_some_and(|v| v != "1")
+    let odd = q.get(TAKEN_DOWN).is_some_and(|v| v != "1")
         || q.get(FIND)
             .is_some_and(|v| v.trim().is_empty() || v != v.trim());
     (stale || first || tab != kept || odd).then(|| query(q, keys, None, kept))
@@ -445,17 +451,17 @@ mod tests {
         assert_eq!(c("tab=blockers&page=2").as_deref(), Some("page=2"));
         assert_eq!(c("tab=nope").as_deref(), Some(""));
         assert_eq!(c("tab=lists&bc=x").as_deref(), Some("tab=lists"));
-        // The banned switch travels with every link and has one spelling.
-        assert_eq!(c("banned=1&page=2"), None);
-        assert_eq!(c("banned=yes&page=2").as_deref(), Some("page=2"));
-        let b = Params::parse("banned=1&lists=3");
+        // The taken_down switch travels with every link and has one spelling.
+        assert_eq!(c("takendown=1&page=2"), None);
+        assert_eq!(c("takendown=yes&page=2").as_deref(), Some("page=2"));
+        let b = Params::parse("takendown=1&lists=3");
         assert_eq!(
             link("/did/x", &b, &keys, "page", 2, None),
-            "/did/x?banned=1&page=2&lists=3"
+            "/did/x?takendown=1&page=2&lists=3"
         );
         assert_eq!(
             tab_link("/did/x", &b, &keys, Some("lists")),
-            "/did/x?tab=lists&banned=1&lists=3"
+            "/did/x?tab=lists&takendown=1&lists=3"
         );
         // The filter travels with every link too; an empty one is dropped.
         let f = Params::parse("find=alice&lists=2");
@@ -472,22 +478,22 @@ mod tests {
         assert_eq!(c("find=alice"), None);
         // The switch keeps the pages the tables are on.
         assert_eq!(
-            banned_link("/did/x", &b, &keys, None, false),
+            taken_down_link("/did/x", &b, &keys, None, false),
             "/did/x?lists=3"
         );
         assert_eq!(
-            banned_link(
+            taken_down_link(
                 "/did/x",
                 &Params::parse("page=3"),
                 &keys,
                 Some("outgoing"),
                 true
             ),
-            "/did/x?tab=outgoing&banned=1&page=3"
+            "/did/x?tab=outgoing&takendown=1&page=3"
         );
         assert_eq!(
-            banned_link("/did/x", &Params::default(), &keys, None, true),
-            "/did/x?banned=1"
+            taken_down_link("/did/x", &Params::default(), &keys, None, true),
+            "/did/x?takendown=1"
         );
         // A page past the end goes back to the last one.
         assert_eq!(past_end(Total::Rows(120), 3, 50), None);

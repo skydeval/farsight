@@ -719,6 +719,45 @@
     }
   }
 
+  // How long ago `then` was, in calendar terms, as its two largest
+  // units: "1 year, 11 months", "5 months, 12 days", "9 days". Null for
+  // a date that is not in the past.
+  function since(then, now) {
+    if (isNaN(then.getTime()) || then > now) {
+      return null;
+    }
+    var years = now.getFullYear() - then.getFullYear();
+    var months = now.getMonth() - then.getMonth();
+    var days = now.getDate() - then.getDate();
+    if (days < 0) {
+      months -= 1;
+      // The days of the month before this one.
+      days += new Date(now.getFullYear(), now.getMonth(), 0).getDate();
+    }
+    if (months < 0) {
+      years -= 1;
+      months += 12;
+    }
+    function unit(n, word) {
+      return n + " " + word + (n === 1 ? "" : "s");
+    }
+    var parts = [];
+    if (years > 0) {
+      parts.push(unit(years, "year"));
+      if (months > 0) {
+        parts.push(unit(months, "month"));
+      }
+    } else if (months > 0) {
+      parts.push(unit(months, "month"));
+      if (days > 0) {
+        parts.push(unit(days, "day"));
+      }
+    } else {
+      parts.push(days > 0 ? unit(days, "day") : "less than a day");
+    }
+    return parts.join(", ");
+  }
+
   // Under the DID in the account page's header: when the DID was created
   // and which host holds the account, as the profile card knows them.
   function heroFacts(card) {
@@ -736,6 +775,10 @@
       t.setAttribute("data-abs", "");
       t.textContent = made.textContent.replace(/ UTC$/, "");
       line.appendChild(t);
+      var old = since(new Date(Date.parse(made.getAttribute("datetime"))), new Date());
+      if (old) {
+        line.appendChild(document.createTextNode(" (" + old + " ago)"));
+      }
     }
     if (host) {
       line.appendChild(document.createTextNode(made ? " \u00b7 Hosted on " : "Hosted on "));
@@ -775,8 +818,8 @@
         var img = document.createElement("img");
         img.className = "hero-avatar";
         img.alt = "";
-        img.width = 56;
-        img.height = 56;
+        img.width = 88;
+        img.height = 88;
         img.referrerPolicy = "no-referrer";
         img.onerror = function () {
           if (img.parentNode) {
@@ -856,7 +899,7 @@
       });
   }
 
-  // A link marked data-swap (the "Show banned accounts" switch) changes
+  // A link marked data-swap (the "Show taken down accounts" switch) changes
   // what the tables hold. Without this script the link is followed.
   function swaps() {
     document.addEventListener("click", function (event) {
@@ -953,7 +996,7 @@
   // stays and a reload shows the rest.
   function pending() {
     // One reader at a time: a call made after the tables changed (the
-    // banned switch) retires the reader before it.
+    // taken-down switch) retires the reader before it.
     var run = ++pendingRun;
     var tries = 0;
     function again() {

@@ -1056,7 +1056,7 @@ async fn lookup_did(
         let filter = Filter {
             hide_inactive: true,
             show_suspended: false,
-            show_banned: false,
+            show_taken_down: false,
             find: None,
             excluded: &[],
         };

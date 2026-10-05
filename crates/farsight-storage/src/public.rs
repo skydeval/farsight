@@ -439,14 +439,14 @@ pub enum Counted {
 /// means "more than `cap`". Counts records, not accounts.
 ///
 /// Counts with the public tables' rule: suspended accounts count;
-/// accounts a host has taken down count only with `banned`; deactivated
+/// accounts a host has taken down count only with `takendown`; deactivated
 /// and deleted accounts never do.
 pub async fn bounded_count(
     conn: &mut PgConnection,
     what: Counted,
     key: i64,
     excluded: &[i64],
-    banned: bool,
+    taken_down: bool,
     find: Option<&crate::ui_rows::Find>,
     cap: i64,
 ) -> Result<i64> {
@@ -464,7 +464,7 @@ pub async fn bounded_count(
                   OR EXISTS (SELECT 1 FROM handle_cache h
                              WHERE h.did = a.did AND h.handle LIKE $5::text))
            LIMIT $3) x",
-        crate::ui_rows::hidden_statuses(true, banned)
+        crate::ui_rows::hidden_statuses(true, taken_down)
     ))
     .bind(key)
     .bind(excluded)

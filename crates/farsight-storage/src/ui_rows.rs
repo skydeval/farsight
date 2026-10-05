@@ -47,10 +47,10 @@ const SHOWN_B: &str = "COALESCE(LEAST(b.created_at, b.first_seen), '-infinity'::
 const HIDDEN: &str = "(1, 2, 3, 4)";
 
 /// The statuses a table leaves out, as an SQL list: deactivated (1) and
-/// deleted (4) always; taken down (2) unless `banned`; suspended (3)
+/// deleted (4) always; taken down (2) unless `takendown`; suspended (3)
 /// unless `suspended`. With neither, the API's hidden set (§3.1).
-pub fn hidden_statuses(suspended: bool, banned: bool) -> &'static str {
-    match (suspended, banned) {
+pub fn hidden_statuses(suspended: bool, taken_down: bool) -> &'static str {
+    match (suspended, taken_down) {
         (false, false) => HIDDEN,
         (true, false) => "(1, 2, 4)",
         (false, true) => "(1, 3, 4)",
@@ -298,8 +298,8 @@ pub struct Filter<'a> {
     /// temporary; the public tables show them).
     pub show_suspended: bool,
     /// With `hide_inactive`: keep the accounts a host has taken down
-    /// ("banned"). Deactivated and deleted accounts always stay out.
-    pub show_banned: bool,
+    /// ("taken down"). Deactivated and deleted accounts always stay out.
+    pub show_taken_down: bool,
     /// Rows whose listed account is one of these `actors.id` values
     /// (`public_ui.excluded_dids`).
     pub excluded: &'a [i64],
@@ -335,7 +335,7 @@ fn build<'a>(
     if filter.hide_inactive {
         q.push(format!(
             " AND a.status NOT IN {}",
-            hidden_statuses(filter.show_suspended, filter.show_banned)
+            hidden_statuses(filter.show_suspended, filter.show_taken_down)
         ));
     }
     if !filter.excluded.is_empty() {
@@ -856,7 +856,7 @@ mod tests {
         let f = Filter {
             hide_inactive: true,
             show_suspended: false,
-            show_banned: false,
+            show_taken_down: false,
             find: None,
             excluded: &ids,
         };

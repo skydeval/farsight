@@ -614,7 +614,7 @@ nav.tabs a.tab.active {
 .tabbed[data-active="lists"] > #lists,
 .tabbed[data-active="outgoing"] > #outgoing,
 .tabbed[data-active="members"] > #members,
-.tabbed[data-active="listblockers"] > #listblockers,
+.tabbed[data-active="subscribers"] > #subscribers,
 .tabbed[data-active="history"] > #history {
   display: block;
 }
@@ -676,7 +676,7 @@ nav.pager.fit {
   flex-wrap: nowrap;
 }
 
-/* "Show banned accounts": a link that reads as a checkbox. */
+/* "Show taken down accounts": a link that reads as a checkbox. */
 p.table-options {
   margin: 0.6rem 0 0;
 }
@@ -721,7 +721,7 @@ a.toggle.on .box {
   text-transform: uppercase;
   vertical-align: middle;
 }
-.acct-tag.acct-banned {
+.acct-tag.acct-takendown {
   border-color: var(--bad-border);
   background: var(--bad-bg);
   color: var(--bad);
@@ -737,12 +737,73 @@ a.toggle.on .box {
 
 /* The account's avatar in the page header, put there by the script. */
 .hero-avatar {
-  width: 56px;
-  height: 56px;
-  border-radius: 50%;
+  width: 88px;
+  height: 88px;
   object-fit: cover;
   flex-shrink: 0;
   border: 1px solid var(--card-border);
+}
+/* Avatars are rounded squares; where the browser can draw one, a
+   squircle (sides slightly bowed). */
+.hero-avatar, .pc-avatar {
+  border-radius: 26%;
+}
+@supports (corner-shape: squircle) {
+  .hero-avatar, .pc-avatar {
+    border-radius: 42%;
+    corner-shape: squircle;
+  }
+}
+
+/* Home: what the instance holds, and how to read a page. */
+dl.home-totals {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.75rem 2.5rem;
+  margin: 1.75rem 0 0;
+}
+dl.home-totals div {
+  text-align: center;
+}
+dl.home-totals dt {
+  font-size: 0.78rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+dl.home-totals dd {
+  margin: 0.1rem 0 0;
+  font-size: 1.6rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--fg-strong);
+  font-variant-numeric: tabular-nums;
+}
+section.home-guide {
+  max-width: 44rem;
+  margin: 2.25rem auto 0;
+  text-align: left;
+}
+section.home-guide h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--fg-strong);
+}
+section.home-guide dt {
+  margin-top: 0.8rem;
+  font-weight: 700;
+  color: var(--fg);
+}
+section.home-guide dt .acct-tag {
+  margin-left: 0;
+}
+section.home-guide dd {
+  margin: 0.15rem 0 0;
+  font-size: 0.92rem;
+  line-height: 1.5;
+  color: var(--muted);
 }
 nav.pager a, nav.pager span {
   display: inline-flex;
@@ -879,7 +940,6 @@ a.who:hover, a.who:focus-visible {
   flex: 0 0 56px;
   width: 56px;
   height: 56px;
-  border-radius: 50%;
   object-fit: cover;
   background: var(--code);
   border: 2px solid var(--line);
@@ -1781,7 +1841,6 @@ footer {
   margin-bottom: 0.85rem;
 }
 .pc-avatar {
-  border-radius: 50%;
   border: 2px solid var(--accent);
   box-shadow: 0 0 10px -2px var(--accent-glow);
   flex-shrink: 0;
@@ -1820,7 +1879,7 @@ footer {
   h1 { font-size: 1.4rem; }
   .hero h1 { font-size: 1.85rem; }
   .profile-main-row { gap: 0.75rem; }
-  .hero-avatar { width: 40px; height: 40px; }
+  .hero-avatar { width: 64px; height: 64px; }
   /* The boxes of an account or list page reach both edges of a narrow
      screen, and their tables reach the edges of the box: the width goes
      to the rows. */

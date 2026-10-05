@@ -144,7 +144,10 @@ holds a value that differs from the running one, no setting can be
 saved from the running server (pausing the sweep over the API
 included) until the restart.
 
-`/` is the public UI's home page when the public UI is on. Otherwise it
+`/` is the public UI's home page when the public UI is on: the
+instance's name and description, the search box, three totals (blocks
+indexed, lists tracked, accounts seen; the counts `getStats` gives) and
+a short guide to the tabs and the account tags. Otherwise it
 redirects to `/admin`, or, on an instance with neither interface, shows
 a few lines of text.
 
@@ -241,17 +244,23 @@ nothing else in a browser.
   time, chosen with tabs under its header (`?tab=…`). Row times carry
   no zone; one line under the header names it ("All times are in
   EDT."; UTC without the page's script).
+  A list page has "Members" and "Subscribers" (`?tab=subscribers`):
+  the accounts that subscribe to the list as a block list. Mute
+  subscriptions are private and never appear.
+- **Avatars** are rounded squares (squircles where the browser draws
+  them), in the header and on the cards.
 - **Inactive accounts.** A table leaves out accounts that are
   deactivated or deleted. An account its host has **suspended** is
   shown, tagged "suspended". An account its host has **taken down**
-  ("banned") is left out until the visitor ticks "Show banned accounts"
-  (`?banned=1`); the heading gives both numbers, "4,114 (6,234 counting
-  banned accounts)". The switch keeps the page the table is on; an
+  (tagged "taken down") is left out until the visitor ticks "Show taken down accounts"
+  (`?takendown=1`); the heading gives both numbers, "4,114 (6,234 counting
+  taken-down accounts)". The switch keeps the page the table is on; an
   address that names a page past a table's end is answered with its
   last page. The page of a suspended or taken-down account
   itself stays withheld.
 - **Header.** The account page's header shows the account's avatar,
-  when its DID was created and which host holds the account. The
+  when its DID was created, with its age ("1 year, 11 months ago"), and
+  which host holds the account. The
   page's script takes all three from the account's profile card (the
   avatar only with `show_avatars`); the visitor's browser fetches the
   image from the account's own server.
@@ -336,7 +345,7 @@ public_ui = false                 # the toggle
 
 [public_ui]
 instance_description = ""         # plain text on the home page
-contact = ""                      # "" = server.contact
+contact = ""                      # "" = server.contact; no public page shows it
 show_outgoing_blocks = false
 record_viewer_url = ""            # admin lookup pages; "" = records are not links
 show_avatars = true               # false = cards carry no image

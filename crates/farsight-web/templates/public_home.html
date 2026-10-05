@@ -1,11 +1,9 @@
 {% extends "public_base.html" %}
 {% block content %}
 <div class="hero">
-<div class="hero-badge"><span class="pulse-dot" aria-hidden="true"></span> ATProto Block Graph Index</div>
 <h1>Farsight at {{ hostname }}</h1>
 {% for p in description %}<p class="hero-desc">{{ p }}</p>
 {% endfor %}
-{% if !contact.is_empty() %}<p class="contact">Contact: {{ contact }}</p>{% endif %}
 
 <div class="search-deck">
 <form class="search home-search" method="get" action="/search" role="search">
@@ -26,6 +24,30 @@
 </div>
 </form>
 </div>
+
+{% if !totals.is_empty() %}<dl class="home-totals">
+{% for t in totals %}<div><dt>{{ t.0 }}</dt><dd>{{ t.1 }}</dd></div>
+{% endfor %}</dl>{% endif %}
+
+<section class="home-guide" aria-labelledby="guide-title">
+<h2 id="guide-title">How to read a page</h2>
+<dl>
+<dt>Blocked By</dt>
+<dd>Accounts that block the account you looked up, one row for each block, newest first.</dd>
+<dt>Blocked By Lists</dt>
+<dd>Lists the account has been put on that other people subscribe to as block lists. The number at the top adds up those subscriptions.</dd>
+<dt>Blocking</dt>
+<dd>Accounts the account itself blocks, where this instance shows them.</dd>
+<dt>History</dt>
+<dd>The handles and hosts the account has had, as the PLC directory records them.</dd>
+<dt>Members and Subscribers</dt>
+<dd>On a list's page: who is on the list, and who subscribes to it as a block list. Mute subscriptions are private, so they are never shown.</dd>
+<dt><span class="acct-tag acct-suspended">suspended</span> and <span class="acct-tag acct-takendown">taken down</span></dt>
+<dd>What an account's host has done to it. Suspended accounts stay in the tables with their tag. Taken-down accounts are left out until you tick “Show taken down accounts”. Deactivated and deleted accounts are not shown.</dd>
+<dt>Still being verified</dt>
+<dd>A row appears only once this instance has checked that the handle belongs to the account, which takes a few seconds the first time an account is seen.</dd>
+</dl>
+</section>
 
 {% if let Some(t) = updated %}<div class="telemetry-bar updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}
 </div>

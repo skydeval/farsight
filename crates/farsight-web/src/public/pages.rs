@@ -1,7 +1,7 @@
 //! The public pages: home, search, an account and a list.
 //!
 //! The four sections that show a creation time — blockers, outgoing
-//! blocks, a list's members and its listblockers — read their rows through
+//! blocks, a list's members and its subscribers — read their rows through
 //! [`crate::rows`], newest first by shown time once the section's index is
 //! ready, with the withheld rule applied in the query. The lists naming an
 //! account are read the same way, newest first by the shown time of the
@@ -75,7 +75,7 @@ pub struct Who {
     pub card: String,
     /// A verified handle, if cached.
     pub handle: Option<String>,
-    /// What a host has done to the account, if anything: `banned` (taken
+    /// What a host has done to the account, if anything: `takendown` (taken
     /// down) or `suspended`.
     pub tag: Option<&'static str>,
 }
@@ -84,7 +84,7 @@ pub struct Who {
 /// asked; its row is held back until it has (see [`Section::pending`]).
 fn who(r: &Req<'_>, asked: &mut Asked, shown: &Shown<'_>, did: &str) -> Option<Who> {
     let tag = shown.tag(did);
-    let handle = if tag == Some(BANNED) {
+    let handle = if tag == Some(TAKEN_DOWN) {
         // A taken-down account's host no longer answers for it: nothing
         // to check, so the row waits for nothing and shows what is known.
         r.st.public.handles.get(did).map(|h| clean(&h))
@@ -105,11 +105,22 @@ fn who(r: &Req<'_>, asked: &mut Asked, shown: &Shown<'_>, did: &str) -> Option<W
 }
 
 /// The tag of an account its host has taken down.
-const BANNED: &str = "banned";
+const TAKEN_DOWN: &str = "takendown";
 /// The tag of an account its host has suspended.
 const SUSPENDED: &str = "suspended";
 
-/// The "Show banned accounts" switch of a table.
+impl Who {
+    /// What the tag says.
+    pub fn tag_text(&self) -> &'static str {
+        match self.tag {
+            Some(TAKEN_DOWN) => "taken down",
+            Some(other) => other,
+            None => "",
+        }
+    }
+}
+
+/// The "Show taken down accounts" switch of a table.
 #[derive(Debug, Clone)]
 pub struct Toggle {
     /// The page with the switch the other way.
@@ -156,12 +167,12 @@ pub struct Section<R> {
 /// lists", "Blocks by this account".
 const DID_PAGES: [&str; 3] = ["page", "lists", "out"];
 /// Of the list page's: "Members", "Blocked by".
-const LIST_PAGES: [&str; 2] = ["page", "blockers"];
+const LIST_PAGES: [&str; 2] = ["page", "subscribers"];
 /// The tables of the account page, as its tabs name them; the first is
 /// the one in view without a `tab` parameter.
 const DID_TABS: [&str; 4] = ["blockers", "lists", "outgoing", "history"];
 /// Of the list page.
-const LIST_TABS: [&str; 2] = ["members", "listblockers"];
+const LIST_TABS: [&str; 2] = ["members", "subscribers"];
 /// The cursor parameters of earlier versions. An address that still
 /// carries one is redirected to the first page of its section.
 const DID_CURSORS: [&str; 3] = ["bc", "nc", "oc"];
@@ -331,7 +342,7 @@ struct Shown<'a> {
     withheld: &'a Withheld,
     status: HashMap<String, ActorRef>,
     /// Taken-down accounts are shown (the page's switch is on).
-    banned: bool,
+    taken_down: bool,
 }
 
 impl Shown<'_> {
@@ -339,7 +350,7 @@ impl Shown<'_> {
         r: &Req<'_>,
         withheld: &'a Withheld,
         dids: Vec<String>,
-        banned: bool,
+        taken_down: bool,
     ) -> Result<Shown<'a>, Fail> {
         let status = if dids.is_empty() {
             HashMap::new()
@@ -352,7 +363,7 @@ impl Shown<'_> {
         Ok(Shown {
             withheld,
             status,
-            banned,
+            taken_down,
         })
     }
 
@@ -364,7 +375,7 @@ impl Shown<'_> {
             return false;
         }
         match self.status.get(did).map(|a| a.status) {
-            Some(actor_status::TAKENDOWN) => self.banned,
+            Some(actor_status::TAKENDOWN) => self.taken_down,
             Some(actor_status::SUSPENDED) => true,
             Some(s) => !actor_status::is_hidden(s),
             None => true,
@@ -374,7 +385,7 @@ impl Shown<'_> {
     /// The tag a row naming `did` carries.
     fn tag(&self, did: &str) -> Option<&'static str> {
         match self.status.get(did).map(|a| a.status) {
-            Some(actor_status::TAKENDOWN) => Some(BANNED),
+            Some(actor_status::TAKENDOWN) => Some(TAKEN_DOWN),
             Some(actor_status::SUSPENDED) => Some(SUSPENDED),
             _ => None,
         }
@@ -391,12 +402,12 @@ async fn total(
     what: Counted,
     key: i64,
     w: &Withheld,
-    banned: bool,
+    taken_down: bool,
     find: Option<&Find>,
 ) -> Total {
     let n = async {
         let mut tx = r.st.api.read_tx().await.ok()?;
-        let n = store::bounded_count(&mut tx, what, key, &w.ids, banned, find, COUNT_CAP)
+        let n = store::bounded_count(&mut tx, what, key, &w.ids, taken_down, find, COUNT_CAP)
             .await
             .ok()?;
         let _ = tx.rollback().await;
@@ -422,7 +433,7 @@ async fn counts(
     r: &Req<'_>,
     key: Option<(Counted, i64)>,
     w: &Withheld,
-    banned: bool,
+    taken_down: bool,
     base: &str,
     q: &Params,
     keys: &[&str],
@@ -439,7 +450,9 @@ async fn counts(
     // The heading keeps the table's whole count; the page controls and
     // the note go by what the filter leaves.
     let matching = match (finder, key) {
-        (Some(f), Some((what, key))) => Some(total(r, what, key, w, banned, Some(&f.find)).await),
+        (Some(f), Some((what, key))) => {
+            Some(total(r, what, key, w, taken_down, Some(&f.find)).await)
+        }
         (Some(_), None) => Some(Total::Rows(0)),
         (None, _) => None,
     };
@@ -459,10 +472,10 @@ async fn counts(
         // Offered on every table of accounts, also where it would add
         // nothing: a switch that comes and goes reads as a fault.
         toggle: Some(Toggle {
-            href: paging::banned_link(base, q, keys, tab, !banned),
-            on: banned,
+            href: paging::taken_down_link(base, q, keys, tab, !taken_down),
+            on: taken_down,
         }),
-        pages: matching.unwrap_or(if banned { all } else { rest }),
+        pages: matching.unwrap_or(if taken_down { all } else { rest }),
         note: matching.and_then(|m| find_note(finder, m)),
     }
 }
@@ -515,11 +528,11 @@ fn cache_for(held: usize) -> Cache {
 }
 
 /// The withheld rule as the row queries apply it.
-fn row_filter<'a>(w: &'a Withheld, banned: bool, find: Option<&'a Find>) -> Filter<'a> {
+fn row_filter<'a>(w: &'a Withheld, taken_down: bool, find: Option<&'a Find>) -> Filter<'a> {
     Filter {
         hide_inactive: true,
         show_suspended: true,
-        show_banned: banned,
+        show_taken_down: taken_down,
         excluded: &w.ids,
         find,
     }
@@ -677,8 +690,9 @@ struct HomePage {
     c: Chrome,
     hostname: String,
     description: Vec<String>,
-    /// `public_ui.contact`, or `server.contact`.
-    contact: String,
+    /// What this instance holds, as `getStats` counts it: block records,
+    /// tracked lists, accounts seen.
+    totals: Vec<(&'static str, String)>,
     updated: Option<Stamp>,
 }
 
@@ -706,7 +720,14 @@ pub async fn home(r: &Req<'_>) -> Result<Response, Fail> {
             } else {
                 description
             },
-            contact: super::contact(cfg),
+            totals: [
+                ("Blocks indexed", "blocks"),
+                ("Lists tracked", "trackedLists"),
+                ("Accounts seen", "actors"),
+            ]
+            .into_iter()
+            .filter_map(|(label, key)| stats["counts"][key].as_i64().map(|n| (label, thousands(n))))
+            .collect(),
             updated: last_updated(&[&stats["freshness"]]),
         },
         StatusCode::OK,
@@ -821,7 +842,7 @@ struct DidPage {
     /// What the filter box says.
     find: String,
     /// Taken-down accounts are in the tables (the filter keeps it so).
-    banned: bool,
+    taken_down: bool,
     tabs: Vec<Tab>,
     /// The id of the table in view.
     active: &'static str,
@@ -869,8 +890,8 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let find = finder.as_ref().map(|f| &f.find);
     let (_slot, _permit) = r.render_slots().await?;
     let api = &r.st.api;
-    let banned = paging::banned(q);
-    let filter = row_filter(&withheld, banned, find);
+    let taken_down = paging::taken_down(q);
+    let filter = row_filter(&withheld, taken_down, find);
     let numbered =
         |section, key, number| crate::rows::numbered(r.st, section, key, filter, number, PAGE_ROWS);
 
@@ -907,7 +928,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     dids.extend(naming_page.rows.iter().map(|l| l.owner_did.clone()));
     dids.extend(out_page.rows.iter().map(|o| o.did.clone()));
     recall(r.st, cfg, &dids).await;
-    let shown = Shown::load(r, &withheld, dids, banned).await?;
+    let shown = Shown::load(r, &withheld, dids, taken_down).await?;
     let mut asked = Asked::new(cfg);
     let pager = |section, label, key, number, total, more| {
         Pager::new(
@@ -929,7 +950,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         r,
         actor.map(|a| (Counted::IncomingBlocks, a.id)),
         &withheld,
-        banned,
+        taken_down,
         &base,
         q,
         &DID_PAGES,
@@ -1023,7 +1044,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
                 r,
                 actor.map(|a| (Counted::OutgoingBlocks, a.id)),
                 &withheld,
-                banned,
+                taken_down,
                 &base,
                 q,
                 &DID_PAGES,
@@ -1081,7 +1102,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         card: actor.map(|_| card_href(did.as_str())),
         history,
         find: finder.map(|f| f.text).unwrap_or_default(),
-        banned,
+        taken_down,
         base: base.clone(),
         c: chrome(cfg, did.as_str(), &og_title, OG_ACCOUNT, &base),
         did: did.to_string(),
@@ -1164,7 +1185,7 @@ pub async fn list(
         return Ok(crate::common::moved(&base, Some(&query)));
     }
     let m_page = paging::number(q, "page", &base)?;
-    let k_page = paging::number(q, "blockers", &base)?;
+    let k_page = paging::number(q, "subscribers", &base)?;
     let withheld = r.withheld().await?;
     let actor = actor_row(r, owner).await?;
     if let Some(reason) = withheld.reason(owner.as_str(), actor.map(|a| a.status)) {
@@ -1192,8 +1213,8 @@ pub async fn list(
         .await?
         .body;
     let (state, show_members) = state_words(listing["state"].as_str().unwrap_or(""));
-    let banned = paging::banned(q);
-    let filter = row_filter(&withheld, banned, None);
+    let taken_down = paging::taken_down(q);
+    let filter = row_filter(&withheld, taken_down, None);
     let member_page = if show_members {
         crate::rows::numbered(r.st, Rows::ListMembers, info.id, filter, m_page, PAGE_ROWS).await?
     } else {
@@ -1206,7 +1227,7 @@ pub async fn list(
     let mut dids: Vec<String> = member_page.rows.iter().map(|m| m.did.clone()).collect();
     dids.extend(blocker_page.rows.iter().map(|b| b.did.clone()));
     recall(r.st, cfg, &dids).await;
-    let shown = Shown::load(r, &withheld, dids, banned).await?;
+    let shown = Shown::load(r, &withheld, dids, taken_down).await?;
     let mut asked = Asked::new(cfg);
     let pager = |section, label, key, number, total, more| {
         Pager::new(
@@ -1230,7 +1251,7 @@ pub async fn list(
             r,
             Some((Counted::ListMembers, info.id)),
             &withheld,
-            banned,
+            taken_down,
             &base,
             q,
             &LIST_PAGES,
@@ -1273,11 +1294,11 @@ pub async fn list(
         r,
         Some((Counted::ListBlockers, info.id)),
         &withheld,
-        banned,
+        taken_down,
         &base,
         q,
         &LIST_PAGES,
-        Some("listblockers"),
+        Some("subscribers"),
         None,
     )
     .await;
@@ -1289,9 +1310,9 @@ pub async fn list(
                 &base,
                 q,
                 &LIST_PAGES,
-                "blockers",
+                "subscribers",
                 last,
-                Some("listblockers"),
+                Some("subscribers"),
             ),
         ));
     }
@@ -1307,9 +1328,9 @@ pub async fn list(
         rows,
         pending,
         pager: pager(
-            "listblockers",
-            "Blocked by",
-            "blockers",
+            "subscribers",
+            "Subscribers",
+            "subscribers",
             k_page,
             k_total,
             blocker_page.more,
@@ -1329,7 +1350,7 @@ pub async fn list(
     if members.is_some() {
         shown_tabs.push(("members", "Members"));
     }
-    shown_tabs.push(("listblockers", "Blocked By"));
+    shown_tabs.push(("subscribers", "Subscribers"));
     let (tabs, active) = tabs(&base, q, &LIST_PAGES, &LIST_TABS, &shown_tabs);
     let t = ListPage {
         tabs,

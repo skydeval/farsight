@@ -7,7 +7,7 @@
 <p>With the public UI on, anyone can open <code>https://{{ e.hostname }}/</code> without logging in and see:</p>
 <ul>
 <li><strong>The instance hostname</strong>: {{ e.hostname }}.</li>
-<li><strong>The operator contact</strong> (shown on the home page): {{ e.shown_contact }}. <code>server.contact</code> ({{ e.server_contact }}) is already public through <code>getStats</code> and the User-Agent of this instance's outbound requests.</li>
+<li><strong>The operator contact</strong>: the public pages do not show it. <code>server.contact</code> ({{ e.server_contact }}) is already public through <code>getStats</code> and the User-Agent of this instance's outbound requests.</li>
 <li><strong>When the index was last updated</strong>: one line at the foot of each page.</li>
 <li><strong>Incoming blocks</strong> for any account: which accounts block it.</li>
 <li><strong>Lists naming any account</strong>: the listblocked lists it is on, each with its name, owner and number of listblocks.</li>
