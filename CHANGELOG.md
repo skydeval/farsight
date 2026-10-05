@@ -231,8 +231,8 @@ Database schema version 9.
 - A Docker image and a compose file that runs the server, the backfill
   service and PostgreSQL.
 
-[Unreleased]: https://github.com/skydeval/horizon-farsight/compare/8cad9c3...HEAD
-[0.5.0]: https://github.com/skydeval/horizon-farsight/compare/380a503...8cad9c3
+[Unreleased]: https://github.com/skydeval/horizon-farsight/compare/63fb4a6...HEAD
+[0.5.0]: https://github.com/skydeval/horizon-farsight/compare/380a503...63fb4a6
 [0.4.0]: https://github.com/skydeval/horizon-farsight/compare/d69003d...380a503
 [0.3.0]: https://github.com/skydeval/horizon-farsight/compare/11408c3...d69003d
 [0.2.0]: https://github.com/skydeval/horizon-farsight/compare/0207b49...11408c3
