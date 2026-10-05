@@ -1,5 +1,5 @@
 // Farsight UI: the theme toggle, times in the visitor's timezone, profile
-// cards, copy buttons and the "/" search shortcut. Nothing here is needed
+// cards and the "/" search shortcut. Nothing here is needed
 // to read a page: without it the times stay in UTC, the links work and
 // there are no cards. The admin pages load the same file; it does nothing
 // where its elements are absent.
@@ -415,151 +415,6 @@
     });
   }
 
-  // ---- Copy buttons and section links ---------------------------------
-
-  var toastTimer = null;
-  function showToast(msg) {
-    var toast = document.getElementById("toast");
-    if (!toast) {
-      toast = document.createElement("div");
-      toast.id = "toast";
-      toast.className = "toast";
-      toast.setAttribute("role", "status");
-      toast.setAttribute("aria-live", "polite");
-      document.body.appendChild(toast);
-    }
-    toast.textContent = msg;
-    toast.hidden = false;
-    // Force layout reflow for animation
-    void toast.offsetWidth;
-    toast.classList.add("show");
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () {
-      toast.classList.remove("show");
-      setTimeout(function () {
-        if (!toast.classList.contains("show")) {
-          toast.hidden = true;
-        }
-      }, 300);
-    }, 2400);
-  }
-
-  function copyText(text, btn) {
-    var done = function () {
-      if (btn) {
-        btn.classList.add("copied");
-        setTimeout(function () {
-          btn.classList.remove("copied");
-        }, 2000);
-      }
-      var preview = text.length > 36 ? text.slice(0, 33) + "…" : text;
-      showToast("Copied to clipboard: " + preview);
-    };
-
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done).catch(function () {
-        legacyCopy(text, done);
-      });
-    } else {
-      legacyCopy(text, done);
-    }
-  }
-
-  function legacyCopy(text, done) {
-    try {
-      var ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      ta.style.pointerEvents = "none";
-      document.body.appendChild(ta);
-      ta.focus();
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-      done();
-    } catch (e) {}
-  }
-
-  function interactiveActions() {
-    document.addEventListener("click", function (event) {
-      // Copy buttons.
-      var copyBtn = event.target.closest ? event.target.closest(".copy-btn, [data-copy]") : null;
-      if (copyBtn) {
-        var val = copyBtn.getAttribute("data-copy");
-        if (val) {
-          event.preventDefault();
-          copyText(val, copyBtn);
-          return;
-        }
-      }
-
-      // A stat tile scrolls to its section.
-      var jump = event.target.closest ? event.target.closest("[data-jump]") : null;
-      if (jump) {
-        var targetId = jump.getAttribute("data-jump");
-        var targetEl = document.getElementById(targetId);
-        if (targetEl) {
-          event.preventDefault();
-          var still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-          targetEl.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "start" });
-          try {
-            history.pushState(null, "", "#" + targetId);
-          } catch (e) {}
-        }
-      }
-    });
-  }
-
-  function scrollSpy() {
-    var nav = document.querySelector(".sticky-sections");
-    if (!nav || !("IntersectionObserver" in window)) {
-      return;
-    }
-    var links = nav.querySelectorAll("a.section-pill[href^='#']");
-    if (!links.length) {
-      return;
-    }
-
-    var targets = [];
-    for (var i = 0; i < links.length; i++) {
-      var id = links[i].getAttribute("href").slice(1);
-      var el = document.getElementById(id);
-      if (el) {
-        targets.push({ id: id, el: el, link: links[i] });
-      }
-    }
-    if (!targets.length) {
-      return;
-    }
-
-    var observer = new IntersectionObserver(
-      function (entries) {
-        var visible = null;
-        for (var j = 0; j < entries.length; j++) {
-          if (entries[j].isIntersecting) {
-            visible = entries[j].target.id;
-            break;
-          }
-        }
-        if (visible) {
-          for (var k = 0; k < targets.length; k++) {
-            if (targets[k].id === visible) {
-              targets[k].link.classList.add("active");
-            } else {
-              targets[k].link.classList.remove("active");
-            }
-          }
-        }
-      },
-      { rootMargin: "-100px 0px -60% 0px", threshold: 0.05 }
-    );
-
-    for (var m = 0; m < targets.length; m++) {
-      observer.observe(targets[m].el);
-    }
-  }
-
   // ---- Micro-interactions: '/' key to focus search --------------------
 
   function shortcuts() {
@@ -595,8 +450,6 @@
     document.addEventListener("visibilitychange", keepTimes);
     cards();
     shortcuts();
-    interactiveActions();
-    scrollSpy();
     zoneNote();
     tabs();
     pending();
@@ -1121,6 +974,5 @@
   // A section swapped in by htmx carries new times.
   document.addEventListener("htmx:afterSwap", function (event) {
     times(event.target && event.target.parentNode ? event.target.parentNode : document);
-    scrollSpy();
   });
 })();

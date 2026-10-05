@@ -1339,57 +1339,6 @@ footer {
   margin-bottom: 1.25rem;
 }
 
-.profile-actions {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-}
-
-.action-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  padding: 0.35rem 0.75rem;
-  border-radius: var(--radius-sm);
-  font-size: 0.82rem;
-  font-weight: 600;
-  font-family: inherit;
-  background: var(--card);
-  border: 1px solid var(--line);
-  color: var(--fg);
-  cursor: pointer;
-  transition: all 0.15s ease;
-  text-decoration: none;
-  box-shadow: var(--shadow-sm);
-}
-.action-btn:hover {
-  background: var(--card-hover);
-  border-color: var(--line-strong);
-  color: var(--fg-strong);
-  transform: translateY(-1px);
-}
-.action-btn:active {
-  transform: translateY(0);
-}
-
-/* Copy button specific behavior */
-.copy-btn .check-icon {
-  display: none;
-  color: var(--ok);
-}
-.copy-btn.copied {
-  border-color: var(--ok);
-  background: var(--ok-bg);
-  color: var(--ok);
-}
-.copy-btn.copied .copy-icon {
-  display: none;
-}
-.copy-btn.copied .check-icon {
-  display: inline-block;
-}
-
 /* Profile main row */
 .profile-main-row {
   display: flex;
@@ -1400,11 +1349,6 @@ footer {
 /* The account page's header ends with this row. */
 .profile-main-row:last-child {
   margin-bottom: 0;
-}
-
-/* The account page's copy button sits beside the name. */
-.profile-main-row > .profile-actions {
-  flex-shrink: 0;
 }
 
 .profile-id-block {
@@ -1465,155 +1409,6 @@ footer {
   text-transform: uppercase;
   font-size: 0.74rem;
   letter-spacing: 0.04em;
-}
-
-/* Telemetry Stats Ribbon */
-.stats-ribbon {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 0.85rem;
-  margin-top: 1.5rem;
-  margin-bottom: 1.5rem;
-}
-.stat-card {
-  display: flex;
-  align-items: center;
-  gap: 0.9rem;
-  padding: 1rem 1.15rem;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  text-decoration: none;
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-  box-shadow: var(--shadow-sm);
-  cursor: pointer;
-}
-.stat-card:hover {
-  transform: translateY(-2px);
-  border-color: var(--accent);
-  box-shadow: 0 6px 18px -4px var(--accent-glow), var(--shadow);
-}
-.stat-card:active {
-  transform: translateY(0);
-}
-
-.stat-icon {
-  width: 42px;
-  height: 42px;
-  border-radius: var(--radius-sm);
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-}
-.blocker-icon {
-  background: var(--bad-bg);
-  color: var(--bad);
-  border: 1px solid var(--bad-border);
-}
-.list-icon {
-  background: var(--accent-subtle);
-  color: var(--accent);
-  border: 1px solid var(--accent-glow);
-}
-.outgoing-icon {
-  background: rgba(168, 85, 247, 0.12);
-  color: var(--aurora-violet);
-  border: 1px solid rgba(168, 85, 247, 0.3);
-}
-
-.stat-content {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-.stat-num {
-  font-size: 1.55rem;
-  font-weight: 800;
-  font-family: var(--font-mono);
-  color: var(--fg-strong);
-  line-height: 1.1;
-  letter-spacing: -0.02em;
-}
-.stat-title {
-  font-size: 0.85rem;
-  font-weight: 700;
-  color: var(--fg);
-  margin-top: 0.15rem;
-}
-.stat-desc {
-  font-size: 0.74rem;
-  color: var(--muted-light);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* Sticky Segmented Section Tabs */
-.sticky-sections {
-  position: sticky;
-  top: 3.5rem;
-  z-index: 25;
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.65rem 0.75rem;
-  background: var(--card-glass);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  margin-top: 1.25rem;
-  box-shadow: var(--shadow-sm);
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.sticky-sections::-webkit-scrollbar {
-  display: none;
-}
-
-.section-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.45rem;
-  padding: 0.4rem 0.9rem;
-  border-radius: var(--radius-full);
-  font-size: 0.84rem;
-  font-weight: 600;
-  color: var(--muted);
-  text-decoration: none;
-  background: transparent;
-  border: 1px solid transparent;
-  transition: all 0.15s ease;
-  white-space: nowrap;
-}
-.section-pill:hover {
-  color: var(--fg-strong);
-  background: var(--pill);
-}
-.section-pill.active {
-  color: var(--accent-fg, var(--fg-strong));
-  background: var(--accent);
-  border-color: var(--accent);
-  box-shadow: 0 2px 10px -2px var(--accent-glow);
-}
-.section-pill.active svg {
-  stroke: currentColor;
-}
-.badge-count {
-  display: inline-block;
-  font-size: 0.74rem;
-  font-family: var(--font-mono);
-  font-weight: 700;
-  padding: 0.1rem 0.45rem;
-  border-radius: 9999px;
-  background: var(--pill);
-  color: var(--fg);
-  border: 1px solid var(--line);
-}
-.section-pill.active .badge-count {
-  background: rgba(0, 0, 0, 0.2);
-  border-color: rgba(255, 255, 255, 0.2);
-  color: inherit;
 }
 
 /* Data Sections & Tables */
@@ -1913,32 +1708,6 @@ footer {
   line-height: 1.6;
 }
 
-/* Toast Notification (Micro-Interaction) */
-.toast {
-  position: fixed;
-  bottom: 2rem;
-  left: 50%;
-  transform: translate(-50%, 20px);
-  opacity: 0;
-  pointer-events: none;
-  background: var(--card-glass);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid var(--accent);
-  box-shadow: 0 12px 32px -4px rgba(0, 0, 0, 0.3), 0 0 16px -2px var(--accent-glow);
-  color: var(--fg-strong);
-  padding: 0.65rem 1.35rem;
-  border-radius: var(--radius-full);
-  font-size: 0.88rem;
-  font-weight: 600;
-  z-index: 1000;
-  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.toast.show {
-  transform: translate(-50%, 0);
-  opacity: 1;
-  pointer-events: auto;
-}
 
 /* Hover Card Enhancements */
 .pc-header {
@@ -2027,7 +1796,6 @@ footer {
   .data-table .td-list, .data-table .list-link { white-space: nowrap; }
   .data-table th:first-child, .data-table td:first-child, .data-table .td-owner { min-width: 0; }
   .time-badge { font-size: 0.72rem; padding: 0 0.35rem; }
-  .stats-ribbon { grid-template-columns: 1fr; }
   table { font-size: 0.86rem; }
   th, td { padding: 0.55rem 0.75rem; }
   form.home-search .search-box { flex-direction: column; align-items: stretch; padding: 0.5rem; }
