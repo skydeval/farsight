@@ -31,6 +31,10 @@ commits it covers.
 
 ### Added
 
+- Admin dashboard: a "Catching up" block at the top says how far the
+  history sweep, the handle pass and the reading of list descriptions
+  have got and about how long each has left. A line goes away when its
+  work is done.
 - The admin DID lookup page has the account header of the public page
   (avatar, handle, DID, creation date and age, host) with the backfill
   state on its right, its three tables behind tabs, numbered page

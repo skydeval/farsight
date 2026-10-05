@@ -2198,9 +2198,22 @@ async fn check_pass(
     let before = n(pool, stored).await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     let settings = a.admin_get(cookie, "/admin/settings").await?;
+    let dash_off = a.admin_get(cookie, "/admin/dashboard/fragment").await?;
+    let caught = |t: &str, label: &str| {
+        between(
+            t,
+            &format!("<div class=\"l\">{label}</div><div class=\"v\">"),
+            "</div>",
+        )
+        .first()
+        .map(|v| v.to_string())
+    };
     c.check(
-        "off by default: Settings shows handle_pass_rps = 0 and nothing is checked in the background",
+        "off by default: Settings shows handle_pass_rps = 0, nothing is checked in the background and the dashboard's \"Catching up\" has no line for handles or list descriptions",
         settings.text.contains("name=\"handle_pass_rps\" min=\"0\" max=\"200\" value=\"0\"")
+            && dash_off.status == 200
+            && caught(&dash_off.text, "Handles").is_none()
+            && caught(&dash_off.text, "List descriptions").is_none()
             && n(pool, stored).await? == before,
         format!("{before} stored answers"),
     );
@@ -2254,6 +2267,18 @@ async fn check_pass(
         &a.metrics_text().await?,
         "farsight_handle_pass_position",
         &[],
+    );
+    let dash_on = a.admin_get(cookie, "/admin/dashboard/fragment").await?;
+    let line = caught(&dash_on.text, "Handles").unwrap_or_default();
+    c.check(
+        "while it walks, the dashboard's \"Catching up\" block says how far it has got and about how long the rest takes",
+        dash_on.text.contains("<span>Catching up</span>")
+            && line.contains("% of accounts checked, about ")
+            && line.ends_with(" left"),
+        format!(
+            "Handles: {line:?}; List descriptions: {:?}",
+            caught(&dash_on.text, "List descriptions")
+        ),
     );
     set_pass(a, cookie, 0).await?;
     tokio::time::sleep(Duration::from_secs(8)).await;

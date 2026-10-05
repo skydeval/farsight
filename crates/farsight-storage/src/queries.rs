@@ -584,6 +584,17 @@ pub async fn lists_unread(
     .await?)
 }
 
+/// Present lists: how many have not been read for their description, and
+/// how many there are.
+pub async fn lists_unread_count(conn: &mut PgConnection) -> Result<(i64, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE NOT about_read), count(*) FROM lists
+         WHERE record_state = 1",
+    )
+    .fetch_one(conn)
+    .await?)
+}
+
 /// Stores what a list's record says about itself, read for a row older
 /// than the columns. Only a present record that has not been read is
 /// written: a record applied in the meantime is newer than this read.

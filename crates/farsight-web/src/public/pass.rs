@@ -29,6 +29,7 @@
 //! request.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use farsight_core::Did;
@@ -273,6 +274,20 @@ async fn check_one(st: Arc<WebState>, item: Item) -> Option<(String, Option<Stri
     None
 }
 
+/// How far the pass and the list filler have got since the server
+/// started, for the dashboard.
+#[derive(Debug, Default)]
+pub struct Progress {
+    /// The `actors.id` the walk has reached.
+    pub cursor: AtomicI64,
+    /// The newest `actors.id` when the walk last looked.
+    pub last: AtomicI64,
+    /// Walks completed.
+    pub laps: AtomicU64,
+    /// Rounds of the list filler completed.
+    pub list_rounds: AtomicU64,
+}
+
 /// Where the walk is.
 #[derive(Debug, Default)]
 struct Walk {
@@ -305,9 +320,11 @@ async fn next_items(st: &WebState, walk: &mut Walk) -> farsight_storage::Result<
         walk.cursor = 0;
     }
     let last = store::last_actor_id(&mut conn).await?;
+    st.public.progress.last.store(last, Ordering::Relaxed);
     for _ in 0..WINDOWS_PER_STEP {
         if walk.cursor >= last {
             walk.rested_since = Some(Instant::now());
+            st.public.progress.laps.fetch_add(1, Ordering::Relaxed);
             ::metrics::counter!(LAPS).increment(1);
             tracing::info!(accounts = last, "handle pass: reached the last account");
             return Ok(Vec::new());
@@ -321,6 +338,7 @@ async fn next_items(st: &WebState, walk: &mut Walk) -> farsight_storage::Result<
         )
         .await?;
         walk.cursor = next;
+        st.public.progress.cursor.store(next, Ordering::Relaxed);
         ::metrics::gauge!(POSITION).set(next as f64);
         if !rows.is_empty() {
             return Ok(rows
@@ -488,6 +506,10 @@ pub async fn run_lists(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
         };
         if batch.is_empty() {
             cursor = 0;
+            st.public
+                .progress
+                .list_rounds
+                .fetch_add(1, Ordering::Relaxed);
             if pause(&mut stop, LIST_LAP_REST).await {
                 return;
             }

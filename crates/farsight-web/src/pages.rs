@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -443,6 +444,8 @@ pub struct Warning {
 pub struct DashboardData {
     /// Warnings (§9.3, budget, v1, gaps).
     pub warnings: Vec<Warning>,
+    /// Work still catching up, in words; empty when there is none.
+    pub catching: Vec<Stat>,
     /// Index counts.
     pub counts: Vec<Stat>,
     /// Firehose.
@@ -461,6 +464,61 @@ pub struct DashboardData {
     pub lists: Vec<Stat>,
     /// Top buckets by lifetime interning.
     pub buckets: Vec<(String, String, String, String)>,
+}
+
+/// A duration in words, to two units and no less than a minute: "1 day
+/// 4 hours".
+fn long_secs(s: i64) -> String {
+    let unit = |n: i64, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3600, (s % 3600) / 60);
+    if d > 0 && h > 0 {
+        format!("{} {}", unit(d, "day"), unit(h, "hour"))
+    } else if d > 0 {
+        unit(d, "day")
+    } else if h > 0 && m > 0 {
+        format!("{} {}", unit(h, "hour"), unit(m, "minute"))
+    } else if h > 0 {
+        unit(h, "hour")
+    } else {
+        unit(m.max(1), "minute")
+    }
+}
+
+/// One line of the dashboard's "Catching up": the share done of `total`
+/// and, when a rate is known, the time the rest takes.
+fn catching_line(done: i64, total: i64, what: &str, left_secs: Option<i64>) -> String {
+    // Never "100.0%" while something is left.
+    let share = (done.max(0) as f64 / total.max(1) as f64 * 100.0).min(99.9);
+    match left_secs {
+        Some(s) => format!("{share:.1}% {what}, about {} left", long_secs(s.max(0))),
+        None => format!("{share:.1}% {what}"),
+    }
+}
+
+/// The handle pass's line: none while it is off, before its first step
+/// and once it has reached the last account. The time left is what the
+/// accounts ahead take at the configured rate; accounts already answered
+/// are passed over, so it is an upper bound.
+fn handles_line(rps: u32, cursor: i64, last: i64, laps: u64) -> Option<String> {
+    if rps == 0 || laps > 0 || last <= 0 || cursor >= last {
+        return None;
+    }
+    Some(catching_line(
+        cursor,
+        last,
+        "of accounts checked",
+        Some((last - cursor) / i64::from(rps)),
+    ))
+}
+
+/// The list filler's line (one list a second while the pass is on): none
+/// once every list is read or a round has ended, after which only lists
+/// whose owner's server does not answer are left.
+fn lists_line(rps: u32, unread: i64, total: i64, rounds: u64) -> Option<String> {
+    if rps == 0 || rounds > 0 || unread <= 0 {
+        return None;
+    }
+    Some(catching_line(total - unread, total, "read", Some(unread)))
 }
 
 fn stat(label: &str, value: impl ToString) -> Stat {
@@ -538,6 +596,17 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
         if let Some(e) = s["etaSeconds"].as_i64() {
             d.backfill.push(stat("ETA", common::human_secs(e)));
         }
+        if s["state"] != "completed" {
+            if let Some(p) = s["progress"].as_f64() {
+                let mut line = format!("{:.1}% of accounts swept", (p * 100.0).min(99.9));
+                if s["state"] == "paused" {
+                    line.push_str(", paused");
+                } else if let Some(e) = s["etaSeconds"].as_i64() {
+                    line.push_str(&format!(", about {} left", long_secs(e)));
+                }
+                d.catching.push(stat("History", line));
+            }
+        }
     } else {
         d.backfill.push(stat("Sweep", "not started"));
     }
@@ -569,6 +638,25 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
     d.coverage = coverage_words(&stats["freshness"]);
 
     let mut conn = st.api.pool.acquire().await.map_err(|e| e.to_string())?;
+    let rps = st.api.config.current().config.public_ui.handle_pass_rps;
+    let at = &st.public.progress;
+    if let Some(line) = handles_line(
+        rps,
+        at.cursor.load(Ordering::Relaxed),
+        at.last.load(Ordering::Relaxed),
+        at.laps.load(Ordering::Relaxed),
+    ) {
+        d.catching.push(stat("Handles", line));
+    }
+    let rounds = at.list_rounds.load(Ordering::Relaxed);
+    if rps > 0 && rounds == 0 {
+        let (unread, total) = farsight_storage::queries::lists_unread_count(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(line) = lists_line(rps, unread, total, rounds) {
+            d.catching.push(stat("List descriptions", line));
+        }
+    }
     for (s, n) in farsight_storage::queries::lists_by_state(&mut conn)
         .await
         .map_err(|e| e.to_string())?
@@ -1455,6 +1543,35 @@ async fn reset_submit(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn catching_up_lines() {
+        assert_eq!(long_secs(100_800), "1 day 4 hours");
+        assert_eq!(long_secs(86_400 * 12), "12 days");
+        assert_eq!(long_secs(3_660), "1 hour 1 minute");
+        assert_eq!(long_secs(59), "1 minute");
+        assert_eq!(
+            handles_line(10, 500_000, 10_000_000, 0).as_deref(),
+            Some("5.0% of accounts checked, about 10 days 23 hours left")
+        );
+        // Off, not started, at the end, or a walk already completed.
+        assert_eq!(handles_line(0, 5, 10, 0), None);
+        assert_eq!(handles_line(10, 0, 0, 0), None);
+        assert_eq!(handles_line(10, 10, 10, 0), None);
+        assert_eq!(handles_line(10, 5, 10, 1), None);
+        assert_eq!(
+            lists_line(10, 7_200, 10_000, 0).as_deref(),
+            Some("28.0% read, about 2 hours left")
+        );
+        assert_eq!(lists_line(10, 0, 10_000, 0), None);
+        assert_eq!(lists_line(10, 3, 10_000, 1), None);
+        assert_eq!(lists_line(0, 3, 10_000, 0), None);
+        // Something left is never shown as all done.
+        assert_eq!(
+            lists_line(10, 1, 1_000_000, 0).as_deref(),
+            Some("99.9% read, about 1 minute left")
+        );
+    }
 
     #[test]
     fn coverage_sentence() {

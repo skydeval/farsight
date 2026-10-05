@@ -5,6 +5,13 @@
 <span class="pulse-dot" aria-hidden="true"></span>
 <div><strong>Coverage:</strong> {{ d.coverage }}</div>
 </div>
+{% if !d.catching.is_empty() %}<div class="card" id="catching">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+<span>Catching up</span>
+</h2>
+{% for s in d.catching %}<div class="fact"><div class="l">{{ s.label }}</div><div class="v">{{ s.value }}</div></div>{% endfor %}
+</div>{% endif %}
 <div class="grid">
 <div class="card">
 <h2>

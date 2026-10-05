@@ -252,6 +252,8 @@ pub struct PublicState {
     excluded: Mutex<Option<ExcludedCache>>,
     /// Enable requests awaiting confirmation, by confirmation token.
     pub pending: Mutex<HashMap<String, PendingEnable>>,
+    /// How far the handle pass and the list filler have got.
+    pub progress: pass::Progress,
 }
 
 impl PublicState {
