@@ -236,6 +236,34 @@ pub async fn store_none(conn: &mut PgConnection, did: &str) -> Result<()> {
     Ok(())
 }
 
+/// The avatar CID stored for `did` and when it was read; an empty CID
+/// means the profile has no avatar.
+pub async fn avatar_stored(
+    conn: &mut PgConnection,
+    did: &str,
+) -> Result<Option<(String, DateTime<Utc>)>> {
+    Ok(
+        sqlx::query_as("SELECT cid, checked_at FROM avatar_cache WHERE did = $1")
+            .bind(did)
+            .fetch_optional(conn)
+            .await?,
+    )
+}
+
+/// Stores the avatar CID read for `did` now; `None` for a profile
+/// without one.
+pub async fn avatar_store(conn: &mut PgConnection, did: &str, cid: Option<&str>) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO avatar_cache (did, cid, checked_at) VALUES ($1, $2, now())
+         ON CONFLICT (did) DO UPDATE SET cid = EXCLUDED.cid, checked_at = EXCLUDED.checked_at",
+    )
+    .bind(did)
+    .bind(cid.unwrap_or(""))
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Records that `did` definitely has no handle to show, as of now. A
 /// handle stored for it is replaced: its document no longer names it, or
 /// the handle now belongs to another account.

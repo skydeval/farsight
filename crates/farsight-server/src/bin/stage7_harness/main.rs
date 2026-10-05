@@ -961,8 +961,8 @@ async fn check_loopback_flow(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<Strin
         .await?;
     let migrations = ctx.n("SELECT max(version) FROM _sqlx_migrations").await?;
     c.check(
-        "no schema change for the sign-in: admin_sessions still has six columns; the newest migration is 11 (the handle cache, the lists' descriptions and the handle queue, which touch no auth table)",
-        schema == 6 && migrations == 11,
+        "no schema change for the sign-in: admin_sessions still has six columns; the newest migration is 12 (the handle cache, the lists' descriptions, the handle queue and the avatar references, which touch no auth table)",
+        schema == 6 && migrations == 12,
         format!("{schema} columns, migration {migrations}"),
     );
     Ok(admin_cookie)
@@ -2371,9 +2371,9 @@ fn check_rollback(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     .unwrap_or_default();
     migrations.sort();
     c.check(
-        "and of the database: this build ships the eight migrations a pre-r22 binary knows and three more, the handle cache, the lists' descriptions and the handle queue — a binary that does not know them refuses the database until they and their migration rows are removed (README, rolling back)",
-        migrations.len() == 11
-            && migrations.last().map(String::as_str) == Some("0011_handle_due.sql"),
+        "and of the database: this build ships the eight migrations a pre-r22 binary knows and four more, the handle cache, the lists' descriptions, the handle queue and the avatar references — a binary that does not know them refuses the database until they and their migration rows are removed (README, rolling back)",
+        migrations.len() == 12
+            && migrations.last().map(String::as_str) == Some("0012_avatar_cache.sql"),
         format!("{} files, last {:?}", migrations.len(), migrations.last()),
     );
     let _ = ctx;

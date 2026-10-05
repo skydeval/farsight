@@ -1922,6 +1922,99 @@ async fn set_pass(a: &Srv, cookie: &str, rps: u32) -> Result<Resp, String> {
         .await
 }
 
+/// `avatar_thumbnails`: cards and list pages name the image as a
+/// thumbnail on Bluesky's image service, from the CID stored for the
+/// account.
+async fn check_thumbnails(
+    c: &mut Checks,
+    a: &Srv,
+    pool: &PgPool,
+    cookie: &str,
+    plc: &Plc,
+) -> Result<(), String> {
+    c.section("19c. avatar thumbnails (avatar_thumbnails)");
+    const LIST_CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    const CID: &str = "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
+    // The list's owner had a card opened by the browser probes, before
+    // it had a profile here: that answer ("no avatar") is stored for a
+    // day. The card is read for an account nothing has asked about.
+    let owner = did("abo", 1);
+    let subject = did("abp", 1);
+    seed::exec(
+        pool,
+        &format!("INSERT INTO actors (did) VALUES ('{subject}') ON CONFLICT DO NOTHING"),
+    )
+    .await?;
+    plc.host(&subject);
+    plc.set_profile(
+        &subject,
+        serde_json::json!({
+            "$type": "app.bsky.actor.profile",
+            "avatar": {"$type": "blob", "ref": {"$link": CID}, "mimeType": "image/jpeg", "size": 1}
+        }),
+    );
+    let set = |on: bool| async move {
+        let page = a.admin_get(cookie, "/admin/settings").await?;
+        let csrf = csrf_of(&page.text).ok_or("no csrf on /admin/settings")?;
+        let mut form = warming_form(&csrf, true);
+        if on {
+            form.push(("avatar_thumbnails", "on".into()));
+        }
+        let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        a.admin
+            .post_form(
+                &format!("{}/admin/settings/public-ui", a.base),
+                &[("cookie", cookie)],
+                &pairs,
+            )
+            .await
+    };
+    let thumb = |who: &str, cid: &str| {
+        format!("https://cdn.bsky.app/img/avatar_thumbnail/plain/{who}/{cid}@jpeg")
+    };
+    let card = format!("/card/{subject}");
+    let list = format!("/list/{owner}/told");
+    let stored =
+        format!("SELECT count(*) FROM avatar_cache WHERE did = '{subject}' AND cid = '{CID}'");
+
+    set(true).await?;
+    let r0 = plc.record_total();
+    let first = a.get(&card).await?;
+    let r1 = plc.record_total();
+    let again = a.get(&card).await?;
+    let r2 = plc.record_total();
+    let lp = a.get(&list).await?;
+    let src = format!("<img class=\"pc-avatar\" src=\"{}\"", thumb(&subject, CID));
+    c.check(
+        "on (saved from Settings, no restart): a card names the avatar as a thumbnail on the image service, by the account's DID and the CID of its profile's avatar; the CID is read from the profile record once and stored, and the next card asks nobody; a list page names its image the same way, itself",
+        first.status == 200
+            && first.text.contains(&src)
+            && r1 == r0 + 1
+            && again.text.contains(&src)
+            && r2 == r1
+            && n(pool, &stored).await? == 1
+            && lp.text.contains(&format!("data-list-image-src=\"{}\"", thumb(&owner, LIST_CID))),
+        format!(
+            "getRecord {r0} → {r1} → {r2}; stored rows {}; card has the thumbnail: {}",
+            n(pool, &stored).await?,
+            first.text.contains(&src)
+        ),
+    );
+    set(false).await?;
+    let off = a.get(&card).await?;
+    let lp_off = a.get(&list).await?;
+    c.check(
+        "off again: no page names the image service; the stored CID is still what a card goes by (no new read of the profile)",
+        off.status == 200
+            && !off.text.contains("cdn.bsky.app")
+            && !lp_off.text.contains("cdn.bsky.app")
+            && lp_off.text.contains(&format!("data-list-image=\"{LIST_CID}\""))
+            && plc.record_total() == r2,
+        format!("getRecord total {}", plc.record_total()),
+    );
+    Ok(())
+}
+
 /// The handle pass: off by default; switched on, it serves queued
 /// identity changes first, then walks the accounts; switched off, it
 /// stops.
@@ -2299,11 +2392,11 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let building = log.find("sort index: building");
     let migrations: i64 = n(&pool, "SELECT count(*) FROM _sqlx_migrations").await?;
     c.check(
-        "a fresh database: the server is live in its normal start-up time, the eleven migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
+        "a fresh database: the server is live in its normal start-up time, the twelve migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
         have == 4
             && health.status == 200
             && e.came_up < Duration::from_secs(60)
-            && migrations == 11
+            && migrations == 12
             && serving.is_some()
             && building.is_some()
             && serving < building
@@ -2888,6 +2981,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     check_shared_budget(c, &b, &cookie, &plc).await?;
     check_warming(c, &a, &pool, &cookie, &plc, &w).await?;
     check_pass(c, &a, &pool, &cookie, &plc).await?;
+    check_thumbnails(c, &a, &pool, &cookie, &plc).await?;
     check_representative(c, &pool, &w).await?;
     drop(b);
     drop(a);

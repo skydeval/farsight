@@ -55,6 +55,8 @@ pub struct Settings {
     pub record_viewer_url: String,
     /// `show_avatars`.
     pub show_avatars: bool,
+    /// `avatar_thumbnails`.
+    pub avatar_thumbnails: bool,
     /// `card_rps`.
     pub card_rps: u32,
     /// `card_burst`; never below `card_rps`.
@@ -101,6 +103,8 @@ pub struct View {
     pub record_viewer_url: String,
     /// Avatars in profile cards.
     pub show_avatars: bool,
+    /// Avatars as thumbnails from Bluesky's image service.
+    pub avatar_thumbnails: bool,
     /// Profile cards per second, process-wide.
     pub card_rps: String,
     /// Burst of the same budget.
@@ -141,6 +145,7 @@ impl View {
             show_opengraph_image: p.show_opengraph_image,
             record_viewer_url: p.record_viewer_url.clone(),
             show_avatars: p.show_avatars,
+            avatar_thumbnails: p.avatar_thumbnails,
             card_rps: p.card_rps.to_string(),
             card_burst: p.effective_card_burst().to_string(),
             handle_warming_enabled: p.handle_warming_enabled,
@@ -169,6 +174,7 @@ impl View {
             show_opengraph_image: b("show_opengraph_image"),
             record_viewer_url: s("record_viewer_url"),
             show_avatars: b("show_avatars"),
+            avatar_thumbnails: b("avatar_thumbnails"),
             card_rps: s("card_rps"),
             card_burst: s("card_burst"),
             handle_warming_enabled: b("handle_warming_enabled"),
@@ -264,6 +270,7 @@ impl Settings {
         Ok(Settings {
             record_viewer_url: viewer.to_owned(),
             show_avatars: v.show_avatars,
+            avatar_thumbnails: v.avatar_thumbnails,
             card_rps,
             // A burst below the rate is raised to it, as the loader does
             // for a hand-edited file; the save says so.
@@ -328,6 +335,7 @@ impl Settings {
             self.record_viewer_url.clone().into(),
         );
         p.insert("show_avatars".into(), self.show_avatars.into());
+        p.insert("avatar_thumbnails".into(), self.avatar_thumbnails.into());
         p.insert("card_rps".into(), i64::from(self.card_rps).into());
         p.insert("card_burst".into(), i64::from(self.card_burst).into());
         p.insert(
@@ -396,6 +404,8 @@ pub struct Exposure {
     /// Profile cards will carry avatars, fetched by visitors' browsers
     /// from the accounts' own servers.
     pub show_avatars: bool,
+    /// The avatars are thumbnails on Bluesky's image service instead.
+    pub avatar_thumbnails: bool,
     /// Records will link to this viewer (its origin), if one is set.
     pub record_viewer: Option<String>,
     /// The outgoing section will be shown.
@@ -411,6 +421,7 @@ impl Exposure {
             hostname: c.server.hostname.clone(),
             server_contact: c.server.contact.clone(),
             show_avatars: c.public_ui.show_avatars,
+            avatar_thumbnails: c.public_ui.avatar_thumbnails,
             record_viewer: url::Url::parse(&c.public_ui.record_viewer_url.replace(['{', '}'], ""))
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_owned)),

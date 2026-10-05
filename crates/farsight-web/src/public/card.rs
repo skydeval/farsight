@@ -114,7 +114,8 @@ impl Outcome {
 struct CardView {
     did: String,
     handle: Option<String>,
-    /// The blob on the account's PDS.
+    /// The image: the blob on the account's PDS, or its thumbnail on
+    /// Bluesky's image service.
     avatar: Option<String>,
     /// A neutral circle where the image would be, so that cards with and
     /// without one have the same shape.
@@ -405,17 +406,65 @@ pub fn avatar_cid(body: &[u8]) -> Option<String> {
     is_cid(cid).then(|| cid.to_owned())
 }
 
-/// The image URL of a card, or why there is none. `Err`: the fetch
-/// failed. `Ok(None)`: the account has no avatar, or its endpoint is not
-/// one an image may be named on.
-async fn avatar(
+/// How long a stored answer about an account's avatar is used before
+/// its profile record is read again.
+pub const AVATAR_FRESH: Duration = Duration::from_secs(24 * 3600);
+
+/// Where Bluesky's image service names a thumbnail of a blob.
+pub const THUMBNAILS: &str = "https://cdn.bsky.app/img/avatar_thumbnail/plain";
+
+/// The address of the thumbnail of blob `cid` of `did` on Bluesky's
+/// image service.
+pub fn thumbnail_url(did: &Did, cid: &str) -> Option<String> {
+    if !is_cid(cid) {
+        return None;
+    }
+    let mut u = Url::parse(THUMBNAILS).ok()?;
+    u.path_segments_mut()
+        .ok()?
+        .push(did.as_str())
+        .push(&format!("{cid}@jpeg"));
+    Some(u.into())
+}
+
+/// The address a visitor's browser loads an avatar from: the thumbnail
+/// on Bluesky's image service with `public_ui.avatar_thumbnails`, else
+/// the blob on the account's own server, if that is one an image may be
+/// named on.
+pub fn avatar_url(cfg: &Config, did: &Did, endpoint: Option<&str>, cid: &str) -> Option<String> {
+    if cfg.public_ui.avatar_thumbnails {
+        return thumbnail_url(did, cid);
+    }
+    let base = endpoint.and_then(avatar_base)?;
+    xrpc(
+        &base,
+        "com.atproto.sync.getBlob",
+        &[("did", did.as_str()), ("cid", cid)],
+    )
+    .map(String::from)
+}
+
+/// What reading an account's profile record says about its avatar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Avatar {
+    /// This blob.
+    Cid(String),
+    /// The profile has none, or there is no profile record.
+    None,
+    /// Nothing to go by: no endpoint, or the answer came from elsewhere.
+    Unusable,
+}
+
+/// Reads the avatar CID from the account's profile record. `Err`: the
+/// fetch failed.
+async fn read_avatar(
     safe: &SafeClient,
     did: &Did,
     endpoint: Option<&str>,
     deadline: tokio::time::Instant,
-) -> Result<Option<String>, ()> {
-    let Some(base) = endpoint.and_then(avatar_base) else {
-        return Ok(None);
+) -> Result<Avatar, ()> {
+    let Some(base) = endpoint.and_then(|e| Url::parse(e).ok()) else {
+        return Ok(Avatar::Unusable);
     };
     let Some(url) = xrpc(
         &base,
@@ -426,7 +475,7 @@ async fn avatar(
             ("rkey", "self"),
         ],
     ) else {
-        return Ok(None);
+        return Ok(Avatar::Unusable);
     };
     let r = match tokio::time::timeout_at(deadline, safe.get(&url)).await {
         Ok(Ok(r)) => r,
@@ -435,24 +484,65 @@ async fn avatar(
     match r.status {
         200 => {}
         // No profile record: a definite absence, not a failure.
-        400 | 404 => return Ok(None),
+        400 | 404 => return Ok(Avatar::None),
         _ => return Err(()),
     }
-    // The image is named on the host the record was read from, so its
-    // address passed the safe client's checks a moment ago. A redirect to
-    // another origin gives no image.
+    // The image is named for the host the record was read from. A
+    // redirect to another origin gives no image.
     if r.final_url.origin() != base.origin() {
-        return Ok(None);
+        return Ok(Avatar::Unusable);
     }
-    let Some(cid) = avatar_cid(&r.body) else {
-        return Ok(None);
+    Ok(avatar_cid(&r.body).map_or(Avatar::None, Avatar::Cid))
+}
+
+/// The image URL of a card, or why there is none. The CID stored for the
+/// account is used for [`AVATAR_FRESH`]; after that, or without one, the
+/// profile record is read and its answer stored. `Err`: the fetch
+/// failed. `Ok(None)`: the account has no avatar, or its endpoint is not
+/// one an image may be named on.
+async fn avatar(
+    st: &WebState,
+    cfg: &Config,
+    did: &Did,
+    endpoint: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<Option<String>, ()> {
+    let stored = match st.api.pool.acquire().await {
+        Ok(mut conn) => farsight_storage::handles::avatar_stored(&mut conn, did.as_str())
+            .await
+            .ok()
+            .flatten(),
+        Err(_) => None,
     };
-    Ok(xrpc(
-        &base,
-        "com.atproto.sync.getBlob",
-        &[("did", did.as_str()), ("cid", cid.as_str())],
-    )
-    .map(String::from))
+    let fresh = stored.filter(|(_, at)| {
+        (Utc::now() - *at)
+            .to_std()
+            .is_ok_and(|age| age < AVATAR_FRESH)
+    });
+    let cid = match fresh {
+        Some((cid, _)) => Some(cid).filter(|c| !c.is_empty()),
+        None => {
+            let read = read_avatar(&st.safe, did, endpoint, deadline).await?;
+            let found = match read {
+                Avatar::Cid(c) => Some(c),
+                Avatar::None => None,
+                Avatar::Unusable => return Ok(None),
+            };
+            if let Ok(mut conn) = st.api.pool.acquire().await {
+                let written = farsight_storage::handles::avatar_store(
+                    &mut conn,
+                    did.as_str(),
+                    found.as_deref(),
+                )
+                .await;
+                if let Err(e) = written {
+                    tracing::warn!(error = %e, "an avatar reference could not be stored");
+                }
+            }
+            found
+        }
+    };
+    Ok(cid.and_then(|c| avatar_url(cfg, did, endpoint, &c)))
 }
 
 /// The handle of a card: the cached answer, or the account's claim
@@ -663,7 +753,7 @@ async fn card(
         handle(st, cfg, &did, ident.claim.as_deref(), deadline),
         async {
             if show_avatars {
-                avatar(&st.safe, &did, ident.pds.as_deref(), deadline).await
+                avatar(st, cfg, &did, ident.pds.as_deref(), deadline).await
             } else {
                 Ok(None)
             }
@@ -908,6 +998,27 @@ mod tests {
         assert_eq!(avatar_cid(&body).as_deref(), Some(cid));
         let none = serde_json::to_vec(&json!({"value": {"displayName": "x"}})).unwrap();
         assert_eq!(avatar_cid(&none), None);
+        let did = Did::parse("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        assert_eq!(
+            thumbnail_url(&did, cid).as_deref(),
+            Some(
+                format!("https://cdn.bsky.app/img/avatar_thumbnail/plain/did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/{cid}@jpeg")
+                    .as_str()
+            )
+        );
+        assert_eq!(thumbnail_url(&did, "x/../y"), None);
+        let mut cfg = Config::default();
+        assert!(
+            avatar_url(&cfg, &did, Some("https://pds.example"), cid).is_some_and(
+                |u| u.starts_with("https://pds.example/xrpc/com.atproto.sync.getBlob?")
+            )
+        );
+        assert_eq!(
+            avatar_url(&cfg, &did, Some("http://pds.example"), cid),
+            None
+        );
+        cfg.public_ui.avatar_thumbnails = true;
+        assert!(avatar_url(&cfg, &did, None, cid).is_some_and(|u| u.starts_with(THUMBNAILS)));
         let odd =
             serde_json::to_vec(&json!({"value": {"avatar": {"ref": {"$link": "x y"}}}})).unwrap();
         assert_eq!(avatar_cid(&odd), None);

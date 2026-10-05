@@ -67,6 +67,13 @@ operator then sees the visitor's address and the time. On a page listing who blo
 server can log who looks. Off: cards keep everything else, and visitors' browsers contact only this instance. Cards already
 cached keep or lack the image for up to five minutes.</div>
 
+<label><input type="checkbox" name="avatar_thumbnails"{% if p.avatar_thumbnails %} checked{% endif %}> Load avatars as small thumbnails from Bluesky's image service (<code>avatar_thumbnails</code>)</label>
+<div class="hint">Off: a visitor's browser fetches each avatar, and a list's image, as the original upload from the account's own
+server, about 300 kB each on average. On: it fetches a thumbnail of a few kB from <code>cdn.bsky.app</code>, which browsers
+keep for a week, so cards and headers load faster. Bluesky's image service then sees the visitor's address, not each
+account's server, and an image appears only if that service has it. Farsight stores which image an account uses (its CID,
+read again after a day), never the image. Only with avatars on.</div>
+
 <label for="card_rps">Profile cards per second, for all visitors together (<code>card_rps</code>)</label>
 <input type="number" id="card_rps" name="card_rps" min="1" value="{{ p.card_rps }}">
 <label for="card_burst">Burst (<code>card_burst</code>)</label>

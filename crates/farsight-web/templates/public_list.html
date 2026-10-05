@@ -7,7 +7,7 @@
 </div>
 </div>
 
-<div class="profile-main-row"{% if let Some(i) = image %} data-list-image="{{ i }}" data-owner="{{ owner.did }}" data-owner-card="{{ owner.card }}"{% endif %}>
+<div class="profile-main-row"{% if let Some(i) = image %} data-list-image="{{ i }}" data-owner="{{ owner.did }}" data-owner-card="{{ owner.card }}"{% if let Some(s) = image_src %} data-list-image-src="{{ s }}"{% endif %}{% endif %}>
 <div class="profile-id-block">
 <h1 class="subject">
 {% if let Some(n) = name %}<span class="handle">{{ n }}</span>{% endif %}

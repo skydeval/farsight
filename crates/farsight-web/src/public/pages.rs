@@ -1171,6 +1171,9 @@ struct ListPage {
     /// CID of the record's image, with `public_ui.show_avatars`. The
     /// page's script names the image on the owner's server.
     image: Option<String>,
+    /// The image's address, where the page can name it itself (with
+    /// `public_ui.avatar_thumbnails`).
+    image_src: Option<String>,
     tabs: Vec<Tab>,
     /// The id of the table in view.
     active: &'static str,
@@ -1472,6 +1475,11 @@ pub async fn list(
             .as_deref()
             .map(description_lines)
             .unwrap_or_default(),
+        image_src: about
+            .avatar_cid
+            .as_deref()
+            .filter(|_| cfg.public_ui.show_avatars && cfg.public_ui.avatar_thumbnails)
+            .and_then(|c| card::thumbnail_url(owner, c)),
         image: about.avatar_cid.filter(|_| cfg.public_ui.show_avatars),
         members,
         blockers,

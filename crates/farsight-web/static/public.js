@@ -725,6 +725,28 @@
     if (!/^b[a-z2-7]{7,127}$/.test(cid) || !owner) {
       return;
     }
+    var place = function (src) {
+      var img = document.createElement("img");
+      img.className = "hero-avatar";
+      img.alt = "";
+      img.width = 88;
+      img.height = 88;
+      img.referrerPolicy = "no-referrer";
+      img.onerror = function () {
+        if (img.parentNode) {
+          img.parentNode.removeChild(img);
+        }
+      };
+      img.src = src;
+      row.insertBefore(img, row.firstChild);
+    };
+    // The server names the image itself where it is a thumbnail on the
+    // image service; otherwise the owner's card says which host has it.
+    var named = row.getAttribute("data-list-image-src");
+    if (named) {
+      place(named);
+      return;
+    }
     fetch(row.getAttribute("data-owner-card"), { credentials: "same-origin" })
       .then(function (r) {
         if (r.status !== 200 || r.redirected) {
@@ -739,25 +761,14 @@
         if (!host || !/^[a-z0-9.-]+(:[0-9]+)?$/i.test(host)) {
           return;
         }
-        var img = document.createElement("img");
-        img.className = "hero-avatar";
-        img.alt = "";
-        img.width = 88;
-        img.height = 88;
-        img.referrerPolicy = "no-referrer";
-        img.onerror = function () {
-          if (img.parentNode) {
-            img.parentNode.removeChild(img);
-          }
-        };
-        img.src =
+        place(
           "https://" +
-          host +
-          "/xrpc/com.atproto.sync.getBlob?did=" +
-          encodeURIComponent(owner) +
-          "&cid=" +
-          encodeURIComponent(cid);
-        row.insertBefore(img, row.firstChild);
+            host +
+            "/xrpc/com.atproto.sync.getBlob?did=" +
+            encodeURIComponent(owner) +
+            "&cid=" +
+            encodeURIComponent(cid)
+        );
       })
       .catch(function () {
         // No image: the header is complete without one.

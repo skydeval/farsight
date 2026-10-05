@@ -16,9 +16,17 @@ commits it covers.
 
 ## [0.5.0] - 2026-10-04
 
-Database schema version 11.
+Database schema version 12.
 
 ### Added
+
+- `public_ui.avatar_thumbnails` (off by default): avatars and list
+  images load as thumbnails of a few kB from Bluesky's image service
+  instead of the original upload, about 300 kB on average, from each
+  account's own server.
+- Farsight remembers which image an account's profile uses (new table
+  `avatar_cache`, a CID, never the image) for a day, so opening a
+  profile card no longer reads the profile record every time.
 
 - The handle pass (`public_ui.handle_pass_rps`, off by default): a
   background worker that checks the handle of every account Farsight

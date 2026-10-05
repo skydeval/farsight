@@ -254,6 +254,17 @@ nothing else in a browser.
   characters), and its image. Farsight stores the text and which image
   it is; the image itself is fetched by the visitor's browser from the
   owner's server, and only with `show_avatars`.
+- **Avatar thumbnails** (`avatar_thumbnails`, off by default). By
+  default a visitor's browser loads each avatar, and a list's image,
+  as the original upload from the account's own server: about 300 kB
+  on average, up to 1 MB. With the setting on it loads a thumbnail of
+  a few kB from Bluesky's image service (`cdn.bsky.app`), which a
+  browser keeps for a week. That service then sees the visitor's
+  address in place of each account's server, and an image appears
+  only if the service has it. Either way Farsight stores which image
+  an account uses (table `avatar_cache`, read again after a day), so
+  a card does not read the profile record every time, and never the
+  image.
 - **Avatars** are rounded squares (squircles where the browser draws
   them), in the header and on the cards.
 - **Inactive accounts.** A table leaves out accounts that are
@@ -380,6 +391,7 @@ contact = ""                      # "" = server.contact; no public page shows it
 show_outgoing_blocks = false
 record_viewer_url = ""            # admin lookup pages; "" = records are not links
 show_avatars = true               # false = cards carry no image
+avatar_thumbnails = false         # true = small thumbnails from cdn.bsky.app, not originals from each account's server
 card_rps = 4                      # cards fetched per second, all visitors
 card_burst = 8
 show_opengraph_image = true
@@ -416,6 +428,15 @@ warning; the value does nothing, and the key is removed the next time
 you save the Public UI settings.
 
 ### Upgrading from an earlier version
+
+From a version without `avatar_thumbnails`:
+
+- **One new table**, `avatar_cache` (schema version 12), created by
+  the server at start: which image each account's profile uses (a
+  CID), written as profile cards are opened. Nothing has to be edited.
+- **Rolling back.** An older binary does not start on schema version
+  12: `DROP TABLE avatar_cache; UPDATE schema_version SET version =
+  11; DELETE FROM _sqlx_migrations WHERE version = 12;` first.
 
 From a version without the handle pass:
 
