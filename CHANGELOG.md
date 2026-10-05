@@ -72,6 +72,14 @@ Database schema version 11.
   another account, removes the stored handle. An unreachable host still
   leaves it in place.
 
+### Fixed
+
+- Outbound connections are closed ten seconds after their last request
+  instead of ninety. Checking handles at a steady rate held one open
+  connection per account checked, which reached the process's limit of
+  open files about every two minutes; every outbound request then
+  failed for a minute.
+
 ### Removed
 
 - The "ATProto Block Graph Index" label above the home page's name and

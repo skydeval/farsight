@@ -19,6 +19,8 @@ use crate::config::Config;
 
 /// Maximum redirects followed (§11.3).
 pub const MAX_REDIRECTS: u8 = 3;
+/// How long a connection is kept after its last request.
+pub const IDLE_CONNECTION: Duration = Duration::from_secs(10);
 /// Per-request timeout (§5.2 bounds).
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Response body cap (§5.2 bounds).
@@ -201,6 +203,13 @@ impl SafeClient {
             .user_agent(config.user_agent.clone())
             .timeout(config.timeout)
             .connect_timeout(Duration::from_secs(10))
+            // Handle checks contact a different host each time. A
+            // connection kept for the default 90 s after one request is
+            // an open file for 90 s: at ten checks a second that is the
+            // process's whole allowance (1,024 by default), and every
+            // request then fails until some expire.
+            .pool_idle_timeout(IDLE_CONNECTION)
+            .pool_max_idle_per_host(2)
             .build()
             .expect("HTTP client builds");
         SafeClient { config, http, dns }
