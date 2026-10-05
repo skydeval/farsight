@@ -1408,8 +1408,13 @@ table.free td.num {
   }
 }
 
-/* Column headers centred over their columns (the DID lookup's tables). */
-.data-table.heads-centered thead th {
+/* The headers of the narrow columns (record, purpose, count, date) are
+   centred over them; a wide column's header stays above its names, at
+   the left (the DID lookup's tables). */
+.data-table.heads-centered thead th.th-record,
+.data-table.heads-centered thead th.th-purpose,
+.data-table.heads-centered thead th.th-num,
+.data-table.heads-centered thead th.th-date {
   text-align: center;
 }
 

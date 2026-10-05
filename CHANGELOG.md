@@ -55,9 +55,10 @@ commits it covers.
   second line; the "First seen" column is gone; the tables stand in
   their block without a frame; and the list's facts include its
   description. Old cursor addresses (`mc`, `bc`) are ignored.
-- Admin DID lookup: its tables stand in their block without a frame, a
-  header band or a fill, with a thin line between rows, and their
-  column headers are centred.
+- Tables that stand in their block without a frame, a header band or a
+  fill, with a thin line between rows: the admin DID lookup's (where
+  the headers of the narrow columns are centred), the "Recent errors"
+  table on Operations, and every table of the public account page.
 - Admin dashboard: Exceptions and Lists by state are rows like the
   blocks above them, and the host-bucket table has no frame.
 - On the History tab, public and admin, the handle history and the

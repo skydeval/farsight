@@ -65,7 +65,7 @@
 <span>Recent errors</span>
 </h2>
 {% if errors.is_empty() %}<p class="empty">No recent errors logged.</p>{% else %}
-<table><tr><th>When (UTC)</th><th>Component</th><th>DID</th><th>Message</th></tr>
+<table class="free"><tr><th>When (UTC)</th><th>Component</th><th>DID</th><th>Message</th></tr>
 {% for e in errors %}<tr><td class="num">{{ e.0 }}</td><td><span class="pill">{{ e.1 }}</span></td><td><code>{{ e.2 }}</code></td><td>{{ e.3 }}</td></tr>{% endfor %}</table>{% endif %}
 </div>
 {% endblock %}

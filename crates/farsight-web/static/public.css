@@ -1555,6 +1555,50 @@ footer {
   background: var(--card-hover);
 }
 
+/* A table that just stands in its block (the account page's): no frame,
+   no header band, no fill; the thin line between rows stays. */
+.table-responsive.free {
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+.data-table.free {
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+.data-table.free th {
+  background: none;
+}
+.data-table.free th,
+.data-table.free td {
+  padding-left: 0;
+}
+.data-table.free th:last-child,
+.data-table.free td:last-child {
+  padding-right: 0;
+}
+.data-table.free .data-row:hover td {
+  background: none;
+}
+@media (hover: hover) and (min-width: 44rem) {
+  .data-table.free thead th:first-child,
+  .data-table.free thead th:last-child,
+  .data-table.free tbody tr:last-child td:first-child,
+  .data-table.free tbody tr:last-child td:last-child {
+    border-radius: 0;
+  }
+}
+@media (max-width: 44rem) {
+  /* A framed table reaches the edges of a narrow screen; this one keeps
+     the block's own margin. */
+  .data-section .table-responsive.free {
+    margin-left: 0;
+    margin-right: 0;
+  }
+}
+
 /* The first column keeps a readable width; a narrow screen scrolls the
    table inside .table-responsive instead of wrapping names by the letter. */
 .data-table th:first-child, .data-table td:first-child {
