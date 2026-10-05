@@ -1,31 +1,71 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>List lookup</h1>
-<form class="card row" method="get" action="/admin/lookup/list" style="gap: 0.6rem; align-items: center; margin-top: 0;">
-<input type="text" name="q" value="{{ q }}" placeholder="at://did:…/app.bsky.graph.list/… or https://bsky.app/profile/…/lists/…" autofocus style="flex: 1 1 20rem; max-width: none;">
+<form class="card row lookup-form" method="get" action="/admin/lookup/list">
+<input type="text" name="q" value="{{ q }}" placeholder="at://did:…/app.bsky.graph.list/… or https://bsky.app/profile/…/lists/…"{% if subject.is_none() %} autofocus{% endif %} aria-label="List URI or link">
 <button type="submit">Look up</button>
 </form>
 {% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
-{% if let Some(u) = uri %}
+{% if let Some(s) = subject %}
 <div class="card" style="margin-bottom: 1.25rem;">
-<p style="margin: 0; font-size: 1.05rem;"><strong><code>{{ u }}</code></strong>{% if let Some(h) = history %} · <a href="{{ h }}" class="pill" style="font-size:0.85rem;">View history →</a>{% endif %}</p>
+<p style="margin: 0; font-size: 1.05rem;"><strong><code>{{ s.uri }}</code></strong> · <a href="{{ s.history }}" class="pill" style="font-size:0.85rem;">View history →</a></p>
 </div>
-<div class="card"><table>{% for f in facts %}<tr><th>{{ f.label }}</th><td>{{ f.value }}</td></tr>{% endfor %}</table></div>
+<div class="card"><table>{% for f in s.facts %}<tr><th>{{ f.label }}</th><td>{{ f.value }}</td></tr>{% endfor %}</table></div>
+
 <nav class="tabs" role="tablist" aria-label="Tables">
-{% for s in sections %}<a class="tab{% if s.id == active %} active{% endif %}" role="tab" href="{{ s.tab }}" data-tab="{{ s.id }}" aria-controls="{{ s.id }}" aria-selected="{% if s.id == active %}true{% else %}false{% endif %}">{{ s.title }}</a>
+{% for t in s.tabs %}<a class="tab{% if t.active %} active{% endif %}" role="tab" href="{{ t.href }}" data-tab="{{ t.id }}" aria-controls="{{ t.id }}" aria-selected="{% if t.active %}true{% else %}false{% endif %}">{{ t.label }}</a>
 {% endfor %}</nav>
-<div class="tabbed" data-active="{{ active }}">
-{% for s in sections %}
-<section id="{{ s.id }}" class="card data-section tab-panel">
-<h2>{{ s.title }}</h2>
-{% if let Some(e) = s.error %}<div class="banner bad">{{ e }}</div>{% endif %}
-{% if !s.coverage.is_empty() %}<p class="muted">{{ s.coverage }}</p>{% endif %}
-{% if s.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
-<table><tr>{% for c in s.columns %}<th>{{ c }}</th>{% endfor %}</tr>
-{% for r in s.rows %}<tr>{% for v in r %}<td>{{ v.html|safe }}</td>{% endfor %}</tr>{% endfor %}</table>{% endif %}
-{% if let Some(n) = s.next %}<p class="pager"><a href="{{ n }}">Next page →</a></p>{% endif %}
+<div class="tabbed" data-active="{{ s.active }}">
+<section id="members" class="card data-section tab-panel">
+<div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<h2><span class="sr-only">Members </span><span class="count count-big">{% if let Some(n) = s.members.count %}{{ n }}{% else %}—{% endif %}</span></h2>
+<p class="muted">Accounts on this list.</p>
+</div>
+{% if !s.members.coverage.is_empty() %}<p class="coverage">{{ s.members.coverage }}</p>{% endif %}
+{% if let Some(e) = s.members.error %}<div class="banner bad">{{ e }}</div>{% endif %}
+{% if s.members.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
+{{ s.members.pager|safe }}
+<div class="table-responsive free">
+<table class="data-table free">
+<thead><tr><th scope="col" class="th-account">Member</th><th scope="col" class="th-record">Record</th><th scope="col" class="th-date">Added</th></tr></thead>
+<tbody>
+{% for r in s.members.rows %}<tr class="data-row">
+<td class="td-account">{{ r.who|safe }}</td>
+<td class="td-record"><button type="button" class="copy-uri" data-copy="{{ r.uri }}" title="{{ r.uri }}">Copy at:// URL</button>{% if let Some(v) = r.view %} <a class="record-view" href="{{ v }}" target="_blank" rel="noopener noreferrer nofollow">View</a>{% endif %}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time><span class="ago" data-ago></span>{% else %}<span class="time-none" aria-hidden="true">—</span><span class="ago"></span>{% endif %}</td>
+</tr>
+{% endfor %}</tbody>
+</table>
+</div>
+{{ s.members.pager|safe }}
+{% endif %}
 </section>
-{% endfor %}
+
+<section id="subscribers" class="card data-section tab-panel">
+<div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<h2><span class="sr-only">Subscribers </span><span class="count count-big">{% if let Some(n) = s.subscribers.count %}{{ n }}{% else %}—{% endif %}</span></h2>
+<p class="muted">Accounts that subscribe to this list as a block list. Mute subscriptions are private and are not shown.</p>
+</div>
+{% if let Some(e) = s.subscribers.error %}<div class="banner bad">{{ e }}</div>{% endif %}
+{% if s.subscribers.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
+{{ s.subscribers.pager|safe }}
+<div class="table-responsive free">
+<table class="data-table free">
+<thead><tr><th scope="col" class="th-account">Subscriber</th><th scope="col" class="th-record">Record</th><th scope="col" class="th-date">Created</th></tr></thead>
+<tbody>
+{% for r in s.subscribers.rows %}<tr class="data-row">
+<td class="td-account">{{ r.who|safe }}</td>
+<td class="td-record"><button type="button" class="copy-uri" data-copy="{{ r.uri }}" title="{{ r.uri }}">Copy at:// URL</button>{% if let Some(v) = r.view %} <a class="record-view" href="{{ v }}" target="_blank" rel="noopener noreferrer nofollow">View</a>{% endif %}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time><span class="ago" data-ago></span>{% else %}<span class="time-none" aria-hidden="true">—</span><span class="ago"></span>{% endif %}</td>
+</tr>
+{% endfor %}</tbody>
+</table>
+</div>
+{{ s.subscribers.pager|safe }}
+{% endif %}
+</section>
 </div>
 {% endif %}
 {% endblock %}

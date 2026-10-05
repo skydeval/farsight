@@ -14,6 +14,11 @@ commits it covers.
 
 ## [Unreleased]
 
+### Removed
+
+- The dashboard's "Oldest pending lists" block. The number of pending
+  lists is still under Exceptions.
+
 ### Fixed
 
 - Turning a page of a table no longer makes the page jump. A page
@@ -43,8 +48,15 @@ commits it covers.
   their block, as Index is, in place of an inner table that squeezed
   values onto several lines. In all four blocks the name is at the
   left and the value at the right, and the Index figures are smaller.
-- Admin list lookup: Members and Inbound listblocks sit behind tabs
-  (`?tab=listblocks`), and the list's facts include its description.
+- Admin list lookup: Members and Subscribers (the former "Inbound
+  listblocks") sit behind tabs (`?tab=subscribers`) and turn by page
+  number with counts; the record's at-uri is copied with a button
+  rather than printed; dates carry no zone and say how long ago on a
+  second line; the "First seen" column is gone; the tables stand in
+  their block without a frame; and the list's facts include its
+  description. Old cursor addresses (`mc`, `bc`) are ignored.
+- Admin dashboard: Exceptions and Lists by state are rows like the
+  blocks above them, and the host-bucket table has no frame.
 - On the History tab, public and admin, the handle history and the
   host history stand side by side, and one under the other on a narrow
   screen.

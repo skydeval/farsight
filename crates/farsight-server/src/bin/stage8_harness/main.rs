@@ -82,7 +82,6 @@ const BROWSER_IMAGE: &str = "mcr.microsoft.com/playwright:v1.48.0-jammy";
 const BROWSER_SCRIPT: &str = include_str!("../../../../../scripts/stage8-browser-probes.mjs");
 /// The instant the seeded rows are dated around.
 const BASE: &str = "'2026-09-01T00:00:00Z'::timestamptz";
-const STALE_LINK: &str = "This link carries a position that can no longer be read";
 const NO_FIRST_SEEN: &str = "Stored before Farsight kept this date";
 const SHORT_CARD: &str = "Profile not available right now.";
 
@@ -367,7 +366,7 @@ fn admin_section<'a>(html: &'a str, title: &str) -> Option<&'a str> {
         "Lists naming this account" => Some("lists"),
         // The list lookup page's.
         "Members" => Some("members"),
-        "Inbound listblocks" => Some("listblocks"),
+        "Subscribers" => Some("subscribers"),
         _ => None,
     };
     if let Some(found) = id.and_then(|id| section(html, id)) {
@@ -463,21 +462,6 @@ fn heads(sec: &str) -> Vec<String> {
         rest = &rest[b..];
     }
     out
-}
-
-/// The value of query parameter `key` of a relative link (cursors are
-/// base64url and need no decoding).
-fn query_of(link: &str, key: &str) -> Option<String> {
-    link.split_once('?')?
-        .1
-        .split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .find(|(k, _)| *k == key)
-        .map(|(_, v)| v.to_owned())
-}
-
-fn cursor_json(raw: &str) -> Option<Value> {
-    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(raw).ok()?).ok()
 }
 
 /// Walks a public section through its pages.
@@ -1250,29 +1234,31 @@ fn order_of(plan: &str) -> &'static str {
 
 async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<(), String> {
     c.section("6. cursors (admin tables) and page numbers (public tables)");
-    // The list lookup's tables still page by cursor; the DID lookup's
-    // page by number.
+    // No admin table pages by cursor any more: the lookups page by
+    // number, each with its own address.
     let filler_uri = format!("at://{}/app.bsky.graph.list/filler", did("flo", 1));
     let page = a.admin_get(cookie, &lookup_list(&filler_uri)).await?;
-    let next = admin_section(&page.text, "Inbound listblocks")
-        .and_then(admin_next)
-        .unwrap_or_default();
-    let raw = query_of(&next, "bc").unwrap_or_default();
-    let v = cursor_json(&raw).unwrap_or(Value::Null);
+    let msec = admin_section(&page.text, "Members").unwrap_or("");
+    let ssec = admin_section(&page.text, "Subscribers").unwrap_or("");
+    let subs2 = a
+        .admin_get(
+            cookie,
+            &format!("{}&tab=subscribers&subs=2", lookup_list(&filler_uri)),
+        )
+        .await?;
+    let s2 = admin_section(&subs2.text, "Subscribers").unwrap_or("");
     c.check(
-        "a cursor of the new order (the list lookup's tables) is the codebase's opaque format — base64url of a JSON array — tagged \"t\": [\"t\", microseconds, blocker id, record key]",
-        v[0] == "t" && v[1].is_i64() && v[2].is_i64() && v[3].is_string() && v.as_array().is_some_and(|x| x.len() == 4),
-        v.to_string(),
-    );
-    let out = a.admin_get(cookie, &lookup_list(&w.l4_uri)).await?;
-    let onext = admin_section(&out.text, "Members")
-        .and_then(admin_next)
-        .unwrap_or_default();
-    let ov = cursor_json(&query_of(&onext, "mc").unwrap_or_default()).unwrap_or(Value::Null);
-    c.check(
-        "sections that list one author's or one list's records carry [\"t\", microseconds, record key]",
-        ov[0] == "t" && ov[1].is_i64() && ov[2].is_string() && ov.as_array().is_some_and(|x| x.len() == 3),
-        ov.to_string(),
+        "the admin list lookup pages by number: a list of 20,000 members and 20,000 subscribers has 400 pages of each, the next page of Members is &page=2 and of Subscribers &tab=subscribers&subs=2, which holds the next 50 and opens with the Subscribers tab in front",
+        admin_next(msec).is_some_and(|n| n.ends_with("&page=2"))
+            && admin_next(ssec).is_some_and(|n| n.ends_with("&tab=subscribers&subs=2"))
+            && controls_of(msec).ends_with("… 400 →")
+            && controls_of(ssec).ends_with("… 400 →")
+            && row_dids(msec).len() == 50
+            && row_dids(ssec).len() == 50
+            && row_dids(s2).len() == 50
+            && row_dids(s2)[0] != row_dids(ssec)[0]
+            && subs2.text.contains("<div class=\"tabbed\" data-active=\"subscribers\">"),
+        format!("{:?} / {:?}", controls_of(msec), controls_of(ssec)),
     );
     // A cursor of the order before the indexes: [blocker id, record key].
     let old = URL_SAFE_NO_PAD.encode(br#"[42,"3ksbl00000007"]"#);
@@ -1295,16 +1281,17 @@ async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Resu
         format!("{public_next}; {} / {} / {}", stale.status, garbage.status, zero.status),
     );
     let admin = a
-        .admin_get(cookie, &format!("{}&bc={old}", lookup_list(&filler_uri)))
+        .admin_get(
+            cookie,
+            &format!("{}&bc={old}&mc={old}", lookup_list(&filler_uri)),
+        )
         .await?;
-    let sec = admin_section(&admin.text, "Inbound listblocks").unwrap_or("");
     c.check(
-        "on the admin list lookup an old cursor gives the section's error line and no rows; the other section still renders",
+        "on the admin list lookup a cursor of an earlier version in the address is ignored: the first pages, as without it",
         admin.status == 200
-            && sec.contains(STALE_LINK)
-            && row_dids(sec).is_empty()
-            && admin.text.contains("<h2>Members</h2>"),
-        support::truncate(sec, 200),
+            && row_dids(admin_section(&admin.text, "Members").unwrap_or("")) == row_dids(msec)
+            && row_dids(admin_section(&admin.text, "Subscribers").unwrap_or("")) == row_dids(ssec),
+        format!("{}", admin.status),
     );
     let did_page = a.admin_get(cookie, &lookup_did(&w.s)).await?;
     let old_link = a
@@ -1871,7 +1858,7 @@ async fn check_admin_columns(
         "listitem and listblock links",
     );
 
-    c.section("14. \"First seen\" is an admin column: on the list lookup, which needs a session, and on no public page");
+    c.section("14. the lookup pages' columns; no first_seen on a lookup page or a public page");
     let admin = a.admin_get(cookie, &lookup_did(&w.s)).await?;
     let asec = admin_section(&admin.text, "Incoming blocks").unwrap_or("");
     c.check(
@@ -1887,11 +1874,11 @@ async fn check_admin_columns(
     );
     let ladmin = a.admin_get(cookie, &lookup_list(&w.l4_uri)).await?;
     c.check(
-        "the list lookup keeps the column: Members and Inbound listblocks have \"First seen\"",
-        heads(admin_section(&ladmin.text, "Members").unwrap_or(""))
-            == ["Member", "Listitem", "Added", "First seen"]
-            && heads(admin_section(&ladmin.text, "Inbound listblocks").unwrap_or(""))
-                == ["Blocker", "Listblock", "Created", "First seen"],
+        "the list lookup the same: Member, Record, Added and Subscriber, Record, Created, with no \"First seen\" column",
+        heads(admin_section(&ladmin.text, "Members").unwrap_or("")) == ["Member", "Record", "Added"]
+            && heads(admin_section(&ladmin.text, "Subscribers").unwrap_or(""))
+                == ["Subscriber", "Record", "Created"]
+            && !ladmin.text.contains("First seen"),
         "list lookup",
     );
     let anon = a.get(&lookup_did(&w.s)).await?;

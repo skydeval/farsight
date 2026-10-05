@@ -3120,19 +3120,6 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
 
 // ------------------------------------------------------ 15. record links
 
-/// The Record cells of a lookup page, in row order: the second cell of
-/// each row of a table that has one (account, record, time, first seen).
-fn record_cells(sec: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    for row in between(sec, "<tr><td>", "</tr>") {
-        let cells: Vec<&str> = row.split("</td><td>").collect();
-        if cells.len() == 4 && cells[1].contains("class=\"record\"") {
-            out.push(cells[1]);
-        }
-    }
-    out
-}
-
 /// The record cells of the DID lookup's block table: the at-uri each
 /// "Copy at:// URL" button holds, and the viewer link beside it, if any.
 fn did_records(html: &str) -> Vec<(String, Option<String>)> {
@@ -3207,36 +3194,6 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
             .map(str::to_owned)
             .collect()
     };
-    let cells =
-        |html: &str| -> Vec<String> { record_cells(html).into_iter().map(str::to_owned).collect() };
-    let plain = |cell: &String, set: &BTreeSet<String>| {
-        cell.strip_prefix("<code class=\"record\">")
-            .and_then(|x| x.strip_suffix("</code>"))
-            .is_some_and(|uri| set.contains(uri))
-    };
-    let linked = |cell: &String, set: &BTreeSet<String>| {
-        let Some(rest) = cell.strip_prefix("<a class=\"record\" href=\"") else {
-            return false;
-        };
-        let Some((href, tail)) = rest.split_once('"') else {
-            return false;
-        };
-        let Some(uri) = tail
-            .strip_prefix(" target=\"_blank\" rel=\"noopener noreferrer nofollow\"><code>")
-            .and_then(|x| x.strip_suffix("</code></a>"))
-        else {
-            return false;
-        };
-        // at://{authority}/{collection}/{rkey} ⇒ the template with each part.
-        let parts: Vec<&str> = uri.trim_start_matches("at://").splitn(3, '/').collect();
-        set.contains(uri)
-            && parts.len() == 3
-            && href
-                == format!(
-                    "https://viewer.example/at/{}/{}/{}",
-                    parts[0], parts[1], parts[2]
-                )
-    };
     // No public table has a Record column, whatever the viewer setting.
     let public_clean = |page: &Resp, lp: &Resp| {
         let block_heads = ["Account", "Created"];
@@ -3261,16 +3218,16 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
     );
     let dl = h.admin_get(&did_lookup).await?;
     let ll = h.admin_get(&list_lookup).await?;
-    let (b, l) = (did_records(&dl.text), cells(&ll.text));
+    let (b, l) = (did_records(&dl.text), did_records(&ll.text));
     c.check(
-        "record_viewer_url empty: on the DID lookup every record cell is a button holding the stored record's at-uri, which is not printed; on the list lookup it is the at-uri as plain text — no link anywhere",
+        "record_viewer_url empty: on the lookup pages every record cell is a button holding the stored record's at-uri, which is not printed in a cell — no link anywhere",
         b.len() == 50
             && b.iter().all(|(uri, link)| incoming.contains(uri) && link.is_none())
             && !dl.text.contains(">at://")
             && !l.is_empty()
-            && l.iter().all(|x| plain(x, &on_list))
-            && l.iter().any(|x| x.contains("/app.bsky.graph.listitem/"))
-            && l.iter().any(|x| x.contains("/app.bsky.graph.listblock/"))
+            && l.iter().all(|(uri, link)| on_list.contains(uri) && link.is_none())
+            && l.iter().any(|(uri, _)| uri.contains("/app.bsky.graph.listitem/"))
+            && l.iter().any(|(uri, _)| uri.contains("/app.bsky.graph.listblock/"))
             && !dl.text.contains("target=\"_blank\"")
             && !ll.text.contains("target=\"_blank\""),
         format!("{} / {} cells; first {:?}", b.len(), l.len(), b.first()),
@@ -3290,9 +3247,9 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
     h.set(&[("record_viewer_url", Some(VIEWER))]).await?;
     let dl = h.admin_get(&did_lookup).await?;
     let ll = h.admin_get(&list_lookup).await?;
-    let (b, l) = (did_records(&dl.text), cells(&ll.text));
+    let (b, l) = (did_records(&dl.text), did_records(&ll.text));
     c.check(
-        "record_viewer_url set, without restart: on the DID lookup a View link stands beside every button, and on the list lookup every record cell is a link, built from the template with the record's authority, collection and rkey, opening in a new tab with rel=noopener noreferrer nofollow, its text the at-uri",
+        "record_viewer_url set, without restart: on the lookup pages a View link stands beside every button, built from the template with the record's authority, collection and rkey, opening in a new tab with rel=noopener noreferrer nofollow, its text the at-uri",
         b.len() == 50
             && b.iter().all(|(uri, link)| {
                 incoming.contains(uri)
@@ -3300,7 +3257,9 @@ async fn check_record_links(c: &mut Checks, h: &mut H, w: &World) -> Result<(), 
                     && link.as_deref() == Some(viewer_href(uri).as_str())
             })
             && !l.is_empty()
-            && l.iter().all(|x| linked(x, &on_list)),
+            && l.iter().all(|(uri, link)| {
+                on_list.contains(uri) && link.as_deref() == Some(viewer_href(uri).as_str())
+            }),
         format!("first {:?}", b.first()),
     );
     let page = h.get(&path_did(&w.s)).await?;

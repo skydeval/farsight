@@ -1302,6 +1302,7 @@ nav.pager .pager-gap {
 }
 
 .tabbed[data-active="members"] > #members,
+.tabbed[data-active="subscribers"] > #subscribers,
 .tabbed[data-active="history"] > #history {
   display: block;
 }
@@ -1354,6 +1355,57 @@ h3.history-title {
 }
 .removed p.pager {
   margin: 0.6rem 0 0;
+}
+
+/* A table that just stands in its block: no frame, no header band, no
+   fill; a hairline between rows, as between the dashboard's rows. */
+table.free {
+  margin: 0.25rem 0 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+table.free th,
+table.free td {
+  padding-left: 0;
+  background: none;
+  border-bottom: 1px solid var(--line);
+}
+table.free th:last-child,
+table.free td:last-child {
+  padding-right: 0;
+}
+table.free tr:last-child td {
+  border-bottom: 0;
+}
+table.free tbody tr:hover {
+  background: none;
+}
+table.free th.num,
+table.free td.num {
+  text-align: right;
+}
+.table-responsive.free {
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  margin-top: 0.25rem;
+}
+@media (hover: hover) and (min-width: 44rem) {
+  .data-table.free thead th:first-child,
+  .data-table.free thead th:last-child,
+  .data-table.free tbody tr:last-child td:first-child,
+  .data-table.free tbody tr:last-child td:last-child {
+    border-radius: 0;
+  }
+}
+@media (max-width: 44rem) {
+  .data-section .table-responsive.free {
+    margin-left: 0;
+    margin-right: 0;
+  }
 }
 
 /* The lookup box above the header. */

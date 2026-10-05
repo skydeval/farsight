@@ -164,7 +164,21 @@ pub struct Pager {
 impl Pager {
     fn new(ask: &Ask, table: usize, total: Total, more: bool) -> Pager {
         let (id, label, _) = TABLES[table];
-        let current = ask.pages[table];
+        Pager::build(id, label, ask.pages[table], total, more, |p| {
+            ask.link(id, Some((table, p)))
+        })
+    }
+
+    /// The controls of table `id` on page `current`; `to` gives a page's
+    /// address.
+    pub(super) fn build(
+        id: &'static str,
+        label: &'static str,
+        current: i64,
+        total: Total,
+        more: bool,
+        to: impl Fn(i64) -> String,
+    ) -> Pager {
         let (items, open) = paging::items(current, total, more, PAGE_ROWS);
         let last = items
             .iter()
@@ -174,7 +188,6 @@ impl Pager {
             })
             .max()
             .unwrap_or(1);
-        let to = |p: i64| ask.link(id, Some((table, p)));
         Pager {
             section: id,
             label,

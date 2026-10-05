@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use askama::Template;
 use axum::Router;
-use axum::extract::{Form, Query, RawQuery, State};
+use axum::extract::{Form, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -23,17 +23,14 @@ use farsight_core::{AtUri, Collection, Did};
 use farsight_storage::backfill_api::{self, Request, RequestOutcome, Requester};
 use farsight_storage::gates::GateState;
 use farsight_storage::keys::Limits;
-use farsight_storage::ui_rows::{Filter, Section as Rows, SortIndexes};
+use farsight_storage::ui_rows::SortIndexes;
 use serde_json::Value;
 use tokio::sync::{Semaphore, watch};
 
-use crate::cells::{self, Cell};
 use crate::common::{self, NO_STORE, cookie, ct_eq, read_cookie, render_private};
-use crate::public::text::{LISTBLOCK, LISTITEM, Record};
-use crate::public::warming::Asked;
-use crate::rows;
 
 mod admin_did;
+mod admin_list;
 
 /// Admin session cookie (§8.6).
 pub const ADMIN_COOKIE: &str = "farsight_admin";
@@ -218,7 +215,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         )
         .route("/admin/logout", post(logout))
         .route("/admin/lookup/did", get(admin_did::lookup_did))
-        .route("/admin/lookup/list", get(lookup_list))
+        .route("/admin/lookup/list", get(admin_list::lookup_list))
         .route("/admin/did/{did}/history", get(crate::history::did_history))
         .route(
             "/admin/list/{did}/{rkey}/history",
@@ -454,8 +451,6 @@ pub struct DashboardData {
     pub gaps: Vec<String>,
     /// Sweep and queues.
     pub backfill: Vec<Stat>,
-    /// Oldest pending lists (URI, age).
-    pub pending: Vec<(String, String)>,
     /// Exceptions.
     pub exceptions: Vec<Stat>,
     /// Coverage in words.
@@ -574,16 +569,6 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
     d.coverage = coverage_words(&stats["freshness"]);
 
     let mut conn = st.api.pool.acquire().await.map_err(|e| e.to_string())?;
-    for (did, rkey, at) in farsight_storage::queries::oldest_pending(&mut conn, 10)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        let age = at.map_or("—".into(), |a| {
-            common::human_secs((Utc::now() - a).num_seconds())
-        });
-        d.pending
-            .push((format!("at://{did}/app.bsky.graph.list/{rkey}"), age));
-    }
     for (s, n) in farsight_storage::queries::lists_by_state(&mut conn)
         .await
         .map_err(|e| e.to_string())?
@@ -851,34 +836,6 @@ pub async fn resolve_handle(safe: &SafeClient, handle: &str) -> Result<Did, Stri
     Did::parse(body.trim()).map_err(|_| format!("{handle} did not resolve to a DID"))
 }
 
-/// A table section of a lookup page.
-#[derive(Debug, Clone, Default)]
-pub struct Section {
-    /// The section's id, which is its tab's.
-    pub id: &'static str,
-    /// The address that shows the page with this section's tab in front.
-    pub tab: String,
-    /// Title.
-    pub title: String,
-    /// Column headers.
-    pub columns: Vec<String>,
-    /// Rows.
-    pub rows: Vec<Vec<Cell>>,
-    /// Coverage in words.
-    pub coverage: String,
-    /// Next-page link (relative).
-    pub next: Option<String>,
-    /// Error.
-    pub error: Option<String>,
-}
-
-fn link_with(base: &str, pairs: &[(&str, &str)]) -> String {
-    let q: String = url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(pairs)
-        .finish();
-    format!("{base}?{q}")
-}
-
 pub(crate) async fn permit(st: &WebState) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
     match tokio::time::timeout(
         farsight_api::PERMIT_WAIT,
@@ -889,82 +846,6 @@ pub(crate) async fn permit(st: &WebState) -> Result<tokio::sync::OwnedSemaphoreP
         Ok(Ok(p)) => Ok(p),
         _ => Err("The server is busy; try again shortly.".into()),
     }
-}
-
-/// What a section says when its page link carries a cursor it cannot
-/// read: a link made before the table changed its order.
-const STALE_LINK: &str = "This link carries a position that can no longer be read (the table's \
-                          order may have changed). Open the lookup again for the first page.";
-
-fn section_error(e: farsight_api::error::XrpcError) -> String {
-    if e.status == StatusCode::BAD_REQUEST {
-        STALE_LINK.to_owned()
-    } else {
-        e.message
-    }
-}
-
-/// The column headers of a section that sorts by shown time. "First seen"
-/// is an admin column: nothing public serves that date.
-fn time_columns(who: &str, record: &str, time: &str) -> Vec<String> {
-    vec![
-        who.to_owned(),
-        record.to_owned(),
-        time.to_owned(),
-        "First seen".to_owned(),
-    ]
-}
-
-/// The rows of such a section. `authority` is the account whose repo
-/// holds the records; `None`: the row's own account. Reads the stored
-/// handles of the rows' accounts first.
-async fn time_rows(
-    st: &WebState,
-    asked: &mut Asked,
-    viewer: &str,
-    collection: &'static str,
-    authority: Option<&str>,
-    rows: &[farsight_storage::ui_rows::Row],
-) -> Vec<Vec<Cell>> {
-    let dids: Vec<String> = rows.iter().map(|b| b.did.clone()).collect();
-    crate::public::handles::recall(st, &st.api.config.current().config, &dids).await;
-    rows.iter()
-        .map(|b| {
-            vec![
-                Cell::account(&cells::account(st, asked, &b.did)),
-                Cell::record(&Record::of(
-                    viewer,
-                    authority.unwrap_or(&b.did),
-                    collection,
-                    &b.rkey,
-                )),
-                Cell::time(b.created_at),
-                Cell::first_seen(b.first_seen),
-            ]
-        })
-        .collect()
-}
-
-/// The list lookup page.
-#[derive(Template)]
-#[template(path = "lookup_list.html")]
-pub struct ListPage {
-    /// Navigation.
-    pub nav: Nav,
-    /// The query.
-    pub q: String,
-    /// The list URI.
-    pub uri: Option<String>,
-    /// Error.
-    pub error: Option<String>,
-    /// Facts.
-    pub facts: Vec<Stat>,
-    /// Members, inbound listblocks: each behind a tab.
-    pub sections: Vec<Section>,
-    /// The id of the section in view.
-    pub active: &'static str,
-    /// The list's history page; offered to a logged-in admin only.
-    pub history: Option<String>,
 }
 
 /// Parses an AT-URI or a `https://bsky.app/profile/<actor>/lists/<rkey>`
@@ -982,211 +863,6 @@ pub fn parse_list_ref(q: &str) -> Option<(String, String)> {
         _ => None,
     }
 }
-
-async fn lookup_list(
-    State(st): State<Arc<WebState>>,
-    headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
-    let s = match gate(&st, &headers).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let query = q.get("q").map(|s| s.trim().to_owned()).unwrap_or_default();
-    let mut page = ListPage {
-        nav: nav(&Some(s)),
-        q: query.clone(),
-        uri: None,
-        error: None,
-        facts: Vec::new(),
-        sections: Vec::new(),
-        active: "members",
-        history: None,
-    };
-    if query.is_empty() {
-        return render_private(&page);
-    }
-    let Some((actor, rkey)) = parse_list_ref(&query) else {
-        page.error =
-            Some("Enter an at://…/app.bsky.graph.list/… URI or a bsky.app list URL.".into());
-        return render_private(&page);
-    };
-    let owner = if actor.starts_with("did:") {
-        Did::parse(&actor).map_err(|e| e.to_string())
-    } else {
-        resolve_handle(&st.safe, &actor).await
-    };
-    let owner = match owner {
-        Ok(d) => d,
-        Err(e) => {
-            page.error = Some(e);
-            return render_private(&page);
-        }
-    };
-    let uri = format!("at://{}/app.bsky.graph.list/{rkey}", owner.as_str());
-    page.uri = Some(uri.clone());
-    page.history = Some(crate::public::text::admin_list_history_href(
-        owner.as_str(),
-        &rkey,
-    ));
-    let _permit = match permit(&st).await {
-        Ok(p) => p,
-        Err(e) => {
-            page.error = Some(e);
-            return render_private(&page);
-        }
-    };
-    let cfg = st.api.config.current();
-    let viewer = cfg.config.public_ui.record_viewer_url.as_str();
-    let mut asked = Asked::new(&cfg.config);
-    let info = match st.api.pool.acquire().await {
-        Ok(mut conn) => farsight_storage::queries::list_info(&mut conn, owner.as_str(), &rkey)
-            .await
-            .ok()
-            .flatten(),
-        Err(_) => None,
-    };
-    // Called for the list's facts and its freshness; the rows are read
-    // below.
-    let p = vec![
-        ("list".to_owned(), uri.clone()),
-        ("limit".to_owned(), "1".to_owned()),
-    ];
-    // The two tables sit behind tabs; `tab` says which is in view.
-    page.active = if q.get("tab").map(String::as_str) == Some("listblocks") {
-        "listblocks"
-    } else {
-        "members"
-    };
-    let mut members = Section {
-        id: "members",
-        tab: link_with("/admin/lookup/list", &[("q", uri.as_str())]),
-        title: "Members".into(),
-        columns: time_columns("Member", "Listitem", "Added"),
-        ..Section::default()
-    };
-    let mut serves = false;
-    match handlers::get_list_members(&st.api, &Params::from_pairs(p)).await {
-        Ok(r) => {
-            let b = &r.body;
-            page.facts.push(stat("Owner", owner.as_str()));
-            page.facts
-                .push(stat("Purpose", b["purpose"].as_str().unwrap_or("—")));
-            page.facts
-                .push(stat("Name", b["name"].as_str().unwrap_or("—")));
-            // What the list says about itself, as stored: read from the
-            // record when it was applied, or on the first view of the
-            // list's public page.
-            let about = match (&info, st.api.pool.acquire().await) {
-                (Some(i), Ok(mut conn)) => farsight_storage::queries::list_about(&mut conn, i.id)
-                    .await
-                    .ok(),
-                _ => None,
-            };
-            page.facts.push(stat(
-                "Description",
-                match about {
-                    Some(a) if a.read => a
-                        .description
-                        .map(|d| crate::public::text::clean(&d.replace(['\r', '\n'], " ")))
-                        .filter(|d| !d.trim().is_empty())
-                        .unwrap_or_else(|| "—".to_owned()),
-                    Some(_) => "Not read yet".to_owned(),
-                    None => "—".to_owned(),
-                },
-            ));
-            page.facts
-                .push(stat("State", b["state"].as_str().unwrap_or("—")));
-            page.facts
-                .push(stat("Listblocks", b["listblockCount"].clone()));
-            page.facts.push(stat(
-                "Capped",
-                if b["capped"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "no"
-                },
-            ));
-            // Members are served as the API serves them: for a list that
-            // is indexed, whose owner is shown.
-            serves = matches!(b["state"].as_str(), Some("ready" | "retained"))
-                && info.as_ref().is_some_and(|i| {
-                    !farsight_storage::codes::actor_status::is_hidden(i.owner_status)
-                });
-            members.coverage = coverage_words(&b["freshness"]);
-        }
-        Err(e) => members.error = Some(e.message),
-    }
-    let mut blockers = Section {
-        id: "listblocks",
-        tab: link_with(
-            "/admin/lookup/list",
-            &[("q", uri.as_str()), ("tab", "listblocks")],
-        ),
-        title: "Inbound listblocks".into(),
-        columns: time_columns("Blocker", "Listblock", "Created"),
-        ..Section::default()
-    };
-    if let Some(info) = &info {
-        page.facts.push(stat("Stored items", info.item_count));
-        if serves {
-            match rows::page(
-                &st,
-                Rows::ListMembers,
-                info.id,
-                Filter::default(),
-                q.get("mc").map(String::as_str),
-                50,
-            )
-            .await
-            {
-                Ok(p) => {
-                    members.rows = time_rows(
-                        &st,
-                        &mut asked,
-                        viewer,
-                        LISTITEM,
-                        Some(owner.as_str()),
-                        &p.rows,
-                    )
-                    .await;
-                    members.next = p.next.as_deref().map(|c| {
-                        link_with("/admin/lookup/list", &[("q", uri.as_str()), ("mc", c)])
-                    });
-                }
-                Err(e) => members.error = Some(section_error(e)),
-            }
-        }
-        match rows::page(
-            &st,
-            Rows::ListBlockers,
-            info.id,
-            Filter::default(),
-            q.get("bc").map(String::as_str),
-            50,
-        )
-        .await
-        {
-            Ok(p) => {
-                blockers.rows = time_rows(&st, &mut asked, viewer, LISTBLOCK, None, &p.rows).await;
-                blockers.next = p.next.as_deref().map(|c| {
-                    link_with(
-                        "/admin/lookup/list",
-                        &[("q", uri.as_str()), ("tab", "listblocks"), ("bc", c)],
-                    )
-                });
-            }
-            Err(e) => blockers.error = Some(section_error(e)),
-        }
-    }
-    asked.submit(&st);
-    page.sections.push(members);
-    page.sections.push(blockers);
-    render_private(&page)
-}
-
-// ---------------------------------------------------------------------------
-// Operations
 
 /// The operations page.
 #[derive(Template)]
