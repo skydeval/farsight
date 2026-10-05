@@ -21,7 +21,6 @@
 <dt class="hero-side-title">Backfill</dt><dd></dd>
 {% for b in s.backfill %}<dt>{{ b.0 }}</dt><dd>{{ b.1 }}</dd>
 {% endfor %}</dl>{% endif %}
-<a href="{{ s.history }}" class="pill hero-history">View history →</a>
 </div>
 </div>
 </div>
@@ -141,6 +140,93 @@
 {{ s.lists.pager|safe }}
 {% endif %}
 </section>
+
+{% if let Some(h) = s.history %}
+<section id="history" class="card data-section tab-panel">
+<div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<h2>History</h2>
+<p class="muted">The handles and hosts this account has had, as the PLC directory records them (claims at the time, not verified here), and the records naming it that this instance stored and later removed.</p>
+</div>
+
+<h3 class="history-title">Handle history</h3>
+{% if let Some(n) = h.note %}<p class="empty">{{ n }}</p>{% else if h.handles.is_empty() %}<p class="muted">None recorded.</p>{% else %}
+<div class="table-responsive">
+<table class="data-table">
+<thead><tr><th scope="col" class="th-account">Handle</th><th scope="col" class="th-date">Since</th></tr></thead>
+<tbody>
+{% for r in h.handles %}<tr class="data-row"><td class="td-account"><span class="held">{{ r.value }}</span>{% if r.current %} <span class="pill held-current">current</span>{% endif %}</td><td class="td-date"><time datetime="{{ r.since.iso }}" class="time-badge" data-abs>{{ r.since.bare }}</time><span class="ago" data-ago></span></td></tr>
+{% endfor %}</tbody>
+</table>
+</div>
+{% endif %}
+
+<h3 class="history-title">PDS history</h3>
+{% if h.note.is_some() %}<p class="muted">Not available.</p>{% else if h.hosts.is_empty() %}<p class="muted">None recorded.</p>{% else %}
+<div class="table-responsive">
+<table class="data-table">
+<thead><tr><th scope="col" class="th-account">Host</th><th scope="col" class="th-date">Since</th></tr></thead>
+<tbody>
+{% for r in h.hosts %}<tr class="data-row"><td class="td-account"><span class="held">{{ r.value }}</span>{% if r.current %} <span class="pill held-current">current</span>{% endif %}</td><td class="td-date"><time datetime="{{ r.since.iso }}" class="time-badge" data-abs>{{ r.since.bare }}</time><span class="ago" data-ago></span></td></tr>
+{% endfor %}</tbody>
+</table>
+</div>
+{% endif %}
+
+{% match h.removed %}{% when Err with (e) %}
+<h3 class="history-title">Removed blocks</h3>
+<div class="banner bad">{{ e }}</div>
+{% when Ok with (rm) %}
+<div id="removed-blocks" class="removed">
+<h3 class="history-title">Removed blocks</h3>
+<p class="muted">Blocks naming this account that this instance stored and later removed, newest removal first.</p>
+{% if !rm.blocks.rows.is_empty() %}
+<div class="table-responsive">
+<table class="data-table removed-table">
+<thead><tr><th scope="col" class="th-account">Blocker</th><th scope="col" class="th-record">Record</th><th scope="col" class="th-date">Created</th><th scope="col" class="th-date">Seen</th><th scope="col" class="th-date">Removed</th><th scope="col" class="th-cause">How it ended</th></tr></thead>
+<tbody>
+{% for r in rm.blocks.rows %}<tr class="data-row">
+<td class="td-account">{% if let Some(w) = r.who %}{{ w|safe }}{% endif %}</td>
+<td class="td-record"><button type="button" class="copy-uri" data-copy="{{ r.record }}" title="{{ r.record }}">Copy at:// URL</button></td>
+<td class="td-date">{% if let Some(t) = r.created_at %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time><span class="ago" data-ago></span>{% else %}<span class="time-none" aria-hidden="true">—</span><span class="ago"></span>{% endif %}</td>
+<td class="td-date td-seen">{% if let Some(t) = r.first_seen_at %}<time datetime="{{ t.iso }}" class="time-badge" data-abs title="First seen">{{ t.bare }}</time>{% else %}<span class="time-none" title="Stored before this instance kept dates">—</span>{% endif %}<span class="to">{% if let Some(t) = r.last_seen_at %}to <time datetime="{{ t.iso }}" data-abs>{{ t.bare }}</time>{% endif %}</span></td>
+<td class="td-date"><time datetime="{{ r.removed_at.iso }}" class="time-badge" data-abs>{{ r.removed_at.bare }}</time><span class="ago" data-ago></span></td>
+<td class="td-cause">{{ r.cause }}{% if let Some(m) = r.mark %} <span class="pill">{{ m }}</span>{% endif %}</td>
+</tr>
+{% endfor %}</tbody>
+</table>
+</div>
+{% endif %}
+{% if rm.blocks.empty %}<p class="muted">No removals recorded.</p>{% endif %}
+{{ rm.blocks.pager|safe }}
+</div>
+
+<div id="removed-memberships" class="removed">
+<h3 class="history-title">Removed lists</h3>
+<p class="muted">List entries naming this account that this instance stored and later removed, newest removal first.</p>
+{% if !rm.memberships.rows.is_empty() %}
+<div class="table-responsive">
+<table class="data-table removed-table">
+<thead><tr><th scope="col" class="th-list">List</th><th scope="col" class="th-record">Record</th><th scope="col" class="th-date">Created</th><th scope="col" class="th-date">Seen</th><th scope="col" class="th-date">Removed</th><th scope="col" class="th-cause">How it ended</th></tr></thead>
+<tbody>
+{% for r in rm.memberships.rows %}<tr class="data-row">
+<td class="td-list">{% if let Some(l) = r.list %}<a href="{{ l.href }}" class="list-link"><span>{% if let Some(n) = l.name %}{{ n }}{% else %}{{ l.uri }}{% endif %}</span></a>{% if let Some(p) = l.purpose %} <span class="muted">({{ p }})</span>{% endif %}{% if let Some(st) = l.state %} <span class="muted">{{ st }}</span>{% endif %}{% endif %}</td>
+<td class="td-record"><button type="button" class="copy-uri" data-copy="{{ r.record }}" title="{{ r.record }}">Copy at:// URL</button></td>
+<td class="td-date">{% if let Some(t) = r.created_at %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time><span class="ago" data-ago></span>{% else %}<span class="time-none" aria-hidden="true">—</span><span class="ago"></span>{% endif %}</td>
+<td class="td-date td-seen">{% if let Some(t) = r.first_seen_at %}<time datetime="{{ t.iso }}" class="time-badge" data-abs title="First seen">{{ t.bare }}</time>{% else %}<span class="time-none" title="Stored before this instance kept dates">—</span>{% endif %}<span class="to">{% if let Some(t) = r.last_seen_at %}to <time datetime="{{ t.iso }}" data-abs>{{ t.bare }}</time>{% endif %}</span></td>
+<td class="td-date"><time datetime="{{ r.removed_at.iso }}" class="time-badge" data-abs>{{ r.removed_at.bare }}</time><span class="ago" data-ago></span></td>
+<td class="td-cause">{{ r.cause }}{% if let Some(m) = r.mark %} <span class="pill">{{ m }}</span>{% endif %}</td>
+</tr>
+{% endfor %}</tbody>
+</table>
+</div>
+{% endif %}
+{% if rm.memberships.empty %}<p class="muted">No removals recorded.</p>{% endif %}
+{{ rm.memberships.pager|safe }}
+</div>
+{% endmatch %}
+</section>
+{% endif %}
 </div>
 {% endif %}
 {% endblock %}

@@ -22,8 +22,17 @@ commits it covers.
   controls, a filter box on the blocks and lists tables, and a "Copy
   at:// URL" button for each block record.
 
+- A History tab on the admin DID lookup page, at the right end of the
+  tabs: the account's handle history and PDS history from the PLC
+  directory, and the removed blocks and removed list entries that used
+  to be on a separate page. It is read only when the tab is opened.
+
 ### Changed
 
+- The DID lookup page's "View history" link is replaced by the History
+  tab. The account's separate history page, with its "What this page
+  covers" section, still exists at its address; the tab leaves that
+  section out.
 - On the admin DID lookup page: dates carry no time zone (each table
   states it once) and say how long ago on a second line; the "First
   seen" column is gone; the record's at-uri is copied with a button

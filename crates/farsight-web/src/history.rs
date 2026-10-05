@@ -43,7 +43,7 @@ use crate::common::render_private;
 use crate::pages::{Nav, WebState, gate, message, nav, permit};
 use crate::public::pages::{purpose_words, state_words};
 use crate::public::text::{
-    BLOCK, LISTBLOCK, LISTITEM, admin_did_history_href, admin_list_history_href, clean,
+    BLOCK, LISTBLOCK, LISTITEM, Stamp, admin_did_history_href, admin_list_history_href, clean,
     duration_words, list_uri,
 };
 use crate::public::warming::Asked;
@@ -99,6 +99,15 @@ pub struct RemovedRow {
     pub last_seen: Option<String>,
     /// Removed.
     pub removed: String,
+    /// The same four as instants, for a page whose script writes times
+    /// in the viewer's zone.
+    pub created_at: Option<Stamp>,
+    /// First seen, as an instant.
+    pub first_seen_at: Option<Stamp>,
+    /// Last seen, as an instant.
+    pub last_seen_at: Option<Stamp>,
+    /// Removed, as an instant.
+    pub removed_at: Stamp,
     /// How it ended.
     pub cause: &'static str,
     /// "blocks this account again" / "on this list now".
@@ -248,6 +257,10 @@ fn removed_row(
         first_seen: h.first_seen.map(when),
         last_seen: h.last_seen.map(when),
         removed: when(h.removed_at),
+        created_at: h.created_at.map(Stamp::of),
+        first_seen_at: h.first_seen.map(Stamp::of),
+        last_seen_at: h.last_seen.map(Stamp::of),
+        removed_at: Stamp::of(h.removed_at),
         cause: cause_words(kind, h.cause),
         mark: h.live.then(|| live_mark(kind)),
     }
@@ -474,6 +487,92 @@ async fn load(
         windows,
         status,
     })
+}
+
+/// The removed records naming an account, for the History tab of the
+/// DID lookup page: the two sections of the account's history page, their
+/// "next" links leading back into the tab (`lead` is the lookup page's
+/// address with the tab chosen, ending in `&`).
+pub(crate) struct DidRemoved {
+    /// Removed blocks.
+    pub blocks: HistorySection,
+    /// Removed list memberships.
+    pub memberships: HistorySection,
+}
+
+/// Reads [`DidRemoved`]. `q` carries the sections' cursors (`hb`, `hm`).
+/// `Err`: what to say in the tab instead.
+pub(crate) async fn did_removed(
+    st: &WebState,
+    did: &Did,
+    q: &Params,
+    lead: &str,
+) -> Result<DidRemoved, &'static str> {
+    let (Ok(a), Ok(b)) = (
+        history_cursor(q, DID_CURSORS[0]),
+        history_cursor(q, DID_CURSORS[1]),
+    ) else {
+        return Err("This link carries a position that can no longer be read. Open the tab again.");
+    };
+    let cfg = st.api.config.current();
+    let cfg = &cfg.config;
+    let hz = horizon(cfg, Utc::now());
+    let data = match load(st, &Subject::Did(did), a, b, hz).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e.message, "history tab query failed");
+            return Err("The removed records could not be read. The details were logged.");
+        }
+    };
+    let parties: Vec<String> = data
+        .first
+        .iter()
+        .chain(&data.second)
+        .filter(|h| !h.party.is_empty())
+        .map(|h| h.party.clone())
+        .collect();
+    crate::public::handles::recall(st, cfg, &parties).await;
+    let mut asked = Asked::new(cfg);
+    // The sections' links are made for the history page's address; here
+    // they continue the lookup page's.
+    let into_tab = |mut sec: HistorySection| {
+        sec.pager.next = sec
+            .pager
+            .next
+            .and_then(|n| n.split_once('?').map(|(_, rest)| format!("{lead}{rest}")));
+        sec
+    };
+    let base = admin_did_history_href(did.as_str());
+    let out = DidRemoved {
+        blocks: into_tab(history_section(
+            st,
+            &mut asked,
+            None,
+            &data,
+            Kind::Block,
+            &data.first,
+            &base,
+            q,
+            &DID_CURSORS,
+            "hb",
+            "removed-blocks",
+        )),
+        memberships: into_tab(history_section(
+            st,
+            &mut asked,
+            None,
+            &data,
+            Kind::Membership,
+            &data.second,
+            &base,
+            q,
+            &DID_CURSORS,
+            "hm",
+            "removed-memberships",
+        )),
+    };
+    asked.submit(st);
+    Ok(out)
 }
 
 #[derive(Template)]

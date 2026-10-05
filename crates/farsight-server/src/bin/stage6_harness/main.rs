@@ -2494,9 +2494,9 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
             && !r.text.contains("did:plc:")
     };
     c.check(
-        "the DID and list lookup pages link to \"View history\" for a logged-in admin; without a session there is no lookup page, only the redirect to /enter",
-        with.text.contains(&format!("<a href=\"{base}\""))
-            && with.text.contains("View history")
+        "for a logged-in admin the DID lookup page has a History tab and the list lookup page links to \"View history\"; without a session there is no lookup page, only the redirect to /enter",
+        with.text.contains("data-tab=\"history\"")
+            && with.text.contains("&amp;tab=history\"")
             && lwith.text.contains(&format!("<a href=\"{lbase}\""))
             && lwith.text.contains("View history")
             && to_enter(&without)

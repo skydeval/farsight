@@ -1256,6 +1256,47 @@ nav.pager .pager-gap {
   display: block;
 }
 
+.tabbed[data-active="history"] > #history {
+  display: block;
+}
+/* The History tab stands apart, at the right end of the strip. */
+nav.tabs a.tab[data-tab="history"] {
+  margin-left: auto;
+}
+/* The History tab's parts. */
+h3.history-title {
+  margin: 1.6rem 0 0.4rem;
+  font-size: 1.02rem;
+  font-weight: 700;
+  color: var(--fg-strong);
+}
+.section-header + h3.history-title {
+  margin-top: 0.5rem;
+}
+.held {
+  font-weight: 600;
+}
+.pill.held-current {
+  margin-left: 0.4rem;
+  font-size: 0.72rem;
+}
+/* First seen, and under it "to" the last time seen. */
+.data-table td.td-seen .to {
+  display: block;
+  min-height: 1.2em;
+  margin-top: 0.1rem;
+  font-size: 0.74rem;
+  line-height: 1.2;
+  color: var(--muted);
+}
+.data-table th.th-cause,
+.data-table td.td-cause {
+  min-width: 9rem;
+}
+.removed p.pager {
+  margin: 0.6rem 0 0;
+}
+
 /* The lookup box above the header. */
 form.lookup-form {
   gap: 0.6rem;

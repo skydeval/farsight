@@ -1407,6 +1407,49 @@ async fn check_history_tab(c: &mut Checks, a: &Srv, plc: &Plc, w: &World) -> Res
 
 // --------------------------------------------------------- 7. public pages
 
+/// The admin DID lookup's History tab: the PLC log's handles and hosts
+/// and the removed records, read only when the tab is asked for.
+async fn check_admin_history_tab(
+    c: &mut Checks,
+    a: &Srv,
+    cookie: &str,
+    plc: &Plc,
+    w: &World,
+) -> Result<(), String> {
+    c.section("7c2. the admin DID lookup's History tab");
+    let before = plc.audit_total();
+    let plain = a.admin_get(cookie, &lookup_did(&w.s)).await?;
+    let after_plain = plc.audit_total();
+    let asked = a
+        .admin_get(cookie, &format!("{}&tab=history", lookup_did(&w.s)))
+        .await?;
+    let after_asked = plc.audit_total();
+    let sec = section(&asked.text, "history").unwrap_or("");
+    let titles: Vec<&str> = between(sec, "<h3 class=\"history-title\">", "</h3>");
+    let tabs: Vec<&str> = between(&plain.text, " data-tab=\"", "\"");
+    let standalone = a
+        .admin_get(cookie, &format!("/admin/did/{}/history", w.s))
+        .await?;
+    c.check(
+        "the lookup page offers History as its last tab and reads nothing for it; asked for (&tab=history), the page reads the account's PLC audit log once and shows, in this order, Handle history, PDS history, Removed blocks and Removed lists — without the \"What this page covers\" block, which the account's own history page still has",
+        tabs == ["blocks", "listblocks", "lists", "history"]
+            && section(&plain.text, "history").is_none()
+            && after_plain == before
+            && asked.status == 200
+            && asked.text.contains("<div class=\"tabbed\" data-active=\"history\">")
+            && titles == ["Handle history", "PDS history", "Removed blocks", "Removed lists"]
+            && sec.contains("id=\"removed-blocks\"")
+            && sec.contains("id=\"removed-memberships\"")
+            && !asked.text.contains("What this page covers")
+            && !asked.text.contains("id=\"limits\"")
+            && after_asked == before + 1
+            && standalone.status == 200
+            && standalone.text.contains("id=\"limits\""),
+        format!("tabs {tabs:?}; titles {titles:?}; audit requests {before} → {after_plain} → {after_asked}"),
+    );
+    Ok(())
+}
+
 /// A list stored before its description was kept has its record read on
 /// the first view of its page, once.
 async fn check_list_about(c: &mut Checks, a: &Srv, pool: &PgPool, plc: &Plc) -> Result<(), String> {
@@ -2997,6 +3040,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     check_cursors(c, &a, &cookie, &w).await?;
     check_public_columns(c, &a, &w).await?;
     check_history_tab(c, &a, &plc, &w).await?;
+    check_admin_history_tab(c, &a, &cookie, &plc, &w).await?;
     check_list_about(c, &a, &pool, &plc).await?;
     check_live(c, pg, args.skip_live).await?;
     if args.browser {

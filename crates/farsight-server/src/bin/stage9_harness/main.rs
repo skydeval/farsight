@@ -473,12 +473,12 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
     );
     let page = a.admin_get(cookie, &lookup).await?;
     c.check(
-        "the signed-in lookup shows the blocker, a button that copies its record's address, a card link and the history link",
+        "the signed-in lookup shows the blocker, a button that copies its record's address, a card link and the History tab",
         page.status == 200
             && page.text.contains(&w.blocker)
             && page.text.contains("class=\"copy-uri\" data-copy=\"at://")
             && page.text.contains("data-card-session")
-            && page.text.contains(&hist)
+            && page.text.contains("data-tab=\"history\"")
             && page
                 .text
                 .contains(&format!("/admin/lookup/did?q={}", enc(&w.blocker))),

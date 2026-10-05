@@ -27,6 +27,7 @@ use farsight_storage::ui_rows::{self, Filter, Find, Section as Rows};
 use super::{Nav, WebState, coverage_words, gate, nav, permit, resolve_handle};
 use crate::cells;
 use crate::common::render_private;
+use crate::public::card;
 use crate::public::paging::{self, Item, Total};
 use crate::public::text::{BLOCK, Record, Stamp, clean, thousands};
 use crate::public::warming::Asked;
@@ -49,6 +50,9 @@ pub const TABLES: [(&str, &str, &str); 3] = [
     ("lists", "Lists", "lists"),
 ];
 
+/// The History tab: read only when the address asks for it.
+pub const HISTORY: &str = "history";
+
 /// What the address asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Ask {
@@ -64,10 +68,14 @@ struct Ask {
 
 impl Ask {
     fn read(did: &str, q: &HashMap<String, String>) -> Ask {
-        let tab = q
-            .get("tab")
-            .and_then(|t| TABLES.iter().find(|x| x.0 == t.as_str()))
-            .map_or(TABLES[0].0, |x| x.0);
+        let tab = match q.get("tab").map(String::as_str) {
+            Some(HISTORY) => HISTORY,
+            Some(t) => TABLES
+                .iter()
+                .find(|x| x.0 == t)
+                .map_or(TABLES[0].0, |x| x.0),
+            None => TABLES[0].0,
+        };
         let page = |key: &str| {
             q.get(key)
                 .and_then(|v| v.parse::<i64>().ok())
@@ -272,6 +280,44 @@ impl<R> Default for Table<R> {
     }
 }
 
+/// A handle or a host the account has had.
+#[derive(Debug, Clone)]
+pub struct HeldRow {
+    /// The handle or host.
+    pub value: String,
+    /// Since when.
+    pub since: Stamp,
+    /// It is the one the account has now.
+    pub current: bool,
+}
+
+fn held_rows(list: &[card::Held]) -> Vec<HeldRow> {
+    let last = list.len().saturating_sub(1);
+    list.iter()
+        .enumerate()
+        .rev()
+        .map(|(i, h)| HeldRow {
+            value: clean(&h.value),
+            since: Stamp::of(h.since),
+            current: i == last,
+        })
+        .collect()
+}
+
+/// The History tab: the account's earlier handles and hosts from its PLC
+/// audit log, and the records naming it that this instance stored and
+/// later removed.
+pub struct HistoryTab {
+    /// Why there are no handles and hosts to show, if so.
+    pub note: Option<&'static str>,
+    /// Handles, newest first.
+    pub handles: Vec<HeldRow>,
+    /// Hosts, newest first.
+    pub hosts: Vec<HeldRow>,
+    /// The removed records, or what to say in their place.
+    pub removed: Result<crate::history::DidRemoved, &'static str>,
+}
+
 /// The account in view.
 pub struct Subject {
     /// The DID.
@@ -281,8 +327,8 @@ pub struct Subject {
     /// Its profile-card fragment: the header takes the avatar, the
     /// creation date and the host from it.
     pub card: String,
-    /// Its history page.
-    pub history: String,
+    /// The History tab, when it is the one asked for.
+    pub history: Option<HistoryTab>,
     /// Backfill state: label and value.
     pub backfill: Vec<(&'static str, String)>,
     /// The filter text.
@@ -649,6 +695,42 @@ pub async fn lookup_did(
             backfill.push(("Discovery", b.discovery.state.api_name().to_owned()));
         }
     }
+    // The History tab: one request to the PLC directory, under the card
+    // budget, and the history tables.
+    let history = if ask.tab == HISTORY {
+        let (note, handles, hosts) = match card::history(&st, &cfg.config, &did).await {
+            card::History::Log(log) => (None, held_rows(&log.handles), held_rows(&log.hosts)),
+            card::History::NoLog => (
+                Some(
+                    "This account's DID is not registered in the PLC directory, which is where its handles and hosts are read from.",
+                ),
+                Vec::new(),
+                Vec::new(),
+            ),
+            card::History::Unavailable => (
+                Some(
+                    "The handles and hosts could not be read from the PLC directory right now. Try again in a moment.",
+                ),
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
+        let cursors = Params::from_pairs(
+            ["hb", "hm"]
+                .iter()
+                .filter_map(|k| q.get(*k).map(|v| ((*k).to_owned(), v.clone())))
+                .collect(),
+        );
+        let lead = format!("{}&", ask.link(HISTORY, None));
+        Some(HistoryTab {
+            note,
+            handles,
+            hosts,
+            removed: crate::history::did_removed(&st, &did, &cursors, &lead).await,
+        })
+    } else {
+        None
+    };
     crate::public::handles::recall(&st, &cfg.config, &[did.to_string()]).await;
     let handle = st
         .public
@@ -662,16 +744,18 @@ pub async fn lookup_did(
         did: did.to_string(),
         handle,
         card: cells::admin_card_href(did.as_str()),
-        history: crate::public::text::admin_did_history_href(did.as_str()),
+        history,
         backfill,
         find: ask.find.clone(),
         tabs: TABLES
             .iter()
-            .map(|(id, label, _)| Tab {
+            .map(|(id, label, _)| (*id, *label))
+            .chain([(HISTORY, "History")])
+            .map(|(id, label)| Tab {
                 id,
                 label,
                 href: ask.link(id, None),
-                active: *id == ask.tab,
+                active: id == ask.tab,
             })
             .collect(),
         active: ask.tab,
@@ -720,6 +804,16 @@ mod tests {
         assert_eq!(
             a.link("blocks", Some((0, 1))),
             "/admin/lookup/did?q=did%3Aplc%3Aaaaaaaaaaaaaaaaaaaaaaaaa&find=cat&lists=2"
+        );
+    }
+
+    #[test]
+    fn the_history_tab_is_a_tab_of_its_own() {
+        let a = ask(&[("tab", "history"), ("page", "2")]);
+        assert_eq!(a.tab, HISTORY);
+        assert_eq!(
+            a.link(HISTORY, None),
+            "/admin/lookup/did?q=did%3Aplc%3Aaaaaaaaaaaaaaaaaaaaaaaaa&tab=history&page=2"
         );
     }
 
