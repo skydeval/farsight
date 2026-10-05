@@ -36,6 +36,8 @@
   --code-fg: #0369a1;
   --pill: #f1f5f9;
   --pill-hover: #e2e8f0;
+  /* The shade of every other row of a table without lines. */
+  --stripe: rgba(15, 23, 42, 0.04);
   --nav-bg: rgba(255, 255, 255, 0.86);
   --nav-border: rgba(226, 232, 240, 0.85);
   --shadow-sm: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
@@ -99,6 +101,7 @@
     --code-fg: #a3c3fb;
     --pill: #272727;
     --pill-hover: #313131;
+    --stripe: rgba(244, 244, 244, 0.04);
     --nav-bg: rgba(22, 22, 22, 0.92);
     --nav-border: rgba(244, 244, 244, 0.14);
     --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
@@ -151,6 +154,7 @@
   --code-fg: #a3c3fb;
   --pill: #272727;
   --pill-hover: #313131;
+  --stripe: rgba(244, 244, 244, 0.04);
   --nav-bg: rgba(22, 22, 22, 0.92);
   --nav-border: rgba(244, 244, 244, 0.14);
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
@@ -1406,6 +1410,30 @@ table.free td.num {
     margin-left: 0;
     margin-right: 0;
   }
+}
+
+/* A frameless table without lines either: every other row carries a
+   faint shade instead, enough to follow a row across and too little to
+   take contrast from its text. */
+table.free.striped th,
+table.free.striped td {
+  border-bottom: 0;
+  padding-left: 0.6rem;
+}
+table.free.striped th:last-child,
+table.free.striped td:last-child {
+  padding-right: 0.6rem;
+}
+table.free.striped tbody tr:nth-child(even) td {
+  background: var(--stripe);
+}
+table.free.striped tbody tr:nth-child(even) td:first-child {
+  border-top-left-radius: var(--radius-sm);
+  border-bottom-left-radius: var(--radius-sm);
+}
+table.free.striped tbody tr:nth-child(even) td:last-child {
+  border-top-right-radius: var(--radius-sm);
+  border-bottom-right-radius: var(--radius-sm);
 }
 
 /* The lookup box above the header. */

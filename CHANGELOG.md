@@ -55,6 +55,9 @@ commits it covers.
   second line; the "First seen" column is gone; the tables stand in
   their block without a frame; and the list's facts include its
   description. Old cursor addresses (`mc`, `bc`) are ignored.
+- Admin DID lookup: its tables have no frame and no lines; every other
+  row carries a faint shade instead. Text on a shaded row keeps at
+  least 4.5:1 contrast in both themes.
 - Admin dashboard: Exceptions and Lists by state are rows like the
   blocks above them, and the host-bucket table has no frame.
 - On the History tab, public and admin, the handle history and the
