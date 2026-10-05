@@ -39,6 +39,12 @@ commits it covers.
 
 ### Changed
 
+- Admin dashboard: Firehose, Backfill and Storage are rows that fill
+  their block, as Index is, in place of an inner table that squeezed
+  values onto several lines. In all four blocks the name is at the
+  left and the value at the right, and the Index figures are smaller.
+- Admin list lookup: Members and Inbound listblocks sit behind tabs
+  (`?tab=listblocks`), and the list's facts include its description.
 - On the History tab, public and admin, the handle history and the
   host history stand side by side, and one under the other on a narrow
   screen.

@@ -854,6 +854,10 @@ pub async fn resolve_handle(safe: &SafeClient, handle: &str) -> Result<Did, Stri
 /// A table section of a lookup page.
 #[derive(Debug, Clone, Default)]
 pub struct Section {
+    /// The section's id, which is its tab's.
+    pub id: &'static str,
+    /// The address that shows the page with this section's tab in front.
+    pub tab: String,
     /// Title.
     pub title: String,
     /// Column headers.
@@ -955,8 +959,10 @@ pub struct ListPage {
     pub error: Option<String>,
     /// Facts.
     pub facts: Vec<Stat>,
-    /// Members, inbound listblocks.
+    /// Members, inbound listblocks: each behind a tab.
     pub sections: Vec<Section>,
+    /// The id of the section in view.
+    pub active: &'static str,
     /// The list's history page; offered to a logged-in admin only.
     pub history: Option<String>,
 }
@@ -994,6 +1000,7 @@ async fn lookup_list(
         error: None,
         facts: Vec::new(),
         sections: Vec::new(),
+        active: "members",
         history: None,
     };
     if query.is_empty() {
@@ -1045,7 +1052,15 @@ async fn lookup_list(
         ("list".to_owned(), uri.clone()),
         ("limit".to_owned(), "1".to_owned()),
     ];
+    // The two tables sit behind tabs; `tab` says which is in view.
+    page.active = if q.get("tab").map(String::as_str) == Some("listblocks") {
+        "listblocks"
+    } else {
+        "members"
+    };
     let mut members = Section {
+        id: "members",
+        tab: link_with("/admin/lookup/list", &[("q", uri.as_str())]),
         title: "Members".into(),
         columns: time_columns("Member", "Listitem", "Added"),
         ..Section::default()
@@ -1059,6 +1074,27 @@ async fn lookup_list(
                 .push(stat("Purpose", b["purpose"].as_str().unwrap_or("—")));
             page.facts
                 .push(stat("Name", b["name"].as_str().unwrap_or("—")));
+            // What the list says about itself, as stored: read from the
+            // record when it was applied, or on the first view of the
+            // list's public page.
+            let about = match (&info, st.api.pool.acquire().await) {
+                (Some(i), Ok(mut conn)) => farsight_storage::queries::list_about(&mut conn, i.id)
+                    .await
+                    .ok(),
+                _ => None,
+            };
+            page.facts.push(stat(
+                "Description",
+                match about {
+                    Some(a) if a.read => a
+                        .description
+                        .map(|d| crate::public::text::clean(&d.replace(['\r', '\n'], " ")))
+                        .filter(|d| !d.trim().is_empty())
+                        .unwrap_or_else(|| "—".to_owned()),
+                    Some(_) => "Not read yet".to_owned(),
+                    None => "—".to_owned(),
+                },
+            ));
             page.facts
                 .push(stat("State", b["state"].as_str().unwrap_or("—")));
             page.facts
@@ -1082,6 +1118,11 @@ async fn lookup_list(
         Err(e) => members.error = Some(e.message),
     }
     let mut blockers = Section {
+        id: "listblocks",
+        tab: link_with(
+            "/admin/lookup/list",
+            &[("q", uri.as_str()), ("tab", "listblocks")],
+        ),
         title: "Inbound listblocks".into(),
         columns: time_columns("Blocker", "Listblock", "Created"),
         ..Section::default()
@@ -1128,10 +1169,12 @@ async fn lookup_list(
         {
             Ok(p) => {
                 blockers.rows = time_rows(&st, &mut asked, viewer, LISTBLOCK, None, &p.rows).await;
-                blockers.next = p
-                    .next
-                    .as_deref()
-                    .map(|c| link_with("/admin/lookup/list", &[("q", uri.as_str()), ("bc", c)]));
+                blockers.next = p.next.as_deref().map(|c| {
+                    link_with(
+                        "/admin/lookup/list",
+                        &[("q", uri.as_str()), ("tab", "listblocks"), ("bc", c)],
+                    )
+                });
             }
             Err(e) => blockers.error = Some(section_error(e)),
         }

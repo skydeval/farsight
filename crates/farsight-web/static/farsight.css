@@ -317,12 +317,57 @@ h3 {
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.02em;
 }
+.stat {
+  gap: 1rem;
+}
+/* The figure is no larger than leaves room for its name on the line. */
+.stat .n {
+  text-align: right;
+  font-size: 1.15rem;
+  white-space: nowrap;
+}
+.stat .l {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
 .stat .l {
   color: var(--muted);
   font-size: 0.85rem;
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.03em;
+}
+
+/* A label and its value on one line, the label at the left and the
+   value at the right: the dashboard's Firehose, Backfill and Storage. */
+.fact {
+  padding: 0.55rem 0;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+}
+.fact:last-child {
+  border-bottom: none;
+}
+.fact .l {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.fact .v {
+  min-width: 0;
+  text-align: right;
+  font-weight: 600;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.fact .v.num {
+  font-variant-numeric: tabular-nums;
 }
 
 .muted { color: var(--muted); }
@@ -1256,6 +1301,7 @@ nav.pager .pager-gap {
   display: block;
 }
 
+.tabbed[data-active="members"] > #members,
 .tabbed[data-active="history"] > #history {
   display: block;
 }

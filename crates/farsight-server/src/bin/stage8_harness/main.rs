@@ -365,6 +365,9 @@ fn admin_section<'a>(html: &'a str, title: &str) -> Option<&'a str> {
         "Incoming blocks" => Some("blocks"),
         "Incoming listblocks" => Some("listblocks"),
         "Lists naming this account" => Some("lists"),
+        // The list lookup page's.
+        "Members" => Some("members"),
+        "Inbound listblocks" => Some("listblocks"),
         _ => None,
     };
     if let Some(found) = id.and_then(|id| section(html, id)) {

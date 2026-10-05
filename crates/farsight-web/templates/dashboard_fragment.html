@@ -11,14 +11,14 @@
 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
 <span>Index</span>
 </h2>
-{% for s in d.counts %}<div class="stat"><div class="n">{{ s.value }}</div><div class="l">{{ s.label }}</div></div>{% endfor %}
+{% for s in d.counts %}<div class="stat"><div class="l">{{ s.label }}</div><div class="n">{{ s.value }}</div></div>{% endfor %}
 </div>
 <div class="card">
 <h2>
 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
 <span>Firehose</span>
 </h2>
-<table>{% for s in d.firehose %}<tr><th>{{ s.label }}</th><td>{% if s.label == "Connected" && s.value == "yes" %}<span class="ok"><span class="pulse-dot" aria-hidden="true"></span> yes</span>{% else %}{{ s.value }}{% endif %}</td></tr>{% endfor %}</table>
+{% for s in d.firehose %}<div class="fact"><div class="l">{{ s.label }}</div><div class="v">{% if s.label == "Connected" && s.value == "yes" %}<span class="ok"><span class="pulse-dot" aria-hidden="true"></span> yes</span>{% else %}{{ s.value }}{% endif %}</div></div>{% endfor %}
 {% if !d.gaps.is_empty() %}<h3 style="margin-top:1rem; color:var(--warn);">Unrepaired gaps</h3><ul>{% for g in d.gaps %}<li>{{ g }}</li>{% endfor %}</ul>{% endif %}
 </div>
 <div class="card">
@@ -26,14 +26,14 @@
 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
 <span>Backfill</span>
 </h2>
-<table>{% for s in d.backfill %}<tr><th>{{ s.label }}</th><td>{{ s.value }}</td></tr>{% endfor %}</table>
+{% for s in d.backfill %}<div class="fact"><div class="l">{{ s.label }}</div><div class="v">{{ s.value }}</div></div>{% endfor %}
 </div>
 <div class="card">
 <h2>
 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
 <span>Storage</span>
 </h2>
-{% if d.storage.is_empty() %}<p class="muted">Not measured yet.</p>{% endif %}<table>{% for s in d.storage %}<tr><th>{{ s.label }}</th><td class="num">{{ s.value }}</td></tr>{% endfor %}</table>
+{% if d.storage.is_empty() %}<p class="muted">Not measured yet.</p>{% endif %}{% for s in d.storage %}<div class="fact"><div class="l">{{ s.label }}</div><div class="v num">{{ s.value }}</div></div>{% endfor %}
 </div>
 </div>
 <div class="grid">

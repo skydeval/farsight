@@ -11,8 +11,12 @@
 <p style="margin: 0; font-size: 1.05rem;"><strong><code>{{ u }}</code></strong>{% if let Some(h) = history %} · <a href="{{ h }}" class="pill" style="font-size:0.85rem;">View history →</a>{% endif %}</p>
 </div>
 <div class="card"><table>{% for f in facts %}<tr><th>{{ f.label }}</th><td>{{ f.value }}</td></tr>{% endfor %}</table></div>
+<nav class="tabs" role="tablist" aria-label="Tables">
+{% for s in sections %}<a class="tab{% if s.id == active %} active{% endif %}" role="tab" href="{{ s.tab }}" data-tab="{{ s.id }}" aria-controls="{{ s.id }}" aria-selected="{% if s.id == active %}true{% else %}false{% endif %}">{{ s.title }}</a>
+{% endfor %}</nav>
+<div class="tabbed" data-active="{{ active }}">
 {% for s in sections %}
-<div class="card">
+<section id="{{ s.id }}" class="card data-section tab-panel">
 <h2>{{ s.title }}</h2>
 {% if let Some(e) = s.error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if !s.coverage.is_empty() %}<p class="muted">{{ s.coverage }}</p>{% endif %}
@@ -20,7 +24,8 @@
 <table><tr>{% for c in s.columns %}<th>{{ c }}</th>{% endfor %}</tr>
 {% for r in s.rows %}<tr>{% for v in r %}<td>{{ v.html|safe }}</td>{% endfor %}</tr>{% endfor %}</table>{% endif %}
 {% if let Some(n) = s.next %}<p class="pager"><a href="{{ n }}">Next page →</a></p>{% endif %}
-</div>
+</section>
 {% endfor %}
+</div>
 {% endif %}
 {% endblock %}
