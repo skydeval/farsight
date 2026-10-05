@@ -82,8 +82,8 @@ for (const [name, engine] of [
       return { cells: cells.length, rewritten: done.length, sample: done[0] ? done[0].textContent : "" };
     });
     out(
-      `${name}: the admin pages run the UI script — every time cell of the lookup table (Created, First seen) is rewritten to the viewer's timezone, with the server's UTC text kept in its title`,
-      times.cells > 50 && times.rewritten === times.cells,
+      `${name}: the admin pages run the UI script — every time cell of the lookup tables is rewritten to the viewer's timezone, with the server's UTC text kept in its title`,
+      times.cells > 0 && times.rewritten === times.cells,
       JSON.stringify(times),
     );
 

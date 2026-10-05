@@ -14,7 +14,25 @@ commits it covers.
 
 ## [Unreleased]
 
+### Added
+
+- The admin DID lookup page has the account header of the public page
+  (avatar, handle, DID, creation date and age, host) with the backfill
+  state on its right, its three tables behind tabs, numbered page
+  controls, a filter box on the blocks and lists tables, and a "Copy
+  at:// URL" button for each block record.
+
 ### Changed
+
+- On the admin DID lookup page: dates carry no time zone (each table
+  states it once) and say how long ago on a second line; the "First
+  seen" column is gone; the record's at-uri is copied with a button
+  rather than printed, with a "View" link beside it when a record
+  viewer is configured. Old cursor addresses (`bc`, `lc`, `nc`) are
+  ignored. The list lookup page is unchanged.
+- The admin pages have their own script, `/static/admin.js`, and their
+  own copies of the styles they share a look with: the admin and the
+  public pages no longer share a script.
 
 - The dark theme uses the Carbon palette: background `#161616`, text
   `#f4f4f4`, accent `#78a9ff`, on a flat background. The gradient rule

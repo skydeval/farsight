@@ -137,6 +137,88 @@ pub struct IncomingListBlock {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// One numbered page of [`incoming_list_blocks`], hidden accounts left
+/// out: `limit` rows from `offset`, in the same order. The admin lookup
+/// page turns pages by number.
+pub async fn incoming_list_blocks_at(
+    conn: &mut PgConnection,
+    subject_id: i64,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<IncomingListBlock>> {
+    type Row = (
+        i64,
+        String,
+        String,
+        Option<i16>,
+        Option<String>,
+        i64,
+        String,
+        String,
+        Option<DateTime<Utc>>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(&format!(
+        "SELECT l.id, o.did, l.rkey, l.purpose, l.name, b.author_id, ba.did, b.rkey, b.created_at
+         FROM lists l
+         JOIN actors o ON o.id = l.owner_id
+         JOIN list_blocks b ON b.list_id = l.id
+         JOIN actors ba ON ba.id = b.author_id
+         WHERE l.id IN (SELECT li.list_id FROM list_items li WHERE li.subject_id = $1)
+           AND l.track_state IN (2, 3) AND l.record_state = 1
+           AND o.status NOT IN {HIDDEN} AND ba.status NOT IN {HIDDEN}
+         ORDER BY l.id, b.author_id, b.rkey LIMIT $2 OFFSET $3"
+    ))
+    .bind(subject_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, owner_did, lrkey, purpose, name, author_id, blocker, rkey, created_at)| {
+                IncomingListBlock {
+                    list: ListRef {
+                        id,
+                        owner_did,
+                        rkey: lrkey,
+                        purpose,
+                        name,
+                    },
+                    author_id,
+                    blocker,
+                    rkey,
+                    created_at,
+                }
+            },
+        )
+        .collect())
+}
+
+/// How many rows [`incoming_list_blocks_at`] pages over, counted up to
+/// `cap + 1`.
+pub async fn incoming_list_blocks_count(
+    conn: &mut PgConnection,
+    subject_id: i64,
+    cap: i64,
+) -> Result<i64> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM (
+           SELECT 1 FROM lists l
+           JOIN actors o ON o.id = l.owner_id
+           JOIN list_blocks b ON b.list_id = l.id
+           JOIN actors ba ON ba.id = b.author_id
+           WHERE l.id IN (SELECT li.list_id FROM list_items li WHERE li.subject_id = $1)
+             AND l.track_state IN (2, 3) AND l.record_state = 1
+             AND o.status NOT IN {HIDDEN} AND ba.status NOT IN {HIDDEN}
+           LIMIT $2) x"
+    ))
+    .bind(subject_id)
+    .bind(cap + 1)
+    .fetch_one(conn)
+    .await?)
+}
+
 /// Every listblock on every **ready or retained** list naming
 /// `subject_id` whose record is present (§3.2): one pair per listblock,
 /// ordered by list id, blocker actor id, listblock rkey. Uncounted

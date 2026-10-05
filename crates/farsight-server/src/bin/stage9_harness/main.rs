@@ -58,10 +58,11 @@ const BROWSER_SCRIPT: &str = include_str!("../../../../../scripts/stage9-browser
 const BARE: &str = "not found";
 const RETIRED: &str = "`access.ui` is retired";
 const NEEDS_RESTART: &str = "`access.admin_ui` requires a restart";
-const STATIC: [(&str, &str); 5] = [
+const STATIC: [(&str, &str); 6] = [
     ("/static/farsight.css", "text/css"),
     ("/static/public.css", "text/css"),
     ("/static/public.js", "text/javascript"),
+    ("/static/admin.js", "text/javascript"),
     ("/static/htmx.min.js", "text/javascript"),
     ("/static/og-default.png", "image/png"),
 ];
@@ -412,7 +413,7 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
             && did.text.contains(&format!("/static/public.js?v={version}\""))
             && did.text.contains(&format!("/static/htmx.min.js?v={version}\""))
             && dash.text.contains(&format!("/static/farsight.css?v={version}\""))
-            && dash.text.contains(&format!("/static/public.js?v={version}\""))
+            && dash.text.contains(&format!("/static/admin.js?v={version}\""))
             && stamped.status == 200
             && stamped.text == plain.text
             && cc(&stamped) == "public, max-age=3600",
@@ -459,22 +460,23 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
     .await?;
     let dash = a.admin_get(cookie, "/admin").await?;
     c.check(
-        "the dashboard's links, poll and logout form all name /admin paths; the page loads /static/public.js",
+        "the dashboard's links, poll and logout form all name /admin paths; the page loads the admin pages' own script, /static/admin.js",
         dash.text.contains("hx-get=\"/admin/dashboard/fragment\"")
             && dash.text.contains("href=\"/admin/lookup/did\"")
             && dash.text.contains("href=\"/admin/ops\"")
             && dash.text.contains("href=\"/admin/settings\"")
             && dash.text.contains("action=\"/admin/logout\"")
-            && dash.text.contains("src=\"/static/public.js?v=")
+            && dash.text.contains("src=\"/static/admin.js?v=")
+            && !dash.text.contains("/static/public.js")
             && !dash.text.contains("farsight.js"),
         support::truncate(&dash.text, 120),
     );
     let page = a.admin_get(cookie, &lookup).await?;
     c.check(
-        "the signed-in lookup shows the blocker, \"First seen\", a card link and the history link",
+        "the signed-in lookup shows the blocker, a button that copies its record's address, a card link and the history link",
         page.status == 200
             && page.text.contains(&w.blocker)
-            && page.text.contains("First seen")
+            && page.text.contains("class=\"copy-uri\" data-copy=\"at://")
             && page.text.contains("data-card-session")
             && page.text.contains(&hist)
             && page

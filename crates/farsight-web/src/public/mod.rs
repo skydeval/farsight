@@ -103,6 +103,8 @@ pub fn csp(cfg: &Config) -> &'static str {
 pub const PUBLIC_CSS: &str = include_str!("../../static/public.css");
 /// The script: theme toggle, local times, profile cards.
 pub const PUBLIC_JS: &str = include_str!("../../static/public.js");
+/// The admin pages' script: its own copy, changed separately.
+pub const ADMIN_JS: &str = include_str!("../../static/admin.js");
 /// The one preview image, the same for every page (1200×630).
 pub const OG_IMAGE: &[u8] = include_bytes!("../../static/og-default.png");
 /// The icon of every page's browser tab: Farsight's mark.

@@ -450,6 +450,22 @@ pub async fn bounded_count(
     find: Option<&crate::ui_rows::Find>,
     cap: i64,
 ) -> Result<i64> {
+    let hidden = crate::ui_rows::hidden_statuses(true, taken_down);
+    bounded_count_hiding(conn, what, key, excluded, hidden, find, cap).await
+}
+
+/// [`bounded_count`] with the statuses left out given as a SQL list, as
+/// [`crate::ui_rows::hidden_statuses`] writes it. The admin tables leave
+/// out the API's hidden set, which is not the public tables' rule.
+pub async fn bounded_count_hiding(
+    conn: &mut PgConnection,
+    what: Counted,
+    key: i64,
+    excluded: &[i64],
+    hidden: &'static str,
+    find: Option<&crate::ui_rows::Find>,
+    cap: i64,
+) -> Result<i64> {
     let (from, on, col) = match what {
         Counted::IncomingBlocks => ("blocks", "r.author_id", "r.subject_id"),
         Counted::OutgoingBlocks => ("blocks", "r.subject_id", "r.author_id"),
@@ -459,12 +475,11 @@ pub async fn bounded_count(
     Ok(sqlx::query_scalar(&format!(
         "SELECT count(*) FROM (
            SELECT 1 FROM {from} r JOIN actors a ON a.id = {on}
-           WHERE {col} = $1 AND a.status NOT IN {} AND NOT (a.id = ANY($2))
+           WHERE {col} = $1 AND a.status NOT IN {hidden} AND NOT (a.id = ANY($2))
              AND ($4::bigint[] IS NULL OR a.id = ANY($4) OR a.did LIKE $5::text
                   OR EXISTS (SELECT 1 FROM handle_cache h
                              WHERE h.did = a.did AND h.handle LIKE $5::text))
-           LIMIT $3) x",
-        crate::ui_rows::hidden_statuses(true, taken_down)
+           LIMIT $3) x"
     ))
     .bind(key)
     .bind(excluded)

@@ -475,6 +475,8 @@ pub struct NamingRow {
     pub name: Option<String>,
     /// Counted listblocks on it.
     pub listblock_count: i32,
+    /// Its `purpose` code, if the record states one Farsight knows.
+    pub purpose: Option<i16>,
     /// Owner-claimed `createdAt` of the listitem naming the account (the
     /// one with the lowest record key if it is named twice).
     pub added_at: Option<DateTime<Utc>>,
@@ -514,7 +516,8 @@ fn naming_from(ids: u8, pattern: u8) -> String {
 
 fn naming_sql() -> String {
     format!(
-        "SELECT l.id, o.did, l.rkey, l.name, l.listblock_count, x.created_at, x.first_seen
+        "SELECT l.id, o.did, l.rkey, l.name, l.listblock_count, x.created_at, x.first_seen,
+                l.purpose
          FROM (SELECT DISTINCT ON (li.list_id) li.list_id, li.created_at, li.first_seen
                FROM list_items li WHERE li.subject_id = $1
                ORDER BY li.list_id, li.rkey) x
@@ -547,6 +550,7 @@ pub async fn lists_naming(
         i32,
         Option<DateTime<Utc>>,
         Option<DateTime<Utc>>,
+        Option<i16>,
     );
     let rows: Vec<Raw> = sqlx::query_as(&naming_sql())
         .bind(subject_id)
@@ -560,14 +564,17 @@ pub async fn lists_naming(
     Ok(rows
         .into_iter()
         .map(
-            |(list_id, owner_did, rkey, name, listblock_count, added_at, first_seen)| NamingRow {
-                list_id,
-                owner_did,
-                rkey,
-                name,
-                listblock_count,
-                added_at,
-                first_seen,
+            |(list_id, owner_did, rkey, name, listblock_count, added_at, first_seen, purpose)| {
+                NamingRow {
+                    list_id,
+                    owner_did,
+                    rkey,
+                    name,
+                    listblock_count,
+                    purpose,
+                    added_at,
+                    first_seen,
+                }
             },
         )
         .collect())
@@ -905,6 +912,7 @@ mod tests {
         assert_eq!(Find::containing(""), "%%");
         let t = |h| Utc.with_ymd_and_hms(2026, 10, 3, h, 0, 0).unwrap();
         let row = |c, f| NamingRow {
+            purpose: None,
             list_id: 1,
             owner_did: String::new(),
             rkey: String::new(),

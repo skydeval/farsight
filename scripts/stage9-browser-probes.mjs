@@ -100,7 +100,7 @@ try {
   });
   await lookup.goto(`${base}/admin/lookup/did?q=${encodeURIComponent(subject)}`);
   await probe(
-    "the lookup page under /admin loads /static/public.js (not /static/farsight.js); hovering an account asks /admin/card/{did} with the session and shows the card",
+    "the lookup page under /admin loads the admin script, /static/admin.js (not /static/public.js or /static/farsight.js); hovering an account asks /admin/card/{did} with the session and shows the card",
     async () => {
       const link = lookup.locator("a.who[data-card-session]").first();
       const n = await lookup.locator("a.who[data-card-session]").count();
@@ -113,7 +113,8 @@ try {
       return [
         n > 0 &&
           r.status() === 200 &&
-          asked.some((a) => a === "200 /static/public.js") &&
+          asked.some((a) => a === "200 /static/admin.js") &&
+          !asked.some((a) => a.includes("/static/public.js")) &&
           !asked.some((a) => a.includes("farsight.js")) &&
           (cards > 0 || !!described),
         `${n} links; ${asked.join(", ")}; card elements ${cards}; aria-describedby ${described}`,

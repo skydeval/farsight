@@ -28,6 +28,7 @@ pub fn asset_version() -> &'static str {
             HTMX,
             crate::public::PUBLIC_CSS,
             crate::public::PUBLIC_JS,
+            crate::public::ADMIN_JS,
             crate::public::FAVICON,
         ] {
             h.update(file.as_bytes());
@@ -97,6 +98,12 @@ pub async fn public_css() -> Response {
 /// path.
 pub async fn js() -> Response {
     asset(crate::public::PUBLIC_JS, "text/javascript; charset=utf-8")
+}
+
+/// `GET /static/admin.js`: the script of the admin pages, sign-in and
+/// setup.
+pub async fn admin_js() -> Response {
+    asset(crate::public::ADMIN_JS, "text/javascript; charset=utf-8")
 }
 
 /// `GET /static/htmx.min.js`.

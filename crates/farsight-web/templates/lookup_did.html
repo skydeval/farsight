@@ -1,26 +1,146 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>DID lookup</h1>
-<form class="card row" method="get" action="/admin/lookup/did" style="gap: 0.6rem; align-items: center; margin-top: 0;">
-<input type="text" name="q" value="{{ q }}" placeholder="did:plc:… or handle.example" autofocus style="flex: 1 1 20rem; max-width: none;">
+<h1 class="sr-only">DID lookup</h1>
+<form class="card row lookup-form" method="get" action="/admin/lookup/did">
+<input type="text" name="q" value="{{ q }}" placeholder="did:plc:… or handle.example"{% if subject.is_none() %} autofocus{% endif %} aria-label="DID or handle">
 <button type="submit">Look up</button>
 </form>
 {% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
-{% if let Some(d) = did %}
-<div class="card" style="margin-bottom: 1.25rem;">
-<p style="margin: 0; font-size: 1.1rem;"><strong><code>{{ d }}</code></strong>{% if let Some(h) = history %} · <a href="{{ h }}" class="pill" style="font-size:0.85rem;">View history →</a>{% endif %}</p>
+{% if let Some(s) = subject %}
+<div class="profile-hero-card card">
+<div class="profile-main-row" data-hero-card="{{ s.card }}">
+<div class="profile-id-block">
+<h2 class="subject">
+{% if let Some(h) = s.handle %}<span class="handle">{{ h }}</span>{% endif %}
+<code class="did-code">{{ s.did }}</code>
+</h2>
+<p class="hero-facts" data-hero-facts hidden></p>
 </div>
-{% if !backfill.is_empty() %}<div class="card"><h2>Backfill</h2>{% for l in backfill %}<div>{{ l }}</div>{% endfor %}</div>{% endif %}
-{% for s in sections %}
-<div class="card">
-<h2>{{ s.title }}</h2>
-{% if let Some(e) = s.error %}<div class="banner bad">{{ e }}</div>{% endif %}
-{% if !s.coverage.is_empty() %}<p class="muted">{{ s.coverage }}</p>{% endif %}
-{% if s.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
-<table><tr>{% for c in s.columns %}<th>{{ c }}</th>{% endfor %}</tr>
-{% for r in s.rows %}<tr>{% for v in r %}<td>{{ v.html|safe }}</td>{% endfor %}</tr>{% endfor %}</table>{% endif %}
-{% if let Some(n) = s.next %}<p class="pager"><a href="{{ n }}">Next page →</a></p>{% endif %}
+<div class="hero-side">
+{% if !s.backfill.is_empty() %}<dl class="hero-backfill" aria-label="Backfill">
+<dt class="hero-side-title">Backfill</dt><dd></dd>
+{% for b in s.backfill %}<dt>{{ b.0 }}</dt><dd>{{ b.1 }}</dd>
+{% endfor %}</dl>{% endif %}
+<a href="{{ s.history }}" class="pill hero-history">View history →</a>
 </div>
+</div>
+</div>
+
+<nav class="tabs" role="tablist" aria-label="Tables">
+{% for t in s.tabs %}<a class="tab{% if t.active %} active{% endif %}" role="tab" href="{{ t.href }}" data-tab="{{ t.id }}" aria-controls="{{ t.id }}" aria-selected="{% if t.active %}true{% else %}false{% endif %}">{{ t.label }}</a>
+{% endfor %}</nav>
+<div class="tabbed" data-active="{{ s.active }}">
+<section id="blocks" class="card data-section tab-panel">
+<div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<form class="find" method="get" action="/admin/lookup/did#blocks" role="search"><input type="hidden" name="q" value="{{ s.did }}"><input type="search" name="find" value="{{ s.find }}" placeholder="Filter by handle or DID" aria-label="Filter this table" maxlength="100" autocomplete="off" spellcheck="false"></form>
+<h2><span class="sr-only">Incoming blocks </span><span class="count count-big">{% if let Some(n) = s.blocks.count %}{{ n }}{% else %}—{% endif %}</span></h2>
+<p class="muted">Accounts which have blocked this account.</p>
+</div>
+{% if !s.blocks.coverage.is_empty() %}<p class="coverage">{{ s.blocks.coverage }}</p>{% endif %}
+{% if let Some(e) = s.blocks.error %}<div class="banner bad">{{ e }}</div>{% endif %}
+{% if let Some(n) = s.blocks.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
+{% if s.blocks.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
+{{ s.blocks.pager|safe }}
+<div class="table-responsive">
+<table class="data-table">
+<thead>
+<tr>
+<th scope="col" class="th-account">Blocker</th>
+<th scope="col" class="th-record">Record</th>
+<th scope="col" class="th-date">Created</th>
+</tr>
+</thead>
+<tbody>
+{% for r in s.blocks.rows %}
+<tr class="data-row">
+<td class="td-account">{{ r.who|safe }}</td>
+<td class="td-record"><button type="button" class="copy-uri" data-copy="{{ r.uri }}" title="{{ r.uri }}">Copy at:// URL</button>{% if let Some(v) = r.view %} <a class="record-view" href="{{ v }}" target="_blank" rel="noopener noreferrer nofollow">View</a>{% endif %}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time><span class="ago" data-ago></span>{% else %}<span class="time-none" aria-hidden="true">—</span><span class="ago"></span>{% endif %}</td>
+</tr>
 {% endfor %}
+</tbody>
+</table>
+</div>
+{{ s.blocks.pager|safe }}
+{% endif %}
+</section>
+
+<section id="listblocks" class="card data-section tab-panel">
+<div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<h2><span class="sr-only">Incoming listblocks </span><span class="count count-big">{% if let Some(n) = s.listblocks.count %}{{ n }}{% else %}—{% endif %}</span></h2>
+<p class="muted">Listblocks on the lists that name this account: one row for each list and blocker.</p>
+</div>
+{% if !s.listblocks.coverage.is_empty() %}<p class="coverage">{{ s.listblocks.coverage }}</p>{% endif %}
+{% if let Some(e) = s.listblocks.error %}<div class="banner bad">{{ e }}</div>{% endif %}
+{% if s.listblocks.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
+{{ s.listblocks.pager|safe }}
+<div class="table-responsive">
+<table class="data-table">
+<thead>
+<tr>
+<th scope="col" class="th-list">List</th>
+<th scope="col" class="th-purpose">Purpose</th>
+<th scope="col" class="th-account">Blocker</th>
+<th scope="col" class="th-date">Created</th>
+</tr>
+</thead>
+<tbody>
+{% for r in s.listblocks.rows %}
+<tr class="data-row">
+<td class="td-list"><a href="{{ r.list_href }}" class="list-link"><span>{{ r.list }}</span></a></td>
+<td class="td-purpose">{{ r.purpose }}</td>
+<td class="td-account">{{ r.who|safe }}</td>
+<td class="td-date">{% if let Some(t) = r.when %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time><span class="ago" data-ago></span>{% else %}<span class="time-none" aria-hidden="true">—</span><span class="ago"></span>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{{ s.listblocks.pager|safe }}
+{% endif %}
+</section>
+
+<section id="lists" class="card data-section tab-panel">
+<div class="section-header">
+<p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
+<form class="find" method="get" action="/admin/lookup/did#lists" role="search"><input type="hidden" name="q" value="{{ s.did }}"><input type="hidden" name="tab" value="lists"><input type="search" name="find" value="{{ s.find }}" placeholder="Filter by list or owner" aria-label="Filter this table" maxlength="100" autocomplete="off" spellcheck="false"></form>
+<h2><span class="sr-only">Lists naming this account </span><span class="count count-big">{% if let Some(n) = s.lists.count %}{{ n }}{% else %}—{% endif %}</span></h2>
+<p class="muted">Listblocked lists this account has been added to.</p>
+</div>
+{% if !s.lists.coverage.is_empty() %}<p class="coverage">{{ s.lists.coverage }}</p>{% endif %}
+{% if let Some(e) = s.lists.error %}<div class="banner bad">{{ e }}</div>{% endif %}
+{% if let Some(n) = s.lists.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
+{% if s.lists.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
+{{ s.lists.pager|safe }}
+<div class="table-responsive">
+<table class="data-table">
+<thead>
+<tr>
+<th scope="col" class="th-list">List</th>
+<th scope="col" class="th-purpose">Purpose</th>
+<th scope="col" class="th-account">Owner</th>
+<th scope="col" class="th-num">Listblocks</th>
+<th scope="col" class="th-date">Added</th>
+</tr>
+</thead>
+<tbody>
+{% for r in s.lists.rows %}
+<tr class="data-row">
+<td class="td-list"><a href="{{ r.list_href }}" class="list-link"><span>{{ r.list }}</span></a></td>
+<td class="td-purpose">{{ r.purpose }}</td>
+<td class="td-account">{{ r.owner|safe }}</td>
+<td class="td-num">{{ r.listblocks }}</td>
+<td class="td-date">{% if let Some(t) = r.added %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time><span class="ago" data-ago></span>{% else %}<span class="time-none" aria-hidden="true">—</span><span class="ago"></span>{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{{ s.lists.pager|safe }}
+{% endif %}
+</section>
+</div>
 {% endif %}
 {% endblock %}

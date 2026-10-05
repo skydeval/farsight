@@ -29,9 +29,11 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::cells::{self, Cell};
 use crate::common::{self, NO_STORE, cookie, ct_eq, read_cookie, render_private};
-use crate::public::text::{BLOCK, LISTBLOCK, LISTITEM, Record};
+use crate::public::text::{LISTBLOCK, LISTITEM, Record};
 use crate::public::warming::Asked;
 use crate::rows;
+
+mod admin_did;
 
 /// Admin session cookie (§8.6).
 pub const ADMIN_COOKIE: &str = "farsight_admin";
@@ -215,7 +217,7 @@ pub fn router(state: Arc<WebState>) -> Router {
             get(crate::enter::client_metadata),
         )
         .route("/admin/logout", post(logout))
-        .route("/admin/lookup/did", get(lookup_did))
+        .route("/admin/lookup/did", get(admin_did::lookup_did))
         .route("/admin/lookup/list", get(lookup_list))
         .route("/admin/did/{did}/history", get(crate::history::did_history))
         .route(
@@ -247,6 +249,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/static/farsight.css", get(common::css))
         .route("/static/public.css", get(common::public_css))
         .route("/static/public.js", get(common::js))
+        .route("/static/admin.js", get(common::admin_js))
         .route("/static/htmx.min.js", get(common::htmx))
         .route(common::OG_IMAGE_PATH, get(common::og_image))
         .route("/static/favicon.svg", get(common::favicon))
@@ -865,26 +868,6 @@ pub struct Section {
     pub error: Option<String>,
 }
 
-/// The DID lookup page.
-#[derive(Template)]
-#[template(path = "lookup_did.html")]
-pub struct DidPage {
-    /// Navigation.
-    pub nav: Nav,
-    /// The query.
-    pub q: String,
-    /// The resolved DID.
-    pub did: Option<String>,
-    /// Error.
-    pub error: Option<String>,
-    /// Sections.
-    pub sections: Vec<Section>,
-    /// Backfill state lines.
-    pub backfill: Vec<String>,
-    /// The account's history page.
-    pub history: Option<String>,
-}
-
 fn link_with(base: &str, pairs: &[(&str, &str)]) -> String {
     let q: String = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(pairs)
@@ -956,213 +939,6 @@ async fn time_rows(
             ]
         })
         .collect()
-}
-
-fn text_cell(v: &Value) -> Cell {
-    Cell::text(v.as_str().unwrap_or(""))
-}
-
-async fn lookup_did(
-    State(st): State<Arc<WebState>>,
-    headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
-    let s = match gate(&st, &headers).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let query = q.get("q").map(|s| s.trim().to_owned()).unwrap_or_default();
-    let mut page = DidPage {
-        nav: nav(&Some(s)),
-        q: query.clone(),
-        did: None,
-        error: None,
-        sections: Vec::new(),
-        backfill: Vec::new(),
-        history: None,
-    };
-    if query.is_empty() {
-        return render_private(&page);
-    }
-    let did = if query.starts_with("did:") {
-        Did::parse(&query).map_err(|e| e.to_string())
-    } else {
-        resolve_handle(&st.safe, &query).await
-    };
-    let did = match did {
-        Ok(d) => d,
-        Err(e) => {
-            page.error = Some(e);
-            return render_private(&page);
-        }
-    };
-    page.did = Some(did.as_str().to_owned());
-    page.history = Some(crate::public::text::admin_did_history_href(did.as_str()));
-    let _permit = match permit(&st).await {
-        Ok(p) => p,
-        Err(e) => {
-            page.error = Some(e);
-            return render_private(&page);
-        }
-    };
-    let cfg = st.api.config.current();
-    let viewer = cfg.config.public_ui.record_viewer_url.as_str();
-    let mut asked = Asked::new(&cfg.config);
-    let actor = did.as_str().to_owned();
-    let base_pairs = |extra: (&str, &str)| -> String {
-        let mut v: Vec<(&str, &str)> = vec![("q", actor.as_str())];
-        for k in ["bc", "lc", "nc"] {
-            if k != extra.0 {
-                if let Some(c) = q.get(k) {
-                    v.push((k, c.as_str()));
-                }
-            }
-        }
-        v.push(extra);
-        link_with("/admin/lookup/did", &v)
-    };
-    let params = |cursor_key: Option<&str>| {
-        let mut p = vec![("actor".to_owned(), actor.clone())];
-        match cursor_key {
-            Some(k) => {
-                p.push(("limit".to_owned(), "50".to_owned()));
-                if let Some(c) = q.get(k) {
-                    p.push(("cursor".to_owned(), c.clone()));
-                }
-            }
-            // Called for its freshness only.
-            None => p.push(("limit".to_owned(), "1".to_owned())),
-        }
-        Params::from_pairs(p)
-    };
-    // Incoming blocks: coverage from the API's computation, rows from the
-    // section's own query, hidden accounts left out as the API does.
-    let mut sec = Section {
-        title: "Incoming blocks".into(),
-        columns: time_columns("Blocker", "Record", "Created"),
-        ..Section::default()
-    };
-    match handlers::get_incoming_blocks(&st.api, &params(None)).await {
-        Ok(r) => sec.coverage = coverage_words(&r.body["freshness"]),
-        Err(e) => sec.error = Some(e.message),
-    }
-    let subject = match st.api.pool.acquire().await {
-        Ok(mut conn) => farsight_storage::queries::actor(&mut conn, did.as_str())
-            .await
-            .ok()
-            .flatten(),
-        Err(_) => None,
-    };
-    if let Some(a) = subject {
-        let filter = Filter {
-            hide_inactive: true,
-            show_suspended: false,
-            show_taken_down: false,
-            find: None,
-            excluded: &[],
-        };
-        match rows::page(
-            &st,
-            Rows::IncomingBlocks,
-            a.id,
-            filter,
-            q.get("bc").map(String::as_str),
-            50,
-        )
-        .await
-        {
-            Ok(p) => {
-                sec.rows = time_rows(&st, &mut asked, viewer, BLOCK, None, &p.rows).await;
-                sec.next = p.next.as_deref().map(|c| base_pairs(("bc", c)));
-            }
-            Err(e) => sec.error = Some(section_error(e)),
-        }
-    }
-    page.sections.push(sec);
-    // Incoming listblocks.
-    let mut sec = Section {
-        title: "Incoming listblocks".into(),
-        columns: vec![
-            "List".into(),
-            "Purpose".into(),
-            "Name".into(),
-            "Blocker".into(),
-        ],
-        ..Section::default()
-    };
-    match handlers::get_incoming_list_blocks(&st.api, &params(Some("lc"))).await {
-        Ok(r) => {
-            let items = r.body["items"].as_array().cloned().unwrap_or_default();
-            let dids: Vec<String> = items
-                .iter()
-                .filter_map(|i| i["blocker"].as_str().map(str::to_owned))
-                .collect();
-            crate::public::handles::recall(&st, &cfg.config, &dids).await;
-            for i in items {
-                sec.rows.push(vec![
-                    text_cell(&i["list"]),
-                    text_cell(&i["listPurpose"]),
-                    text_cell(&i["listName"]),
-                    match i["blocker"].as_str() {
-                        Some(d) => Cell::account(&cells::account(&st, &mut asked, d)),
-                        None => Cell::default(),
-                    },
-                ]);
-            }
-            sec.coverage = coverage_words(&r.body["freshness"]);
-            sec.next = r.body["cursor"].as_str().map(|c| base_pairs(("lc", c)));
-        }
-        Err(e) => sec.error = Some(e.message),
-    }
-    page.sections.push(sec);
-    // Lists naming.
-    let mut sec = Section {
-        title: "Listblocked lists naming this account".into(),
-        columns: vec![
-            "List".into(),
-            "Purpose".into(),
-            "Name".into(),
-            "Listblocks".into(),
-        ],
-        ..Section::default()
-    };
-    match handlers::get_lists_naming(&st.api, &params(Some("nc"))).await {
-        Ok(r) => {
-            for l in r.body["lists"].as_array().cloned().unwrap_or_default() {
-                sec.rows.push(vec![
-                    text_cell(&l["uri"]),
-                    text_cell(&l["purpose"]),
-                    text_cell(&l["name"]),
-                    Cell::text(&l["listblockCount"].to_string()),
-                ]);
-            }
-            sec.coverage = coverage_words(&r.body["freshness"]);
-            sec.next = r.body["cursor"].as_str().map(|c| base_pairs(("nc", c)));
-        }
-        Err(e) => sec.error = Some(e.message),
-    }
-    page.sections.push(sec);
-    asked.submit(&st);
-    // Backfill state.
-    if let Ok(mut conn) = st.api.pool.acquire().await {
-        let discovery = !cfg.config.backfill.backlinks.url.is_empty();
-        if let Ok(b) = backfill_api::status(&mut conn, did.as_str(), discovery).await {
-            page.backfill
-                .push(format!("Repo: {}", b.repo.state.api_name()));
-            if let Some(t) = b.repo.last_backfilled_at {
-                page.backfill.push(format!(
-                    "Last backfilled: {}",
-                    t.format("%Y-%m-%d %H:%M UTC")
-                ));
-            }
-            if let Some(e) = b.repo.last_error {
-                page.backfill.push(format!("Last error: {e}"));
-            }
-            page.backfill
-                .push(format!("Discovery: {}", b.discovery.state.api_name()));
-        }
-    }
-    render_private(&page)
 }
 
 /// The list lookup page.

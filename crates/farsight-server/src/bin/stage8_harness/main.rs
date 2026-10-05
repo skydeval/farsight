@@ -360,6 +360,16 @@ fn section<'a>(html: &'a str, id: &str) -> Option<&'a str> {
 
 /// The card of an admin lookup page whose heading is `title`.
 fn admin_section<'a>(html: &'a str, title: &str) -> Option<&'a str> {
+    // The DID lookup page keeps its tables in sections behind tabs.
+    let id = match title {
+        "Incoming blocks" => Some("blocks"),
+        "Incoming listblocks" => Some("listblocks"),
+        "Lists naming this account" => Some("lists"),
+        _ => None,
+    };
+    if let Some(found) = id.and_then(|id| section(html, id)) {
+        return Some(found);
+    }
     let open = format!("<h2>{title}</h2>");
     let a = html.find(&open)? + open.len();
     let b = html[a..]
@@ -422,8 +432,12 @@ fn controls_of(sec: &str) -> String {
     out.join(" ")
 }
 
-/// The "Next page" link of an admin section.
+/// The next page of an admin section: the arrow of its page controls
+/// (the DID lookup), or its "Next page" link (the list lookup).
 fn admin_next(sec: &str) -> Option<String> {
+    if sec.contains("<nav class=\"pager\"") {
+        return next_of(sec);
+    }
     let b = sec.find("\">Next page")?;
     let a = sec[..b].rfind("href=\"")? + 6;
     Some(sec[a..b].replace("&amp;", "&"))
@@ -1233,14 +1247,17 @@ fn order_of(plan: &str) -> &'static str {
 
 async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<(), String> {
     c.section("6. cursors (admin tables) and page numbers (public tables)");
-    let page = a.admin_get(cookie, &lookup_did(&w.s)).await?;
-    let next = admin_section(&page.text, "Incoming blocks")
+    // The list lookup's tables still page by cursor; the DID lookup's
+    // page by number.
+    let filler_uri = format!("at://{}/app.bsky.graph.list/filler", did("flo", 1));
+    let page = a.admin_get(cookie, &lookup_list(&filler_uri)).await?;
+    let next = admin_section(&page.text, "Inbound listblocks")
         .and_then(admin_next)
         .unwrap_or_default();
     let raw = query_of(&next, "bc").unwrap_or_default();
     let v = cursor_json(&raw).unwrap_or(Value::Null);
     c.check(
-        "a cursor of the new order (admin tables) is the codebase's opaque format — base64url of a JSON array — tagged \"t\": [\"t\", microseconds, blocker id, record key]",
+        "a cursor of the new order (the list lookup's tables) is the codebase's opaque format — base64url of a JSON array — tagged \"t\": [\"t\", microseconds, blocker id, record key]",
         v[0] == "t" && v[1].is_i64() && v[2].is_i64() && v[3].is_string() && v.as_array().is_some_and(|x| x.len() == 4),
         v.to_string(),
     );
@@ -1275,16 +1292,37 @@ async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Resu
         format!("{public_next}; {} / {} / {}", stale.status, garbage.status, zero.status),
     );
     let admin = a
-        .admin_get(cookie, &format!("{}&bc={old}", lookup_did(&w.s)))
+        .admin_get(cookie, &format!("{}&bc={old}", lookup_list(&filler_uri)))
         .await?;
-    let sec = admin_section(&admin.text, "Incoming blocks").unwrap_or("");
+    let sec = admin_section(&admin.text, "Inbound listblocks").unwrap_or("");
     c.check(
-        "on the admin lookup page an old cursor gives the section's error line and no rows; the other sections still render",
+        "on the admin list lookup an old cursor gives the section's error line and no rows; the other section still renders",
         admin.status == 200
             && sec.contains(STALE_LINK)
             && row_dids(sec).is_empty()
-            && admin.text.contains("<h2>Incoming listblocks</h2>"),
+            && admin.text.contains("<h2>Members</h2>"),
         support::truncate(sec, 200),
+    );
+    let did_page = a.admin_get(cookie, &lookup_did(&w.s)).await?;
+    let old_link = a
+        .admin_get(cookie, &format!("{}&bc={old}", lookup_did(&w.s)))
+        .await?;
+    let dsec = admin_section(&did_page.text, "Incoming blocks").unwrap_or("");
+    let second = a
+        .admin_get(cookie, &format!("{}&page=2", lookup_did(&w.s)))
+        .await?;
+    let ssec = admin_section(&second.text, "Incoming blocks").unwrap_or("");
+    c.check(
+        "the admin DID lookup pages by number like the public tables, with its own address: 305 blocks are seven pages, the next page is &page=2 and holds the next 50; a cursor of an earlier version in the address is ignored",
+        admin_next(dsec).is_some_and(|n| n.ends_with("&page=2"))
+            && controls_of(dsec) == "(←) [1] 2 3 4 5 6 7 →"
+            && row_dids(dsec).len() == 50
+            && controls_of(ssec) == "← 1 [2] 3 4 5 6 7 →"
+            && row_dids(ssec).len() == 50
+            && row_dids(ssec)[0] != row_dids(dsec)[0]
+            && old_link.status == 200
+            && row_dids(admin_section(&old_link.text, "Incoming blocks").unwrap_or("")) == row_dids(dsec),
+        format!("{:?} / {:?}", controls_of(dsec), controls_of(ssec)),
     );
     Ok(())
 }
@@ -1700,20 +1738,27 @@ async fn check_admin_card(
             && plc.audit_total() == before + 1,
         format!("{} / {} / {}", unknown.status, bad.status, wrong.status),
     );
-    let js = a.get("/static/public.js").await?;
+    let js = a.get("/static/admin.js").await?;
+    let public_js = a.get("/static/public.js").await?;
     let old_js = a.get("/static/farsight.js").await?;
     let page = a.admin_get(cookie, &lookup_did(&w.s)).await?;
     c.check(
         "the three fixes of v2.4.3 §3.3 are in what the browser gets: admin pages load /static/public.js (the one UI script, ungated; its second name /static/farsight.js is gone); the script asks with credentials \"same-origin\" only for a link marked data-card-session and never injects an answer that is not a 200 or was reached through a redirect; it names no admin path",
+        // The admin pages have their own script, a copy of the public one
+        // that changes separately; neither names an admin path.
         js.status == 200
+            && public_js.status == 200
             && old_js.status == 404
-            && page.text.contains("<script src=\"/static/public.js?v=")
+            && page.text.contains("<script src=\"/static/admin.js?v=")
+            && !page.text.contains("/static/public.js")
             && !page.text.contains("/static/farsight.js")
-            && js.text.contains("link.hasAttribute(\"data-card-session\")")
-            && js.text.contains("credentials: session ? \"same-origin\" : \"omit\"")
-            && js.text.contains("r.status !== 200 || r.redirected")
-            && !js.text.contains("/admin/")
-            && !js.text.contains("/lookup"),
+            && [&js, &public_js].iter().all(|j| {
+                j.text.contains("link.hasAttribute(\"data-card-session\")")
+                    && j.text.contains("credentials: session ? \"same-origin\" : \"omit\"")
+                    && j.text.contains("r.status !== 200 || r.redirected")
+                    && !j.text.contains("/admin/")
+                    && !j.text.contains("/lookup")
+            }),
         format!("public.js {} / farsight.js {}", js.status, old_js.status),
     );
     Ok(())
@@ -1732,20 +1777,22 @@ async fn check_admin_columns(
     let first = did("tib", 120);
     let rkey = "3ktib00000120";
     let uri = format!("at://{first}/app.bsky.graph.block/{rkey}");
-    c.check(
-        "record_viewer_url empty: the record cell is the at-uri as plain text",
-        plain
-            .text
-            .contains(&format!("<td><code class=\"record\">{uri}</code></td>"))
-            && !plain.text.contains("target=\"_blank\""),
-        "plain text",
+    let copy = format!(
+        "<button type=\"button\" class=\"copy-uri\" data-copy=\"{uri}\" title=\"{uri}\">Copy at:// URL</button>"
     );
     c.check(
-        "record_viewer_url set: the cell is a link built from the template with the record's authority, collection and rkey, target=_blank rel=\"noopener noreferrer nofollow\", its text the at-uri",
+        "record_viewer_url empty: the DID lookup's record cell is a button that copies the at-uri; the address is not printed, and there is no link",
+        plain.text.contains(&format!("<td class=\"td-record\">{copy}</td>"))
+            && !plain.text.contains(&format!(">{uri}<"))
+            && !plain.text.contains("target=\"_blank\""),
+        "copy button",
+    );
+    c.check(
+        "record_viewer_url set: beside the button, a link built from the template with the record's authority, collection and rkey, target=_blank rel=\"noopener noreferrer nofollow\"",
         linked.text.contains(&format!(
-            "<td><a class=\"record\" href=\"https://viewer.example/at/{first}/app.bsky.graph.block/{rkey}\" target=\"_blank\" rel=\"noopener noreferrer nofollow\"><code>{uri}</code></a></td>"
+            "<td class=\"td-record\">{copy} <a class=\"record-view\" href=\"https://viewer.example/at/{first}/app.bsky.graph.block/{rkey}\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">View</a></td>"
         )),
-        "link",
+        "button and link",
     );
     let list = b.admin_get(cookie, &lookup_list(&w.l4_uri)).await?;
     let owner = did("lso", 1);
@@ -1756,33 +1803,23 @@ async fn check_admin_columns(
         "listitem and listblock links",
     );
 
-    c.section("14. \"First seen\" is an admin column: on the lookup pages, which need a session, and on no public page");
+    c.section("14. \"First seen\" is an admin column: on the list lookup, which needs a session, and on no public page");
     let admin = a.admin_get(cookie, &lookup_did(&w.s)).await?;
     let asec = admin_section(&admin.text, "Incoming blocks").unwrap_or("");
-    // Rows stored before the date was kept sort further down: look for
-    // their cell on the following pages.
-    let dash = format!("<td><span class=\"muted\" title=\"{NO_FIRST_SEEN}\">—</span></td>");
-    let mut undated = asec.contains(&dash);
-    let mut next = admin_next(asec);
-    for _ in 0..7 {
-        let Some(url) = next else { break };
-        let r = a.admin_get(cookie, &url).await?;
-        let sec = admin_section(&r.text, "Incoming blocks").unwrap_or("");
-        undated |= sec.contains(&dash);
-        next = admin_next(sec);
-    }
-    // Row g of S was first seen at BASE - g minutes: 23:5x on 2026-08-31,
-    // minutes no stated createdAt of these rows falls in.
     c.check(
-        "signed-in admin on /admin/lookup/did: a \"First seen\" column, last, with the stored first_seen in a <time> element, and \"—\" with its title for rows stored before the date was kept",
-        heads(asec) == ["Blocker", "Record", "Created", "First seen"]
-            && asec.contains("<td><time datetime=\"2026-08-31T23:59:00Z\">2026-08-31 23:59:00 UTC</time></td></tr>")
-            && undated,
-        format!("{:?}; undated cell seen: {undated}", heads(asec)),
+        "signed-in admin on /admin/lookup/did: Blocker, Record, Created — no \"First seen\" column and no first_seen value; a date is the instant without its zone (the table states the zone once) with a second line for how long ago, which the page's script writes",
+        heads(asec) == ["Blocker", "Record", "Created"]
+            && !admin.text.contains("First seen")
+            && !admin.text.contains("2026-08-31T23:5")
+            && asec.contains("class=\"time-badge\" data-abs>")
+            && asec.contains("</time><span class=\"ago\" data-ago></span></td>")
+            && !asec.contains(" UTC</time>")
+            && asec.contains("All times are in <span data-zone>UTC</span>."),
+        format!("{:?}", heads(asec)),
     );
     let ladmin = a.admin_get(cookie, &lookup_list(&w.l4_uri)).await?;
     c.check(
-        "the list lookup the same: Members and Inbound listblocks have \"First seen\"",
+        "the list lookup keeps the column: Members and Inbound listblocks have \"First seen\"",
         heads(admin_section(&ladmin.text, "Members").unwrap_or(""))
             == ["Member", "Listitem", "Added", "First seen"]
             && heads(admin_section(&ladmin.text, "Inbound listblocks").unwrap_or(""))
@@ -2513,19 +2550,15 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let (walked, _) = walk(&h, &public_did(&subject), "blockers").await?;
     let admin = h.admin_get(&cookie, &lookup_did(&subject)).await?;
-    let old_next = admin_section(&admin.text, "Incoming blocks")
-        .and_then(admin_next)
-        .unwrap_or_default();
-    let old_cursor =
-        cursor_json(&query_of(&old_next, "bc").unwrap_or_default()).unwrap_or(Value::Null);
+    let (admin_walked, _) =
+        admin_walk(&h, &cookie, &lookup_did(&subject), "Incoming blocks").await?;
     c.check(
-        "until its index is valid a section keeps its previous order and cursors, with the same columns and filters: the public table pages in the old order, the admin table with an untagged [id, rkey] cursor, and the admin table still has its \"First seen\" column",
+        "until its index is valid a section keeps its previous order, with the same columns and filters: the public table and the admin table both page in the old order",
         walked == stored
             && walked.len() == 250
-            && old_cursor[0].is_i64()
-            && old_cursor.as_array().is_some_and(|x| x.len() == 2)
-            && heads(admin_section(&admin.text, "Incoming blocks").unwrap_or("")) == ["Blocker", "Record", "Created", "First seen"],
-        format!("cursor {old_cursor}"),
+            && admin_walked == stored
+            && heads(admin_section(&admin.text, "Incoming blocks").unwrap_or("")) == ["Blocker", "Record", "Created"],
+        format!("{} public rows, {} admin rows", walked.len(), admin_walked.len()),
     );
 
     c.section("23. raising the budget releases the build");
@@ -2560,16 +2593,12 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     );
     let want = expected(&pool, Section::IncomingBlocks, sid, true).await?;
     let (walked, _) = walk(&h, &public_did(&subject), "blockers").await?;
-    let stale = h.admin_get(&cookie, &old_next).await?;
-    let stale_sec = admin_section(&stale.text, "Incoming blocks").unwrap_or("");
+    let (admin_walked, _) =
+        admin_walk(&h, &cookie, &lookup_did(&subject), "Incoming blocks").await?;
     c.check(
-        "the section switched by itself: the public table now pages by shown time, and the admin link made before the switch gives the section's error line and no rows",
-        walked == want
-            && walked != stored
-            && stale.status == 200
-            && stale_sec.contains(STALE_LINK)
-            && row_dids(stale_sec).is_empty(),
-        format!("stale link: {}", stale.status),
+        "the section switched by itself: the public table and the admin table now page by shown time",
+        walked == want && walked != stored && admin_walked == want,
+        format!("{} admin rows", admin_walked.len()),
     );
     Ok(())
 }
