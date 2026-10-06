@@ -14,7 +14,7 @@ members = [
 version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
-repository = "https://github.com/skydeval/horizon-farsight"
+repository = "https://github.com/skydeval/farsight"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
