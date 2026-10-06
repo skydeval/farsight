@@ -73,7 +73,7 @@ with neither interface, shows a few lines of text.
 ## Top lists
 
 Two rankings for the home page, each off by default and switched on
-separately. With both on they are two tabs.
+separately.
 
 - **Top blockers** (`show_top_blockers`): the 20 accounts that have
   made the most blocks.
@@ -82,8 +82,9 @@ separately. With both on they are two tabs.
   names accounts on the instance's front page; consider whether you
   want that.
 
-Each has two tables side by side, "Last 24 hours" and "All time", with
-ten rows and the other ten behind "Show more".
+They sit side by side on two tabs, "Last 24H" and "All Time"
+(`/?tab=alltime`), each table with ten rows and the other ten behind
+"Show more".
 
 - **They are counted once a day, at 05:00 EST** (10:00 UTC; 06:00
   during daylight time), in the background. The page reads the stored
@@ -92,7 +93,7 @@ ten rows and the other ten behind "Show more".
   within a few minutes. "Most blocked" of all time reads every stored
   block: about a minute and a half, and a few GB of temporary files,
   for 150 million blocks.
-- **"Last 24 hours"** is the day that ended at the last 05:00 EST:
+- **"Last 24H"** is the day that ended at the last 05:00 EST:
   blocks this instance stored during it whose own date is within a day
   of when they arrived, and that are still stored when it is counted.
   Old blocks read by the backfill do not count, nor does a block that

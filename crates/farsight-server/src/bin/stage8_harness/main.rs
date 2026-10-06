@@ -2034,8 +2034,8 @@ fn top_rows(table: &str) -> Vec<(String, i64)> {
         .collect()
 }
 
-/// The two tables of a top list's tab, the last day then all time, each
-/// with the rows behind "Show more" after its first ten.
+/// The two tables of a period's tab, top blockers then most blocked,
+/// each with the rows behind "Show more" after its first ten.
 fn top_tables(home: &str, id: &str) -> Vec<Vec<(String, i64)>> {
     let Some(i) = home.find(&format!("<section id=\"{id}\"")) else {
         return Vec::new();
@@ -2135,9 +2135,9 @@ async fn check_top_lists(
     )
     .await?;
     let home = a.get("/").await?;
-    let other = a.get("/?tab=topblocked").await?;
-    let blockers = top_tables(&home.text, "topblockers");
-    let blocked = top_tables(&home.text, "topblocked");
+    let other = a.get("/?tab=alltime").await?;
+    let day = top_tables(&home.text, "lastday");
+    let all = top_tables(&home.text, "alltime");
     let ranked = |t: &Vec<(String, i64)>| {
         !t.is_empty() && t.len() <= 20 && t.windows(2).all(|w| w[0].1 >= w[1].1) && t[0].1 > 0
     };
@@ -2173,41 +2173,42 @@ async fn check_top_lists(
     )
     .await?;
     c.check(
-        "switched on (saved from Settings, no restart): within the task's next look the four lists are stored for the day that ended at 05:00 EST; the home page has a tab for each ranking, the first in view and ?tab=topblocked the other; each tab has two tables, the last day and all time, at most 20 rows each, largest count first, with no description and one line naming the day",
+        "switched on (saved from Settings, no restart): within the task's next look the four lists are stored for the day that ended at 05:00 EST; the home page has a tab for each period, \"Last 24H\" in view and ?tab=alltime the other; each tab has two tables, top blockers and most blocked, at most 20 rows each, largest count first, with no description and one line naming the day",
         saved.status < 400
             && lists == 4
-            && blockers.len() == 2
-            && blocked.len() == 2
-            && blockers.iter().chain(blocked.iter()).all(ranked)
-            && home.text.contains("data-active=\"topblockers\"")
-            && other.text.contains("data-active=\"topblocked\"")
-            && home.text.contains("data-tab=\"topblocked\"")
+            && day.len() == 2
+            && all.len() == 2
+            && day.iter().chain(all.iter()).all(ranked)
+            && home.text.contains("data-active=\"lastday\"")
+            && other.text.contains("data-active=\"alltime\"")
+            && home.text.contains(">Last 24H</a>")
+            && home.text.contains(">All Time</a>")
             && !home.text.contains("top-note")
             && home.text.contains("Last counted for the day up to <time datetime=\""),
         format!(
             "{lists} lists after {} s; rows {:?} and {:?}",
             started.elapsed().as_secs(),
-            blockers.iter().map(Vec::len).collect::<Vec<_>>(),
-            blocked.iter().map(Vec::len).collect::<Vec<_>>()
+            day.iter().map(Vec::len).collect::<Vec<_>>(),
+            all.iter().map(Vec::len).collect::<Vec<_>>()
         ),
     );
     let lead = |t: &[Vec<(String, i64)>], i: usize| t.get(i).and_then(|t| t.first()).cloned();
     c.check(
         "each table leads with the right account and number: the most blocks made and received in that day, and of all time; a block logged after the day ended does not count, nor one that is no longer stored",
-        lead(&blockers, 0) == Some(day_blocks.clone())
-            && lead(&blocked, 0) == Some(day_blocked.clone())
-            && lead(&blockers, 1) == Some(all_blocks.clone())
-            && lead(&blocked, 1) == Some(all_blocked.clone())
-            && !blockers.iter().flatten().any(|r| r.0 == phantom),
+        lead(&day, 0) == Some(day_blocks.clone())
+            && lead(&day, 1) == Some(day_blocked.clone())
+            && lead(&all, 0) == Some(all_blocks.clone())
+            && lead(&all, 1) == Some(all_blocked.clone())
+            && !day.iter().flatten().any(|r| r.0 == phantom),
         format!(
             "day {:?} / {:?}, expected {day_blocks:?} / {day_blocked:?}; all time {:?} / {:?}, expected {all_blocks:?} / {all_blocked:?}",
-            lead(&blockers, 0),
-            lead(&blocked, 0),
-            lead(&blockers, 1),
-            lead(&blocked, 1)
+            lead(&day, 0),
+            lead(&day, 1),
+            lead(&all, 0),
+            lead(&all, 1)
         ),
     );
-    let long = blockers.iter().chain(blocked.iter()).any(|t| t.len() > 10);
+    let long = day.iter().chain(all.iter()).any(|t| t.len() > 10);
     c.check(
         "a table shows ten rows; the rest are behind \"Show more\", which only a table of more than ten has",
         long == home.text.contains("<details class=\"top-more\">")

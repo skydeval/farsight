@@ -710,9 +710,11 @@ struct TopRow {
     count: String,
 }
 
-/// One top list: a period's ranking.
+/// One top list: a ranking for a period.
 struct TopTable {
-    period: &'static str,
+    title: &'static str,
+    /// What the number counts.
+    unit: &'static str,
     /// The first ten.
     rows: Vec<TopRow>,
     /// The rest, behind "Show more".
@@ -721,20 +723,14 @@ struct TopTable {
     empty: &'static str,
 }
 
-/// The two lists of one ranking, the last 24 hours and all time: one
-/// tab of the home page.
+/// The rankings of one period, side by side: one tab of the home page.
 struct TopGroup {
     id: &'static str,
-    /// What the number counts.
-    unit: &'static str,
     tables: Vec<TopTable>,
 }
 
 /// The home page's tabs, first to last.
-const HOME_TABS: [(&str, &str); 2] = [
-    ("topblockers", "Top blockers"),
-    ("topblocked", "Most blocked"),
-];
+const HOME_TABS: [(&str, &str); 2] = [("lastday", "Last 24H"), ("alltime", "All Time")];
 
 /// The home page's top lists, as stored by the background task, the end
 /// of the day they were counted for, and how many of their accounts are
@@ -808,10 +804,15 @@ async fn top_groups(
             .collect();
         let more = rows.split_off(rows.len().min(super::top::FIRST));
         Some(TopTable {
-            period: if matches!(kind, Kind::BlockersDay | Kind::BlockedDay) {
-                "Last 24 hours"
+            title: if kind.blockers() {
+                "Top blockers"
             } else {
-                "All time"
+                "Most blocked"
+            },
+            unit: if kind.blockers() {
+                "Blocks"
+            } else {
+                "Blockers"
             },
             rows,
             more,
@@ -822,32 +823,28 @@ async fn top_groups(
             },
         })
     };
-    let mut groups = Vec::new();
-    if p.show_top_blockers {
-        groups.push(TopGroup {
+    // A switch that is off has no stored list here, so no table.
+    let groups = vec![
+        TopGroup {
             id: HOME_TABS[0].0,
-            unit: "Blocks",
-            tables: [Kind::BlockersDay, Kind::BlockersAll]
+            tables: [Kind::BlockersDay, Kind::BlockedDay]
                 .into_iter()
                 .filter_map(&mut table)
                 .collect(),
-        });
-    }
-    if p.show_top_blocked {
-        groups.push(TopGroup {
+        },
+        TopGroup {
             id: HOME_TABS[1].0,
-            unit: "Blockers",
-            tables: [Kind::BlockedDay, Kind::BlockedAll]
+            tables: [Kind::BlockersAll, Kind::BlockedAll]
                 .into_iter()
                 .filter_map(&mut table)
                 .collect(),
-        });
-    }
+        },
+    ];
     asked.submit(r.st);
     Ok((groups, day, held))
 }
 
-/// `/`. `q` may name the top list in view (`?tab=topblocked`).
+/// `/`. `q` may name the top lists' period in view (`?tab=alltime`).
 pub async fn home(r: &Req<'_>, q: &Params) -> Result<Response, Fail> {
     let cfg = r.config();
     let (_slot, _permit) = r.render_slots().await?;

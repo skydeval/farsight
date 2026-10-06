@@ -655,8 +655,8 @@ nav.tabs a.tab.active {
 .tabbed[data-active="blockinglists"] > #blockinglists,
 .tabbed[data-active="members"] > #members,
 .tabbed[data-active="subscribers"] > #subscribers,
-.tabbed[data-active="topblockers"] > #topblockers,
-.tabbed[data-active="topblocked"] > #topblocked,
+.tabbed[data-active="lastday"] > #lastday,
+.tabbed[data-active="alltime"] > #alltime,
 .tabbed[data-active="history"] > #history {
   display: block;
 }
@@ -835,9 +835,8 @@ dl.home-totals dd {
   color: var(--fg-strong);
   font-variant-numeric: tabular-nums;
 }
-/* The home page's top lists: a tab for each ranking, and in it the
-   last day and all time side by side (one under the other on a narrow
-   screen). Each shows ten rows; the rest open under them. */
+/* The home page's top lists: a tab for each period, and in it the two
+   rankings side by side (one under the other on a narrow screen). Each shows ten rows; the rest open under them. */
 .top-lists {
   max-width: 60rem;
   margin: 0 auto 2.5rem;
@@ -845,23 +844,20 @@ dl.home-totals dd {
 .top-group {
   padding: 1.25rem 1.5rem 1.4rem;
 }
-.top-group .top-title {
-  margin: 0 0 1rem;
-  font-size: 1.15rem;
-  color: var(--fg-strong);
-}
 .top-pair {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 1.5rem 2.5rem;
   align-items: start;
 }
+.top-pair.single {
+  grid-template-columns: minmax(0, 30rem);
+  justify-content: center;
+}
 .top-list h3 {
-  margin: 0 0 0.4rem;
-  font-size: 0.78rem;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--muted);
+  margin: 0 0 0.5rem;
+  font-size: 1.05rem;
+  color: var(--fg-strong);
 }
 .top-table {
   table-layout: fixed;

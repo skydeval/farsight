@@ -31,10 +31,10 @@ commits it covers.
 
 ### Added
 
-- Public home page: "Top blockers" and "Most blocked", on two tabs.
-  Each shows the 20 accounts with the most blocks made or received,
-  for the last day and for all time, side by side: ten rows, and ten
-  more behind "Show more". The lists are counted once a day, at 05:00
+- Public home page: "Top blockers" and "Most blocked", side by side,
+  on two tabs: "Last 24H" and "All Time". Each lists the 20 accounts
+  with the most blocks made or received: ten rows, and ten more behind
+  "Show more". The lists are counted once a day, at 05:00
   EST, in the background; the page reads the stored result. Both are
   off by default and switched on separately in Settings → Public UI
   (`show_top_blockers`, `show_top_blocked`). Schema version 13.

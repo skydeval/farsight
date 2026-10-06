@@ -56,7 +56,7 @@ how long, or how to reach you about their data, say it here.</div>
 <div class="hint">"Top blockers": the 20 accounts that made the most blocks, for the last day and for all time, ten shown and ten behind "Show more". Counted once a day, at 05:00 EST; the first lists appear within a few minutes of saving.</div>
 
 <label><input type="checkbox" name="show_top_blocked"{% if p.show_top_blocked %} checked{% endif %}> List the accounts that are blocked the most on the home page (<code>show_top_blocked</code>)</label>
-<div class="hint">"Most blocked": the 20 accounts that the most others block directly, for the last day and for all time, on a tab beside "Top blockers". This names accounts on the instance's front page; consider whether you want that. Counting the all-time list reads every stored block, which takes a minute or two.</div>
+<div class="hint">"Most blocked": the 20 accounts that the most others block directly, for the last day and for all time, beside "Top blockers". This names accounts on the instance's front page; consider whether you want that. Counting the all-time list reads every stored block, which takes a minute or two.</div>
 
 <label for="record_viewer_url">Record viewer URL (<code>record_viewer_url</code>)</label>
 <input type="text" id="record_viewer_url" name="record_viewer_url" maxlength="500" spellcheck="false" placeholder="https://viewer.example/at/{authority}/{collection}/{rkey}" value="{{ p.record_viewer_url }}">
