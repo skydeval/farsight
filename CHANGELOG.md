@@ -104,9 +104,10 @@ commits it covers.
   lookup's listblocks and stored items). In the Index block a
   figure too long to sit beside its name goes to a line of its own, at
   the right.
-- The default Jetstream is `wss://jetstream.us-east.bsky.network`,
-  Bluesky's public v2 instance, in place of `jetstream2.us-east`, which
-  serves v1 only. The setup wizard's note says which public instances
+- The default Jetstream is Bluesky's two public v2 instances,
+  `wss://jetstream.us-east.bsky.network` and, as its failover,
+  `wss://jetstream.us-west.bsky.network`, in place of
+  `jetstream2.us-east`, which serves v1 only. The setup wizard's note says which public instances
   offer v2. An existing config keeps the address it has.
 - The public list page's tables, the list lookup's facts and
   Operations' API keys are frameless like the other tables.

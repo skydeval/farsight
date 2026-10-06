@@ -22,9 +22,10 @@ The wizard asks for:
 - the setup token;
 - the public hostname and an admin contact;
 - the Jetstream source (it tests the connection and checks for v2
-  support). The default is Bluesky's public v2 instance
-  `wss://jetstream.us-east.bsky.network`;
-  `wss://jetstream.us-west.bsky.network` is the other. On a v1
+  support). The default is Bluesky's two public v2 instances,
+  `wss://jetstream.us-east.bsky.network` and
+  `wss://jetstream.us-west.bsky.network`, one per line: the second
+  takes over if the first fails. On a v1
   instance (Bluesky's older `jetstream1` and `jetstream2`) coverage
   stays `partial`;
 - backfill preferences and the disk space available to Postgres;

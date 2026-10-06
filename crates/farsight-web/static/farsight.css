@@ -1474,6 +1474,20 @@ table.api-usage td.num {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
+/* An endpoint's name is never broken; on a narrow screen the table
+   scrolls sideways inside its block, and the time may take two lines. */
+.api-usage-scroll {
+  overflow-x: auto;
+}
+table.api-usage td:first-child {
+  white-space: nowrap;
+}
+@media (max-width: 44rem) {
+  table.api-usage td.num:last-child {
+    white-space: normal;
+    min-width: 9rem;
+  }
+}
 /* A table of facts has its labels down the side. */
 table.free.facts tr:last-child th {
   border-bottom: 0;

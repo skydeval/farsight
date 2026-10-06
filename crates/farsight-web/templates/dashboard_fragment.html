@@ -60,9 +60,9 @@
 <span>API usage</span>
 </h2>
 <p class="muted">Requests each endpoint has answered{% if let Some(s) = d.api_since %} since this server started, <time datetime="{{ s.iso }}" data-plain>{{ s.text }}</time>{% endif %}. The admin pages' own reads are not counted.</p>
-<table class="free api-usage"><tr><th>Endpoint</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">Rate limited</th><th class="num">Last called</th></tr>
+<div class="api-usage-scroll"><table class="free api-usage"><tr><th>Endpoint</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">Rate limited</th><th class="num">Last called</th></tr>
 {% for a in d.api %}<tr{% if !a.used %} class="unused"{% endif %}><td><code>{{ a.name }}</code></td><td class="num">{{ a.requests }}</td><td class="num">{{ a.errors }}</td><td class="num">{{ a.limited }}</td><td class="num">{% if let Some(t) = a.last %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% else %}never{% endif %}</td></tr>
-{% endfor %}</table>
+{% endfor %}</table></div>
 </div>
 <div class="card">
 <h2>

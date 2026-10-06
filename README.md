@@ -74,8 +74,8 @@ docker logs farsight          # copy the setup token printed at startup
 
 The wizard asks for the public hostname, the Jetstream source, backfill
 preferences, who may read the API and which web interfaces to serve,
-then writes the config and starts ingesting. The default Jetstream is
-Bluesky's public v2 instance.
+then writes the config and starts ingesting. The default Jetstream
+source is Bluesky's two public v2 instances.
 
 Hardware: 4 vCPU, 8 GB RAM and a 500 GB SSD are recommended; a 100 GB
 disk is supported with limits.
