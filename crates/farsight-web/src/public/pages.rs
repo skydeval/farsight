@@ -698,8 +698,6 @@ struct HomePage {
     /// Their tabs, and the one in view.
     tabs: Vec<Tab>,
     active: &'static str,
-    /// The end of the day they were counted for.
-    top_day: Option<Stamp>,
     updated: Option<Stamp>,
 }
 
@@ -732,15 +730,14 @@ struct TopGroup {
 /// The home page's tabs, first to last.
 const HOME_TABS: [(&str, &str); 2] = [("lastday", "Last 24H"), ("alltime", "All Time")];
 
-/// The home page's top lists, as stored by the background task, the end
-/// of the day they were counted for, and how many of their accounts are
-/// still waiting for a handle check. The
+/// The home page's top lists, as stored by the background task, and how
+/// many of their accounts are still waiting for a handle check. The
 /// page's own rule applies to the rows: excluded, deactivated, deleted
 /// and taken-down accounts are left out, and the next ones move up.
 async fn top_groups(
     r: &Req<'_>,
     cfg: &farsight_core::Config,
-) -> Result<(Vec<TopGroup>, Option<Stamp>, usize), Fail> {
+) -> Result<(Vec<TopGroup>, usize), Fail> {
     use farsight_storage::top::{self, Kind};
     let p = &cfg.public_ui;
     let wanted = |k: Kind| {
@@ -751,7 +748,7 @@ async fn top_groups(
         }
     };
     if !Kind::ALL.into_iter().any(wanted) {
-        return Ok((Vec::new(), None, 0));
+        return Ok((Vec::new(), 0));
     }
     let mut stored = Vec::new();
     {
@@ -773,11 +770,6 @@ async fn top_groups(
     let shown = Shown::load(r, &withheld, dids, false).await?;
     let mut asked = Asked::new(cfg);
     let mut held = 0;
-    let day = stored
-        .iter()
-        .filter_map(|(_, s)| s.as_ref().map(|s| s.day_end))
-        .max()
-        .map(Stamp::of);
     let mut table = |kind: Kind| -> Option<TopTable> {
         let (_, list) = stored.iter().find(|(k, _)| *k == kind)?;
         let mut rows: Vec<TopRow> = list
@@ -841,7 +833,7 @@ async fn top_groups(
         },
     ];
     asked.submit(r.st);
-    Ok((groups, day, held))
+    Ok((groups, held))
 }
 
 /// `/`. `q` may name the top lists' period in view (`?tab=alltime`).
@@ -852,7 +844,7 @@ pub async fn home(r: &Req<'_>, q: &Params) -> Result<Response, Fail> {
         .await?
         .body;
     let description = paragraphs(&cfg.public_ui.instance_description);
-    let (top, top_day, held) = top_groups(r, cfg).await?;
+    let (top, held) = top_groups(r, cfg).await?;
     let shown: Vec<(&'static str, &'static str)> = HOME_TABS
         .into_iter()
         .filter(|(id, _)| top.iter().any(|g| g.id == *id))
@@ -881,7 +873,6 @@ pub async fn home(r: &Req<'_>, q: &Params) -> Result<Response, Fail> {
             top,
             tabs,
             active,
-            top_day,
             updated: last_updated(&[&stats["freshness"]]),
         },
         StatusCode::OK,

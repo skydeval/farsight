@@ -59,7 +59,6 @@
 {% endfor %}</div>
 </section>
 {% endfor %}</div>
-{% if let Some(s) = top_day %}<p class="top-asof">Counted once a day, at 05:00 EST. Last counted for the day up to <time datetime="{{ s.iso }}">{{ s.text }}</time>.</p>{% endif %}
 </div>
 {% endif %}{% endblock %}
 {% block updated %}{% if let Some(t) = updated %}<div class="pill footer-updated updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}{% endblock %}

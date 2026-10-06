@@ -2173,7 +2173,7 @@ async fn check_top_lists(
     )
     .await?;
     c.check(
-        "switched on (saved from Settings, no restart): within the task's next look the four lists are stored for the day that ended at 05:00 EST; the home page has a tab for each period, \"Last 24H\" in view and ?tab=alltime the other; each tab has two tables, top blockers and most blocked, at most 20 rows each, largest count first, with no description and one line naming the day",
+        "switched on (saved from Settings, no restart): within the task's next look the four lists are stored for the day that ended at 05:00 EST; the home page has a tab for each period, \"Last 24H\" in view and ?tab=alltime the other; each tab has two tables, top blockers and most blocked, at most 20 rows each, largest count first, with no description and no line about when they are counted",
         saved.status < 400
             && lists == 4
             && day.len() == 2
@@ -2184,7 +2184,7 @@ async fn check_top_lists(
             && home.text.contains(">Last 24H</a>")
             && home.text.contains(">All Time</a>")
             && !home.text.contains("top-note")
-            && home.text.contains("Last counted for the day up to <time datetime=\""),
+            && !home.text.contains("top-asof"),
         format!(
             "{lists} lists after {} s; rows {:?} and {:?}",
             started.elapsed().as_secs(),

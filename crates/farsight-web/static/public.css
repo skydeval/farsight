@@ -926,16 +926,10 @@ details.top-more[open] {
 details.top-more[open] > table {
   animation: guide-open 0.2s ease-out;
 }
-.top-list .top-empty, .top-lists .top-asof {
-  color: var(--muted);
-  font-size: 0.82rem;
-}
 .top-list .top-empty {
   margin: 0.6rem 0 0;
-}
-.top-lists .top-asof {
-  margin: 0.9rem 0 0;
-  text-align: center;
+  color: var(--muted);
+  font-size: 0.82rem;
 }
 @media (max-width: 44rem) {
   .top-pair {

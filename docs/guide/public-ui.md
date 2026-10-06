@@ -88,7 +88,7 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
 
 - **They are counted once a day, at 05:00 EST** (10:00 UTC; 06:00
   during daylight time), in the background. The page reads the stored
-  result and says which day it was counted for. Nothing is counted
+  result. Nothing is counted
   while both switches are off; after switching one on, the lists appear
   within a few minutes. "Most blocked" of all time reads every stored
   block: about a minute and a half, and a few GB of temporary files,
