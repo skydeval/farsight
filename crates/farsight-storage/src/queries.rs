@@ -138,8 +138,14 @@ pub struct IncomingListBlock {
 }
 
 /// One numbered page of [`incoming_list_blocks`], hidden accounts left
-/// out: `limit` rows from `offset`, in the same order. The admin lookup
-/// page turns pages by number.
+/// out: the `limit` listblocks from `offset`, in the same order. The
+/// admin lookup page turns pages by number.
+///
+/// The page is cut from the listblocks before their authors are read:
+/// an account on 400 lists has tens of thousands of listblocks, and
+/// reading every author's row to sort them all took minutes. A hidden
+/// author's listblock is therefore dropped from its page, not replaced,
+/// so a page can hold fewer than `limit` rows.
 pub async fn incoming_list_blocks_at(
     conn: &mut PgConnection,
     subject_id: i64,
@@ -158,15 +164,21 @@ pub async fn incoming_list_blocks_at(
         Option<DateTime<Utc>>,
     );
     let rows: Vec<Row> = sqlx::query_as(&format!(
-        "SELECT l.id, o.did, l.rkey, l.purpose, l.name, b.author_id, ba.did, b.rkey, b.created_at
-         FROM lists l
-         JOIN actors o ON o.id = l.owner_id
-         JOIN list_blocks b ON b.list_id = l.id
-         JOIN actors ba ON ba.id = b.author_id
-         WHERE l.id IN (SELECT li.list_id FROM list_items li WHERE li.subject_id = $1)
-           AND l.track_state IN (2, 3) AND l.record_state = 1
-           AND o.status NOT IN {HIDDEN} AND ba.status NOT IN {HIDDEN}
-         ORDER BY l.id, b.author_id, b.rkey LIMIT $2 OFFSET $3"
+        "SELECT p.id, p.owner_did, p.lrkey, p.purpose, p.name, p.author_id, ba.did, p.rkey,
+                p.created_at
+         FROM (
+           SELECT l.id, o.did AS owner_did, l.rkey AS lrkey, l.purpose, l.name, b.author_id,
+                  b.rkey, b.created_at
+           FROM lists l
+           JOIN actors o ON o.id = l.owner_id
+           JOIN list_blocks b ON b.list_id = l.id
+           WHERE l.id IN (SELECT li.list_id FROM list_items li WHERE li.subject_id = $1)
+             AND l.track_state IN (2, 3) AND l.record_state = 1
+             AND o.status NOT IN {HIDDEN}
+           ORDER BY l.id, b.author_id, b.rkey LIMIT $2 OFFSET $3) p
+         JOIN actors ba ON ba.id = p.author_id
+         WHERE ba.status NOT IN {HIDDEN}
+         ORDER BY p.id, p.author_id, p.rkey"
     ))
     .bind(subject_id)
     .bind(limit)
@@ -195,8 +207,9 @@ pub async fn incoming_list_blocks_at(
         .collect())
 }
 
-/// How many rows [`incoming_list_blocks_at`] pages over, counted up to
-/// `cap + 1`.
+/// How many listblocks [`incoming_list_blocks_at`] pages through, up to
+/// `cap`. It counts the listblocks, not their authors' rows, so those
+/// of a hidden author are counted though their rows are not shown.
 pub async fn incoming_list_blocks_count(
     conn: &mut PgConnection,
     subject_id: i64,
@@ -207,10 +220,9 @@ pub async fn incoming_list_blocks_count(
            SELECT 1 FROM lists l
            JOIN actors o ON o.id = l.owner_id
            JOIN list_blocks b ON b.list_id = l.id
-           JOIN actors ba ON ba.id = b.author_id
            WHERE l.id IN (SELECT li.list_id FROM list_items li WHERE li.subject_id = $1)
              AND l.track_state IN (2, 3) AND l.record_state = 1
-             AND o.status NOT IN {HIDDEN} AND ba.status NOT IN {HIDDEN}
+             AND o.status NOT IN {HIDDEN}
            LIMIT $2) x"
     ))
     .bind(subject_id)

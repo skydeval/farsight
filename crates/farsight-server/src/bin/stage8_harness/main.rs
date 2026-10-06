@@ -2211,12 +2211,12 @@ async fn check_top_lists(
     let long = day.iter().chain(all.iter()).any(|t| t.len() > 10);
     c.check(
         "a table shows ten rows; the rest are behind \"Show more\", which only a table of more than ten has",
-        long == home.text.contains("<details class=\"top-more\">")
+        long == home.text.contains("class=\"top-more-toggle")
             && home
                 .text
                 .split("<div class=\"top-list\">")
                 .skip(1)
-                .all(|t| top_rows(t.split("<details").next().unwrap_or("")).len() <= 10),
+                .all(|t| top_rows(t.split("top-more-toggle").next().unwrap_or("")).len() <= 10),
         format!("a table of more than ten: {long}"),
     );
     let off = save(false).await?;

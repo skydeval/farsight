@@ -21,6 +21,13 @@ commits it covers.
 
 ### Fixed
 
+- The admin DID lookup no longer times out on an account that is on
+  hundreds of lists. Its "Incoming listblocks" table read every
+  listblock's author before cutting a page; it now cuts the page first.
+  A listblock of a deactivated or deleted account is left off its page
+  and still counted in the heading.
+- Home page top lists: "Show fewer" sits under the extra rows, not
+  between them and the first ten.
 - While a repair cycle is running, the gap alert says so, with how
   many accounts it has re-read, where it used to keep telling you to
   start one. Operations says a repair is already running when asked

@@ -867,6 +867,9 @@ dl.home-totals dd {
   font-size: 1.05rem;
   color: var(--fg-strong);
 }
+.top-list {
+  position: relative;
+}
 .top-table {
   table-layout: fixed;
 }
@@ -887,17 +890,22 @@ dl.home-totals dd {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-details.top-more {
-  border-top: 1px solid var(--line);
+/* The rest of a list: a checkbox the reader does not see, the rows it
+   shows, and under them its label, drawn as the button. */
+.top-more-toggle:not(:checked) + .top-more-rows {
+  display: none;
 }
-details.top-more > summary {
+.top-more-rows {
+  border-top: 1px solid var(--line);
+  animation: guide-open 0.2s ease-out;
+}
+label.top-more {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
   margin-top: 0.55rem;
   padding: 0.25rem 0.7rem;
   cursor: pointer;
-  list-style: none;
   user-select: none;
   font-size: 0.82rem;
   font-weight: 600;
@@ -906,33 +914,24 @@ details.top-more > summary {
   border-radius: var(--radius-full);
   background: var(--pill);
 }
-details.top-more > summary::-webkit-details-marker {
-  display: none;
-}
-details.top-more > summary:hover, details.top-more[open] > summary {
+label.top-more:hover, .top-more-toggle:checked ~ label.top-more {
   color: var(--accent);
 }
-details.top-more .guide-arrow {
+.top-more-toggle:focus-visible ~ label.top-more {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+label.top-more .guide-arrow {
   transition: transform 0.2s ease;
 }
-details.top-more .when-open, details.top-more[open] .when-closed {
+.top-more-toggle:checked ~ label.top-more .guide-arrow {
+  transform: rotate(-90deg);
+}
+label.top-more .when-open, .top-more-toggle:checked ~ label.top-more .when-closed {
   display: none;
 }
-details.top-more[open] .when-open {
+.top-more-toggle:checked ~ label.top-more .when-open {
   display: inline;
-}
-details.top-more[open] .guide-arrow {
-  transform: rotate(90deg);
-}
-/* Open, the rest follows the first ten and the button goes under it. */
-details.top-more[open] {
-  display: flex;
-  flex-direction: column-reverse;
-  align-items: flex-start;
-  border-top: 0;
-}
-details.top-more[open] > table {
-  animation: guide-open 0.2s ease-out;
 }
 .top-list .top-empty {
   margin: 0.6rem 0 0;
@@ -948,8 +947,8 @@ details.top-more[open] > table {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  details.top-more .guide-arrow { transition: none; }
-  details.top-more[open] > table { animation: none; }
+  label.top-more .guide-arrow { transition: none; }
+  .top-more-rows { animation: none; }
 }
 /* The guide: a heading that opens and closes it, with an arrow that
    turns. In place on the home page; in the bar on the other pages,

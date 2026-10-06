@@ -47,14 +47,13 @@
 {% for r in t.rows %}<tr class="data-row{% if r.who.tag.is_some() %} tagged{% endif %}"><td class="td-rank">{{ r.rank }}</td><td class="td-account">{{ r.who|safe }}</td><td class="td-count">{{ r.count }}</td></tr>
 {% endfor %}</tbody>
 </table>
-{% if !t.more.is_empty() %}<details class="top-more">
-<summary><svg class="guide-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 6 15 12 9 18"/></svg><span class="when-closed">Show {{ t.more.len() }} more</span><span class="when-open">Show fewer</span></summary>
-<table class="data-table free top-table" aria-label="{{ t.title }}, continued">
+{% if !t.more.is_empty() %}<input type="checkbox" class="top-more-toggle sr-only" id="more-{{ g.id }}-{{ loop.index }}" aria-label="Show the next {{ t.more.len() }} of {{ t.title }}">
+<table class="data-table free top-table top-more-rows" aria-label="{{ t.title }}, continued">
 <tbody>
 {% for r in t.more %}<tr class="data-row{% if r.who.tag.is_some() %} tagged{% endif %}"><td class="td-rank">{{ r.rank }}</td><td class="td-account">{{ r.who|safe }}</td><td class="td-count">{{ r.count }}</td></tr>
 {% endfor %}</tbody>
 </table>
-</details>{% endif %}{% endif %}
+<label class="top-more" for="more-{{ g.id }}-{{ loop.index }}"><svg class="guide-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 6 15 12 9 18"/></svg><span class="when-closed">Show {{ t.more.len() }} more</span><span class="when-open">Show fewer</span></label>{% endif %}{% endif %}
 </div>
 {% endfor %}</div>
 </section>
