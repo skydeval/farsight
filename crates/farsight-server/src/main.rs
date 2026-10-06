@@ -178,18 +178,15 @@ fn set_admin_did_command(args: &[String]) -> ExitCode {
         }
     };
     let env: Vec<(String, String)> = std::env::vars().collect();
-    let keep_password = env
-        .iter()
-        .any(|(k, v)| k == "FARSIGHT__AUTH__ADMIN_PASSWORD_BCRYPT" && !v.is_empty());
-    let edit = match config::set_admin_did(&text, did, keep_password) {
-        Ok(e) => e,
+    let new_text = match config::set_admin_did(&text, did) {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("{}: {e}", path.display());
             return ExitCode::from(1);
         }
     };
     // The file need not load before the edit; the result must.
-    let loaded = match config::load_from_parts(Some(&edit.text), &env) {
+    let loaded = match config::load_from_parts(Some(&new_text), &env) {
         Ok(l) => l,
         Err(e) => {
             eprintln!(
@@ -213,22 +210,7 @@ fn set_admin_did_command(args: &[String]) -> ExitCode {
         }
         eprintln!("warning: {did} could not be resolved ({e}); setting it anyway (--force)");
     }
-    if edit.was_migration {
-        let backup = config::pre_oauth_backup_path(&path);
-        if let Err(e) = config::write_replace(&backup, &text) {
-            eprintln!(
-                "writing {} failed: {e}. Nothing was changed.",
-                backup.display()
-            );
-            return ExitCode::from(1);
-        }
-        println!(
-            "The previous configuration was kept as {} (it holds the old password hash; delete \
-             it once sign-in works).",
-            backup.display()
-        );
-    }
-    if let Err(e) = config::write_replace(&path, &edit.text) {
+    if let Err(e) = config::write_replace(&path, &new_text) {
         eprintln!(
             "writing {} failed: {e}. Nothing was changed.",
             path.display()
@@ -239,9 +221,6 @@ fn set_admin_did_command(args: &[String]) -> ExitCode {
     match identity.ok().and_then(|i| i.handle) {
         Some(h) => println!("Handle: @{h}"),
         None => println!("Handle: none verified"),
-    }
-    if edit.removed_password {
-        println!("The retired admin password was removed from the file.");
     }
     println!();
     println!("Restart farsight to apply (`docker restart farsight`).");

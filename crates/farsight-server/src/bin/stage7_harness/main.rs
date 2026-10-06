@@ -8,8 +8,8 @@
 //!
 //! Sections:
 //!
-//! - 1: config: admin DID syntax, the three states, the retired `ui` key,
-//!   the public UI's independence of `admin_ui`;
+//! - 1: config: admin DID syntax, the three states, the public UI's
+//!   independence of `admin_ui`;
 //! - 2: client modes and the client metadata document;
 //! - 3: a loopback sign-in end to end, and the requests it made;
 //! - 4: a hosted sign-in end to end (client metadata without
@@ -17,9 +17,9 @@
 //! - 5: DPoP nonces; 6: the callback's checks, in order;
 //! - 7: flow lifetime; 8: `gate` and `/robots.txt` by configuration;
 //! - 9: rate limits; 10: Settings;
-//! - 11: migration from a password; 12: the CLI, and a changed admin DID;
-//! - 13: what is logged and what never is; 14: rollback;
-//! - 15: the browser (`--browser`): the session cookie after the callback
+//! - 11: no admin DID; 12: the CLI, and a changed admin DID;
+//! - 13: what is logged and what never is;
+//! - 14: the browser (`--browser`): the session cookie after the callback
 //!   page, in Chromium, Firefox and WebKit.
 //!
 //! `--keep` keeps the Postgres container.
@@ -56,7 +56,6 @@ const D1: &str = "did:plc:adminoneaaaaaaaaaaaaaaaa";
 const D2: &str = "did:plc:admintwoaaaaaaaaaaaaaaaa";
 const OTHER: &str = "did:plc:someoneelseaaaaaaaaaaaaa";
 const UNKNOWN: &str = "did:plc:unknownaaaaaaaaaaaaaaaaa";
-const PASSWORD: &str = "harness-password-123";
 const REFUSED: &str = "Sign-in did not complete. Start again.";
 const BROWSER_IMAGE: &str = "mcr.microsoft.com/playwright:v1.48.0-jammy";
 const BROWSER_SCRIPT: &str = include_str!("../../../../../scripts/stage7-browser-probes.mjs");
@@ -66,7 +65,7 @@ fn hex(b: &[u8]) -> String {
 }
 
 /// A `config.toml` for the harness.
-fn config_toml(dsn: &str, hostname: &str, standin: &str, access: &str, auth: &str) -> String {
+fn config_toml(dsn: &str, hostname: &str, standin: &str, access: &str) -> String {
     format!(
         r#"[server]
 hostname = "{hostname}"
@@ -91,7 +90,6 @@ reads = "public"
 
 [auth]
 admin_token_sha256 = "{}"
-{auth}
 
 [metrics]
 bind = "127.0.0.1:{}"
@@ -270,8 +268,8 @@ impl Ctx {
         }
     }
 
-    fn config(&self, hostname: &str, access: &str, auth: &str) -> String {
-        config_toml(&self.dsn, hostname, &self.standin.base, access, auth)
+    fn config(&self, hostname: &str, access: &str) -> String {
+        config_toml(&self.dsn, hostname, &self.standin.base, access)
     }
 
     fn retire(&self, mut s: Srv) {
@@ -443,12 +441,12 @@ fn query_of(url: &str, key: &str) -> Option<String> {
 
 fn check_config(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     c.section("1. config: the admin DID and the three states");
-    let load = |access: &str, auth: &str, env: &[(&str, &str)]| {
+    let load = |access: &str, env: &[(&str, &str)]| {
         let env: Vec<(String, String)> = env
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
-        config::load_from_parts(Some(&ctx.config(HOSTNAME, access, auth)), &env)
+        config::load_from_parts(Some(&ctx.config(HOSTNAME, access)), &env)
     };
     let bad: Vec<&str> = [
         "alice.example",
@@ -461,53 +459,41 @@ fn check_config(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     ]
     .into_iter()
     .filter(|d| {
-        !load(&format!("admin_did = \"{d}\""), "", &[])
+        !load(&format!("admin_did = \"{d}\""), &[])
             .err()
             .is_some_and(|e| e.to_string().contains("access.admin_did"))
     })
     .collect();
     let good: Vec<&str> = [D1, "did:web:alice.example"]
         .into_iter()
-        .filter(|d| load(&format!("admin_did = \"{d}\""), "", &[]).is_err())
+        .filter(|d| load(&format!("admin_did = \"{d}\""), &[]).is_err())
         .collect();
     c.check(
         "a malformed access.admin_did fails the load, naming the key (a handle, a short or upper-case did:plc, a did:web with a port or a path, another method); did:plc and did:web load",
         bad.is_empty() && good.is_empty(),
         format!("accepted {bad:?}; refused {good:?}"),
     );
-    let hash = bcrypt::hash(PASSWORD, 4).map_err(|e| e.to_string())?;
-    let pw = format!("admin_password_bcrypt = \"{hash}\"");
-    let migration = load("", &pw, &[]);
-    let unconfigured = load("", "", &[]);
-    let configured = load(&format!("admin_did = \"{D1}\""), &pw, &[]);
-    let from_env = load("", &pw, &[("FARSIGHT__ACCESS__ADMIN_DID", D1)]);
-    let disabled = load("admin_ui = false", "", &[]);
+    let unconfigured = load("", &[]);
+    let configured = load(&format!("admin_did = \"{D1}\""), &[]);
+    let from_env = load("", &[("FARSIGHT__ACCESS__ADMIN_DID", D1)]);
+    let disabled = load("admin_ui = false", &[]);
     let state = |r: &Result<config::LoadedConfig, config::ConfigError>| {
         r.as_ref().ok().map(|l| l.admin_auth())
     };
     c.check(
-        "a file with a password and no admin DID loads, in the migration state, with a warning",
-        state(&migration) == Some(AdminAuth::Migration)
-            && migration
-                .as_ref()
-                .is_ok_and(|l| l.warnings.iter().any(|w| w.contains("needs migration"))),
-        format!("{:?}", state(&migration)),
-    );
-    c.check(
-        "a file with neither loads, unconfigured, with a warning; with the admin UI off (admin_ui = false) neither key matters",
+        "a file without an admin DID loads, unconfigured, with a warning; with the admin UI off (admin_ui = false) the admin DID does not matter",
         state(&unconfigured) == Some(AdminAuth::Unconfigured)
             && unconfigured.as_ref().is_ok_and(|l| l.warnings.iter().any(|w| w.contains("not configured")))
             && state(&disabled) == Some(AdminAuth::Disabled),
         format!("{:?} / {:?}", state(&unconfigured), state(&disabled)),
     );
     c.check(
-        "with an admin DID (file or environment) a leftover password is ignored and warned about",
+        "an admin DID, in the file or in the environment, configures sign-in as that DID, with no warning",
         state(&configured) == Some(AdminAuth::Configured(D1.into()))
             && state(&from_env) == Some(AdminAuth::Configured(D1.into()))
-            && [&configured, &from_env].iter().all(|r| {
-                r.as_ref()
-                    .is_ok_and(|l| l.warnings.iter().any(|w| w.contains("ignored")))
-            }),
+            && [&configured, &from_env]
+                .iter()
+                .all(|r| r.as_ref().is_ok_and(|l| l.warnings.is_empty())),
         format!("{:?} / {:?}", state(&configured), state(&from_env)),
     );
     let env_only = config::load_from_parts(
@@ -517,53 +503,24 @@ fn check_config(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             ("FARSIGHT__SERVER__CONTACT", "mailto:x@h.test"),
             ("FARSIGHT__STORAGE__DATABASE_URL", "postgres://x"),
             ("FARSIGHT__AUTH__ADMIN_TOKEN_SHA256", &"0".repeat(64)),
-            ("FARSIGHT__AUTH__ADMIN_PASSWORD_BCRYPT", &hash),
         ]
         .map(|(k, v)| (k.to_owned(), v.to_owned())),
     );
     c.check(
-        "an env-only config with a password and no admin DID loads (no crash on upgrade) and is unconfigured, never migration",
+        "an env-only config without an admin DID loads and is unconfigured",
         state(&env_only) == Some(AdminAuth::Unconfigured),
-        format!("{:?}", env_only.as_ref().map(|l| l.admin_auth()).map_err(ToString::to_string)),
-    );
-    // The retired key: accepted, warned about, and read only for
-    // "disabled" when `admin_ui` is not in the file.
-    let retired = |access: &str| {
-        load(access, "", &[]).ok().map(|l| {
-            (
-                l.config.access.admin_ui,
-                l.warnings
-                    .iter()
-                    .any(|w| w.contains("`access.ui` is retired")),
-            )
-        })
-    };
-    let old = [
-        retired(&format!("ui = \"public_read\"\nadmin_did = \"{D1}\"")),
-        retired(&format!("ui = \"auth_all\"\nadmin_did = \"{D1}\"")),
-        retired("ui = \"disabled\""),
-        retired(&format!(
-            "ui = \"disabled\"\nadmin_ui = true\nadmin_did = \"{D1}\""
-        )),
-        retired("ui = \"public_read\"\nadmin_ui = false"),
-    ];
-    c.check(
-        "the retired access.ui still loads, with a warning: public_read and auth_all leave the admin UI on, \"disabled\" turns it off — unless admin_ui is in the file, which then decides",
-        old == [
-            Some((true, true)),
-            Some((true, true)),
-            Some((false, true)),
-            Some((true, true)),
-            Some((false, true)),
-        ] && load("admin_ui = true", "", &[])
-            .is_ok_and(|l| !l.warnings.iter().any(|w| w.contains("access.ui"))),
-        format!("{old:?}"),
+        format!(
+            "{:?}",
+            env_only
+                .as_ref()
+                .map(|l| l.admin_auth())
+                .map_err(ToString::to_string)
+        ),
     );
     let mut combos = Vec::new();
     for admin_ui in [true, false] {
         if let Err(e) = load(
             &format!("admin_ui = {admin_ui}\npublic_ui = true\nadmin_did = \"{D1}\""),
-            "",
             &[],
         ) {
             combos.push(format!("admin_ui = {admin_ui}: {e}"));
@@ -571,7 +528,7 @@ fn check_config(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     }
     for reads in ["api_key", "disabled"] {
         let text = ctx
-            .config(HOSTNAME, "admin_ui = true\npublic_ui = true", "")
+            .config(HOSTNAME, "admin_ui = true\npublic_ui = true")
             .replace("reads = \"public\"", &format!("reads = \"{reads}\""));
         if !config::load_from_parts(Some(&text), &[])
             .err()
@@ -593,7 +550,7 @@ async fn check_process_start(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     let dir = Srv::dir("badcfg")?;
     write_private(
         &dir.join("config.toml"),
-        &ctx.config(HOSTNAME, "admin_did = \"alice.example\"", ""),
+        &ctx.config(HOSTNAME, "admin_did = \"alice.example\""),
     )?;
     let out = Command::new("timeout")
         .arg("20")
@@ -678,7 +635,7 @@ async fn check_modes(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<(), String> {
     let button =
         |r: &Resp| r.text.contains("Sign in with ATProto") && r.text.contains("action=\"/enter\"");
     c.check(
-        "/enter has the sign-in button on the hostname and on 127.0.0.1; one button, no password or handle field; never cached",
+        "/enter has the sign-in button on the hostname and on 127.0.0.1; one button, no input field; never cached",
         hosted.status == 200
             && loop_page.status == 200
             && button(&hosted)
@@ -730,7 +687,7 @@ async fn check_unhostable(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     for hostname in ["203.0.113.7", "farsight", "farsight.test:8443"] {
         let s = Srv::with_config(
             "ip",
-            &ctx.config(hostname, &format!("admin_did = \"{D1}\""), ""),
+            &ctx.config(hostname, &format!("admin_did = \"{D1}\"")),
             &[],
         )
         .await?;
@@ -745,21 +702,24 @@ async fn check_unhostable(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             .get(&format!("{}/enter", s.base), &[("host", hostname)])
             .await?;
         let loop_page = http.get(&format!("{}/enter", s.base), &[]).await?;
+        let signed = ctx.sign_in(&s, &ctx.fresh(), &s.loopback()).await?;
         let good = meta.status == 404
             && page.status == 200
             && !page.text.contains("Sign in with ATProto")
             && page.text.contains("cannot be used for ATProto sign-in")
             && !page.text.contains("Sign in at <a")
-            && loop_page.text.contains("Sign in with ATProto");
+            && loop_page.text.contains("Sign in with ATProto")
+            && signed.status == 200
+            && set_cookie(&signed, "farsight_admin").is_some();
         ok &= good;
         detail.push(format!(
-            "{hostname}: metadata {} page {}",
-            meta.status, page.status
+            "{hostname}: metadata {} page {} sign-in {}",
+            meta.status, page.status, signed.status
         ));
         ctx.retire(s);
     }
     c.check(
-        "a hostname that is an IP address, a single label or has a port cannot be a hosted client: no metadata (404), no button on that Host — only the loopback instructions — and the button on 127.0.0.1",
+        "a hostname that is an IP address, a single label or has a port cannot be a hosted client: no metadata (404), no button on that Host — only the loopback instructions — and the button on 127.0.0.1, where a sign-in completes",
         ok,
         detail.join("; "),
     );
@@ -1247,7 +1207,7 @@ async fn check_callback(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<(), String
     );
     c.unverified(
         "sub equals the flow's DID but the configured admin DID changed mid-flow ⇒ 403",
-        "not reachable over HTTP: the admin DID changes only at a restart (which drops every flow) or by the migration edit (in a state where no flow exists). The comparison is in the callback next to the sub check (enter.rs) and was read, not exercised",
+        "not reachable over HTTP: the admin DID changes only at a restart, which drops every flow. The comparison is in the callback next to the sub check (enter.rs) and was read, not exercised",
     );
     // Two tabs.
     let http = ctx.fresh();
@@ -1324,7 +1284,6 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         &ctx.config(
             HOSTNAME,
             &format!("admin_ui = true\npublic_ui = true\nadmin_did = \"{D1}\""),
-            "",
         ),
         &[],
     )
@@ -1473,11 +1432,7 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     // The admin UI alone: nothing of it is public any more.
     let s = Srv::with_config(
         "adminonly",
-        &ctx.config(
-            HOSTNAME,
-            &format!("admin_ui = true\nadmin_did = \"{D1}\""),
-            "",
-        ),
+        &ctx.config(HOSTNAME, &format!("admin_ui = true\nadmin_did = \"{D1}\"")),
         &[],
     )
     .await?;
@@ -1521,7 +1476,6 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             &ctx.config(
                 HOSTNAME,
                 &format!("admin_ui = false\npublic_ui = {public_ui}"),
-                "",
             ),
             &[],
         )
@@ -1735,21 +1689,12 @@ async fn check_settings(c: &mut Checks, ctx: &Ctx, a: &Srv, cookie: &str) -> Res
         .await?;
     let csrf = csrf_of(&page.text).unwrap_or_default();
     c.check(
-        "Settings shows the admin DID read-only with the CLI to change it; there is no password form, and POST /admin/settings/password is not a route",
+        "Settings shows the admin DID read-only with the CLI to change it",
         page.status == 200
-            && page.text.contains(&format!("Sign-in is as <code>{D1}</code>"))
-            && page.text.contains("farsight set-admin-did")
-            && !page.text.contains("type=\"password\"")
-            && !page.text.contains("/settings/password")
-            && http
-                .post_form(
-                    &format!("{}/admin/settings/password", a.base),
-                    &[("cookie", cookie)],
-                    &[("csrf", csrf.as_str()), ("password", "x")],
-                )
-                .await?
-                .status
-                == 404,
+            && page
+                .text
+                .contains(&format!("Sign-in is as <code>{D1}</code>"))
+            && page.text.contains("farsight set-admin-did"),
         page.short(),
     );
     let before = std::fs::read_to_string(a.config_path()).map_err(|e| e.to_string())?;
@@ -1795,267 +1740,22 @@ async fn check_settings(c: &mut Checks, ctx: &Ctx, a: &Srv, cookie: &str) -> Res
     Ok(())
 }
 
-// --------------------------------------------------------- 11. migration
+// ------------------------------------------------------- 11. no admin DID
 
-async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
-    c.section("11. migration from a password");
-    let hash = bcrypt::hash(PASSWORD, 4).map_err(|e| e.to_string())?;
-    let old_config = ctx.config(
-        "203.0.113.7:18093",
-        "admin_ui = true",
-        &format!("admin_password_bcrypt = \"{hash}\""),
-    );
-    let s = Srv::with_config("migrate", &old_config, &[]).await?;
-    // A pre-OAuth password session: a row keyed by the plain hash.
-    let pw_cookie = "pw-session-cookie-value";
-    sqlx::query("DELETE FROM admin_sessions")
-        .execute(&ctx.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+async fn check_unconfigured(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
+    c.section("11. no admin DID");
+    // A session stored for an admin DID the config does not name.
+    let stored = "unconfigured-session-cookie";
     farsight_storage::auth::create_session(
         &ctx.pool,
-        &Sha256::digest(pw_cookie.as_bytes()),
+        &farsight_web::pages::oauth_session_key(stored, D1),
         &[9u8; 32],
         None,
         None,
     )
     .await
     .map_err(|e| e.to_string())?;
-    let pw_header = format!("farsight_admin={pw_cookie}");
-    let http = ctx.fresh();
-    let page = http.get(&format!("{}/enter", s.base), &[]).await?;
-    c.check(
-        "in the migration state GET /enter is the migration page: a password field, an admin DID field, the backup note, and — the hostname has a port — the loopback instructions; no sign-in button",
-        page.status == 200
-            && page.text.contains("id=\"migrate\"")
-            && page.text.contains("name=\"password\"")
-            && page.text.contains("name=\"admin_did\"")
-            && page.text.contains("config.toml.pre-oauth")
-            && page.text.contains("cannot be used for ATProto sign-in")
-            && !page.text.contains("Sign in with ATProto"),
-        page.short(),
-    );
-    let settings = http
-        .get(
-            &format!("{}/admin/settings", s.base),
-            &[("cookie", &pw_header)],
-        )
-        .await?;
-    let dash = http
-        .get(
-            &format!("{}/admin/alerts", s.base),
-            &[("cookie", &pw_header)],
-        )
-        .await?;
-    let anon_dash = http.get(&format!("{}/admin", s.base), &[]).await?;
-    let cb = ctx
-        .fresh()
-        .get(
-            &format!("{}/enter/callback?state=x", s.base),
-            &[("cookie", "farsight_flow=x")],
-        )
-        .await?;
-    c.check(
-        "meanwhile an existing password session keeps working, its admin pages' Alerts carry the warning (without a session there is no dashboard: 303 to /enter), Settings links to /enter, and /enter/callback is 400",
-        settings.status == 200
-            && settings.text.contains("<a href=\"/enter\">Set the admin DID</a>")
-            && dash.status == 200
-            && dash.text.contains("Admin sign-in is changing")
-            && anon_dash.status == 303
-            && anon_dash.header("location").as_deref() == Some("/enter")
-            && !anon_dash.text.contains("Admin sign-in is changing")
-            && cb.status == 400,
-        format!("{} {} {}", settings.status, dash.status, cb.status),
-    );
-    let csrf = csrf_of(&settings.text).unwrap_or_default();
-    let stripped = http
-        .post_form(
-            &format!("{}/admin/settings", s.base),
-            &[("cookie", &pw_header)],
-            &[
-                ("csrf", csrf.as_str()),
-                (
-                    "config",
-                    old_config
-                        .replace(&format!("admin_password_bcrypt = \"{hash}\"\n"), "")
-                        .as_str(),
-                ),
-            ],
-        )
-        .await?;
-    c.check(
-        "a Settings save that removes the password hash before the migration is refused; the file is untouched",
-        banner(&stripped.text).contains("cannot be removed before the admin DID is set")
-            && std::fs::read_to_string(s.config_path()).map_err(|e| e.to_string())? == old_config,
-        banner(&stripped.text),
-    );
-    let post = |form: Vec<(&'static str, String)>| {
-        let http = ctx.fresh();
-        let base = s.base.clone();
-        async move {
-            let f: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            http.post_form(&format!("{base}/enter"), &[], &f).await
-        }
-    };
-    let wrong = post(vec![
-        ("password", "wrong-password".into()),
-        ("admin_did", D1.into()),
-    ])
-    .await?;
-    let handle = post(vec![
-        ("password", PASSWORD.into()),
-        ("admin_did", "alice.example".into()),
-    ])
-    .await?;
-    let unknown = post(vec![
-        ("password", PASSWORD.into()),
-        ("admin_did", UNKNOWN.into()),
-    ])
-    .await?;
-    let untouched = std::fs::read_to_string(s.config_path()).map_err(|e| e.to_string())?
-        == old_config
-        && !s.dir.join("config.toml.pre-oauth").exists();
-    c.check(
-        "the migration form: a wrong password ⇒ 401; a handle instead of a DID ⇒ 400; a DID that does not resolve ⇒ the form again with the reason and a \"Use this DID anyway\" box — the DID kept, the password never echoed; nothing written in any of these",
-        wrong.status == 401
-            && wrong.text.contains("Wrong password.")
-            && handle.status == 400
-            && unknown.status == 200
-            && unknown.text.contains("name=\"use_anyway\"")
-            && unknown.text.contains(&format!("value=\"{UNKNOWN}\""))
-            && [&wrong, &handle, &unknown].iter().all(|r| !r.text.contains(PASSWORD))
-            && !wrong.text.contains("name=\"use_anyway\"")
-            && untouched,
-        format!("{} {} {}", wrong.status, handle.status, unknown.status),
-    );
-    let done = post(vec![
-        ("password", PASSWORD.into()),
-        ("admin_did", D1.into()),
-    ])
-    .await?;
-    let new_config = std::fs::read_to_string(s.config_path()).map_err(|e| e.to_string())?;
-    let backup = std::fs::read_to_string(s.dir.join("config.toml.pre-oauth")).unwrap_or_default();
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(s.dir.join("config.toml.pre-oauth"))
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0)
-    };
-    c.check(
-        "the right password and a resolvable DID: one submit writes the config (admin DID set, password hash removed), and answers with the sign-in page saying which DID was set; no session cookie is issued",
-        done.status == 200
-            && done.text.contains(&format!("Admin DID set to {D1}"))
-            && new_config.contains(&format!("admin_did = \"{D1}\""))
-            && !new_config.contains("admin_password_bcrypt")
-            && done
-                .headers
-                .get_all("set-cookie")
-                .iter()
-                .all(|v| v.to_str().is_ok_and(|v| v.starts_with("farsight_admin=;"))),
-        done.short(),
-    );
-    c.check(
-        "config.toml.pre-oauth is the old file, byte for byte, mode 0600 (the rollback copy)",
-        backup == old_config && mode == 0o600,
-        format!("identical: {}, mode {mode:o}", backup == old_config),
-    );
-    let after = http
-        .get(
-            &format!("{}/admin/settings", s.base),
-            &[("cookie", &pw_header)],
-        )
-        .await?;
-    let enter = http.get(&format!("{}/enter", s.base), &[]).await?;
-    let pw_again = post(vec![
-        ("password", PASSWORD.into()),
-        ("admin_did", D2.into()),
-    ])
-    .await?;
-    c.check(
-        "the password session is dead at once (rows deleted, Settings redirects), /enter is now the sign-in page without a restart, and the password signs nobody in and changes nothing",
-        ctx.n("SELECT count(*) FROM admin_sessions").await? == 0
-            && after.status == 303
-            && enter.text.contains("Sign in with ATProto")
-            && !enter.text.contains("name=\"password\"")
-            && set_cookie(&pw_again, "farsight_admin").is_none()
-            && std::fs::read_to_string(s.config_path()).map_err(|e| e.to_string())? == new_config,
-        format!("{} {}", after.status, pw_again.status),
-    );
-    let signed = ctx.sign_in(&s, &ctx.fresh(), &s.loopback()).await?;
-    c.check(
-        "and OAuth sign-in as the new admin DID works on the migrated instance (loopback: its hostname cannot be hosted)",
-        signed.status == 200 && set_cookie(&signed, "farsight_admin").is_some(),
-        signed.short(),
-    );
-    let log = s.log();
-    c.check(
-        "the migration is logged once, with the DID and the address",
-        log.lines()
-            .filter(|l| l.contains("migrated from a password") && l.contains(D1))
-            .count()
-            == 1,
-        "",
-    );
-    ctx.retire(s);
-
-    // "Use anyway", and the password locked by the environment.
-    let bare = ctx.config(HOSTNAME, "admin_ui = true", "");
-    let s = Srv::with_config(
-        "migrate-env",
-        &bare,
-        &[("FARSIGHT__AUTH__ADMIN_PASSWORD_BCRYPT", &hash)],
-    )
-    .await?;
-    let forced = ctx
-        .fresh()
-        .post_form(
-            &format!("{}/enter", s.base),
-            &[],
-            &[
-                ("password", PASSWORD),
-                ("admin_did", UNKNOWN),
-                ("use_anyway", "on"),
-            ],
-        )
-        .await?;
-    let written = std::fs::read_to_string(s.config_path()).map_err(|e| e.to_string())?;
-    let page = ctx.fresh().get(&format!("{}/enter", s.base), &[]).await?;
-    c.check(
-        "\"Use this DID anyway\" sets a DID that does not resolve. With the hash locked by the environment: the DID is written to the file, the hash stays in the environment and is ignored — /enter is the sign-in page",
-        forced.status == 200
-            && forced.text.contains(&format!("Admin DID set to {UNKNOWN}"))
-            && written.contains(&format!("admin_did = \"{UNKNOWN}\""))
-            && page.text.contains("Sign in with ATProto")
-            && !page.text.contains("name=\"password\""),
-        forced.short(),
-    );
-    ctx.retire(s);
-
-    // The CLI ran, the server was not restarted.
-    let s = Srv::with_config("migrate-cli", &old_config, &[]).await?;
-    let (ok, out) = cli(&s.dir, &["set-admin-did", D2], &[]);
-    let after_cli = std::fs::read_to_string(s.config_path()).map_err(|e| e.to_string())?;
-    let refused = ctx
-        .fresh()
-        .post_form(
-            &format!("{}/enter", s.base),
-            &[],
-            &[("password", PASSWORD), ("admin_did", D1)],
-        )
-        .await?;
-    c.check(
-        "the CLI migrates too (backup written, password removed). Until the restart the page is still the migration page, and a submit there is refused (409, \"already set … restart\") — it does not overwrite the CLI's DID",
-        ok && out.contains("config.toml.pre-oauth")
-            && refused.status == 409
-            && banner(&refused.text).contains("already set in config.toml; restart farsight")
-            && std::fs::read_to_string(s.config_path()).map_err(|e| e.to_string())? == after_cli
-            && after_cli.contains(D2)
-            && std::fs::read_to_string(s.dir.join("config.toml.pre-oauth")).unwrap_or_default() == old_config,
-        format!("{ok} {} {}", refused.status, banner(&refused.text)),
-    );
-    ctx.retire(s);
-
-    // Unconfigured.
+    let bare = ctx.config(HOSTNAME, "admin_ui = true");
     let s = Srv::with_config("unconfigured", &bare, &[]).await?;
     let http = ctx.fresh();
     let page = http.get(&format!("{}/enter", s.base), &[]).await?;
@@ -2066,12 +1766,19 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     let settings = http
         .get(
             &format!("{}/admin/settings", s.base),
-            &[("cookie", &format!("farsight_admin={pw_cookie}"))],
+            &[("cookie", &format!("farsight_admin={stored}"))],
+        )
+        .await?;
+    let cb = ctx
+        .fresh()
+        .get(
+            &format!("{}/enter/callback?state=x", s.base),
+            &[("cookie", "farsight_flow=x")],
         )
         .await?;
     let health = http.get(&format!("{}/livez", s.base), &[]).await?;
     c.check(
-        "unconfigured (no admin DID, no password): the process runs; /enter says sign-in is not configured and how to set it, with no button; POST /enter is 400 and starts nothing; no session is accepted",
+        "unconfigured (no admin DID): the process runs; /enter says sign-in is not configured and how to set it, with no button; POST /enter is 400 and starts nothing; /enter/callback is 400; no session is accepted, a stored one included",
         health.status == 200
             && page.status == 200
             && page.text.contains("id=\"unconfigured\"")
@@ -2080,9 +1787,10 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             && !page.text.contains("<form")
             && post.status == 400
             && post.header("location").is_none()
+            && cb.status == 400
             && settings.status == 303
             && s.log().contains("admin sign-in is not configured"),
-        format!("{} {} {}", page.status, post.status, settings.status),
+        format!("{} {} {} {}", page.status, post.status, cb.status, settings.status),
     );
     ctx.retire(s);
     Ok(())
@@ -2155,7 +1863,6 @@ async fn check_cli(c: &mut Checks, ctx: &Ctx, a: Srv, cookie: &str) -> Result<()
             && out.contains("Restart farsight to apply")
             && after.contains(&format!("admin_did = \"{D2}\""))
             && !after.contains(D1)
-            && !dir.join("config.toml.pre-oauth").exists()
             && still.status == 200,
         support::truncate(&out.replace('\n', " "), 200),
     );
@@ -2217,12 +1924,12 @@ async fn check_cli(c: &mut Checks, ctx: &Ctx, a: Srv, cookie: &str) -> Result<()
     let bare_dir = Srv::dir("repair")?;
     write_private(
         &bare_dir.join("config.toml"),
-        &ctx.config(HOSTNAME, "admin_ui = true", ""),
+        &ctx.config(HOSTNAME, "admin_ui = true"),
     )?;
     let (ok, _) = cli(&bare_dir, &["set-admin-did", D1], &[]);
     let repaired = std::fs::read_to_string(bare_dir.join("config.toml")).unwrap_or_default();
     c.check(
-        "set-admin-did also sets the DID in a file that had neither a DID nor a password (the unconfigured state's repair)",
+        "set-admin-did also sets the DID in a file that has none (the unconfigured state's repair)",
         ok && config::load_from_parts(Some(&repaired), &[])
             .is_ok_and(|l| l.admin_auth() == AdminAuth::Configured(D1.into())),
         "",
@@ -2285,101 +1992,10 @@ fn check_logging(c: &mut Checks, ctx: &Ctx) {
     );
 }
 
-// ---------------------------------------------------------- 14. rollback
-
-fn check_rollback(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
-    c.section("14. rollback");
-    let image = std::env::var("FARSIGHT_PRE_R22_IMAGE").unwrap_or_else(|_| "farsight:fs6".into());
-    let have = Command::new("docker")
-        .args(["image", "inspect", &image])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !have {
-        c.unverified(
-            "a pre-r22 binary refuses a config with access.admin_did and loads the pre-oauth backup",
-            format!("no pre-r22 image ({image}) on this host; set FARSIGHT_PRE_R22_IMAGE"),
-        );
-        return Ok(());
-    }
-    let dir = Srv::dir("rollback")?;
-    let hash = bcrypt::hash(PASSWORD, 4).map_err(|e| e.to_string())?;
-    // An unreachable database: the old binary must get past the config
-    // and fail there, not on the config.
-    let old = config_toml(
-        "postgres://nobody:x@127.0.0.1:9/none",
-        HOSTNAME,
-        "https://plc.directory",
-        // Neither `ui` nor `admin_ui`: the old binary refuses the second
-        // and both binaries default to an admin UI.
-        "",
-        &format!("admin_password_bcrypt = \"{hash}\""),
-    );
-    write_private(&dir.join("config.toml"), &old)?;
-    let (ok, _) = cli(&dir, &["set-admin-did", D1, "--force"], &[]);
-    let run = |dir: &Path| -> Result<(Option<i32>, String), String> {
-        use std::os::unix::fs::PermissionsExt;
-        // The image's user must be able to read the files.
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
-        let _ = std::fs::set_permissions(
-            dir.join("config.toml"),
-            std::fs::Permissions::from_mode(0o644),
-        );
-        let out = Command::new("timeout")
-            .args(["900", "docker", "run", "--rm", "--network", "none", "-v"])
-            .arg(format!("{}:/etc/farsight:ro", dir.display()))
-            .args([&image, "farsight"])
-            .output()
-            .map_err(|e| e.to_string())?;
-        Ok((
-            out.status.code(),
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            ),
-        ))
-    };
-    let (code_new, out_new) = run(&dir)?;
-    c.check(
-        format!("a pre-r22 binary ({image}) refuses the migrated config: it exits 1 on the unknown key admin_did"),
-        ok && code_new == Some(1) && out_new.contains("invalid configuration") && out_new.contains("admin_did"),
-        format!("exit {code_new:?}: {}", support::truncate(&out_new, 200)),
-    );
-    std::fs::copy(dir.join("config.toml.pre-oauth"), dir.join("config.toml"))
-        .map_err(|e| e.to_string())?;
-    let restored = std::fs::read_to_string(dir.join("config.toml")).unwrap_or_default();
-    let (code_old, out_old) = run(&dir)?;
-    c.check(
-        "with config.toml.pre-oauth restored over config.toml the same binary accepts the config (it gets as far as the database, which the harness made unreachable): the rollback path of the config",
-        restored == old && !out_old.contains("invalid configuration") && !out_old.contains("unknown field"),
-        format!("exit {code_old:?}: {}", support::truncate(&out_old, 200)),
-    );
-    let mut migrations: Vec<String> = std::fs::read_dir(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../farsight-storage/migrations"),
-    )
-    .map(|d| {
-        d.filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect()
-    })
-    .unwrap_or_default();
-    migrations.sort();
-    c.check(
-        "and of the database: this build ships the eight migrations a pre-r22 binary knows and five more, the handle cache, the lists' descriptions, the handle queue, the avatar references and the top lists — a binary that does not know them refuses the database until they and their migration rows are removed",
-        migrations.len() == 13
-            && migrations.last().map(String::as_str) == Some("0013_top_lists.sql"),
-        format!("{} files, last {:?}", migrations.len(), migrations.last()),
-    );
-    let _ = ctx;
-    Ok(())
-}
-
-// ----------------------------------------------------------- 15. browser
+// ----------------------------------------------------------- 14. browser
 
 async fn check_browser(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), String> {
-    c.section("15. the browser: the session cookie after the callback page");
+    c.section("14. the browser: the session cookie after the callback page");
     let dir = std::env::temp_dir().join("farsight-stage7-browser");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("probes.mjs"), BROWSER_SCRIPT).map_err(|e| e.to_string())?;
@@ -2471,7 +2087,6 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
         HOSTNAME,
         &standin.base,
         &format!("admin_ui = true\nadmin_did = \"{D1}\""),
-        "",
     );
     let a = Srv::with_config("a", &cfg_a, &[]).await?;
     let ctx = Ctx {
@@ -2499,12 +2114,11 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
     check_lifetime(c, &ctx, &cfg_a).await?;
     check_gates(c, &ctx).await?;
     check_rates(c, &ctx, &cfg_a).await?;
-    check_migration(c, &ctx).await?;
+    check_unconfigured(c, &ctx).await?;
     if browser {
         check_browser(c, &ctx, &cfg_a).await?;
     }
     check_logging(c, &ctx);
-    check_rollback(c, &ctx)?;
     Ok(())
 }
 

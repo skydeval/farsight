@@ -192,7 +192,6 @@ impl Wizard {
         c.backfill.backlinks.url = self.backlinks_url.clone();
         c.access = AccessConfig {
             reads: self.reads,
-            ui: None,
             cors: c.access.cors,
             // Only with the operator's confirmation (§8.4 step 6).
             public_ui: self.public_ui && self.public_confirmed,
@@ -486,9 +485,6 @@ pub fn redacted_toml(c: &Config) -> String {
     let mut c = c.clone();
     if !c.auth.admin_token_sha256.is_empty() {
         c.auth.admin_token_sha256 = "<redacted>".into();
-    }
-    if !c.auth.admin_password_bcrypt.is_empty() {
-        c.auth.admin_password_bcrypt = "<redacted>".into();
     }
     if !c.metrics.bearer_token_sha256.is_empty() {
         c.metrics.bearer_token_sha256 = "<redacted>".into();
@@ -1559,15 +1555,13 @@ mod tests {
         w.admin_ui = true;
         w.admin_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into();
         let text = farsight_core::config::to_toml(&w.build_config()).unwrap();
-        assert!(!text.contains("admin_password_bcrypt"));
         let l = farsight_core::config::load_from_parts(Some(&text), &[]).unwrap();
         assert_eq!(
             l.admin_auth(),
             farsight_core::config::AdminAuth::Configured(w.admin_did.clone())
         );
         assert!(l.warnings.is_empty());
-        // The retired key is never written; the switch is.
-        assert!(text.contains("admin_ui = true") && !text.contains("\nui ="));
+        assert!(text.contains("admin_ui = true"));
         // Without the admin UI no admin DID is written.
         w.admin_ui = false;
         let off = farsight_core::config::to_toml(&w.build_config()).unwrap();

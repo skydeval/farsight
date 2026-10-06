@@ -155,10 +155,7 @@ and <code>/xrpc/*</code> and the lookup pages here still return it.</div>
 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
 <span>Admin account</span>
 </h2>
-{% if migration %}
-<p>Admin sign-in is changing from a password to an ATProto account. <a href="/enter">Set the admin DID</a>; the
-password stops working once it is set.</p>
-{% else if admin_did.is_empty() %}
+{% if admin_did.is_empty() %}
 <p class="muted">No admin DID is set.</p>
 {% else %}
 <p>Sign-in is as <code>{{ admin_did }}</code>{% if let Some(h) = admin_handle %} ({{ h }}){% endif %}.</p>

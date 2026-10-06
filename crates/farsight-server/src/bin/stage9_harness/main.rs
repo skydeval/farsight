@@ -1,8 +1,8 @@
 //! `farsight-stage9-harness`: Phase B Mode A for UI v2.5.2 — the public
 //! UI at the root, the admin UI under `/admin` behind a session, the two
-//! switches (`access.public_ui`, `access.admin_ui`), the retired
-//! `access.ui`, that no page has a second address, the static assets,
-//! `robots.txt`, and the wizard's access step.
+//! switches (`access.public_ui`, `access.admin_ui`), that no page has a
+//! second address, the static assets, `robots.txt`, and the wizard's
+//! access step.
 //!
 //! Sections, with the numbers the stage kickoff gives its probes:
 //!
@@ -56,7 +56,6 @@ const BROWSER_SCRIPT: &str = include_str!("../../../../../scripts/stage9-browser
 /// The body of every route that does not exist, or does not exist in
 /// this configuration.
 const BARE: &str = "not found";
-const RETIRED: &str = "`access.ui` is retired";
 const NEEDS_RESTART: &str = "`access.admin_ui` requires a restart";
 const STATIC: [(&str, &str); 6] = [
     ("/static/farsight.css", "text/css"),
@@ -157,6 +156,27 @@ impl Srv {
             .spawn()
             .map_err(|e| format!("spawning farsight: {e}"))?;
         Ok((dir, child, port))
+    }
+
+    /// Starts `farsight` on a config it should refuse: whether it exited
+    /// non-zero by itself, and what it logged.
+    async fn refused(name: &str, text: &str) -> Result<(bool, String), String> {
+        let (dir, mut child, _) = Srv::spawn(name, text)?;
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Some(s),
+                Ok(None) if started.elapsed() > Duration::from_secs(30) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+                Err(_) => break None,
+            }
+        };
+        let log = std::fs::read_to_string(dir.join("server.log")).unwrap_or_default();
+        Ok((status.is_some_and(|s| !s.success()), log))
     }
 
     async fn start(name: &str, dsn: &str, access: &Access<'_>) -> Result<Srv, String> {
@@ -698,7 +718,7 @@ async fn check_admin_only(c: &mut Checks, s: &Srv, cookie: &str, w: &World) -> R
     Ok(())
 }
 
-/// Neither UI; the admin UI switched off by the retired key alone.
+/// Neither UI.
 async fn check_api_only(c: &mut Checks, d: &Srv, w: &World) -> Result<(), String> {
     c.section("1d. neither UI: API only (probes 4, 22, 23)");
     let root = d.get("/").await?;
@@ -770,33 +790,15 @@ async fn check_api_only(c: &mut Checks, d: &Srv, w: &World) -> Result<(), String
 
 // ------------------------------------------------------------------ 2. config
 
-async fn check_config(
-    c: &mut Checks,
-    pg: &Pg,
-    a: &Srv,
-    cookie: &str,
-    d: &Srv,
-) -> Result<(), String> {
-    c.section("2. config: the retired access.ui, admin_ui at restart only (probes 5–9)");
-    let warned = |s: &Srv| s.log().matches(RETIRED).count();
-    c.check(
-        "a file with ui = \"public_read\" and no admin_ui loads with the admin UI on and one warning, which says the dashboard is no longer public",
-        warned(a) == 1 && a.log().contains("no longer public"),
-        format!("{} warning(s)", warned(a)),
-    );
-    c.check(
-        "ui = \"disabled\" and no admin_ui: one warning, and the admin UI is off (section 1d ran on this server)",
-        warned(d) == 1 && d.log().contains("access.admin_ui = false"),
-        format!("{} warning(s)", warned(d)),
-    );
-
-    // Any string loads; no admin DID: unconfigured, and it loads.
+async fn check_config(c: &mut Checks, pg: &Pg, a: &Srv, cookie: &str) -> Result<(), String> {
+    c.section("2. config: unknown keys, admin_ui at restart only (probes 5–9)");
+    // No admin DID: unconfigured, and it loads.
     pg.create_db("s9e").await?;
     let e = Srv::start(
         "e",
         &pg.url("s9e"),
         &Access {
-            lines: "ui = \"garbage\"",
+            lines: "",
             reads: "public",
             crawlable: false,
         },
@@ -805,14 +807,12 @@ async fn check_config(
     let enter = e.get("/enter").await?;
     let dash = e.get("/admin").await?;
     c.check(
-        "ui = \"garbage\" loads with one warning; with the admin UI on and no admin DID the instance is unconfigured: /enter says so, /admin redirects there (probe 7)",
-        warned(&e) == 1
-            && e.log().contains("never one of its values")
-            && e.log().contains("admin sign-in is not configured")
+        "with the admin UI on and no admin DID the instance loads and is unconfigured: the log says so, /enter says so, /admin redirects there (probe 7)",
+        e.log().contains("admin sign-in is not configured")
             && enter.status == 200
             && enter.text.contains("set-admin-did")
             && to_enter(&dash),
-        format!("{} warning(s) | {} | {}", warned(&e), brief(&enter), brief(&dash)),
+        format!("{} | {}", brief(&enter), brief(&dash)),
     );
     drop(e);
 
@@ -826,25 +826,51 @@ async fn check_config(
             crawlable: false,
         },
     );
-    let (dir, mut child, _) = Srv::spawn("f", &text)?;
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) if started.elapsed() > Duration::from_secs(30) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
-            Err(_) => break None,
-        }
-    };
-    let log = std::fs::read_to_string(dir.join("server.log")).unwrap_or_default();
+    let (failed, log) = Srv::refused("f", &text).await?;
     c.check(
         "public_ui = true with reads = \"api_key\": the process exits non-zero naming access.public_ui (probe 8)",
-        status.is_some_and(|s| !s.success()) && log.contains("access.public_ui"),
-        format!("exit {status:?}: {}", support::truncate(log.trim(), 200)),
+        failed && log.contains("access.public_ui"),
+        format!("failed {failed}: {}", support::truncate(log.trim(), 200)),
+    );
+
+    // A key the config does not have does not load.
+    let (good, _) = config_toml(
+        &pg.url("s9f"),
+        &Access {
+            lines: "",
+            reads: "public",
+            crawlable: false,
+        },
+    );
+    let mut bad = Vec::new();
+    for (name, section, key, line) in [
+        ("g", "[access]\n", "`ui`", "ui = \"disabled\"\n"),
+        (
+            "h",
+            "[public_ui]\n",
+            "`show_history`",
+            "show_history = true\n",
+        ),
+        (
+            "i",
+            "[auth]\n",
+            "`admin_password_bcrypt`",
+            "admin_password_bcrypt = \"$2b$04$x\"\n",
+        ),
+    ] {
+        let text = good.replace(section, &format!("{section}{line}"));
+        let (failed, log) = Srv::refused(name, &text).await?;
+        if !(text.contains(line) && failed && log.contains(&format!("unknown field {key}"))) {
+            bad.push(format!(
+                "{key}: failed {failed}: {}",
+                support::truncate(log.trim(), 200)
+            ));
+        }
+    }
+    c.check(
+        "a config file with a key that does not exist — access.ui, public_ui.show_history, auth.admin_password_bcrypt — does not load: the process exits non-zero naming the key",
+        bad.is_empty(),
+        bad.join(" | "),
     );
 
     // The editor cannot switch the admin UI off.
@@ -852,10 +878,9 @@ async fn check_config(
     let page = a.admin_get(cookie, "/admin/settings").await?;
     let csrf = csrf_of(&page.text).unwrap_or_default();
     c.check(
-        "Settings says how the admin UI is switched and no longer names access.ui in its hints",
+        "Settings says how the admin UI is switched",
         page.text
-            .contains("<code>access.admin_ui</code> in config.toml, at restart")
-            && !page.text.contains("access.ui = "),
+            .contains("<code>access.admin_ui</code> in config.toml, at restart"),
         String::new(),
     );
     let off = before.replace("[access]\n", "[access]\nadmin_ui = false\n");
@@ -873,29 +898,13 @@ async fn check_config(
         r.status == 200 && r.text.contains(NEEDS_RESTART) && after == before && still.status == 200,
         format!("{} | file unchanged: {} | /admin {}", r.status, after == before, still.status),
     );
-    // Replacing the retired key by the new one, same effect: allowed.
-    let tidy = before.replace("ui = \"public_read\"\n", "admin_ui = true\n");
-    let r = a
-        .post(
-            "/admin/settings",
-            &[("cookie", cookie)],
-            &[("csrf", &csrf), ("config", &tidy)],
-        )
-        .await?;
-    let tidied = std::fs::read_to_string(a.config_path()).map_err(|e| e.to_string())?;
-    c.check(
-        "replacing ui = \"public_read\" by admin_ui = true in the editor is accepted: the effective value does not change",
-        r.status == 200 && !r.text.contains(NEEDS_RESTART) && tidied.contains("admin_ui = true") && !tidied.contains("ui = \"public_read\""),
-        r.status.to_string(),
-    );
-    std::fs::write(a.config_path(), &before).map_err(|e| e.to_string())?;
 
-    // An unrelated in-process edit works, and rewrites neither key.
+    // An unrelated in-process edit works, and does not write the key.
     let p = a.pause_sweep(true).await?;
     let file = std::fs::read_to_string(a.config_path()).map_err(|e| e.to_string())?;
     c.check(
-        "pausing the sweep over XRPC works, and that edit leaves ui = \"public_read\" in the file and adds no admin_ui (D10)",
-        p.status == 200 && file.contains("ui = \"public_read\"") && !file.contains("admin_ui"),
+        "pausing the sweep over XRPC works, and that edit adds no admin_ui to a file that does not set it (D10)",
+        p.status == 200 && !file.contains("admin_ui"),
         p.short(),
     );
     // A hand edit waiting for a restart does not go live through it.
@@ -934,7 +943,7 @@ async fn check_old_paths(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Re
         format!("/public/search?q={}", enc(s)),
         format!("/public/did/{s}"),
         format!("/public/did/{s}/history"),
-        format!("/public/list/{s}/3kaaaaaaaaaa2?mc=x"),
+        format!("/public/list/{s}/3kaaaaaaaaaa2"),
         format!("/public/card/{s}"),
         "/public/about".into(),
         "/public/nonsense".into(),
@@ -944,7 +953,7 @@ async fn check_old_paths(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Re
         "/public/static/og-default.png".into(),
         "/lookup/did".into(),
         "/lookup/did?q=did%3Aplc%3Ax".into(),
-        "/lookup/list?q=at%3A%2F%2Fx&mc=y".into(),
+        "/lookup/list?q=at%3A%2F%2Fx".into(),
         "/ops".into(),
         "/settings".into(),
         "/reset".into(),
@@ -979,12 +988,11 @@ async fn check_old_paths(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Re
             bad.join(" | ")
         },
     );
-    let hop = a.get(&format!("/did/{s}?bc=abc")).await?;
-    let target = a.get(&format!("/did/{s}")).await?;
+    let extra = a.get(&format!("/did/{s}?bc=x")).await?;
     c.check(
-        "a retired cursor parameter on a page's own address is dropped with one 301, to the page itself",
-        hop.status == 301 && loc(&hop) == format!("/did/{s}") && target.status == 200,
-        format!("{} then {}", brief(&hop), brief(&target)),
+        "a parameter an account page does not have (?bc=x) is not a reason to redirect: the page is served, 200",
+        extra.status == 200 && extra.header("location").is_none(),
+        brief(&extra),
     );
     Ok(())
 }
@@ -1592,13 +1600,13 @@ async fn check_browser(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Resu
 // ------------------------------------------------------------------ main
 
 async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
-    // A: both on, crawlable, with the retired key as an upgraded file has it.
+    // A: both on, crawlable; the file does not set admin_ui.
     pg.create_db("s9a").await?;
     let a = Srv::start(
         "a",
         &pg.url("s9a"),
         &Access {
-            lines: &format!("ui = \"public_read\"\nadmin_did = \"{ADMIN_DID}\"\npublic_ui = true"),
+            lines: &format!("admin_did = \"{ADMIN_DID}\"\npublic_ui = true"),
             reads: "public",
             crawlable: true,
         },
@@ -1628,13 +1636,13 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
         },
     )
     .await?;
-    // D: neither; the admin UI is off by the retired key alone.
+    // D: neither.
     pg.create_db("s9d").await?;
     let d = Srv::start(
         "d",
         &pg.url("s9d"),
         &Access {
-            lines: &format!("ui = \"disabled\"\nadmin_did = \"{ADMIN_DID}\""),
+            lines: &format!("admin_ui = false\nadmin_did = \"{ADMIN_DID}\""),
             reads: "public",
             crawlable: true,
         },
@@ -1659,7 +1667,7 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
     check_public_only(c, &b, b_cookie, &w).await?;
     check_admin_only(c, &s, s_cookie, &w).await?;
     check_api_only(c, &d, &w).await?;
-    check_config(c, pg, &a, a_cookie, &d).await?;
+    check_config(c, pg, &a, a_cookie).await?;
     check_old_paths(c, &a, a_cookie, &w).await?;
     check_static(c, &[("A", &a), ("B", &b), ("C", &s), ("D", &d)]).await?;
     check_wizard(c, pg).await?;

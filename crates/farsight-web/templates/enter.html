@@ -9,7 +9,6 @@
 <p class="muted u-m-0">Control console for Farsight</p>
 </div>
 
-{% if let Some(n) = notice %}<div class="banner ok">{{ n }}</div>{% endif %}
 {% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if kind == "signin" %}
 <form class="stack card enter-card" method="post" action="/enter">

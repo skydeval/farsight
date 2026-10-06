@@ -15,7 +15,6 @@ harness = [
     "farsight-api/harness",
     "farsight-storage/harness",
     "farsight-web/harness",
-    "dep:bcrypt",
     "dep:ring",
     "dep:sha2",
     "dep:base64",
@@ -57,7 +56,6 @@ required-features = ["harness"]
 
 [dependencies]
 base64 = { version = "0.22", optional = true }
-bcrypt = { version = "0.15", optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 chrono.workspace = true
 farsight-api = { path = "../farsight-api" }

@@ -8,7 +8,7 @@
 //!
 //! Sections:
 //!
-//! - 1: toggle gates, the retired `show_history` key, config validation,
+//! - 1: toggle gates, config validation, the first settings save,
 //!   the enable-confirmation flow;
 //! - 2: routes: `/enter`, the withdrawn paths, the sections against
 //!   stored rows, the "On lists" table;
@@ -64,7 +64,6 @@ const EMPTY: &str = "None on record at this instance.";
 const WITHHELD_ACCOUNT: &str = "Data for this account is not shown on this instance.";
 const WITHHELD_LIST: &str = "Data for this list is not shown on this instance.";
 const SHORT_CARD: &str = "Profile not available right now.";
-const RETIRED_WARNING: &str = "no longer has any effect; history pages are admin-only";
 const VIEWER: &str = "https://viewer.example/at/{authority}/{collection}/{rkey}";
 /// What no public page prints any more.
 const COVERAGE_WORDS: [&str; 9] = [
@@ -142,7 +141,6 @@ struct H {
     /// This server's `config.toml`.
     config_path: String,
     /// This server's log.
-    log_path: String,
     next_ip: AtomicU32,
     /// Every public HTML body fetched, for the relative-time check.
     pages: Mutex<Vec<(String, String)>>,
@@ -1213,54 +1211,21 @@ fn check_validation(c: &mut Checks, dsn: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The retired key, first half: a config that still has it loads, with
-/// one warning, and the value does nothing.
-async fn check_retired_key_loads(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
-    c.section("1b. the retired show_history key");
-    let file = h.config_text()?;
-    let log = std::fs::read_to_string(&h.log_path).unwrap_or_default();
-    let warnings = log.matches(RETIRED_WARNING).count();
-    c.check(
-        "a config file with show_history = true loads: the server is up, and logged the retirement warning once",
-        file.contains("show_history = true") && warnings == 1 && h.get("/livez").await?.status == 200,
-        format!("{warnings} warning lines"),
-    );
-    let env = vec![(
-        "FARSIGHT__PUBLIC_UI__SHOW_HISTORY".to_owned(),
-        "true".to_owned(),
-    )];
-    let from_env = farsight_core::config::load_from_parts(Some(&minimal_config("")), &env)
-        .map_err(|e| e.to_string())?;
-    c.check(
-        "the environment form of the key is accepted the same way, and locks nothing",
-        from_env
-            .warnings
-            .iter()
-            .any(|x| x.contains(RETIRED_WARNING))
-            && from_env.env_keys.is_empty(),
-        format!("{:?}", from_env.warnings),
-    );
-    let _ = w;
-    Ok(())
-}
-
-/// Second half, once the public UI is on and the Public UI settings have
-/// been saved once: the value did nothing, and the key is gone from the
-/// file.
-async fn check_retired_key_removed(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
-    c.section("1b. the retired show_history key (after a save)");
+/// Once the public UI is on and the Public UI settings have been saved
+/// once: history has no public path, and the file holds the form's keys.
+async fn check_first_save(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
+    c.section("1b. after the first save of the Public UI settings");
     let hist = h.get(&format!("{}/history", path_did(&w.s))).await?;
     let old_hist = h.get(&format!("/public{}/history", path_did(&w.s))).await?;
     c.check(
-        "show_history = true does nothing: there is no public history path with the public UI on — 404 under the account's page and under /public",
+        "there is no public history path with the public UI on — 404 under the account's page and under /public",
         hist.status == 404 && old_hist.status == 404,
         format!("{} / {}", hist.short(), old_hist.short()),
     );
     let file = h.config_text()?;
     c.check(
-        "the first save of the Public UI settings removed the key from config.toml and wrote the new keys",
-        !file.contains("show_history")
-            && file.contains("record_viewer_url = \"\"")
+        "the first save of the Public UI settings wrote the form's keys to config.toml, those the file did not have included",
+        file.contains("record_viewer_url = \"\"")
             && file.contains("show_avatars = true")
             && file.contains("card_rps = 4")
             && file.contains("card_burst = 8"),
@@ -1276,7 +1241,7 @@ async fn check_retired_key_removed(c: &mut Checks, h: &H, w: &World) -> Result<(
     let reloaded =
         farsight_core::config::load_from_parts(Some(&file), &[]).map_err(|e| e.to_string())?;
     c.check(
-        "the rewritten file loads without the warning",
+        "the rewritten file loads without a warning",
         reloaded.warnings.is_empty(),
         format!("{:?}", reloaded.warnings),
     );
@@ -1310,12 +1275,15 @@ async fn check_enable_flow(c: &mut Checks, h: &mut H, w: &World) -> Result<(), S
         .filter(|k| !settings.text.contains(&format!("name=\"{k}\"")))
         .collect();
     c.check(
-        "Settings has a control for the toggle and every [public_ui] key — the four new ones included — and none for show_history",
+        "Settings has a control for the toggle and every [public_ui] key",
         missing.is_empty()
-            && !settings.text.contains("name=\"show_history\"")
             && settings.text.contains("href=\"/\" target=\"_blank\"")
-            && settings.text.contains("placeholder=\"https://viewer.example/at/{authority}/{collection}/{rkey}\"")
-            && settings.text.contains("fetches it from the account's own server"),
+            && settings.text.contains(
+                "placeholder=\"https://viewer.example/at/{authority}/{collection}/{rkey}\"",
+            )
+            && settings
+                .text
+                .contains("fetches it from the account's own server"),
         format!("missing: {missing:?}"),
     );
     // A direct second POST, with no first: nothing happens.
@@ -1389,7 +1357,7 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
     let get = h.get("/login").await?;
     let post = h
         .fresh()
-        .post_form(&format!("{}/login", h.base), &[], &[("password", "x")])
+        .post_form(&format!("{}/login", h.base), &[], &[])
         .await?;
     let with_cookie = h.admin_get("/login").await?;
     let same = |r: &Resp| {
@@ -1400,7 +1368,7 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
             && r.header("set-cookie").is_none()
     };
     c.check(
-        "/login is no longer a route with the public UI on: GET and POST get the 404 any unknown path gets, byte for byte; no redirect, no cookie",
+        "/login is not a route with the public UI on: GET and POST get the 404 any unknown path gets, byte for byte; no redirect, no cookie",
         same(&get) && same(&post) && same(&with_cookie),
         format!("GET {} POST {}", get.status, post.status),
     );
@@ -1415,14 +1383,18 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
             && enter.header("cache-control").as_deref() == Some("no-store, private"),
         enter.short(),
     );
-    // A password posted to /enter signs nobody in (the flow itself is the
+    // A form posted to /enter signs nobody in (the flow itself is the
     // stage-7 harness's subject).
     let posted = h
         .fresh()
-        .post_form(&format!("{}/enter", h.base), &[], &[("password", "nope")])
+        .post_form(
+            &format!("{}/enter", h.base),
+            &[],
+            &[("admin_did", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")],
+        )
         .await?;
     c.check(
-        "POST /enter takes no password: whatever is posted, no session cookie comes back",
+        "POST /enter reads no form field: whatever is posted, no session cookie comes back",
         set_cookie(&posted, "farsight_admin").is_none() && posted.status != 200,
         format!("{}", posted.status),
     );
@@ -1555,18 +1527,6 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
     );
     let mut bad = Vec::new();
     for (from, to) in [
-        // A cursor of an earlier version: its section starts over.
-        (format!("{}?bc=!!!", path_did(&w.s)), path_did(&w.s)),
-        (
-            format!("{}?bc=abc&lists=2", path_did(&w.s)),
-            format!("{}?lists=2", path_did(&w.s)),
-        ),
-        (format!("{}?nc=bm9wZQ&oc=x", path_did(&w.s)), path_did(&w.s)),
-        (format!("{}?mc=abc", w.list), w.list.clone()),
-        (
-            format!("{}?lc=!!!&page=2", w.list),
-            format!("{}?page=2", w.list),
-        ),
         // Page 1 has one address: the one without the parameter.
         (format!("{}?page=1", path_did(&w.s)), path_did(&w.s)),
         (
@@ -1581,7 +1541,7 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
         }
     }
     c.check(
-        "an address with a cursor of an earlier version (bc, nc, oc, mc, lc) or with a page parameter of 1 ⇒ 301 to the address without it; the other sections keep their page",
+        "an address with a page parameter of 1 ⇒ 301 to the address without it; the other sections keep their page",
         bad.is_empty(),
         bad.join("; "),
     );
@@ -4256,15 +4216,13 @@ async fn start(
 ) -> Result<(Server, H), String> {
     let dsn = pg.url(db);
     let (port, mport) = (free_port()?, free_port()?);
-    // A file as the previous version's Settings page left it: the retired
-    // key is still there.
     let cfg = config_toml(
         &dsn,
         admin,
         &format!("127.0.0.1:{mport}"),
         plc,
         "public_ui = false",
-        "show_history = true",
+        "",
     );
     let server = Server::start(name, Some(&cfg), &format!("127.0.0.1:{port}"), &[])?;
     let http = Http::new(Some("127.0.0.250".parse().expect("ip")));
@@ -4296,7 +4254,6 @@ async fn start(
         csrf: String::new(),
         form,
         config_path: server.config_path().display().to_string(),
-        log_path: server.dir.join("server.log").display().to_string(),
         next_ip: AtomicU32::new(match name {
             "live" => 30_000,
             _ => 0,
@@ -4327,9 +4284,8 @@ async fn phase_ui(
 
     check_gates_off(c, &h, &w).await?;
     check_validation(c, &pg.url("stage6_ui"))?;
-    check_retired_key_loads(c, &h, &w).await?;
     check_enable_flow(c, &mut h, &w).await?;
-    check_retired_key_removed(c, &h, &w).await?;
+    check_first_save(c, &h, &w).await?;
     check_settings_refusals(c, &mut h).await?;
     check_login_route(c, &h).await?;
     check_routes(c, &h, &w).await?;

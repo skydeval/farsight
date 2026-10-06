@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use farsight_core::config::{self, AdminAuth, LoadedConfig};
+use farsight_core::config::{self, LoadedConfig};
 
 /// Channel name for config-change notifications (§5.1).
 pub const CONFIG_CHANNEL: &str = "farsight_config";
@@ -53,14 +53,6 @@ pub fn is_hot(key: &str) -> bool {
 /// Refusal: a settings save tried to change `access.admin_did`.
 pub const ADMIN_DID_READ_ONLY: &str =
     "the admin DID cannot be changed here; use `farsight set-admin-did` and restart farsight";
-/// Refusal: the file already has an admin DID the server has not loaded.
-pub const ADMIN_DID_ALREADY_SET: &str =
-    "the admin DID is already set in config.toml; restart farsight to apply it";
-/// Refusal: the migration edit outside the migration state.
-pub const ADMIN_DID_NOT_MIGRATING: &str = "there is nothing to migrate";
-/// Refusal: removing the password hash before the migration is done.
-pub const PASSWORD_NEEDED_FOR_MIGRATION: &str = "auth.admin_password_bcrypt cannot be removed before the admin DID is set: it is what \
-     the migration page at /enter checks";
 
 /// Refusal: an edit whose result has another `access.admin_ui` than the
 /// config in force. The key is applied at start only (§8.6): an edit made
@@ -193,56 +185,7 @@ impl ConfigStore {
         f(&mut table).map_err(EditError::Invalid)?;
         let new_text =
             toml::to_string_pretty(&table).map_err(|e| EditError::Invalid(e.to_string()))?;
-        self.store_locked(&text, &new_text, false)
-    }
-
-    /// The migration from password sign-in (§8.6): sets
-    /// `access.admin_did` in the file and drops the retired password
-    /// key, after copying the file as it was to `config.toml.pre-oauth`
-    /// (0600, replacing an older copy) so that a pre-OAuth binary can be
-    /// put back. Refused unless the config in force is in the migration
-    /// state, and when the file already has an admin DID (the CLI set
-    /// one and the server has not been restarted). This is the one
-    /// in-process edit that may change the admin DID.
-    pub async fn migrate_admin_did(&self, did: &str) -> Result<EditReport, EditError> {
-        let _guard = self.edit_lock.lock().await;
-        let cur = self.current();
-        if cur.from_env_only {
-            return Err(EditError::ManagedExternally);
-        }
-        if cur.admin_auth() != AdminAuth::Migration {
-            return Err(EditError::AdminDid(ADMIN_DID_NOT_MIGRATING));
-        }
-        let text = self.file_text()?;
-        let file_has_did = text
-            .parse::<toml::Table>()
-            .ok()
-            .and_then(|t| {
-                t.get("access")
-                    .and_then(|a| a.get("admin_did"))
-                    .and_then(toml::Value::as_str)
-                    .map(|d| !d.is_empty())
-            })
-            .unwrap_or(false);
-        if file_has_did {
-            return Err(EditError::AdminDid(ADMIN_DID_ALREADY_SET));
-        }
-        // A password key locked by the environment cannot be removed from
-        // the file's effective config; it stays and is ignored.
-        let keep_password = cur
-            .env_keys
-            .iter()
-            .any(|k| k == "auth.admin_password_bcrypt");
-        let edit = config::set_admin_did(&text, did, keep_password).map_err(EditError::Invalid)?;
-        // Check the result before touching anything on disk.
-        let result = config::load_from_parts(Some(&edit.text), &self.env)
-            .map_err(|e| EditError::Invalid(e.to_string()))?;
-        if result.config.access.admin_ui != cur.config.access.admin_ui {
-            return Err(EditError::AdminUi(ADMIN_UI_NEEDS_RESTART));
-        }
-        config::write_replace(&config::pre_oauth_backup_path(&self.path), &text)
-            .map_err(|e| EditError::Io(format!("writing the pre-OAuth backup failed: {e}")))?;
-        self.store_locked(&text, &edit.text, true)
+        self.store_locked(&text, &new_text)
     }
 
     /// Replaces the whole file with `new_text` (settings page), refusing
@@ -253,15 +196,10 @@ impl ConfigStore {
             return Err(EditError::ManagedExternally);
         }
         let text = self.file_text()?;
-        self.store_locked(&text, new_text, false)
+        self.store_locked(&text, new_text)
     }
 
-    fn store_locked(
-        &self,
-        old_text: &str,
-        new_text: &str,
-        may_change_admin: bool,
-    ) -> Result<EditReport, EditError> {
+    fn store_locked(&self, old_text: &str, new_text: &str) -> Result<EditReport, EditError> {
         let old_file: toml::Value = old_text
             .parse::<toml::Table>()
             .map(toml::Value::Table)
@@ -288,23 +226,13 @@ impl ConfigStore {
         }
         let loaded = config::load_from_parts(Some(new_text), &self.env)
             .map_err(|e| EditError::Invalid(e.to_string()))?;
-        // For every in-process edit, the migration's included.
         if loaded.config.access.admin_ui != cur.config.access.admin_ui {
             return Err(EditError::AdminUi(ADMIN_UI_NEEDS_RESTART));
         }
-        if !may_change_admin {
-            // A stolen session must not become permanent control, and a
-            // typo must not lock the operator out of the page they are on.
-            if loaded.config.access.admin_did != cur.config.access.admin_did {
-                return Err(EditError::AdminDid(ADMIN_DID_READ_ONLY));
-            }
-            // Dropping the password mid-migration would leave no way to
-            // sign in and end the saver's own session.
-            if cur.admin_auth() == AdminAuth::Migration
-                && loaded.admin_auth() == AdminAuth::Unconfigured
-            {
-                return Err(EditError::AdminDid(PASSWORD_NEEDED_FOR_MIGRATION));
-            }
+        // A stolen session must not become permanent control, and a typo
+        // must not lock the operator out of the page they are on.
+        if loaded.config.access.admin_did != cur.config.access.admin_did {
+            return Err(EditError::AdminDid(ADMIN_DID_READ_ONLY));
         }
         config::write_replace(&self.path, new_text).map_err(|e| EditError::Io(e.to_string()))?;
         let (oe, ne) = (effective(&cur), effective(&loaded));

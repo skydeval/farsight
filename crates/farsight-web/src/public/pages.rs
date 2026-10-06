@@ -174,11 +174,6 @@ const LIST_PAGES: [&str; 2] = ["page", "subscribers"];
 const DID_TABS: [&str; 5] = ["blockers", "lists", "outgoing", "blockinglists", "history"];
 /// Of the list page.
 const LIST_TABS: [&str; 2] = ["members", "subscribers"];
-/// The cursor parameters of earlier versions. An address that still
-/// carries one is redirected to the first page of its section.
-const DID_CURSORS: [&str; 3] = ["bc", "nc", "oc"];
-const LIST_CURSORS: [&str; 2] = ["mc", "lc"];
-
 /// A handle or host on the History tab.
 #[derive(Debug, Clone)]
 pub struct HeldRow {
@@ -1012,7 +1007,7 @@ struct DidPage {
 pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let cfg = r.config();
     let base = did_href(did.as_str());
-    if let Some(query) = paging::canonical(q, &DID_PAGES, &DID_CURSORS, &DID_TABS) {
+    if let Some(query) = paging::canonical(q, &DID_PAGES, &DID_TABS) {
         return Ok(crate::common::moved(&base, Some(&query)));
     }
     let b_page = paging::number(q, "page", &base)?;
@@ -1527,7 +1522,7 @@ pub async fn list(
     let cfg = r.config();
     let base = list_href(owner.as_str(), rkey.as_str());
     let uri = list_uri(owner.as_str(), rkey.as_str());
-    if let Some(query) = paging::canonical(q, &LIST_PAGES, &LIST_CURSORS, &LIST_TABS) {
+    if let Some(query) = paging::canonical(q, &LIST_PAGES, &LIST_TABS) {
         return Ok(crate::common::moved(&base, Some(&query)));
     }
     let m_page = paging::number(q, "page", &base)?;

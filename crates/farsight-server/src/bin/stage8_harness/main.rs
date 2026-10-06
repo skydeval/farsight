@@ -46,8 +46,6 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use farsight_core::record::BlockRecord;
 use farsight_core::{Collection, Did, Record, RecordKey};
@@ -1260,58 +1258,33 @@ async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Resu
             && subs2.text.contains("<div class=\"tabbed\" data-active=\"subscribers\">"),
         format!("{:?} / {:?}", controls_of(msec), controls_of(ssec)),
     );
-    // A cursor of the order before the indexes: [blocker id, record key].
-    let old = URL_SAFE_NO_PAD.encode(br#"[42,"3ksbl00000007"]"#);
     let public = a.get(&public_did(&w.s)).await?;
     let public_next = section(&public.text, "blockers")
         .and_then(next_of)
         .unwrap_or_default();
-    let stale = a.get(&format!("{}?bc={old}", public_did(&w.s))).await?;
-    let garbage = a.get(&format!("{}?bc=%21%21", public_did(&w.s))).await?;
     let zero = a.get(&format!("{}?page=0", public_did(&w.s))).await?;
     c.check(
-        "the public tables carry no cursor: the next page is ?page=2; an address that still has a cursor of an earlier version, readable or not, is redirected (301) to the first page of its section; a page number that is not one gets the 400 page with its \"Open the first page\" link — never a 500",
+        "the public tables carry no cursor: the next page is ?page=2; a page number that is not one gets the 400 page with its \"Open the first page\" link — never a 500",
         public_next == format!("{}?page=2", public_did(&w.s))
-            && [&stale, &garbage].iter().all(|r| {
-                r.status == 301 && r.header("location").as_deref() == Some(public_did(&w.s).as_str())
-            })
             && zero.status == 400
             && zero.text.contains("Open the first page")
             && zero.text.contains(&format!("href=\"{}\"", public_did(&w.s))),
-        format!("{public_next}; {} / {} / {}", stale.status, garbage.status, zero.status),
-    );
-    let admin = a
-        .admin_get(
-            cookie,
-            &format!("{}&bc={old}&mc={old}", lookup_list(&filler_uri)),
-        )
-        .await?;
-    c.check(
-        "on the admin list lookup a cursor of an earlier version in the address is ignored: the first pages, as without it",
-        admin.status == 200
-            && row_dids(admin_section(&admin.text, "Members").unwrap_or("")) == row_dids(msec)
-            && row_dids(admin_section(&admin.text, "Subscribers").unwrap_or("")) == row_dids(ssec),
-        format!("{}", admin.status),
+        format!("{public_next}; {}", zero.status),
     );
     let did_page = a.admin_get(cookie, &lookup_did(&w.s)).await?;
-    let old_link = a
-        .admin_get(cookie, &format!("{}&bc={old}", lookup_did(&w.s)))
-        .await?;
     let dsec = admin_section(&did_page.text, "Incoming blocks").unwrap_or("");
     let second = a
         .admin_get(cookie, &format!("{}&page=2", lookup_did(&w.s)))
         .await?;
     let ssec = admin_section(&second.text, "Incoming blocks").unwrap_or("");
     c.check(
-        "the admin DID lookup pages by number like the public tables, with its own address: 305 blocks are seven pages, the next page is &page=2 and holds the next 50; a cursor of an earlier version in the address is ignored",
+        "the admin DID lookup pages by number like the public tables, with its own address: 305 blocks are seven pages, the next page is &page=2 and holds the next 50",
         admin_next(dsec).is_some_and(|n| n.ends_with("&page=2"))
             && controls_of(dsec) == "(←) [1] 2 3 4 5 6 7 →"
             && row_dids(dsec).len() == 50
             && controls_of(ssec) == "← 1 [2] 3 4 5 6 7 →"
             && row_dids(ssec).len() == 50
-            && row_dids(ssec)[0] != row_dids(dsec)[0]
-            && old_link.status == 200
-            && row_dids(admin_section(&old_link.text, "Incoming blocks").unwrap_or("")) == row_dids(dsec),
+            && row_dids(ssec)[0] != row_dids(dsec)[0],
         format!("{:?} / {:?}", controls_of(dsec), controls_of(ssec)),
     );
     Ok(())

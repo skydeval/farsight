@@ -346,8 +346,8 @@ pub async fn discover(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Serv
     check_server_metadata(&issuer, &server_meta, safe.config())
 }
 
-/// What a DID resolves to, for the operator to confirm (wizard, migration
-/// page, CLI) and for display.
+/// What a DID resolves to, for the operator to confirm (wizard, CLI) and
+/// for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// The handle the document claims, if it resolves back to the DID.

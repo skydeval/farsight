@@ -202,9 +202,6 @@ pub async fn run(
     let web = Arc::new(farsight_web::WebState {
         api: api.clone(),
         safe: SafeClient::new(SafeClientConfig::from_config(&cfg, VERSION)),
-        bcrypt_permits: Arc::new(Semaphore::new(
-            cfg.rate_limit.bcrypt_concurrency.max(1) as usize
-        )),
         recent_logins: Mutex::new(Default::default()),
         oauth: Default::default(),
         reset: reset_tx,

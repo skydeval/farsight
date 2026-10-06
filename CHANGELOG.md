@@ -5,8 +5,7 @@ All notable changes to Farsight are recorded in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Before 1.0, a minor version may change addresses, settings or the
-database schema; each entry says so where it does, and the README's
-"Upgrading from an earlier version" has the steps.
+database schema; each entry says so where it does.
 
 No version has been tagged yet. The entries below were written
 afterwards from the commit history, and each is linked to the range of
@@ -19,6 +18,11 @@ commits it covers.
 - The redirects from addresses the pages had before any release
   (`/public/…`, and the admin pages at `/lookup/…`, `/ops`, `/settings`
   and `/reset`). Those paths are unknown paths now.
+- What was kept for configs and links from before any release: the
+  password sign-in and its migration page (`auth.admin_password_bcrypt`,
+  `rate_limit.bcrypt_concurrency`), the keys `access.ui` and
+  `public_ui.show_history`, and the redirect of `?bc=…`-style cursor
+  parameters. A config file with one of these keys does not load.
 - The dashboard's "Oldest pending lists" block. The number of pending
   lists is still under Exceptions.
 

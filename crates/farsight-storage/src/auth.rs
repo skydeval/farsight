@@ -214,8 +214,7 @@ pub async fn delete_session<'e>(ex: impl PgExecutor<'e>, id_sha256: &[u8]) -> Re
     Ok(())
 }
 
-/// Revokes every admin session (password change, admin-token rotation,
-/// reset; §8.6).
+/// Revokes every admin session (admin-token rotation, reset; §8.6).
 pub async fn delete_all_sessions<'e>(ex: impl PgExecutor<'e>) -> Result<u64> {
     Ok(sqlx::query("DELETE FROM admin_sessions")
         .execute(ex)

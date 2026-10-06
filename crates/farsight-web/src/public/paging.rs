@@ -4,8 +4,7 @@
 //! with page controls: `← 1 2 3 4 5 … 21 →`. Each control is a plain
 //! link; the page is a query parameter of its section, so that the two or
 //! three tables of a page turn independently. Page 1 has no parameter:
-//! `?page=1` and the cursor parameters of earlier versions redirect to
-//! the address without them.
+//! `?page=1` redirects to the address without it.
 //!
 //! The last page comes from the section's count, which is exact up to
 //! [`COUNT_CAP`](super::COUNT_CAP). Beyond it, or when the count could
@@ -132,15 +131,13 @@ pub fn past_end(total: Total, page: i64, size: i64) -> Option<i64> {
 }
 
 /// Where a request should have gone instead, if its address is not the
-/// canonical one: it carries a cursor parameter of an earlier version
-/// (`retired`), or names page 1 of a section outright. The other
-/// sections keep their pages; a retired cursor's section starts over.
+/// canonical one: for one, it names page 1 of a section outright. The
+/// other sections keep their pages.
 ///
 /// `tabs` are the page's tables, the first being the one shown without a
 /// `tab` parameter: naming it, or a table the page does not have, is
 /// not canonical either.
-pub fn canonical(q: &Params, keys: &[&str], retired: &[&str], tabs: &[&str]) -> Option<String> {
-    let stale = retired.iter().any(|k| q.get(k).is_some());
+pub fn canonical(q: &Params, keys: &[&str], tabs: &[&str]) -> Option<String> {
     let first = keys.iter().any(|k| q.get(k) == Some("1"));
     let tab = q.get(TAB);
     let kept = tab.filter(|t| tabs.iter().skip(1).any(|k| k == t));
@@ -149,7 +146,7 @@ pub fn canonical(q: &Params, keys: &[&str], retired: &[&str], tabs: &[&str]) -> 
     let odd = q.get(TAKEN_DOWN).is_some_and(|v| v != "1")
         || q.get(FIND)
             .is_some_and(|v| v.trim().is_empty() || v != v.trim());
-    (stale || first || tab != kept || odd).then(|| query(q, keys, None, kept))
+    (first || tab != kept || odd).then(|| query(q, keys, None, kept))
 }
 
 /// `base?…` for the table `tab` (`None`: the page's first), keeping every
@@ -437,20 +434,17 @@ mod tests {
             "/did/x?tab=lists&lists=3"
         );
         assert_eq!(tab_link("/did/x", &q, &keys, None), "/did/x?lists=3");
-        // Canonical: no `=1`, no cursor of an earlier version.
-        let retired = ["bc", "nc", "oc"];
+        // Canonical: no `=1`; a parameter the page does not have is left alone.
         let tabs = ["blockers", "lists", "outgoing"];
-        let c = |s: &str| canonical(&Params::parse(s), &keys, &retired, &tabs);
+        let c = |s: &str| canonical(&Params::parse(s), &keys, &tabs);
         assert_eq!(c("lists=3&utm=x"), None);
         assert_eq!(c("page=1&lists=3").as_deref(), Some("lists=3"));
-        assert_eq!(c("bc=abc").as_deref(), Some(""));
-        assert_eq!(c("page=2&nc=abc").as_deref(), Some("page=2"));
+        assert_eq!(c("bc=abc"), None);
         // The tab: kept when it names another table, dropped when it
         // names the first or none.
         assert_eq!(c("tab=lists&lists=2"), None);
         assert_eq!(c("tab=blockers&page=2").as_deref(), Some("page=2"));
         assert_eq!(c("tab=nope").as_deref(), Some(""));
-        assert_eq!(c("tab=lists&bc=x").as_deref(), Some("tab=lists"));
         // The taken_down switch travels with every link and has one spelling.
         assert_eq!(c("takendown=1&page=2"), None);
         assert_eq!(c("takendown=yes&page=2").as_deref(), Some("page=2"));

@@ -443,23 +443,12 @@ pub enum ReadsMode {
     Disabled,
 }
 
-/// The retired `access.ui` key.
-pub const RETIRED_UI: &str = "access.ui";
-/// The one value of the retired `access.ui` that still means something:
-/// without `access.admin_ui`, it switches the admin UI off.
-pub const RETIRED_UI_DISABLED: &str = "disabled";
-
 /// `[access]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccessConfig {
     /// Read access mode.
     pub reads: ReadsMode,
-    /// Retired (replaced by `admin_ui`): accepted with any value, warned
-    /// about, never written. Read only by the loader, which takes
-    /// `"disabled"` for `admin_ui = false` when `admin_ui` is absent.
-    #[serde(skip_serializing)]
-    pub ui: Option<String>,
     /// Send `Access-Control-Allow-Origin: *` on reads.
     pub cors: bool,
     /// Serve the public UI at the root (§8.6). Requires `reads =
@@ -477,7 +466,6 @@ impl Default for AccessConfig {
     fn default() -> Self {
         AccessConfig {
             reads: ReadsMode::Public,
-            ui: None,
             cors: true,
             public_ui: false,
             admin_ui: true,
@@ -533,11 +521,6 @@ pub struct PublicUiConfig {
     pub show_top_blockers: bool,
     /// The home page lists the accounts that are blocked the most.
     pub show_top_blocked: bool,
-    /// Retired (§16): history pages are admin-only. Accepted so that a
-    /// file written by an earlier version still loads; the value has no
-    /// effect, a warning is logged, and the key is never written back.
-    #[serde(skip_serializing)]
-    pub show_history: Option<bool>,
     /// Emit the `og:image` tag for the static card.
     pub show_opengraph_image: bool,
     /// Theme a visitor gets before choosing one.
@@ -608,7 +591,6 @@ impl Default for PublicUiConfig {
             show_outgoing_blocks: false,
             show_top_blockers: false,
             show_top_blocked: false,
-            show_history: None,
             show_opengraph_image: true,
             dark_mode_default: ThemeDefault::System,
             crawlable: false,
@@ -628,12 +610,6 @@ impl Default for PublicUiConfig {
         }
     }
 }
-
-/// The retired `public_ui.show_history` key.
-pub const RETIRED_SHOW_HISTORY: &str = "public_ui.show_history";
-/// What the loader says when the retired key is present.
-pub const RETIRED_SHOW_HISTORY_WARNING: &str =
-    "`public_ui.show_history` no longer has any effect; history pages are admin-only.";
 
 /// Longest `public_ui.record_viewer_url`, in characters.
 pub const MAX_RECORD_VIEWER_URL: usize = 500;
@@ -695,18 +671,8 @@ pub fn validate_record_viewer_url(v: &str) -> Result<(), String> {
 pub struct AuthConfig {
     /// SHA-256 of the admin token, hex. Required.
     pub admin_token_sha256: String,
-    /// bcrypt hash of the pre-OAuth admin password. Retired: read only
-    /// by the migration page (see [`AdminAuth::Migration`]); otherwise
-    /// accepted and ignored.
-    pub admin_password_bcrypt: String,
 }
 
-/// Warning logged when `auth.admin_password_bcrypt` is present and unused.
-pub const RETIRED_PASSWORD_WARNING: &str = "auth.admin_password_bcrypt is set and ignored: admin sign-in uses access.admin_did; \
-     remove the key";
-/// Warning logged in the migration state.
-pub const MIGRATION_WARNING: &str = "admin sign-in needs migration: access.admin_did is not set; open /enter and set it \
-     with the existing admin password";
 /// Warning logged in the unconfigured state.
 pub const UNCONFIGURED_WARNING: &str = "admin sign-in is not configured: set access.admin_did (farsight set-admin-did, or \
      FARSIGHT__ACCESS__ADMIN_DID) and restart";
@@ -718,10 +684,7 @@ pub enum AdminAuth {
     Disabled,
     /// `access.admin_did` is set: OAuth sign-in as that DID.
     Configured(String),
-    /// A file config from before OAuth sign-in: a password hash and no
-    /// admin DID. `/enter` serves the migration page.
-    Migration,
-    /// No admin DID and no migration path: nobody can sign in.
+    /// No admin DID: nobody can sign in.
     Unconfigured,
 }
 
@@ -917,8 +880,6 @@ pub struct RateLimitConfig {
     pub query_concurrency: u32,
     /// Read query `statement_timeout`.
     pub query_timeout: ConfigDuration,
-    /// Concurrent bcrypt verifications.
-    pub bcrypt_concurrency: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -933,7 +894,6 @@ impl Default for RateLimitConfig {
             ui_lookup_rps: 1,
             query_concurrency: 32,
             query_timeout: ConfigDuration::secs(5),
-            bcrypt_concurrency: 2,
         }
     }
 }
@@ -991,8 +951,6 @@ impl LoadedConfig {
             AdminAuth::Disabled
         } else if !c.access.admin_did.is_empty() {
             AdminAuth::Configured(c.access.admin_did.clone())
-        } else if !self.from_env_only && !c.auth.admin_password_bcrypt.trim().is_empty() {
-            AdminAuth::Migration
         } else {
             AdminAuth::Unconfigured
         }
@@ -1039,7 +997,6 @@ pub fn load_from_parts(
         None => toml::Table::new(),
     };
     let env_keys = apply_env_overrides(&mut table, env)?;
-    let ui_warning = resolve_admin_ui(&mut table);
     let config: Config = toml::Value::Table(table)
         .try_into()
         .map_err(|e: toml::de::Error| ConfigError::Schema(e.to_string()))?;
@@ -1048,65 +1005,17 @@ pub fn load_from_parts(
     } else {
         ConfigSource::EnvOnly
     };
-    let mut warnings = config.validate()?;
-    warnings.extend(ui_warning);
+    let warnings = config.validate()?;
     let mut loaded = LoadedConfig {
         config,
         env_keys,
         warnings,
         from_env_only: source == ConfigSource::EnvOnly,
     };
-    let has_password = !loaded.config.auth.admin_password_bcrypt.trim().is_empty();
-    match loaded.admin_auth() {
-        AdminAuth::Migration => loaded.warnings.push(MIGRATION_WARNING.to_owned()),
-        AdminAuth::Unconfigured => loaded.warnings.push(UNCONFIGURED_WARNING.to_owned()),
-        AdminAuth::Configured(_) | AdminAuth::Disabled if has_password => {
-            loaded.warnings.push(RETIRED_PASSWORD_WARNING.to_owned());
-        }
-        _ => {}
+    if loaded.admin_auth() == AdminAuth::Unconfigured {
+        loaded.warnings.push(UNCONFIGURED_WARNING.to_owned());
     }
     Ok(loaded)
-}
-
-/// Decides `access.admin_ui` on the merged table (file, then environment)
-/// and says what the retired `access.ui` came to (§16):
-///
-/// 1. `admin_ui` present: its value; `ui` is ignored.
-/// 2. else `ui = "disabled"`: off.
-/// 3. else: on (the default).
-///
-/// Run before the table is deserialized, which is the only point where
-/// "absent" and "default" can be told apart.
-fn resolve_admin_ui(table: &mut toml::Table) -> Option<String> {
-    let access = table.get_mut("access")?.as_table_mut()?;
-    let ui = access.get("ui")?.as_str()?.to_owned();
-    if access.contains_key("admin_ui") {
-        return Some(
-            "`access.ui` is retired and ignored; `access.admin_ui` is in force. Remove \
-             `access.ui`."
-                .to_owned(),
-        );
-    }
-    Some(match ui.as_str() {
-        RETIRED_UI_DISABLED => {
-            access.insert("admin_ui".to_owned(), toml::Value::Boolean(false));
-            "`access.ui` is retired; \"disabled\" is read as `access.admin_ui = false`. Replace \
-             it with that."
-                .to_owned()
-        }
-        "public_read" => "`access.ui` is retired. The admin UI is on (`access.admin_ui`) and \
-                          every admin page now needs sign-in: the dashboard and lookups are no \
-                          longer public. Remove `access.ui`."
-            .to_owned(),
-        "auth_all" => "`access.ui` is retired. The admin UI is on (`access.admin_ui`); without \
-                       a session its pages redirect to /enter instead of answering 404. Remove \
-                       `access.ui`."
-            .to_owned(),
-        other => format!(
-            "`access.ui` is retired and \"{other}\" was never one of its values; it is \
-             ignored. The admin UI is on (`access.admin_ui`). Remove `access.ui`."
-        ),
-    })
 }
 
 fn defaults_value() -> toml::Value {
@@ -1184,36 +1093,6 @@ pub fn apply_env_overrides(
         let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
         if path.iter().any(String::is_empty) {
             return Err(ConfigError::UnknownEnvKey(var.clone()));
-        }
-        if path.join(".") == RETIRED_SHOW_HISTORY {
-            // Retired: still typed and accepted, never locked, so that a
-            // Settings save may drop the key from the file.
-            let value = coerce(var, raw, &toml::Value::Boolean(false))?;
-            table
-                .entry("public_ui")
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                .as_table_mut()
-                .ok_or_else(|| ConfigError::Invalid {
-                    key: RETIRED_SHOW_HISTORY.to_owned(),
-                    reason: "`public_ui` in config.toml is not a table".to_owned(),
-                })?
-                .insert("show_history".to_owned(), value);
-            continue;
-        }
-        if path.join(".") == RETIRED_UI {
-            // Retired, like `show_history`: env-managed instances set it
-            // (`FARSIGHT__ACCESS__UI=disabled`) and must keep loading. Any
-            // string; never locked.
-            table
-                .entry("access")
-                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                .as_table_mut()
-                .ok_or_else(|| ConfigError::Invalid {
-                    key: RETIRED_UI.to_owned(),
-                    reason: "`access` in config.toml is not a table".to_owned(),
-                })?
-                .insert("ui".to_owned(), toml::Value::String(raw.clone()));
-            continue;
         }
         let mut hint = &defaults;
         for seg in &path {
@@ -1363,9 +1242,6 @@ impl Config {
         }
         self.validate_public_ui()?;
         let mut warnings = Vec::new();
-        if self.public_ui.show_history.is_some() {
-            warnings.push(RETIRED_SHOW_HISTORY_WARNING.to_owned());
-        }
         if self.public_ui.card_burst < self.public_ui.card_rps {
             warnings.push(format!(
                 "public_ui.card_burst ({}) is below public_ui.card_rps ({}); using {} as the burst",
@@ -1477,78 +1353,32 @@ impl Config {
 }
 
 /// Serializes a config as TOML for `config.toml`. An unset
-/// `access.admin_did` and an unset (retired) `auth.admin_password_bcrypt`
-/// are left out rather than written empty.
+/// `access.admin_did` is left out rather than written empty.
 pub fn to_toml(config: &Config) -> Result<String, ConfigError> {
     let mut table =
         toml::Table::try_from(config).map_err(|e| ConfigError::Schema(e.to_string()))?;
-    for (section, key) in [("access", "admin_did"), ("auth", "admin_password_bcrypt")] {
-        if let Some(t) = table.get_mut(section).and_then(toml::Value::as_table_mut) {
-            if t.get(key).and_then(toml::Value::as_str) == Some("") {
-                t.remove(key);
-            }
+    if let Some(t) = table.get_mut("access").and_then(toml::Value::as_table_mut) {
+        if t.get("admin_did").and_then(toml::Value::as_str) == Some("") {
+            t.remove("admin_did");
         }
     }
     toml::to_string_pretty(&table).map_err(|e| ConfigError::Schema(e.to_string()))
 }
 
-/// Where the pre-OAuth copy of `config.toml` is kept for a rollback.
-pub fn pre_oauth_backup_path(path: &Path) -> std::path::PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".pre-oauth");
-    path.with_file_name(name)
-}
-
-/// What [`set_admin_did`] did to a config file's text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdminDidEdit {
-    /// The new file text.
-    pub text: String,
-    /// The file held a password hash and no admin DID (the migration
-    /// state): the caller writes the backup before the new text.
-    pub was_migration: bool,
-    /// The retired password key was removed.
-    pub removed_password: bool,
-}
-
-/// Sets `access.admin_did` in a `config.toml` text and removes the retired
-/// `auth.admin_password_bcrypt` unless `keep_password` (the key is locked
-/// by the environment). The file need not load before the edit.
-pub fn set_admin_did(text: &str, did: &str, keep_password: bool) -> Result<AdminDidEdit, String> {
+/// Sets `access.admin_did` in a `config.toml` text and returns the new
+/// text. The file need not load before the edit.
+pub fn set_admin_did(text: &str, did: &str) -> Result<String, String> {
     if !valid_admin_did(did) {
         return Err(format!("{did} is not a did:plc or did:web DID"));
     }
     let mut table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
-    let had_did = table
-        .get("access")
-        .and_then(|a| a.get("admin_did"))
-        .and_then(toml::Value::as_str)
-        .is_some_and(|d| !d.is_empty());
-    let has_password = table
-        .get("auth")
-        .and_then(|a| a.get("admin_password_bcrypt"))
-        .and_then(toml::Value::as_str)
-        .is_some_and(|p| !p.trim().is_empty());
     table
         .entry("access")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
         .ok_or("`access` is not a table")?
         .insert("admin_did".to_owned(), toml::Value::String(did.to_owned()));
-    let mut removed_password = false;
-    if !keep_password {
-        if let Some(auth) = table.get_mut("auth").and_then(toml::Value::as_table_mut) {
-            removed_password = auth.remove("admin_password_bcrypt").is_some();
-        }
-    }
-    Ok(AdminDidEdit {
-        text: toml::to_string_pretty(&table).map_err(|e| e.to_string())?,
-        was_migration: !had_did && has_password,
-        removed_password,
-    })
+    toml::to_string_pretty(&table).map_err(|e| e.to_string())
 }
 
 fn temp_path(path: &Path) -> std::path::PathBuf {
@@ -1648,7 +1478,7 @@ mod tests {
         assert!(!c.access.public_ui);
         let p = &c.public_ui;
         assert!(!p.show_outgoing_blocks && p.show_opengraph_image && p.show_avatars);
-        assert!(p.show_history.is_none() && p.record_viewer_url.is_empty());
+        assert!(p.record_viewer_url.is_empty());
         assert_eq!((p.card_rps, p.card_burst), (4, 8));
         assert!(p.handle_warming_enabled);
         assert_eq!((p.handle_rps, p.handle_burst()), (20, 20));
@@ -1758,6 +1588,22 @@ gap_threshold = "300s"
         assert!(matches!(e, ConfigError::Schema(_)));
         let e = load_from_parts(Some("[nope]\n"), &[]).unwrap_err();
         assert!(matches!(e, ConfigError::Schema(_)));
+        for (text, key) in [
+            ("[access]\nui = \"disabled\"\n", "ui"),
+            ("[public_ui]\nshow_history = true\n", "show_history"),
+            (
+                "[auth]\nadmin_password_bcrypt = \"x\"\n",
+                "admin_password_bcrypt",
+            ),
+            (
+                "[rate_limit]\nbcrypt_concurrency = 2\n",
+                "bcrypt_concurrency",
+            ),
+        ] {
+            let e = load_from_parts(Some(text), &[]).unwrap_err();
+            assert!(matches!(e, ConfigError::Schema(_)), "{key}");
+            assert!(e.to_string().contains(&format!("`{key}`")), "{key}: {e}");
+        }
     }
 
     #[test]
@@ -1816,6 +1662,9 @@ gap_threshold = "300s"
             ("FARSIGHT__BACKFILL__NOPE", "1"),
             ("FARSIGHT__BACKFILL__SWEEP", "1"),
             ("FARSIGHT____X", "1"),
+            ("FARSIGHT__ACCESS__UI", "disabled"),
+            ("FARSIGHT__PUBLIC_UI__SHOW_HISTORY", "false"),
+            ("FARSIGHT__AUTH__ADMIN_PASSWORD_BCRYPT", "x"),
         ] {
             assert!(matches!(
                 load_from_parts(Some(&text), &env(&[(k, v)])),
@@ -1867,14 +1716,13 @@ gap_threshold = "300s"
                 ("FARSIGHT__SERVER__CONTACT", "mailto:x@h.test"),
                 ("FARSIGHT__STORAGE__DATABASE_URL", "postgres://x"),
                 ("FARSIGHT__AUTH__ADMIN_TOKEN_SHA256", TOKEN_HASH),
-                ("FARSIGHT__ACCESS__UI", "disabled"),
+                ("FARSIGHT__ACCESS__ADMIN_UI", "false"),
             ]),
         )
         .unwrap();
         assert!(ok.from_env_only);
         assert!(!ok.config.access.admin_ui);
         assert_eq!(ok.admin_auth(), AdminAuth::Disabled);
-        assert!(!ok.env_keys.iter().any(|k| k == RETIRED_UI), "never locked");
     }
 
     #[test]
@@ -1998,37 +1846,6 @@ gap_threshold = "300s"
     }
 
     #[test]
-    fn retired_show_history_loads_with_a_warning() {
-        // A file as the previous version's Settings page wrote it.
-        let mut c = complete();
-        c.public_ui.show_history = None;
-        let mut text = to_toml(&c).unwrap();
-        assert!(!text.contains("show_history"), "never written back");
-        text = text.replace("[public_ui]\n", "[public_ui]\nshow_history = true\n");
-        assert!(text.contains("show_history = true"));
-        let l = load_from_parts(Some(&text), &[]).unwrap();
-        assert_eq!(l.config.public_ui.show_history, Some(true));
-        assert_eq!(l.warnings, [RETIRED_SHOW_HISTORY_WARNING]);
-        // Without the key there is no warning.
-        let l = load_from_parts(Some(&to_toml(&c).unwrap()), &[]).unwrap();
-        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
-        // The environment form is accepted, typed and not locked.
-        let env = vec![(
-            "FARSIGHT__PUBLIC_UI__SHOW_HISTORY".to_owned(),
-            "false".to_owned(),
-        )];
-        let l = load_from_parts(Some(&to_toml(&c).unwrap()), &env).unwrap();
-        assert_eq!(l.config.public_ui.show_history, Some(false));
-        assert!(l.env_keys.is_empty());
-        assert_eq!(l.warnings, [RETIRED_SHOW_HISTORY_WARNING]);
-        let env = vec![(
-            "FARSIGHT__PUBLIC_UI__SHOW_HISTORY".to_owned(),
-            "perhaps".to_owned(),
-        )];
-        assert!(load_from_parts(Some(&to_toml(&c).unwrap()), &env).is_err());
-    }
-
-    #[test]
     fn record_viewer_url_rules() {
         let ok = validate_record_viewer_url;
         assert!(ok("https://viewer.example/at/{authority}/{collection}/{rkey}").is_ok());
@@ -2129,31 +1946,22 @@ gap_threshold = "300s"
         let l = file(&complete(), &[]);
         assert_eq!(l.admin_auth(), AdminAuth::Configured(ADMIN_DID.into()));
         assert!(l.warnings.is_empty());
-        // A file from before OAuth sign-in: migration, and it loads.
-        let mut old = complete();
-        old.access.admin_did.clear();
-        old.auth.admin_password_bcrypt = "$2b$12$abcdefghijklmnopqrstuv".into();
-        let l = file(&old, &[]);
-        assert_eq!(l.admin_auth(), AdminAuth::Migration);
-        assert_eq!(l.warnings, [MIGRATION_WARNING]);
-        // The DID from the environment configures it; the password is
-        // then ignored and warned about.
-        let l = file(&old, &[("FARSIGHT__ACCESS__ADMIN_DID", ADMIN_DID)]);
-        assert_eq!(l.admin_auth(), AdminAuth::Configured(ADMIN_DID.into()));
-        assert_eq!(l.warnings, [RETIRED_PASSWORD_WARNING]);
-        // Neither key: unconfigured, and it loads.
+        // No admin DID: unconfigured, and it loads.
         let mut none = complete();
         none.access.admin_did.clear();
         let l = file(&none, &[]);
         assert_eq!(l.admin_auth(), AdminAuth::Unconfigured);
         assert_eq!(l.warnings, [UNCONFIGURED_WARNING]);
-        // Admin UI off: neither key matters.
+        // The DID from the environment configures it.
+        let l = file(&none, &[("FARSIGHT__ACCESS__ADMIN_DID", ADMIN_DID)]);
+        assert_eq!(l.admin_auth(), AdminAuth::Configured(ADMIN_DID.into()));
+        assert!(l.warnings.is_empty());
+        // Admin UI off: the DID does not matter.
         none.access.admin_ui = false;
         let l = file(&none, &[]);
         assert_eq!(l.admin_auth(), AdminAuth::Disabled);
         assert!(l.warnings.is_empty());
-        // Env-only with a password hash and no DID: unconfigured, never
-        // migration (there is no file to write).
+        // Env-only without a DID: unconfigured.
         let l = load_from_parts(
             None,
             &env(&[
@@ -2161,7 +1969,6 @@ gap_threshold = "300s"
                 ("FARSIGHT__SERVER__CONTACT", "mailto:x@h.test"),
                 ("FARSIGHT__STORAGE__DATABASE_URL", "postgres://x"),
                 ("FARSIGHT__AUTH__ADMIN_TOKEN_SHA256", TOKEN_HASH),
-                ("FARSIGHT__AUTH__ADMIN_PASSWORD_BCRYPT", "$2b$12$x"),
             ]),
         )
         .unwrap();
@@ -2176,71 +1983,11 @@ gap_threshold = "300s"
         ));
     }
 
-    /// The retired `access.ui` (§16): any value loads and is warned
-    /// about; only `"disabled"` without `admin_ui` still decides anything;
-    /// the key is never written.
     #[test]
-    fn retired_ui_key() {
-        let base = to_toml(&complete()).unwrap();
-        assert!(base.contains("admin_ui = true") && !base.contains("\nui ="));
-        let with = |access: &str, env_pairs: &[(&str, &str)]| {
-            let text = base
-                .replace("admin_ui = true\n", "")
-                .replace("[access]\n", &format!("[access]\n{access}"));
-            load_from_parts(Some(&text), &env(env_pairs)).unwrap()
-        };
-        let warned = |l: &LoadedConfig| {
-            l.warnings
-                .iter()
-                .filter(|w| w.contains("access.ui"))
-                .count()
-        };
-        // Neither key: on, no warning.
-        let l = with("", &[]);
-        assert!(l.config.access.admin_ui && warned(&l) == 0);
-        // The three old values, and one that never existed.
-        for (ui, on) in [
-            ("public_read", true),
-            ("auth_all", true),
-            ("disabled", false),
-            ("garbage", true),
-        ] {
-            let l = with(&format!("ui = \"{ui}\"\n"), &[]);
-            assert_eq!(l.config.access.admin_ui, on, "{ui}");
-            assert_eq!(warned(&l), 1, "{ui}: {:?}", l.warnings);
-            assert_eq!(l.config.access.ui.as_deref(), Some(ui));
-            assert!(
-                !to_toml(&l.config).unwrap().contains("\nui ="),
-                "never written"
-            );
-        }
-        // `admin_ui` wins over `ui`, from the file or the environment,
-        // and over an environment `ui` too.
-        let l = with("ui = \"disabled\"\nadmin_ui = true\n", &[]);
-        assert!(l.config.access.admin_ui && warned(&l) == 1);
-        let l = with(
-            "ui = \"disabled\"\n",
-            &[("FARSIGHT__ACCESS__ADMIN_UI", "true")],
-        );
-        assert!(l.config.access.admin_ui);
-        assert!(l.env_keys.iter().any(|k| k == "access.admin_ui"));
-        let l = with("admin_ui = true\n", &[("FARSIGHT__ACCESS__UI", "disabled")]);
-        assert!(l.config.access.admin_ui && warned(&l) == 1);
-        // The environment's `ui` beats the file's, as for every key.
-        let l = with(
-            "ui = \"public_read\"\n",
-            &[("FARSIGHT__ACCESS__UI", "disabled")],
-        );
-        assert!(!l.config.access.admin_ui);
-        assert_eq!(l.admin_auth(), AdminAuth::Disabled);
-    }
-
-    #[test]
-    fn unset_admin_keys_are_not_written() {
+    fn unset_admin_did_is_not_written() {
         let mut c = complete();
         let text = to_toml(&c).unwrap();
         assert!(text.contains("admin_did = \"did:plc:"));
-        assert!(!text.contains("admin_password_bcrypt"));
         c.access.admin_did.clear();
         c.access.admin_ui = false;
         assert!(!to_toml(&c).unwrap().contains("admin_did"));
@@ -2248,31 +1995,15 @@ gap_threshold = "300s"
 
     #[test]
     fn set_admin_did_edits_the_file_text() {
-        let old = "[access]\nui = \"auth_all\"\n\n[auth]\nadmin_token_sha256 = \"x\"\nadmin_password_bcrypt = \"$2b$12$x\"\n";
-        let e = set_admin_did(old, ADMIN_DID, false).unwrap();
-        assert!(e.was_migration && e.removed_password);
-        assert!(e.text.contains(&format!("admin_did = \"{ADMIN_DID}\"")));
-        assert!(!e.text.contains("admin_password_bcrypt"));
-        assert!(e.text.contains("admin_token_sha256") && e.text.contains("auth_all"));
-        // The password stays when the environment locks it.
-        let e = set_admin_did(old, ADMIN_DID, true).unwrap();
-        assert!(e.was_migration && !e.removed_password);
-        assert!(e.text.contains("admin_password_bcrypt"));
-        // Changing an existing DID is not a migration.
-        let e2 = set_admin_did(&e.text, "did:web:alice.example", false).unwrap();
-        assert!(!e2.was_migration);
-        assert!(e2.text.contains("did:web:alice.example") && !e2.text.contains(ADMIN_DID));
+        let old = "[access]\ncors = false\n\n[auth]\nadmin_token_sha256 = \"x\"\n";
+        let text = set_admin_did(old, ADMIN_DID).unwrap();
+        assert!(text.contains(&format!("admin_did = \"{ADMIN_DID}\"")));
+        assert!(text.contains("admin_token_sha256") && text.contains("cors = false"));
+        // An existing DID is replaced.
+        let text = set_admin_did(&text, "did:web:alice.example").unwrap();
+        assert!(text.contains("did:web:alice.example") && !text.contains(ADMIN_DID));
         // A file with no [access] table gets one.
-        assert!(
-            set_admin_did("", ADMIN_DID, false)
-                .unwrap()
-                .text
-                .contains("[access]")
-        );
-        assert!(set_admin_did(old, "alice.example", false).is_err());
-        assert_eq!(
-            pre_oauth_backup_path(Path::new("/etc/farsight/config.toml")),
-            Path::new("/etc/farsight/config.toml.pre-oauth")
-        );
+        assert!(set_admin_did("", ADMIN_DID).unwrap().contains("[access]"));
+        assert!(set_admin_did(old, "alice.example").is_err());
     }
 }

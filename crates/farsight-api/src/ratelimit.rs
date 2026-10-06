@@ -23,8 +23,7 @@ pub enum Class {
     KeyBackfill,
     /// UI handle/DID lookups by anonymous visitors, per IP.
     UiLookup,
-    /// UI sign-in attempts (starts, OAuth callbacks, migration submits),
-    /// per IP.
+    /// UI sign-in attempts (starts, OAuth callbacks), per IP.
     UiLogin,
     /// UI sign-in starts: one bucket for the whole process. An address
     /// with a recent successful sign-in is not charged (§3.6).

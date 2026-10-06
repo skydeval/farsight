@@ -1940,7 +1940,6 @@ async fn check_live(pg: &Pg, c: &mut Checks) -> Res<()> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let bcrypt = bcrypt::hash("harness-password-123", 4).map_err(e)?;
     let cfg = format!(
         r#"[server]
 hostname = "farsight.test"
@@ -1956,11 +1955,9 @@ urls = ["{LIVE_JETSTREAM}"]
 
 [access]
 reads = "public"
-ui = "public_read"
 
 [auth]
 admin_token_sha256 = "{token_hash}"
-admin_password_bcrypt = "{bcrypt}"
 
 [metrics]
 bind = "127.0.0.1:{metrics}"

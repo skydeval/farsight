@@ -26,7 +26,7 @@ use farsight_storage::gates::GateState;
 use farsight_storage::keys::Limits;
 use farsight_storage::ui_rows::SortIndexes;
 use serde_json::Value;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 
 use crate::common::{self, NO_STORE, cookie, ct_eq, read_cookie, render_private};
 
@@ -39,11 +39,6 @@ pub const ADMIN_COOKIE: &str = "farsight_admin";
 pub const SESSION_IDLE: Duration = Duration::from_secs(12 * 3600);
 /// Absolute expiry.
 pub const SESSION_ABSOLUTE: Duration = Duration::from_secs(7 * 24 * 3600);
-/// How long a migration submit from an IP with a recent successful
-/// sign-in may wait for a bcrypt slot; others wait [`LOGIN_WAIT`].
-pub const LOGIN_WAIT_KNOWN: Duration = Duration::from_secs(10);
-/// Bcrypt slot wait for other IPs.
-pub const LOGIN_WAIT: Duration = Duration::from_secs(2);
 
 /// Status the server's background tasks publish for the dashboard.
 #[derive(Debug, Default)]
@@ -94,9 +89,6 @@ pub struct WebState {
     pub api: Arc<ApiState>,
     /// Safe outbound client (handle resolution, §11.3).
     pub safe: SafeClient,
-    /// Bound on concurrent bcrypt verifications (§3.6; the migration
-    /// page only).
-    pub bcrypt_permits: Arc<Semaphore>,
     /// IPs with a successful sign-in: exempt from the process-wide
     /// sign-in bucket (§3.6).
     pub recent_logins: Mutex<HashMap<IpAddr, Instant>>,
@@ -140,12 +132,10 @@ pub fn oauth_session_key(cookie: &str, did: &str) -> [u8; 32] {
 }
 
 /// The key a session cookie is looked up under with this config: bound
-/// to the admin DID when one is configured; the plain hash of a
-/// pre-OAuth password session in the migration state; none otherwise.
+/// to the admin DID when one is configured; none otherwise.
 pub fn session_key(cfg: &LoadedConfig, cookie: &str) -> Option<[u8; 32]> {
     match cfg.admin_auth() {
         AdminAuth::Configured(did) => Some(oauth_session_key(cookie, &did)),
-        AdminAuth::Migration => Some(common::sha256(cookie)),
         AdminAuth::Unconfigured | AdminAuth::Disabled => None,
     }
 }
@@ -925,21 +915,6 @@ async fn dashboard(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Respo
     })
 }
 
-/// Tells the admin that sign-in is changing (the migration state, §8.6).
-fn migration_warning(st: &WebState, d: &mut DashboardData) {
-    if st.api.config.current().admin_auth() == AdminAuth::Migration {
-        d.warnings.insert(
-            0,
-            Warning {
-                class: "bad",
-                text: "Admin sign-in is changing: open /enter to set the admin DID. The \
-                       password stops working once it is set."
-                    .into(),
-            },
-        );
-    }
-}
-
 /// Tells the admin that the tables do not all sort by creation
 /// time yet: the sort indexes are still being built, or are held because
 /// the storage budget has no room for them (§7.6).
@@ -979,7 +954,7 @@ async fn dashboard_fragment(State(st): State<Arc<WebState>>, headers: HeaderMap)
 #[derive(Template)]
 #[template(path = "alerts_fragment.html")]
 pub struct AlertsFragment {
-    /// Warnings (§9.3, budget, v1, gaps, sign-in, sort indexes).
+    /// Warnings (§9.3, budget, v1, gaps, sort indexes).
     pub warnings: Vec<Warning>,
     /// Coverage in words.
     pub coverage: String,
@@ -995,7 +970,6 @@ async fn alerts(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response
         Ok(d) => (d, None),
         Err(e) => (DashboardData::default(), Some(e)),
     };
-    migration_warning(&st, &mut d);
     sort_warning(&st, &mut d);
     render_private(&AlertsFragment {
         warnings: d.warnings,
@@ -1419,8 +1393,6 @@ pub struct SettingsPage {
     pub admin_did: String,
     /// Its verified handle, when known.
     pub admin_handle: Option<String>,
-    /// The instance is in the migration state.
-    pub migration: bool,
     /// The Public UI subsection's values.
     pub p: crate::public_settings::View,
 }
@@ -1433,7 +1405,6 @@ fn redact_file(text: &str) -> String {
     };
     for (sec, key) in [
         ("auth", "admin_token_sha256"),
-        ("auth", "admin_password_bcrypt"),
         ("metrics", "bearer_token_sha256"),
     ] {
         if let Some(v) = t
@@ -1470,7 +1441,6 @@ fn unredact(submitted: &str, current: &str) -> Result<String, String> {
     let lookup = |sec: &str, key: &str| cur.get(sec).and_then(|s| s.get(key)).cloned();
     for (sec, key) in [
         ("auth", "admin_token_sha256"),
-        ("auth", "admin_password_bcrypt"),
         ("metrics", "bearer_token_sha256"),
         ("storage", "database_url"),
     ] {
@@ -1521,7 +1491,6 @@ pub(crate) fn settings_base(st: &WebState, s: &Admin) -> SettingsPage {
             .oauth
             .cached_handle(&cur.config.access.admin_did)
             .flatten(),
-        migration: cur.admin_auth() == AdminAuth::Migration,
         p: crate::public_settings::View::of(&cur.config),
     }
 }
@@ -1856,7 +1825,7 @@ mod tests {
 
     #[test]
     fn redaction_round_trip() {
-        let file = "[auth]\nadmin_token_sha256 = \"abc\"\nadmin_password_bcrypt = \"$2b$x\"\n\
+        let file = "[auth]\nadmin_token_sha256 = \"abc\"\n\
                     [storage]\ndatabase_url = \"postgres://u:secret@db/f\"\n";
         let shown = redact_file(file);
         assert!(!shown.contains("secret") && !shown.contains("abc"));

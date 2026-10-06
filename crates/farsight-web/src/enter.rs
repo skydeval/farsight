@@ -1,12 +1,10 @@
-//! Admin sign-in (design §8.6): `/enter`, the OAuth callback, the client
-//! metadata document and the one-time migration from password sign-in.
+//! Admin sign-in (design §8.6): `/enter`, the OAuth callback and the
+//! client metadata document.
 //!
 //! Sign-in authenticates one account, `access.admin_did`, at that
 //! account's own authorization server (see [`crate::oauth`]). What
 //! `/enter` serves depends on the config's [`AdminAuth`] state: the
-//! sign-in page, the migration page (a pre-OAuth config with a password
-//! and no admin DID), or a note that no admin is configured. The only
-//! place a password is still read is the migration page.
+//! sign-in page, or a note that no admin is configured.
 //!
 //! Logged: a successful sign-in (INFO, with the DID and address), a
 //! completed flow for another account (WARN, at most one a minute).
@@ -18,20 +16,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use askama::Template;
-use axum::extract::{Form, Query, State};
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use farsight_api::clientip::ClientIp;
-use farsight_api::config_store::EditError;
 use farsight_api::ratelimit::{Class, ip_key};
 use farsight_core::Did;
-use farsight_core::config::{AdminAuth, LoadedConfig, valid_admin_did};
+use farsight_core::config::{AdminAuth, LoadedConfig};
 
 use crate::common::{self, NO_STORE, cookie, random_id, read_cookie, render_private};
 use crate::oauth::{self, Taken};
 use crate::pages::{
-    ADMIN_COOKIE, LOGIN_WAIT, LOGIN_WAIT_KNOWN, MessagePage, Nav, SESSION_ABSOLUTE, WebState,
-    admin, metrics_rate_limited, oauth_session_key,
+    ADMIN_COOKIE, MessagePage, Nav, SESSION_ABSOLUTE, WebState, admin, metrics_rate_limited,
+    oauth_session_key,
 };
 
 /// The flow cookie: ties an OAuth callback to the browser that started
@@ -59,24 +56,6 @@ pub struct EnterPage {
     pub hosted_url: Option<String>,
     /// Error.
     pub error: Option<String>,
-    /// Notice.
-    pub notice: Option<String>,
-}
-
-/// The migration page.
-#[derive(Template)]
-#[template(path = "enter_migrate.html")]
-pub struct MigratePage {
-    /// Navigation.
-    pub nav: Nav,
-    /// Error.
-    pub error: Option<String>,
-    /// The DID entered so far.
-    pub did: String,
-    /// The DID did not resolve: offer "use anyway".
-    pub unresolved: bool,
-    /// Where hosted sign-in will be, when the hostname allows it.
-    pub hosted_url: Option<String>,
 }
 
 /// The page that ends a successful sign-in.
@@ -103,12 +82,7 @@ fn status(mut r: Response, s: StatusCode) -> Response {
 
 /// The sign-in page for this request's `Host`: the button where a client
 /// mode applies, otherwise where to go instead.
-fn sign_in_page(
-    cfg: &LoadedConfig,
-    headers: &HeaderMap,
-    error: Option<String>,
-    notice: Option<String>,
-) -> Response {
+fn sign_in_page(cfg: &LoadedConfig, headers: &HeaderMap, error: Option<String>) -> Response {
     let hostname = cfg.config.server.hostname.clone();
     let kind = if oauth::client_for(&hostname, host_header(headers)).is_some() {
         "signin"
@@ -121,7 +95,6 @@ fn sign_in_page(
         hostname,
         hosted_url: hosted_url(cfg),
         error,
-        notice,
     });
     // The form on this page is answered with a redirect to the account's
     // authorization server.
@@ -139,22 +112,6 @@ fn unconfigured_page(cfg: &LoadedConfig) -> Response {
         hostname: cfg.config.server.hostname.clone(),
         hosted_url: hosted_url(cfg),
         error: None,
-        notice: None,
-    })
-}
-
-fn migrate_page(
-    cfg: &LoadedConfig,
-    did: &str,
-    error: Option<String>,
-    unresolved: bool,
-) -> Response {
-    render_private(&MigratePage {
-        nav: Nav::default(),
-        error,
-        did: did.to_owned(),
-        unresolved,
-        hosted_url: hosted_url(cfg),
     })
 }
 
@@ -163,13 +120,12 @@ pub async fn page(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Respon
     let cfg = st.api.config.current();
     match cfg.admin_auth() {
         AdminAuth::Disabled => common::not_found(),
-        AdminAuth::Migration => migrate_page(&cfg, "", None, false),
         AdminAuth::Unconfigured => unconfigured_page(&cfg),
         AdminAuth::Configured(_) => {
             if admin(&st, &headers).await.is_some() {
                 return common::redirect("/admin");
             }
-            sign_in_page(&cfg, &headers, None, None)
+            sign_in_page(&cfg, &headers, None)
         }
     }
 }
@@ -220,19 +176,16 @@ fn flow_cookie(value: Option<&str>, secure: bool) -> HeaderValue {
     HeaderValue::from_str(&c).expect("cookie is ASCII")
 }
 
-/// `POST /enter`: starts a sign-in (or, in the migration state, takes the
-/// migration form).
+/// `POST /enter`: starts a sign-in.
 pub async fn submit(
     State(st): State<Arc<WebState>>,
     headers: HeaderMap,
     client: Option<axum::Extension<ClientIp>>,
-    Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     let cfg = st.api.config.current();
     let client = client.map(|c| c.0);
     let did = match cfg.admin_auth() {
         AdminAuth::Disabled => return common::not_found(),
-        AdminAuth::Migration => return migrate(&st, &cfg, &headers, client, &form).await,
         AdminAuth::Unconfigured => {
             return status(unconfigured_page(&cfg), StatusCode::BAD_REQUEST);
         }
@@ -243,10 +196,7 @@ pub async fn submit(
     }
     let Some(oauth_client) = oauth::client_for(&cfg.config.server.hostname, host_header(&headers))
     else {
-        return status(
-            sign_in_page(&cfg, &headers, None, None),
-            StatusCode::BAD_REQUEST,
-        );
+        return status(sign_in_page(&cfg, &headers, None), StatusCode::BAD_REQUEST);
     };
     let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
     if let Err((_, retry)) = st.api.limiter.check(
@@ -258,7 +208,6 @@ pub async fn submit(
             &cfg,
             &headers,
             Some("Too many sign-in attempts; wait a minute.".into()),
-            None,
         );
         return too_many(page, Class::UiLogin, retry);
     }
@@ -275,7 +224,6 @@ pub async fn submit(
                 &cfg,
                 &headers,
                 Some("Sign-in is busy; try again in a few seconds.".into()),
-                None,
             );
             return too_many(page, Class::UiLoginStart, retry);
         }
@@ -287,7 +235,6 @@ pub async fn submit(
                 &cfg,
                 &headers,
                 Some("The admin account's server could not be reached. Try again shortly.".into()),
-                None,
             ),
             StatusCode::BAD_GATEWAY,
         )
@@ -367,7 +314,7 @@ pub async fn callback(
     let admin_did = match cfg.admin_auth() {
         AdminAuth::Disabled => return common::not_found(),
         AdminAuth::Configured(did) => Some(did),
-        AdminAuth::Migration | AdminAuth::Unconfigured => None,
+        AdminAuth::Unconfigured => None,
     };
     let client = client.map(|c| c.0);
     let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
@@ -502,152 +449,6 @@ pub async fn client_metadata(State(st): State<Arc<WebState>>, headers: HeaderMap
             .into_response(),
         _ => common::not_found(),
     }
-}
-
-/// The migration form (design §8.6): the existing admin password, one
-/// last time, and the new admin DID. One submit, no confirmation step —
-/// the password is never written into a page. On success the config is
-/// rewritten (after the pre-OAuth backup), every password session ends,
-/// and the sign-in page is shown. No session is created here.
-async fn migrate(
-    st: &WebState,
-    cfg: &LoadedConfig,
-    headers: &HeaderMap,
-    client: Option<ClientIp>,
-    form: &HashMap<String, String>,
-) -> Response {
-    if !common::same_origin(headers) {
-        return common::forbidden("cross-origin request refused");
-    }
-    let did = form
-        .get("admin_did")
-        .map(|d| d.trim().to_owned())
-        .unwrap_or_default();
-    let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
-    if let Err((_, retry)) = st.api.limiter.check(
-        Class::UiLogin,
-        &ip_key(ip),
-        Class::UiLogin.limit(&cfg.config, None),
-    ) {
-        let page = migrate_page(
-            cfg,
-            &did,
-            Some("Too many attempts; wait a minute.".into()),
-            false,
-        );
-        return too_many(page, Class::UiLogin, retry);
-    }
-    let wait = if recently_signed_in(st, ip) {
-        LOGIN_WAIT_KNOWN
-    } else {
-        LOGIN_WAIT
-    };
-    let permit = match tokio::time::timeout(wait, st.bcrypt_permits.clone().acquire_owned()).await {
-        Ok(Ok(p)) => p,
-        _ => {
-            return status(
-                migrate_page(
-                    cfg,
-                    &did,
-                    Some("The server is busy; try again shortly.".into()),
-                    false,
-                ),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
-        }
-    };
-    let password = form.get("password").cloned().unwrap_or_default();
-    let hash = cfg.config.auth.admin_password_bcrypt.clone();
-    let ok = tokio::task::spawn_blocking(move || {
-        !hash.is_empty() && bcrypt::verify(password, &hash).unwrap_or(false)
-    })
-    .await
-    .unwrap_or(false);
-    drop(permit);
-    if !ok {
-        return status(
-            migrate_page(cfg, &did, Some("Wrong password.".into()), false),
-            StatusCode::UNAUTHORIZED,
-        );
-    }
-    // Only a caller who knows the password gets as far as an outbound
-    // request for a DID of their choosing.
-    if !valid_admin_did(&did) {
-        return status(
-            migrate_page(
-                cfg,
-                &did,
-                Some(
-                    "Enter a DID: did:plc: followed by 24 characters, or did:web: followed by a \
-                     hostname. A handle will not do."
-                        .into(),
-                ),
-                false,
-            ),
-            StatusCode::BAD_REQUEST,
-        );
-    }
-    let identity = match Did::parse(&did) {
-        Ok(parsed) => oauth::identity(&st.safe, &cfg.config, &parsed).await,
-        Err(e) => Err(e.to_string()),
-    };
-    let use_anyway = form.get("use_anyway").is_some_and(|v| !v.is_empty());
-    let handle = match identity {
-        Ok(i) => i.handle,
-        Err(_) if use_anyway => None,
-        Err(e) => {
-            return migrate_page(
-                cfg,
-                &did,
-                Some(format!(
-                    "{did} could not be resolved ({e}). Check it, or tick \"Use this DID anyway\" \
-                     and enter the password again."
-                )),
-                true,
-            );
-        }
-    };
-    if let Err(e) = st.api.config.migrate_admin_did(&did).await {
-        let code = match e {
-            EditError::AdminDid(_) | EditError::AdminUi(_) => StatusCode::CONFLICT,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        return status(
-            migrate_page(
-                cfg,
-                &did,
-                Some(format!(
-                    "{e}. Nothing was changed; the password still works here."
-                )),
-                false,
-            ),
-            code,
-        );
-    }
-    // Password sessions could no longer be found anyway (their keys are
-    // plain hashes, no longer looked up).
-    let _ = farsight_storage::auth::delete_all_sessions(&st.api.pool).await;
-    let _ = farsight_api::config_store::notify_config(&st.api.pool).await;
-    st.oauth.remember_handle(&did, handle.clone());
-    tracing::warn!(did, ip = %ip, "admin sign-in migrated from a password to an ATProto account");
-    let who = match handle {
-        Some(h) => format!("{did} (@{h})"),
-        None => did.clone(),
-    };
-    let mut r = sign_in_page(
-        &st.api.config.current(),
-        headers,
-        None,
-        Some(format!(
-            "Admin DID set to {who}. The password no longer works; sign in with that account."
-        )),
-    );
-    // Any password-session cookie the browser holds is dead.
-    r.headers_mut().append(
-        header::SET_COOKIE,
-        cookie(ADMIN_COOKIE, "", "/", false, Some(0)),
-    );
-    r
 }
 
 #[cfg(test)]

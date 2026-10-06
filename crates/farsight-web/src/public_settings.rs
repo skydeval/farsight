@@ -11,10 +11,6 @@
 //! Every save goes through the same loader as start-up, so a combination
 //! the loader refuses (the public UI without `reads = "public"`) is refused
 //! here too and nothing is written.
-//!
-//! The retired `show_history` key has no control. A save of this form
-//! deletes it from the file: the save edits the file's existing table, and
-//! a key the form does not name would otherwise stay there for ever.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -344,8 +340,6 @@ impl Settings {
         );
         p.insert("show_top_blockers".into(), self.show_top_blockers.into());
         p.insert("show_top_blocked".into(), self.show_top_blocked.into());
-        // Retired: accepted by the loader, never written back.
-        p.remove("show_history");
         p.insert(
             "record_viewer_url".into(),
             self.record_viewer_url.clone().into(),
@@ -694,12 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn a_save_drops_the_retired_key_and_writes_the_new_ones() {
-        // A file as the previous version's Settings page left it.
-        let mut t: toml::Table =
-            "[public_ui]\nshow_history = true\ncrawlable = true\n[server]\nbind = \"x\"\n"
-                .parse()
-                .unwrap();
+    fn a_save_writes_the_keys_into_the_existing_table() {
+        let mut t: toml::Table = "[public_ui]\ncrawlable = true\n[server]\nbind = \"x\"\n"
+            .parse()
+            .unwrap();
         let mut c = Config::default();
         c.public_ui.record_viewer_url =
             "https://viewer.example/at/{authority}/{collection}/{rkey}".into();
@@ -711,7 +703,6 @@ mod tests {
         assert!(!s.burst_raised);
         s.apply(&mut t).unwrap();
         let p = t["public_ui"].as_table().unwrap();
-        assert!(!p.contains_key("show_history"));
         assert_eq!(
             p["record_viewer_url"].as_str(),
             Some("https://viewer.example/at/{authority}/{collection}/{rkey}")

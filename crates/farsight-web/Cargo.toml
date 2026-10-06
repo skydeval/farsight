@@ -16,7 +16,6 @@ harness = []
 askama = "0.12"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "tokio"] }
 base64 = "0.22"
-bcrypt = "0.15"
 chrono.workspace = true
 farsight-api = { path = "../farsight-api" }
 farsight-core.workspace = true

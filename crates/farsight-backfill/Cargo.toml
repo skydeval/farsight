@@ -11,7 +11,7 @@ publish = false
 # Phase B harness support: lets the process reach loopback fake services
 # (PDS, PLC, relay) over plain HTTP, and builds the stage-4 harness. Off by
 # default so release builds keep the safe outbound client only.
-harness = ["farsight-storage/harness", "dep:bcrypt", "dep:reqwest"]
+harness = ["farsight-storage/harness", "dep:reqwest"]
 
 [lib]
 path = "src/lib.rs"
@@ -27,7 +27,6 @@ required-features = ["harness"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
-bcrypt = { version = "0.15", optional = true }
 chrono.workspace = true
 farsight-core.workspace = true
 farsight-storage = { path = "../farsight-storage" }
