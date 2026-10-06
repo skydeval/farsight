@@ -4,7 +4,7 @@
 #
 # Disk: the farsight-pgdata volume holds the index. Plan for roughly
 # 30-50 GB after the first full sweep plus ~17-19 GB/year of growth;
-# 500 GB is recommended. See README.md, "Storage and hardware".
+# 500 GB is recommended. See docs/guide/storage.md.
 
 name: farsight
 
