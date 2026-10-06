@@ -16,6 +16,9 @@ commits it covers.
 
 ### Removed
 
+- The redirects from addresses the pages had before any release
+  (`/public/…`, and the admin pages at `/lookup/…`, `/ops`, `/settings`
+  and `/reset`). Those paths are unknown paths now.
 - The dashboard's "Oldest pending lists" block. The number of pending
   lists is still under Exceptions.
 

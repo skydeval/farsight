@@ -613,10 +613,10 @@ fn path_did(d: &str) -> String {
 }
 
 /// Whether `path` is an address of the public UI: its pages at the root,
-/// the card fragment, or one of the old addresses under `/public`.
+/// or the card fragment.
 fn is_public(path: &str) -> bool {
     path == "/"
-        || ["/?", "/search", "/did/", "/list/", "/card/", "/public"]
+        || ["/?", "/search", "/did/", "/list/", "/card/"]
             .iter()
             .any(|p| path.starts_with(p))
 }
@@ -1252,7 +1252,7 @@ async fn check_retired_key_removed(c: &mut Checks, h: &H, w: &World) -> Result<(
     let hist = h.get(&format!("{}/history", path_did(&w.s))).await?;
     let old_hist = h.get(&format!("/public{}/history", path_did(&w.s))).await?;
     c.check(
-        "show_history = true does nothing: there is no public history path with the public UI on — 404 under the account's page and at the old /public address",
+        "show_history = true does nothing: there is no public history path with the public UI on — 404 under the account's page and under /public",
         hist.status == 404 && old_hist.status == 404,
         format!("{} / {}", hist.short(), old_hist.short()),
     );
@@ -1483,91 +1483,21 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
         png.header("content-type").as_deref() == Some("image/png") && png.text.contains("PNG"),
         png.header("content-type").unwrap_or_default(),
     );
-    // The addresses the pages and assets had under /public: a permanent
-    // redirect to the new one, with the query.
-    let mut bad = Vec::new();
-    for (old, new) in [
-        ("/public".to_owned(), "/".to_owned()),
-        (
-            "/public/search?q=x.example".to_owned(),
-            "/search?q=x.example".to_owned(),
-        ),
-        (format!("/public{}", path_did(&w.s)), path_did(&w.s)),
-        (
-            format!("/public{}?bc=abc&nc=def", path_did(&w.s)),
-            format!("{}?bc=abc&nc=def", path_did(&w.s)),
-        ),
-        (format!("/public{}", w.list), w.list.clone()),
-        (
-            "/public/static/public.css".to_owned(),
-            "/static/public.css".to_owned(),
-        ),
-        (
-            "/public/static/public.js".to_owned(),
-            "/static/public.js".to_owned(),
-        ),
-        (
-            "/public/static/htmx.min.js".to_owned(),
-            "/static/htmx.min.js".to_owned(),
-        ),
-        (
-            "/public/static/og-default.png".to_owned(),
-            "/static/og-default.png".to_owned(),
-        ),
-    ] {
-        let r = h.get(&old).await?;
-        if r.status != 301
-            || r.header("location").as_deref() != Some(new.as_str())
-            || r.header("cache-control").as_deref() != Some("public, max-age=3600")
-        {
-            bad.push(format!(
-                "{old}: {} → {:?} {:?}",
-                r.status,
-                r.header("location"),
-                r.header("cache-control")
-            ));
-        }
-    }
-    c.check(
-        "the old /public addresses of the home, search, account and list pages and of the four assets answer 301 to the new address, query kept, public, max-age=3600",
-        bad.is_empty(),
-        bad.join("; "),
-    );
-    // The withdrawn paths.
-    let other = h.get("/public/nothing/here").await?;
-    let mut bad = Vec::new();
-    for p in [
-        "/public/about".to_owned(),
-        format!("/public{}/history", path_did(&w.s)),
-        format!("/public{}/history?hb=AAAA", path_did(&w.s)),
-        format!("/public{}/history", w.list),
-        format!("/public{}/history", path_did(&w.unknown)),
-        // The old card address is not redirected: the script takes no
-        // redirected card.
-        format!("/public/card/{}", w.s),
-    ] {
-        for r in [h.get(&p).await?, h.admin_get(&p).await?] {
-            if r.status != 404
-                || r.text != other.text
-                || r.header("cache-control").as_deref() != Some("no-store")
-                || r.header("location").is_some()
-                || r.header("x-robots-tag").as_deref() != Some("noindex, nofollow")
-            {
-                bad.push(format!("{p}: {}", support::truncate(&r.short(), 80)));
-            }
-        }
-    }
-    c.check(
-        "/public/about, both old public history paths and the old card path answer the 404 page any unknown /public/… path gets — no-store, no redirect, with or without an admin session",
-        bad.is_empty() && other.status == 404 && other.text.contains("There is no page at this address."),
-        bad.join("; "),
-    );
-    // Outside /public an unknown path is the bare 404, public UI or not.
+    // A page has one address: nothing answers under /public.
     let unknown = h.get("/no-such-route").await?;
     let mut bad = Vec::new();
     for p in [
         "/about".to_owned(),
         "/nonsense".to_owned(),
+        "/public".to_owned(),
+        "/public/search?q=x.example".to_owned(),
+        format!("/public{}", path_did(&w.s)),
+        format!("/public{}/history", path_did(&w.s)),
+        format!("/public{}", w.list),
+        format!("/public/card/{}", w.s),
+        "/public/about".to_owned(),
+        "/public/static/public.css".to_owned(),
+        "/public/nothing/here".to_owned(),
         format!("{}/history", path_did(&w.s)),
         format!("{}/history", w.list),
     ] {
@@ -1581,7 +1511,7 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
         }
     }
     c.check(
-        "an unknown root path — /about, a history path under an account or list page — is the bare 404 with the public UI on, not the public not-found page",
+        "an unknown path — /about, anything under /public, a history path under an account or list page — is the bare 404 with the public UI on, not a redirect and not the public not-found page",
         bad.is_empty() && unknown.status == 404 && unknown.text == "not found",
         bad.join("; "),
     );
@@ -2878,9 +2808,6 @@ async fn check_cache_and_headers(c: &mut Checks, h: &H, w: &World) -> Result<(),
         (format!("/search?q={}", w.s), "no-store"),
         ("/search?q=".to_owned(), "no-store"),
         ("/did/nope".to_owned(), "no-store"),
-        ("/public/nothing".to_owned(), "no-store"),
-        ("/public/about".to_owned(), "no-store"),
-        (format!("/public{}/history", path_did(&w.s)), "no-store"),
         // A card whose fetch failed (the harness's PLC is unreachable).
         (format!("/card/{}", w.s), "no-store"),
         (format!("/card/{}", w.unknown), "no-store"),
@@ -3098,8 +3025,6 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
         (path_did(&w.s), true),
         (w.list.clone(), true),
         (format!("/card/{}", w.s), false),
-        (format!("/public{}/history", path_did(&w.s)), false),
-        ("/public/about".to_owned(), false),
         (format!("/search?q={}", w.s), false),
         ("/did/nope".to_owned(), false),
         (path_did(&w.e), false),
@@ -3111,9 +3036,9 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
         }
     }
     c.check(
-        "crawlable = true: robots.txt keeps crawlers out of the admin UI, sign-in, the wizard, the API, search and cards (their old addresses too) and the health endpoints, and allows the rest; cards, search, error and withheld pages stay noindex",
+        "crawlable = true: robots.txt keeps crawlers out of the admin UI, sign-in, the wizard, the API, search and cards and the health endpoints, and allows the rest; cards, search, error and withheld pages stay noindex",
         robots.text
-            == "User-agent: *\nDisallow: /admin\nDisallow: /enter\nDisallow: /setup\nDisallow: /xrpc/\nDisallow: /search\nDisallow: /card/\nDisallow: /public/search\nDisallow: /public/card/\nDisallow: /health\nDisallow: /livez\nAllow: /\n"
+            == "User-agent: *\nDisallow: /admin\nDisallow: /enter\nDisallow: /setup\nDisallow: /xrpc/\nDisallow: /search\nDisallow: /card/\nDisallow: /health\nDisallow: /livez\nAllow: /\n"
             && bad.is_empty(),
         if bad.is_empty() { robots.text.replace('\n', " / ") } else { bad.join("; ") },
     );
@@ -4011,7 +3936,7 @@ async fn check_metrics(c: &mut Checks, h: &H) -> Result<(), String> {
             &[("page", page), ("status", status)],
         )
     };
-    let pages = ["home", "search", "did", "list", "card", "robots", "other"];
+    let pages = ["home", "search", "did", "list", "card", "robots"];
     let missing: Vec<&str> = pages
         .iter()
         .copied()
@@ -4023,15 +3948,14 @@ async fn check_metrics(c: &mut Checks, h: &H) -> Result<(), String> {
         .filter_map(|l| l.split("page=\"").nth(1)?.split('"').next())
         .collect();
     c.check(
-        "farsight_public_ui_requests_total has exactly the page labels home, search, did, list, card, robots, other — no about, did_history or list_history — with bucketed statuses; the removed paths are counted under other",
+        "farsight_public_ui_requests_total has exactly the page labels home, search, did, list, card, robots — one per page, nothing for an unknown path — with bucketed statuses",
         missing.is_empty()
             && seen == pages.iter().copied().collect::<BTreeSet<_>>()
             && req("search", "3xx") > 0.0
             && req("did", "4xx") > 0.0
             && req("did", "5xx") > 0.0
             && req("card", "2xx") > 0.0
-            && req("card", "4xx") > 0.0
-            && req("other", "4xx") > 0.0,
+            && req("card", "4xx") > 0.0,
         format!("missing {missing:?}; seen {seen:?}"),
     );
     let labels: BTreeSet<&str> = m

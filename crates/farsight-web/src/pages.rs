@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use askama::Template;
 use axum::Router;
-use axum::extract::{Form, RawQuery, State};
+use axum::extract::{Form, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -252,13 +252,6 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/static/htmx.min.js", get(common::htmx))
         .route(common::OG_IMAGE_PATH, get(common::og_image))
         .route("/static/favicon.svg", get(common::favicon))
-        // The admin pages' addresses before they moved under `/admin`:
-        // redirected for one release, then gone.
-        .route("/lookup/did", get(old_lookup_did))
-        .route("/lookup/list", get(old_lookup_list))
-        .route("/ops", get(old_ops))
-        .route("/settings", get(old_settings))
-        .route("/reset", get(old_reset))
         .merge(crate::public::router())
         .with_state(state)
 }
@@ -269,36 +262,6 @@ async fn admin_slash(State(st): State<Arc<WebState>>) -> Response {
         return common::not_found();
     }
     common::redirect("/admin")
-}
-
-/// A pre-`/admin` address of an admin page: a permanent redirect to the
-/// new one while the admin UI is on, with the request's query. The target
-/// is a constant; nothing of the request's path goes into it.
-fn old_admin_path(st: &WebState, to: &'static str, query: Option<String>) -> Response {
-    if st.api.config.current().admin_auth() == AdminAuth::Disabled {
-        return common::not_found();
-    }
-    common::moved(to, query.as_deref())
-}
-
-async fn old_lookup_did(State(st): State<Arc<WebState>>, RawQuery(q): RawQuery) -> Response {
-    old_admin_path(&st, "/admin/lookup/did", q)
-}
-
-async fn old_lookup_list(State(st): State<Arc<WebState>>, RawQuery(q): RawQuery) -> Response {
-    old_admin_path(&st, "/admin/lookup/list", q)
-}
-
-async fn old_ops(State(st): State<Arc<WebState>>, RawQuery(q): RawQuery) -> Response {
-    old_admin_path(&st, "/admin/ops", q)
-}
-
-async fn old_settings(State(st): State<Arc<WebState>>, RawQuery(q): RawQuery) -> Response {
-    old_admin_path(&st, "/admin/settings", q)
-}
-
-async fn old_reset(State(st): State<Arc<WebState>>, RawQuery(q): RawQuery) -> Response {
-    old_admin_path(&st, "/admin/reset", q)
 }
 
 // ---------------------------------------------------------------------------

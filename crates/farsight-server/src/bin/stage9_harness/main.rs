@@ -1,14 +1,14 @@
 //! `farsight-stage9-harness`: Phase B Mode A for UI v2.5.2 — the public
 //! UI at the root, the admin UI under `/admin` behind a session, the two
 //! switches (`access.public_ui`, `access.admin_ui`), the retired
-//! `access.ui`, the old addresses and their redirects, the static assets,
+//! `access.ui`, that no page has a second address, the static assets,
 //! `robots.txt`, and the wizard's access step.
 //!
 //! Sections, with the numbers the stage kickoff gives its probes:
 //!
 //! - 1: routing in the four switch combinations (1–4), sessions (10–12);
 //! - 2: config (5–9);
-//! - 3: old addresses (13–16);
+//! - 3: no second address for any page (13–16);
 //! - 4: static assets (17–21);
 //! - 5: `/` of an API-only instance (22–23);
 //! - 6: the wizard (24–27);
@@ -691,8 +691,8 @@ async fn check_admin_only(c: &mut Checks, s: &Srv, cookie: &str, w: &World) -> R
     );
     let old_admin = s.get("/settings").await?;
     c.check(
-        "an old admin address redirects here too (the admin UI is on; the public UI does not matter)",
-        old_admin.status == 301 && loc(&old_admin) == "/admin/settings",
+        "an admin page has no address at the root: /settings is an unknown path",
+        bare(&old_admin) && old_admin.header("location").is_none(),
         brief(&old_admin),
     );
     Ok(())
@@ -921,177 +921,70 @@ async fn check_config(
 
 // ----------------------------------------------------------- 3. old addresses
 
+/// The pages have one address each. The addresses they had before
+/// anything was released (`/public/…`, and the admin pages at the root)
+/// are not routes: they get what any unknown path gets.
 async fn check_old_paths(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<(), String> {
-    c.section("3. old addresses: named redirects only (probes 13–16)");
+    c.section("3. no second address for any page");
     let s = &w.subject;
-    let cases: Vec<(String, String)> = vec![
-        ("/public".into(), "/".into()),
-        ("/public?x=1".into(), "/?x=1".into()),
-        (
-            format!("/public/search?q={}", enc(s)),
-            format!("/search?q={}", enc(s)),
-        ),
-        (format!("/public/did/{s}"), format!("/did/{s}")),
-        (
-            format!("/public/did/{s}?bc=abc&nc=d%20e"),
-            format!("/did/{s}?bc=abc&nc=d%20e"),
-        ),
-        (
-            format!("/public/list/{s}/3kaaaaaaaaaa2?mc=x"),
-            format!("/list/{s}/3kaaaaaaaaaa2?mc=x"),
-        ),
-        (
-            "/public/did/did:web:example.com%253A8080".into(),
-            "/did/did:web:example.com%253A8080".into(),
-        ),
-        (
-            "/public/static/public.css".into(),
-            "/static/public.css".into(),
-        ),
-        (
-            "/public/static/public.js".into(),
-            "/static/public.js".into(),
-        ),
-        (
-            "/public/static/htmx.min.js".into(),
-            "/static/htmx.min.js".into(),
-        ),
-        (
-            "/public/static/og-default.png".into(),
-            "/static/og-default.png".into(),
-        ),
+    let paths: Vec<String> = vec![
+        "/public".into(),
+        "/public?x=1".into(),
+        "/public/".into(),
+        format!("/public/search?q={}", enc(s)),
+        format!("/public/did/{s}"),
+        format!("/public/did/{s}/history"),
+        format!("/public/list/{s}/3kaaaaaaaaaa2?mc=x"),
+        format!("/public/card/{s}"),
+        "/public/about".into(),
+        "/public/nonsense".into(),
+        "/public/static/public.css".into(),
+        "/public/static/public.js".into(),
+        "/public/static/htmx.min.js".into(),
+        "/public/static/og-default.png".into(),
+        "/lookup/did".into(),
+        "/lookup/did?q=did%3Aplc%3Ax".into(),
+        "/lookup/list?q=at%3A%2F%2Fx&mc=y".into(),
+        "/ops".into(),
+        "/settings".into(),
+        "/reset".into(),
+        "/dashboard/fragment".into(),
+        "/logout".into(),
+        "/ops/backfill".into(),
+        "/settings/token".into(),
+        "/static/farsight.js".into(),
+        "/nonsense".into(),
+        // Paths that would name another host if a prefix were stripped.
+        "/public//evil.example.com/x".into(),
+        "//evil.example.com/x".into(),
+        "/public/%2F%2Fevil.example.com".into(),
+        "/public/did/%2F%2Fevil.example.com".into(),
+        "/public/did/a%0D%0ALocation:%20https:%2F%2Fevil.example.com".into(),
+        "/lookup//evil.example.com".into(),
     ];
     let mut bad = Vec::new();
-    for (from, to) in &cases {
-        let r = a.get(from).await?;
-        if !(r.status == 301 && loc(&r) == *to && cc(&r) == "public, max-age=3600") {
-            bad.push(format!("{from}: {}", brief(&r)));
-        }
-    }
-    c.check(
-        "the eight old public addresses: 301 to the new one, query kept, public, max-age=3600 (probes 13, 21)",
-        bad.is_empty(),
-        if bad.is_empty() { format!("{} requests", cases.len()) } else { bad.join(" | ") },
-    );
-    let hop = a.get(&format!("/did/{s}?bc=abc")).await?;
-    let target = a.get(&format!("/did/{s}")).await?;
-    c.check(
-        "a redirect's target leads to a page that exists: the cursor parameter the old address carried is retired, so the target answers with one more 301, to the page itself",
-        hop.status == 301 && loc(&hop) == format!("/did/{s}") && target.status == 200,
-        format!("{} then {}", brief(&hop), brief(&target)),
-    );
-    let cases = [
-        ("/lookup/did", "/admin/lookup/did"),
-        (
-            "/lookup/did?q=did%3Aplc%3Ax",
-            "/admin/lookup/did?q=did%3Aplc%3Ax",
-        ),
-        (
-            "/lookup/list?q=at%3A%2F%2Fx&mc=y",
-            "/admin/lookup/list?q=at%3A%2F%2Fx&mc=y",
-        ),
-        ("/ops", "/admin/ops"),
-        ("/settings", "/admin/settings"),
-        ("/reset", "/admin/reset"),
-    ];
-    let mut bad = Vec::new();
-    for (from, to) in cases {
-        for r in [a.get(from).await?, a.admin_get(cookie, from).await?] {
-            if !(r.status == 301 && loc(&r) == to) {
-                bad.push(format!("{from}: {}", brief(&r)));
+    for p in &paths {
+        for r in [a.get(p).await?, a.admin_get(cookie, p).await?] {
+            if !(bare(&r) && r.header("location").is_none()) {
+                bad.push(format!("{p}: {}", brief(&r)));
             }
         }
     }
     c.check(
-        "the five old admin addresses: 301 to /admin/…, query kept, with or without a session (probe 14)",
-        bad.is_empty(),
-        bad.join(" | "),
-    );
-    all(
-        c,
-        "old admin addresses that are not redirected are unknown paths: /dashboard/fragment, /logout, /ops/backfill, /settings/token, /static/farsight.js",
-        a,
-        Some(cookie),
-        &[
-            "/dashboard/fragment",
-            "/logout",
-            "/ops/backfill",
-            "/settings/token",
-            "/static/farsight.js",
-        ],
-        bare,
-    )
-    .await?;
-    // Nothing of the request's path reaches Location.
-    let hostile = [
-        "/public//evil.example.com/x",
-        "/public//evil.example.com",
-        "//evil.example.com/x",
-        "/public/%2F%2Fevil.example.com",
-        "/public/https:%2F%2Fevil.example.com",
-        "/public/static/%2F%2Fevil.example.com",
-        "/public/static/..%2F..%2Fadmin",
-        "/lookup//evil.example.com",
-        "/lookup/%2F%2Fevil.example.com",
-    ];
-    let mut bad = Vec::new();
-    for p in hostile {
-        let r = a.get(p).await?;
-        if !(r.status == 404 && r.header("location").is_none()) {
-            bad.push(format!("{p}: {}", brief(&r)));
-        }
-    }
-    c.check(
-        "paths that would name another host if a prefix were stripped: 404, no Location (probe 15)",
+        "every address a page might once have had — under /public, or an admin page at the root — is an unknown path: the bare 404, no Location, with or without a session",
         bad.is_empty(),
         if bad.is_empty() {
-            hostile.join(" ")
+            format!("{} paths", paths.len())
         } else {
             bad.join(" | ")
         },
     );
-    let mut bad = Vec::new();
-    for p in [
-        "/public/did/%2F%2Fevil.example.com",
-        "/public/did/..%2F..%2Fadmin",
-        "/public/list/%2F%2Fevil.example.com/%2F%2Fx",
-        "/public/did/a%0D%0ALocation:%20https:%2F%2Fevil.example.com",
-    ] {
-        let r = a.get(p).await?;
-        let l = loc(&r);
-        let on_host = (l.starts_with("/did/") || l.starts_with("/list/"))
-            && !l.contains("//")
-            && !l.contains('\n')
-            && !l.contains('\r');
-        if !((r.status == 301 && on_host) || (r.status == 404 && l.is_empty())) {
-            bad.push(format!("{p}: {}", brief(&r)));
-        }
-    }
+    let hop = a.get(&format!("/did/{s}?bc=abc")).await?;
+    let target = a.get(&format!("/did/{s}")).await?;
     c.check(
-        "a parameter that holds an encoded slash, dots or a line break is re-encoded: the target begins with the fixed prefix and stays one segment on this host",
-        bad.is_empty(),
-        bad.join(" | "),
-    );
-    let mut bad = Vec::new();
-    for p in [
-        "/public/nonsense",
-        "/public/about",
-        &format!("/public/card/{s}"),
-        &format!("/public/did/{s}/history"),
-        "/public/static/farsight.css",
-        "/public/",
-    ] {
-        let r = a.get(p).await?;
-        if !(r.status == 404 && r.header("location").is_none()) {
-            bad.push(format!("{p}: {}", brief(&r)));
-        }
-    }
-    let nf = a.get("/public/nonsense").await?;
-    let root_nf = a.get("/nonsense").await?;
-    c.check(
-        "any other /public/… path is not redirected: the public not-found page; an unknown root path is the bare 404 (probe 16)",
-        bad.is_empty() && nf.text.contains("<html") && bare(&root_nf),
-        if bad.is_empty() { format!("{} | {}", nf.status, brief(&root_nf)) } else { bad.join(" | ") },
+        "a retired cursor parameter on a page's own address is dropped with one 301, to the page itself",
+        hop.status == 301 && loc(&hop) == format!("/did/{s}") && target.status == 200,
+        format!("{} then {}", brief(&hop), brief(&target)),
     );
     Ok(())
 }
@@ -1520,16 +1413,7 @@ async fn check_robots_and_metadata(
     let ra = a.get("/robots.txt").await?;
     let lines: Vec<&str> = ra.text.lines().collect();
     let closed = [
-        "/admin",
-        "/enter",
-        "/setup",
-        "/xrpc/",
-        "/search",
-        "/card/",
-        "/public/search",
-        "/public/card/",
-        "/health",
-        "/livez",
+        "/admin", "/enter", "/setup", "/xrpc/", "/search", "/card/", "/health", "/livez",
     ];
     c.check(
         "public UI on and crawlable: the admin UI, sign-in, wizard, API, search, cards and health are closed; Allow: / comes last (probe 28)",
@@ -1589,11 +1473,11 @@ async fn check_contracts(
         async move { http.post_form(&url, &[], &[]).await }
     };
     let p1 = post(a, &format!("/did/{}", w.subject)).await?;
-    let p2 = post(a, "/settings").await?;
+    let p2 = post(a, "/admin/lookup/did").await?;
     let p3 = post(d, "/admin").await?;
     let g = d.get("/admin/logout").await?;
     c.check(
-        "a method a route does not serve is a 405 with Allow, in every configuration: POST /did/{did}, POST /settings (an old address), and — on the API-only server — POST /admin and GET /admin/logout (probe 33)",
+        "a method a route does not serve is a 405 with Allow, in every configuration: POST /did/{did}, POST /admin/lookup/did, and — on the API-only server — POST /admin and GET /admin/logout (probe 33)",
         [&p1, &p2, &p3, &g].iter().all(|r| r.status == 405 && r.header("allow").is_some()),
         format!(
             "{} {:?} | {} | {} | {}",
@@ -1604,13 +1488,8 @@ async fn check_contracts(
             g.status
         ),
     );
-    let slash = a.get("/public/").await?;
-    c.check(
-        "/public/ (an empty tail) does not match the catch-all and is not redirected: 404 (probe 34: the kickoff expected a 301 to /; v2.5.2 §3.6 says 404, and that is what axum does)",
-        slash.status == 404 && slash.header("location").is_none(),
-        brief(&slash),
-    );
-    // Metric labels: the seven, with their new meanings.
+    // Metric labels: one per page; an unknown path is not a public UI
+    // request.
     let before = a.metrics_text().await?;
     a.get("/").await?;
     a.get("/public").await?;
@@ -1630,17 +1509,13 @@ async fn check_contracts(
     labels.sort_unstable();
     labels.dedup();
     c.check(
-        "farsight_public_ui_requests_total keeps its seven page labels; / counts as home, an old address as other (3xx for a redirect, 4xx for a not-found page), robots as robots (probe 36)",
-        labels == ["card", "did", "home", "list", "other", "robots", "search"]
+        "farsight_public_ui_requests_total has one label per page; / counts as home, robots as robots, and an unknown path such as /public is counted under none (probe 36)",
+        labels == ["card", "did", "home", "list", "robots", "search"]
             && delta("home", "2xx") == 1.0
-            && delta("other", "3xx") == 1.0
-            && delta("other", "4xx") == 1.0
             && delta("robots", "2xx") == 1.0,
         format!(
-            "{labels:?} home {} other {}/{} robots {}",
+            "{labels:?} home {} robots {}",
             delta("home", "2xx"),
-            delta("other", "3xx"),
-            delta("other", "4xx"),
             delta("robots", "2xx")
         ),
     );

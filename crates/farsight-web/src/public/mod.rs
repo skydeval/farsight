@@ -1,5 +1,5 @@
 //! The public UI (design §8.6): `/`, `/search`, `/did/…`, `/list/…`,
-//! `/card/…`, their old addresses under `/public`, and `/robots.txt`.
+//! `/card/…`, and `/robots.txt`.
 //!
 //! Anyone may look up the block relationships of a DID or a list. The
 //! surface is toggled by `access.public_ui` and shaped by `[public_ui]`,
@@ -800,102 +800,13 @@ async fn list_route(
     .await
 }
 
-// The addresses the public pages had under `/public` (§8.6): redirected
-// for one release while the public UI is on, then gone. One route per
-// page; each target is a fixed prefix plus the matched parameters,
-// re-encoded. `/public/card/{did}` is not among them: the script takes no
-// redirected card.
-
-/// Answers a request for an old public address: `to` while the public UI
-/// is on, the bare 404 otherwise.
-fn old_public_path(st: &WebState, to: Option<String>, query: Option<String>) -> Response {
-    let started = Instant::now();
-    let resp = match to {
-        Some(to) if st.api.config.current().config.access.public_ui => {
-            crate::common::moved(&to, query.as_deref())
-        }
-        _ => crate::common::not_found(),
-    };
-    metrics::observe(Page::Other, resp.status(), started.elapsed());
-    resp
-}
-
-async fn old_home(State(st): St, RawQuery(q): RawQuery) -> Response {
-    old_public_path(&st, Some("/".to_owned()), q)
-}
-
-async fn old_search(State(st): St, RawQuery(q): RawQuery) -> Response {
-    old_public_path(&st, Some("/search".to_owned()), q)
-}
-
-async fn old_did(
-    State(st): St,
-    path: Result<Path<String>, PathRejection>,
-    RawQuery(q): RawQuery,
-) -> Response {
-    old_public_path(&st, path.ok().map(|Path(did)| text::did_href(&did)), q)
-}
-
-async fn old_list(
-    State(st): St,
-    path: Result<Path<(String, String)>, PathRejection>,
-    RawQuery(q): RawQuery,
-) -> Response {
-    let to = path
-        .ok()
-        .map(|Path((did, rkey))| text::list_href(&did, &rkey));
-    old_public_path(&st, to, q)
-}
-
-async fn old_css(State(st): St) -> Response {
-    old_public_path(&st, Some("/static/public.css".to_owned()), None)
-}
-
-async fn old_js(State(st): St) -> Response {
-    old_public_path(&st, Some("/static/public.js".to_owned()), None)
-}
-
-async fn old_htmx(State(st): St) -> Response {
-    old_public_path(&st, Some("/static/htmx.min.js".to_owned()), None)
-}
-
-async fn old_og_image(State(st): St) -> Response {
-    old_public_path(&st, Some(OG_IMAGE_PATH.to_owned()), None)
-}
-
-/// Anything else under `/public/`: the public not-found page while the
-/// public UI is on, with no redirect. That covers the paths withdrawn in
-/// r21 (`/public/about` and the two history pages — their new home is
-/// behind login, and a redirect would name it) and `/public/card/{did}`.
-async fn other(State(st): St) -> Response {
-    let started = Instant::now();
-    let cfg = st.api.config.current();
-    let resp = if cfg.config.access.public_ui {
-        fail(
-            &cfg.config,
-            Fail::NotFound {
-                title: "Not found".into(),
-                message: "There is no page at this address.".into(),
-                link: None,
-            },
-        )
-    } else {
-        crate::common::not_found()
-    };
-    metrics::observe(Page::Other, resp.status(), started.elapsed());
-    resp
-}
-
 /// What crawlers may not fetch while the public UI is on and
 /// `crawlable`: the admin UI and sign-in, the wizard, the API, search and
-/// the card fragments (old addresses included), the health endpoints.
-/// The old `/public/…` page addresses are left open on purpose, so that a
-/// crawler sees their redirects. `Allow` comes last for crawlers that
-/// take the first match rather than the longest.
+/// the card fragments, the health endpoints. `Allow` comes last for
+/// crawlers that take the first match rather than the longest.
 const ROBOTS_CRAWLABLE: &str = "User-agent: *\nDisallow: /admin\nDisallow: /enter\nDisallow: \
                                 /setup\nDisallow: /xrpc/\nDisallow: /search\nDisallow: \
-                                /card/\nDisallow: /public/search\nDisallow: \
-                                /public/card/\nDisallow: /health\nDisallow: /livez\nAllow: /\n";
+                                /card/\nDisallow: /health\nDisallow: /livez\nAllow: /\n";
 
 /// The body of `/robots.txt`: nothing is offered to crawlers unless the
 /// public UI is on and `crawlable`.
@@ -932,15 +843,6 @@ pub fn router() -> Router<Arc<WebState>> {
         .route("/did/{did}", get(did_route))
         .route("/list/{did}/{rkey}", get(list_route))
         .route("/card/{did}", get(card::route))
-        .route("/public", get(old_home))
-        .route("/public/search", get(old_search))
-        .route("/public/did/{did}", get(old_did))
-        .route("/public/list/{did}/{rkey}", get(old_list))
-        .route("/public/static/public.css", get(old_css))
-        .route("/public/static/public.js", get(old_js))
-        .route("/public/static/htmx.min.js", get(old_htmx))
-        .route("/public/static/og-default.png", get(old_og_image))
-        .route("/public/{*rest}", get(other))
         .route("/robots.txt", get(robots))
 }
 
@@ -960,30 +862,19 @@ mod tests {
         let lines: Vec<&str> = b.lines().collect();
         assert_eq!(lines[0], "User-agent: *");
         for closed in [
-            "/admin",
-            "/enter",
-            "/setup",
-            "/xrpc/",
-            "/search",
-            "/card/",
-            "/public/search",
-            "/public/card/",
-            "/health",
-            "/livez",
+            "/admin", "/enter", "/setup", "/xrpc/", "/search", "/card/", "/health", "/livez",
         ] {
             assert!(
                 lines.contains(&format!("Disallow: {closed}").as_str()),
                 "{closed}"
             );
         }
-        // No rule is a prefix of a public page or of an old page address
-        // that redirects to one.
+        // No rule is a prefix of a public page.
         for open in [
             "/",
             "/did/did:plc:x",
             "/list/did:plc:x/k",
             "/static/public.css",
-            "/public/did/did:plc:x",
         ] {
             assert!(
                 !lines

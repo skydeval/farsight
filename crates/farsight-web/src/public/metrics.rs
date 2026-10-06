@@ -34,21 +34,17 @@ pub enum Page {
     Card,
     /// `/robots.txt`.
     Robots,
-    /// The pages' old addresses under `/public`: redirects and not-found
-    /// pages.
-    Other,
 }
 
 impl Page {
     /// Every page.
-    pub const ALL: [Page; 7] = [
+    pub const ALL: [Page; 6] = [
         Page::Home,
         Page::Search,
         Page::Did,
         Page::List,
         Page::Card,
         Page::Robots,
-        Page::Other,
     ];
 
     /// Metric label.
@@ -60,7 +56,6 @@ impl Page {
             Page::List => "list",
             Page::Card => "card",
             Page::Robots => "robots",
-            Page::Other => "other",
         }
     }
 }
@@ -133,9 +128,6 @@ mod tests {
     #[test]
     fn page_labels_are_the_documented_set() {
         let labels: Vec<&str> = Page::ALL.iter().map(|p| p.label()).collect();
-        assert_eq!(
-            labels,
-            ["home", "search", "did", "list", "card", "robots", "other"]
-        );
+        assert_eq!(labels, ["home", "search", "did", "list", "card", "robots"]);
     }
 }

@@ -178,13 +178,6 @@ try {
       ];
     },
   );
-  await probe("following the old address /public/did/{did} in a browser lands on /did/{did}", async () => {
-    const p = await anon.newPage();
-    await p.goto(`${base}/public/did/${subject}?x=1#blocked-by`);
-    const u = new URL(p.url());
-    await p.close();
-    return [u.pathname === `/did/${subject}` && u.search === "?x=1" && u.hash === "#blocked-by", p.url()];
-  });
   await anon.close();
 
   // The dashboard when its poll is refused: htmx leaves the page as it is.

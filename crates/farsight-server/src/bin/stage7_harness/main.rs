@@ -1399,24 +1399,17 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             enter.status, cb.status, meta.status, css.status, public.status
         ),
     );
-    // The addresses the admin pages had at the root.
+    // An admin page has no address at the root.
     let mut moved = Vec::new();
-    for (old, new) in [
-        ("/lookup/did?q=x.example", "/admin/lookup/did?q=x.example"),
-        ("/lookup/list", "/admin/lookup/list"),
-        ("/ops", "/admin/ops"),
-        ("/settings", "/admin/settings"),
-        ("/reset", "/admin/reset"),
+    for p in [
+        "/lookup/did?q=x.example",
+        "/lookup/list",
+        "/ops",
+        "/settings",
+        "/reset",
+        "/dashboard/fragment",
+        "/logout",
     ] {
-        let r = http.get(&format!("{}{old}", s.base), &[]).await?;
-        if !(r.status == 301
-            && r.header("location").as_deref() == Some(new)
-            && r.header("cache-control").as_deref() == Some("public, max-age=3600"))
-        {
-            moved.push(format!("{old}: {} → {:?}", r.status, r.header("location")));
-        }
-    }
-    for p in ["/dashboard/fragment", "/logout"] {
         let r = http.get(&format!("{}{p}", s.base), &[]).await?;
         if !bare(&r) {
             moved.push(format!("{p}: {}", r.short()));
@@ -1427,7 +1420,7 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         .await?;
     let slash = http.get(&format!("{}/admin/", s.base), &[]).await?;
     c.check(
-        "the admin pages' old root addresses (/lookup/did, /lookup/list, /ops, /settings, /reset) answer 301 to the address under /admin, query kept, public, max-age=3600, without a session lookup; /dashboard/fragment and /logout (GET and POST) are unknown paths now; /admin/ redirects to /admin",
+        "an admin page has no address at the root: /lookup/did, /lookup/list, /ops, /settings, /reset, /dashboard/fragment and /logout (GET and POST) are unknown paths; /admin/ redirects to /admin",
         moved.is_empty()
             && bare(&old_logout)
             && slash.status == 303
@@ -1548,7 +1541,7 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             ("/enter", ""),
             ("/enter/callback?state=x", ""),
             ("/.well-known/atproto-oauth-client-metadata", HOSTNAME),
-            // The old addresses are not redirected either.
+            // Nor does an admin page answer at the root.
             ("/settings", ""),
             ("/lookup/did", ""),
         ] {
