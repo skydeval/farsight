@@ -1479,7 +1479,8 @@ table.api-usage td.num {
 .api-usage-scroll {
   overflow-x: auto;
 }
-table.api-usage td:first-child {
+table.api-usage td:first-child,
+table.api-usage th {
   white-space: nowrap;
 }
 @media (max-width: 44rem) {
