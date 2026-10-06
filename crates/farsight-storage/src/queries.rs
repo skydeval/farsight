@@ -1020,6 +1020,18 @@ pub async fn op_errors(
     .await?)
 }
 
+/// The repair cycle that has not finished, if there is one: its id, the
+/// accounts it has re-read so far and whether it has read the relay's
+/// list to the end (until then the number still to do is not known).
+pub async fn repair_running(conn: &mut PgConnection) -> Result<Option<(i64, i64, bool)>> {
+    Ok(sqlx::query_as(
+        "SELECT id, done, enumerated_at IS NOT NULL FROM sweep_cycles
+         WHERE kind = 2 AND completed_at IS NULL ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(conn)
+    .await?)
+}
+
 /// Top host buckets by lifetime interning (dashboard, §11.2).
 pub async fn top_buckets(
     conn: &mut PgConnection,

@@ -467,29 +467,56 @@ pub struct DashboardData {
     pub buckets: Vec<(String, String, String, String)>,
 }
 
+/// The repair cycle under way before a new one is asked for, as (id,
+/// accounts re-read so far): asking again joins it.
+async fn repair_under_way(st: &WebState) -> Option<(i64, i64)> {
+    let mut conn = st.api.pool.acquire().await.ok()?;
+    farsight_storage::queries::repair_running(&mut conn)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| (r.0, r.1))
+}
+
 /// The warning about firehose gaps, if one is due. A closed gap is healed
-/// by a repair cycle; one that is open because the firehose is down
+/// by a repair cycle: `repair` is the one under way, as (id, accounts
+/// re-read so far). A gap that is open because the firehose is down
 /// closes when it reconnects, and only then can be repaired. The open
 /// interval of a v1 firehose is the v1 warning's subject, not this one's.
-fn gap_warning(repairable: i64, open: i64) -> Option<String> {
+fn gap_warning(repairable: i64, open: i64, repair: Option<(i64, i64)>) -> Option<String> {
     let s = |n: i64| if n == 1 { "" } else { "s" };
-    match (repairable, open) {
-        (0, 0) => None,
-        (r, 0) => Some(format!(
+    let closed = match (repairable, repair) {
+        (0, _) => None,
+        (r, Some((id, done))) => Some(format!(
+            "{r} firehose gap{} being repaired: repair cycle {id} has re-read {} accounts so \
+             far. A repair re-reads every account that changed during the gap, so a long gap \
+             takes days; this alert clears when it finishes.",
+            if r == 1 { " is" } else { "s are" },
+            crate::public::text::thousands(done)
+        )),
+        (r, None) => Some(format!(
             "{r} firehose gap{} can be repaired: start a repair cycle (Operations → start repair).",
             s(r)
         )),
-        (0, o) => Some(format!(
-            "{o} firehose gap{} still open: it closes when the firehose reconnects, and can be \
-             repaired after that.",
-            if o == 1 { " is" } else { "s are" }
-        )),
-        (r, o) => Some(format!(
-            "{r} firehose gap{} can be repaired: start a repair cycle (Operations → start \
-             repair). {o} more {} still open and cannot be repaired yet.",
-            s(r),
-            if o == 1 { "is" } else { "are" }
-        )),
+    };
+    let still = (open > 0).then(|| {
+        if closed.is_some() {
+            format!(
+                "{open} more {} still open and cannot be repaired yet.",
+                if open == 1 { "is" } else { "are" }
+            )
+        } else {
+            format!(
+                "{open} firehose gap{} still open: it closes when the firehose reconnects, and \
+                 can be repaired after that.",
+                if open == 1 { " is" } else { "s are" }
+            )
+        }
+    });
+    match (closed, still) {
+        (None, None) => None,
+        (Some(c), Some(o)) => Some(format!("{c} {o}")),
+        (c, o) => c.or(o),
     }
 }
 
@@ -638,7 +665,9 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
         if let Some(e) = s["etaSeconds"].as_i64() {
             d.backfill.push(stat("ETA", common::human_secs(e)));
         }
-        if s["state"] != "completed" {
+        // The latest cycle is a repair while one runs; its own line is
+        // added below, from the cycle itself.
+        if s["state"] != "completed" && s["source"] != "relay_repos" {
             if let Some(p) = s["progress"].as_f64() {
                 let mut line = format!("{:.1}% of accounts swept", (p * 100.0).min(99.9));
                 if s["state"] == "paused" {
@@ -680,6 +709,23 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
     d.coverage = coverage_words(&stats["freshness"]);
 
     let mut conn = st.api.pool.acquire().await.map_err(|e| e.to_string())?;
+    let repair = farsight_storage::queries::repair_running(&mut conn)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some((_, done, listed)) = repair {
+        d.catching.push(stat(
+            "Gap repair",
+            format!(
+                "{} accounts re-read so far{}",
+                crate::public::text::thousands(done),
+                if listed {
+                    ""
+                } else {
+                    "; how many are left is not known until the relay's list has been read"
+                }
+            ),
+        ));
+    }
     let rps = st.api.config.current().config.public_ui.handle_pass_rps;
     let at = &st.public.progress;
     if let Some(line) = handles_line(
@@ -806,7 +852,7 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
                 .into(),
         });
     }
-    if let Some(text) = gap_warning(repairable, other_open) {
+    if let Some(text) = gap_warning(repairable, other_open, repair.map(|r| (r.0, r.1))) {
         d.warnings.push(Warning { class: "", text });
     }
     Ok(d)
@@ -1185,23 +1231,37 @@ async fn ops_action(
                 Err(e) => Err(e.message),
             }
         }
-        "repair" => match api_admin::start_repair_cycle(&st.api).await {
-            Ok(r) if r.gaps == 0 => Ok((
-                "Nothing to repair: no gap is closed and not yet healed. A gap that is \
-                     still open (a v1 firehose's, or a disconnection in progress) can be \
-                     repaired only once it has closed."
-                    .into(),
-                None,
-            )),
-            Ok(r) => Ok((
+        "repair" => match (
+            repair_under_way(&st).await,
+            api_admin::start_repair_cycle(&st.api).await,
+        ) {
+            (Some((id, done)), Ok(r)) if r.gaps > 0 && r.cycle == Some(id) => Ok((
                 format!(
-                    "Repair cycle {} requested for {} gap(s); the backfill process runs it.",
-                    r.cycle.unwrap_or_default(),
-                    r.gaps
+                    "Repair cycle {id} is already running for {} gap(s): {} accounts re-read so \
+                     far. Nothing new was started.",
+                    r.gaps,
+                    crate::public::text::thousands(done)
                 ),
                 None,
             )),
-            Err(e) => Err(e.message),
+            (_, r) => match r {
+                Ok(r) if r.gaps == 0 => Ok((
+                    "Nothing to repair: no gap is closed and not yet healed. A gap that is \
+                     still open (a v1 firehose's, or a disconnection in progress) can be \
+                     repaired only once it has closed."
+                        .into(),
+                    None,
+                )),
+                Ok(r) => Ok((
+                    format!(
+                        "Repair cycle {} requested for {} gap(s); the backfill process runs it.",
+                        r.cycle.unwrap_or_default(),
+                        r.gaps
+                    ),
+                    None,
+                )),
+                Err(e) => Err(e.message),
+            },
         },
         "keys-create" => {
             let scopes: Vec<String> = form
@@ -1615,19 +1675,31 @@ mod tests {
     #[test]
     fn gap_warnings() {
         // The open interval of a v1 firehose alone raises none.
-        assert_eq!(gap_warning(0, 0), None);
+        assert_eq!(gap_warning(0, 0, None), None);
         assert_eq!(
-            gap_warning(1, 0).as_deref(),
+            gap_warning(1, 0, None).as_deref(),
             Some(
                 "1 firehose gap can be repaired: start a repair cycle (Operations → start repair)."
             )
         );
         assert!(
-            gap_warning(0, 1)
+            gap_warning(0, 1, None)
                 .unwrap()
                 .starts_with("1 firehose gap is still open")
         );
-        assert!(gap_warning(2, 1).unwrap().contains("1 more is still open"));
+        assert!(
+            gap_warning(2, 1, None)
+                .unwrap()
+                .ends_with("1 more is still open and cannot be repaired yet.")
+        );
+        // A repair under way is not something to start.
+        let running = gap_warning(2, 0, Some((2, 136_442))).unwrap();
+        assert!(running.starts_with(
+            "2 firehose gaps are being repaired: repair cycle 2 has re-read 136,442 accounts"
+        ));
+        assert!(!running.contains("start a repair"));
+        // A repair with nothing closed to heal says nothing.
+        assert_eq!(gap_warning(0, 0, Some((2, 5))), None);
     }
 
     #[test]

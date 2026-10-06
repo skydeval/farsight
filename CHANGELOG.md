@@ -21,6 +21,11 @@ commits it covers.
 
 ### Fixed
 
+- While a repair cycle is running, the gap alert says so, with how
+  many accounts it has re-read, where it used to keep telling you to
+  start one. Operations says a repair is already running when asked
+  again, and the dashboard's "Catching up" has a line for it (the
+  "History" line no longer shows the repair's figures as the sweep's).
 - The nightly rebuild of the approximate counters failed with
   "deadlock detected" on a busy instance, every time it ran: it
   rewrote every row of the host buckets while the writers were
