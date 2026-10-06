@@ -82,14 +82,12 @@ account's repo.</p>
 <div class="banner">
 <strong>Complete coverage requires a v2 Jetstream.</strong> Farsight can only report
 <code>complete</code> coverage on a Jetstream that offers the v2 protocol, which carries
-<code>#sync</code> events. No public Bluesky Jetstream instance is known to offer v2 at this
-release: <code>wss://jetstream1.us-east.bsky.network</code>,
-<code>wss://jetstream2.us-east.bsky.network</code>,
-<code>wss://jetstream1.us-west.bsky.network</code> and
-<code>wss://jetstream2.us-west.bsky.network</code> served v1 only when checked on 2026-10-01.
+<code>#sync</code> events. Bluesky's public instances
+<code>wss://jetstream.us-east.bsky.network</code> (the default here) and
+<code>wss://jetstream.us-west.bsky.network</code> offer v2. Its older ones,
+<code>jetstream1</code> and <code>jetstream2</code> under the same two names, serve v1 only.
 On v1 Farsight runs honestly as <code>partial</code> with reason
-<code>sync_events_unavailable</code>. Operators who need <code>complete</code> run their own v2
-Jetstream and enter it here.
+<code>sync_events_unavailable</code>. Use "Test connection" to see what an instance offers.
 </div>
 {% else %}
 <div class="banner ok">A tested instance offers v2.</div>

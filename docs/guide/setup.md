@@ -22,10 +22,11 @@ The wizard asks for:
 - the setup token;
 - the public hostname and an admin contact;
 - the Jetstream source (it tests the connection and checks for v2
-  support). The default is Bluesky's public instance
-  `wss://jetstream2.us-east.bsky.network`. The public instances serve
-  v1 only, so coverage stays `partial` until you point Farsight at a
-  self-hosted v2 Jetstream;
+  support). The default is Bluesky's public v2 instance
+  `wss://jetstream.us-east.bsky.network`;
+  `wss://jetstream.us-west.bsky.network` is the other. On a v1
+  instance (Bluesky's older `jetstream1` and `jetstream2`) coverage
+  stays `partial`;
 - backfill preferences and the disk space available to Postgres;
 - who may read the API, and which web interfaces to serve. Both are
   off unless ticked: the **public UI** (the wizard shows what it makes

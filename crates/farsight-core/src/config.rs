@@ -203,7 +203,7 @@ pub struct FirehoseConfig {
 impl Default for FirehoseConfig {
     fn default() -> Self {
         FirehoseConfig {
-            urls: vec!["wss://jetstream2.us-east.bsky.network".to_owned()],
+            urls: vec!["wss://jetstream.us-east.bsky.network".to_owned()],
             tuning: FirehoseTuning::default(),
         }
     }
@@ -1628,7 +1628,7 @@ mod tests {
         assert_eq!((p.rate_limit_rps, p.rate_limit_burst), (5, 20));
         assert_eq!(p.query_concurrency, 8);
         assert_eq!(p.handle_cache_ttl, ConfigDuration::hours(1));
-        assert_eq!(c.firehose.urls, ["wss://jetstream2.us-east.bsky.network"]);
+        assert_eq!(c.firehose.urls, ["wss://jetstream.us-east.bsky.network"]);
         assert_eq!(c.backfill.tier_shares, [60, 25, 15]);
         assert_eq!(c.backfill.retry_schedule.len(), 4);
         assert_eq!(c.backfill.sweep.source, SweepSource::RelayCollections);

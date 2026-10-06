@@ -75,6 +75,10 @@ commits it covers.
 
 ### Changed
 
+- The default Jetstream is `wss://jetstream.us-east.bsky.network`,
+  Bluesky's public v2 instance, in place of `jetstream2.us-east`, which
+  serves v1 only. The setup wizard's note says which public instances
+  offer v2. An existing config keeps the address it has.
 - The public list page's tables, the list lookup's facts and
   Operations' API keys are frameless like the other tables.
 - Dashboard: the Index counts have thousands separators.

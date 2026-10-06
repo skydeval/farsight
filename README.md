@@ -74,9 +74,8 @@ docker logs farsight          # copy the setup token printed at startup
 
 The wizard asks for the public hostname, the Jetstream source, backfill
 preferences, who may read the API and which web interfaces to serve,
-then writes the config and starts ingesting. The public Jetstream
-instances serve the v1 protocol only, so coverage stays `partial` until
-Farsight is pointed at a self-hosted v2 Jetstream.
+then writes the config and starts ingesting. The default Jetstream is
+Bluesky's public v2 instance.
 
 Hardware: 4 vCPU, 8 GB RAM and a 500 GB SSD are recommended; a 100 GB
 disk is supported with limits.
@@ -112,9 +111,11 @@ Changes are in the [changelog](CHANGELOG.md).
   block lists. Farsight is a self-hosted equivalent of what it
   provided, and its data model matches Clearsky's.
 - **Jetstream**, Bluesky's JSON firehose. It is Farsight's live
-  source. Bluesky runs public instances at
-  `jetstream{1,2}.us-{east,west}.bsky.network`; they currently serve
-  only the v1 protocol, which carries no `#sync` events.
+  source. Bluesky's public instances at
+  `jetstream.us-{east,west}.bsky.network` serve the v2 protocol, which
+  Farsight needs to report complete coverage; the older
+  `jetstream{1,2}.us-{east,west}.bsky.network` serve only v1, which
+  carries no `#sync` events.
 - **Constellation** and **Slingshot** from the microcosm project, a
   backlink index and a record/identity cache. Farsight can use a
   Constellation-compatible backlink API for optional subject
