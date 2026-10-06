@@ -290,9 +290,86 @@ pub fn human_secs(s: i64) -> String {
     }
 }
 
+/// Whether `b` starts with `YYYY-MM-DD HH:MM`, digits in the digit
+/// places.
+fn minute_stamp(b: &[u8]) -> bool {
+    b.len() >= 16
+        && b[..16].iter().enumerate().all(|(i, c)| match i {
+            4 | 7 => *c == b'-',
+            10 => *c == b' ',
+            13 => *c == b':',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// `text` as HTML for an admin page: escaped, with every `YYYY-MM-DD
+/// HH:MM[:SS] UTC` in it as a `<time>` that the page's script rewrites
+/// in the browser's timezone. Without script the UTC text stays.
+pub fn local_times(text: impl AsRef<str>) -> String {
+    let text = text.as_ref();
+    let b = text.as_bytes();
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let (mut out, mut from, mut i) = (String::new(), 0, 0);
+    while i < b.len() {
+        if !b[i].is_ascii_digit() || !minute_stamp(&b[i..]) {
+            i += 1;
+            continue;
+        }
+        let rest = &b[i + 16..];
+        let secs = rest.len() >= 3
+            && rest[0] == b':'
+            && rest[1].is_ascii_digit()
+            && rest[2].is_ascii_digit();
+        let end = i + if secs { 19 } else { 16 };
+        if !b[end..].starts_with(b" UTC") {
+            i += 1;
+            continue;
+        }
+        // All of the match is ASCII, so these are character boundaries.
+        let shown = &text[i..end + 4];
+        out.push_str(&esc(&text[from..i]));
+        out.push_str(&format!(
+            "<time datetime=\"{}T{}{}Z\" data-plain>{shown}</time>",
+            &text[i..i + 10],
+            &text[i + 11..end],
+            if secs { "" } else { ":00" },
+        ));
+        i = end + 4;
+        from = i;
+    }
+    out.push_str(&esc(&text[from..]));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_times_in_a_sentence_become_time_elements() {
+        assert_eq!(
+            local_times("up to 2026-10-05 23:43:08 UTC."),
+            "up to <time datetime=\"2026-10-05T23:43:08Z\" data-plain>2026-10-05 23:43:08 UTC</time>."
+        );
+        assert_eq!(
+            local_times("2026-10-05 23:43 UTC"),
+            "<time datetime=\"2026-10-05T23:43:00Z\" data-plain>2026-10-05 23:43 UTC</time>"
+        );
+        // Nothing else is touched, and the text is escaped.
+        assert_eq!(
+            local_times("a <b> & 2026-10-05 23:43"),
+            "a &lt;b&gt; &amp; 2026-10-05 23:43"
+        );
+        assert_eq!(
+            local_times("é 12026-10-05 23:43 UTC"),
+            "é 1<time datetime=\"2026-10-05T23:43:00Z\" data-plain>2026-10-05 23:43 UTC</time>"
+        );
+    }
 
     #[test]
     fn the_asset_version_is_ten_hex_digits_and_stable() {

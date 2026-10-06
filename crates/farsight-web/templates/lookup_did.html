@@ -19,7 +19,7 @@
 <div class="hero-side">
 {% if !s.backfill.is_empty() %}<dl class="hero-backfill" aria-label="Backfill">
 <dt class="hero-side-title">Backfill</dt><dd></dd>
-{% for b in s.backfill %}<dt>{{ b.0 }}</dt><dd>{{ b.1 }}</dd>
+{% for b in s.backfill %}<dt>{{ b.0 }}</dt><dd>{{ crate::common::local_times(b.1)|safe }}</dd>
 {% endfor %}</dl>{% endif %}
 </div>
 </div>
@@ -36,7 +36,7 @@
 <h2><span class="sr-only">Incoming blocks </span><span class="count count-big">{% if let Some(n) = s.blocks.count %}{{ n }}{% else %}—{% endif %}</span></h2>
 <p class="muted">Accounts which have blocked this account.</p>
 </div>
-{% if !s.blocks.coverage.is_empty() %}<p class="coverage">{{ s.blocks.coverage }}</p>{% endif %}
+{% if !s.blocks.coverage.is_empty() %}<p class="coverage">{{ crate::common::local_times(s.blocks.coverage)|safe }}</p>{% endif %}
 {% if let Some(e) = s.blocks.error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if let Some(n) = s.blocks.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
 {% if s.blocks.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
@@ -71,7 +71,7 @@
 <h2><span class="sr-only">Incoming listblocks </span><span class="count count-big">{% if let Some(n) = s.listblocks.count %}{{ n }}{% else %}—{% endif %}</span></h2>
 <p class="muted">Listblocks on the lists that name this account: one row for each list and blocker.</p>
 </div>
-{% if !s.listblocks.coverage.is_empty() %}<p class="coverage">{{ s.listblocks.coverage }}</p>{% endif %}
+{% if !s.listblocks.coverage.is_empty() %}<p class="coverage">{{ crate::common::local_times(s.listblocks.coverage)|safe }}</p>{% endif %}
 {% if let Some(e) = s.listblocks.error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if s.listblocks.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
 {{ s.listblocks.pager|safe }}
@@ -108,7 +108,7 @@
 <h2><span class="sr-only">Lists naming this account </span><span class="count count-big">{% if let Some(n) = s.lists.count %}{{ n }}{% else %}—{% endif %}</span></h2>
 <p class="muted">Listblocked lists this account has been added to.</p>
 </div>
-{% if !s.lists.coverage.is_empty() %}<p class="coverage">{{ s.lists.coverage }}</p>{% endif %}
+{% if !s.lists.coverage.is_empty() %}<p class="coverage">{{ crate::common::local_times(s.lists.coverage)|safe }}</p>{% endif %}
 {% if let Some(e) = s.lists.error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if let Some(n) = s.lists.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
 {% if s.lists.rows.is_empty() %}<p class="empty">None known.</p>{% else %}

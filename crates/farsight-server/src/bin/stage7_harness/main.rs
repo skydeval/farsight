@@ -1849,7 +1849,10 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         )
         .await?;
     let dash = http
-        .get(&format!("{}/admin", s.base), &[("cookie", &pw_header)])
+        .get(
+            &format!("{}/admin/alerts", s.base),
+            &[("cookie", &pw_header)],
+        )
         .await?;
     let anon_dash = http.get(&format!("{}/admin", s.base), &[]).await?;
     let cb = ctx
@@ -1860,7 +1863,7 @@ async fn check_migration(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         )
         .await?;
     c.check(
-        "meanwhile an existing password session keeps working, its dashboard carries the warning (without a session there is no dashboard: 303 to /enter), Settings links to /enter, and /enter/callback is 400",
+        "meanwhile an existing password session keeps working, its admin pages' Alerts carry the warning (without a session there is no dashboard: 303 to /enter), Settings links to /enter, and /enter/callback is 400",
         settings.status == 200
             && settings.text.contains("<a href=\"/enter\">Set the admin DID</a>")
             && dash.status == 200

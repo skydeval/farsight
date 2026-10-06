@@ -41,7 +41,7 @@
 </h2>
 {% if keys.is_empty() %}<p class="empty">No keys issued yet.</p>{% else %}
 <table><tr><th>Id</th><th>Name</th><th>Scopes</th><th>Created</th><th>Last used</th><th>Revoked</th><th></th></tr>
-{% for k in keys %}<tr><td><code>{{ k.0 }}</code></td><td><strong>{{ k.1 }}</strong></td><td><span class="pill">{{ k.2 }}</span></td><td>{{ k.3 }}</td><td>{{ k.4 }}</td><td>{{ k.5 }}</td>
+{% for k in keys %}<tr><td><code>{{ k.0 }}</code></td><td><strong>{{ k.1 }}</strong></td><td><span class="pill">{{ k.2 }}</span></td><td>{{ crate::common::local_times(k.3)|safe }}</td><td>{{ crate::common::local_times(k.4)|safe }}</td><td>{{ crate::common::local_times(k.5)|safe }}</td>
 <td>{% if k.5.is_empty() %}<form method="post" action="/admin/ops/keys-revoke"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ k.0 }}"><button class="danger" type="submit" style="padding:0.25rem 0.6rem; font-size:0.8rem;">Revoke</button></form>{% endif %}</td></tr>{% endfor %}
 </table>{% endif %}
 <form class="stack" method="post" action="/admin/ops/keys-create" style="margin-top: 1.5rem; border-top: 1px solid var(--line); padding-top: 1rem;">
@@ -65,7 +65,7 @@
 <span>Recent errors</span>
 </h2>
 {% if errors.is_empty() %}<p class="empty">No recent errors logged.</p>{% else %}
-<table class="free"><tr><th>When (UTC)</th><th>Component</th><th>DID</th><th>Message</th></tr>
-{% for e in errors %}<tr><td class="num">{{ e.0 }}</td><td><span class="pill">{{ e.1 }}</span></td><td><code>{{ e.2 }}</code></td><td>{{ e.3 }}</td></tr>{% endfor %}</table>{% endif %}
+<table class="free"><tr><th>When</th><th>Component</th><th>DID</th><th>Message</th></tr>
+{% for e in errors %}<tr><td class="num">{{ crate::common::local_times(e.0)|safe }}</td><td><span class="pill">{{ e.1 }}</span></td><td><code>{{ e.2 }}</code></td><td>{{ e.3 }}</td></tr>{% endfor %}</table>{% endif %}
 </div>
 {% endblock %}

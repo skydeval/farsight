@@ -128,6 +128,34 @@ try {
     return [t.length > 0 && t.every((x) => x.title && x.title.includes("UTC")), JSON.stringify(t.slice(0, 2))];
   });
 
+  await probe("the bar's Alerts opens under the bar with the coverage sentence, its time in the viewer's timezone; Escape closes it", async () => {
+    const box = lookup.locator("details.nav-alerts");
+    await lookup.locator(".alerts-panel .alerts-coverage").waitFor({ state: "attached", timeout: 15000 });
+    await box.locator("summary").click();
+    await lookup.locator(".alerts-panel .alerts-coverage").waitFor({ state: "visible", timeout: 5000 });
+    const seen = await lookup.evaluate(() => {
+      const panel = document.querySelector(".alerts-panel");
+      const r = panel.getBoundingClientRect();
+      return {
+        text: panel.querySelector(".alerts-coverage").textContent.slice(0, 80),
+        times: [...panel.querySelectorAll("time[data-plain]")].map((t) => [t.textContent, t.getAttribute("title"), t.getAttribute("data-local")]),
+        inside: r.left >= 0 && r.right <= window.innerWidth + 1,
+        count: document.getElementById("alerts-count").textContent,
+        banners: panel.querySelectorAll(".banner").length,
+      };
+    });
+    await lookup.keyboard.press("Escape");
+    const open = await box.evaluate((d) => d.open);
+    return [
+      seen.text.startsWith("Coverage:") &&
+        seen.inside &&
+        String(seen.banners) === seen.count &&
+        seen.times.every((t) => t[2] === "1" && / UTC$/.test(t[1] || "")) &&
+        !open,
+      JSON.stringify(seen),
+    ];
+  });
+
   // The public account page at its new address.
   const anon = await browser.newContext();
   const pub = await anon.newPage();

@@ -53,6 +53,13 @@ commits it covers.
 
 ### Changed
 
+- Admin pages: the dashboard's warnings and its coverage sentence moved
+  into an "Alerts" drop-down in the bar, next to the theme selector, on
+  every admin page. A number on it counts the warnings.
+- Admin pages: every remaining time that read in UTC (coverage
+  sentences, firehose gaps, Operations' recent errors and API keys, the
+  removed-records pages, "Last backfilled") now reads in the browser's
+  timezone with its short name. Without script they still read in UTC.
 - Admin dashboard: Firehose, Backfill and Storage are rows that fill
   their block, as Index is, in place of an inner table that squeezed
   values onto several lines. In all four blocks the name is at the

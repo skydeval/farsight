@@ -2396,8 +2396,8 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
     let lim = card_div(&page.text, "limits").unwrap_or("");
     c.check(
         "the limits block states both recording windows, the retention and the limits",
-        lim.contains("This instance recorded removals from 20")
-            && lim.contains("This instance has recorded removals since 20")
+        lim.contains("This instance recorded removals from <time datetime=\"20")
+            && lim.contains("This instance has recorded removals since <time datetime=\"20")
             && lim.contains("Removals older than 365 days are deleted.")
             && lim.contains("This is most of what is missing.")
             && lim.matches("<li>").count() >= 10,

@@ -3,7 +3,7 @@
 <p>Every row is a record this instance stored and later removed. This is not a complete record of anything.</p>
 <h3>When removals were recorded</h3>
 {% if windows.is_empty() %}<p>No recording period falls inside the time this instance keeps removals for.</p>{% endif %}
-<ul>{% for w in windows %}<li>{% if let Some(to) = w.to %}This instance recorded removals from {{ w.from }} to {{ to }}.{% else %}This instance has recorded removals since {{ w.from }}.{% endif %}</li>
+<ul>{% for w in windows %}<li>{% if let Some(to) = w.to %}This instance recorded removals from {{ crate::common::local_times(w.from)|safe }} to {{ crate::common::local_times(to)|safe }}.{% else %}This instance has recorded removals since {{ crate::common::local_times(w.from)|safe }}.{% endif %}</li>
 {% endfor %}</ul>
 {% if !recording %}<p>This instance is not recording removals at present.</p>{% endif %}
 <h3>How long they are kept</h3>

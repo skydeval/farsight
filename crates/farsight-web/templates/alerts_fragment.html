@@ -1,0 +1,5 @@
+<span id="alerts-count" class="alerts-count" hx-swap-oob="true"{% if warnings.is_empty() && error.is_none() %} hidden{% endif %}>{{ warnings.len() }}</span>
+{% if let Some(e) = error %}<div class="banner bad">Could not load: {{ e }}</div>{% endif %}
+{% for w in warnings %}<div class="banner {{ w.class }}">{{ crate::common::local_times(w.text)|safe }}</div>{% endfor %}
+{% if warnings.is_empty() && error.is_none() %}<p class="alerts-none">Nothing needs attention.</p>{% endif %}
+{% if !coverage.is_empty() %}<p class="alerts-coverage"><strong>Coverage:</strong> {{ crate::common::local_times(coverage)|safe }}</p>{% endif %}

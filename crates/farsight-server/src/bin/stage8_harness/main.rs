@@ -2674,7 +2674,7 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let valid = valid_indexes(&pool).await?;
     let log = h.log();
     let cookie = admin_session(&pool, ADMIN_DID).await?;
-    let dash = h.admin_get(&cookie, "/admin").await?;
+    let dash = h.admin_get(&cookie, "/admin/alerts").await?;
     let anon = h.get("/admin").await?;
     let home = h.get("/").await?;
     c.check(
@@ -2686,7 +2686,7 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
         format!("valid: {valid:?}; database {size} B, budget {budget} B, estimate {estimate} B"),
     );
     c.check(
-        "the dashboard tells a signed-in admin — \"2 of 4 indexes ready … the storage budget has no room (needs ~18.6 MB)\" — and nobody else: without a session the dashboard is the 303 to /enter, and the public home says nothing of it",
+        "the admin pages' Alerts tell a signed-in admin — \"2 of 4 indexes ready … the storage budget has no room (needs ~18.6 MB)\" — and nobody else: without a session the dashboard is the 303 to /enter, and the public home says nothing of it",
         dash.text.contains("Sorting by creation time: 2 of 4 indexes ready")
             && dash.text.contains("the storage budget has no room (needs ~18.6 MB)")
             && anon.status == 303
@@ -2736,9 +2736,9 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let have = wait_indexes(&pool, 4, Duration::from_secs(120)).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let log = h.log();
-    let dash = h.admin_get(&cookie, "/admin").await?;
+    let dash = h.admin_get(&cookie, "/admin/alerts").await?;
     c.check(
-        "storage.budget_bytes raised in Settings, without a restart: on its next check the task builds the two held indexes, the gauge reads 4 and the dashboard warning is gone",
+        "storage.budget_bytes raised in Settings, without a restart: on its next check the task builds the two held indexes, the gauge reads 4 and the warning is gone from Alerts",
         save.status < 400
             && raised != text
             && have == 4

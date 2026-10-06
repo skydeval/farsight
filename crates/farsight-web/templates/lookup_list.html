@@ -22,7 +22,7 @@
 <h2><span class="sr-only">Members </span><span class="count count-big">{% if let Some(n) = s.members.count %}{{ n }}{% else %}—{% endif %}</span></h2>
 <p class="muted">Accounts on this list.</p>
 </div>
-{% if !s.members.coverage.is_empty() %}<p class="coverage">{{ s.members.coverage }}</p>{% endif %}
+{% if !s.members.coverage.is_empty() %}<p class="coverage">{{ crate::common::local_times(s.members.coverage)|safe }}</p>{% endif %}
 {% if let Some(e) = s.members.error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if s.members.rows.is_empty() %}<p class="empty">None known.</p>{% else %}
 {{ s.members.pager|safe }}

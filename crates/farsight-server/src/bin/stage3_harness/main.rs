@@ -1890,12 +1890,15 @@ async fn phase_cloudflare(c: &mut Checks, ctx: &Ctx, pg: &Pg) -> Result<(), Stri
             "-c",
             &format!("for i in $(seq 1 30); do wget -q -O /dev/null {url} || true; done"),
         ]))?;
-        // The dashboard needs a session.
+        // The admin pages' Alerts need a session.
         let pool = pg.pool("farsight_cov", 2).await?;
         let cookie = admin_session(&pool, ADMIN_DID).await?;
         let r = ctx
             .http
-            .get(&format!("{}/admin", server.base), &[("cookie", &cookie)])
+            .get(
+                &format!("{}/admin/alerts", server.base),
+                &[("cookie", &cookie)],
+            )
             .await?;
         c.check(
             "> 50% of 5-minute requests from untrusted Cloudflare peers ⇒ dashboard warning",

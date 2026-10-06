@@ -208,6 +208,7 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/admin", get(dashboard))
         .route("/admin/", get(admin_slash))
         .route("/admin/dashboard/fragment", get(dashboard_fragment))
+        .route("/admin/alerts", get(alerts))
         .route("/enter", get(crate::enter::page).post(crate::enter::submit))
         .route("/enter/callback", get(crate::enter::callback))
         .route(
@@ -801,12 +802,10 @@ async fn dashboard(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Respo
         Ok(s) => s,
         Err(r) => return r,
     };
-    let (mut d, error) = match dashboard_data(&st).await {
+    let (d, error) = match dashboard_data(&st).await {
         Ok(d) => (d, None),
         Err(e) => (DashboardData::default(), Some(e)),
     };
-    migration_warning(&st, &mut d);
-    sort_warning(&st, &mut d);
     render_private(&DashboardPage {
         nav: nav(&Some(s)),
         d,
@@ -856,13 +855,41 @@ async fn dashboard_fragment(State(st): State<Arc<WebState>>, headers: HeaderMap)
     if let Err(r) = gate(&st, &headers).await {
         return r;
     }
+    let (d, error) = match dashboard_data(&st).await {
+        Ok(d) => (d, None),
+        Err(e) => (DashboardData::default(), Some(e)),
+    };
+    render_private(&DashboardFragment { d, error })
+}
+
+/// What the bar's "Alerts" holds: the warnings and the coverage
+/// sentence. Every admin page's bar loads it, and again every 30 s.
+#[derive(Template)]
+#[template(path = "alerts_fragment.html")]
+pub struct AlertsFragment {
+    /// Warnings (§9.3, budget, v1, gaps, sign-in, sort indexes).
+    pub warnings: Vec<Warning>,
+    /// Coverage in words.
+    pub coverage: String,
+    /// Load error.
+    pub error: Option<String>,
+}
+
+async fn alerts(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+    if let Err(r) = gate(&st, &headers).await {
+        return r;
+    }
     let (mut d, error) = match dashboard_data(&st).await {
         Ok(d) => (d, None),
         Err(e) => (DashboardData::default(), Some(e)),
     };
     migration_warning(&st, &mut d);
     sort_warning(&st, &mut d);
-    render_private(&DashboardFragment { d, error })
+    render_private(&AlertsFragment {
+        warnings: d.warnings,
+        coverage: d.coverage,
+        error,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -999,7 +1026,7 @@ async fn ops_render(
         if let Ok(rows) = farsight_storage::queries::op_errors(&mut conn, None, 25).await {
             for (_, at, component, did, _, msg) in rows {
                 page.errors.push((
-                    at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
                     component,
                     did.unwrap_or_default(),
                     msg,
@@ -1013,12 +1040,12 @@ async fn ops_render(
                 k.id,
                 k.name,
                 k.scopes.join(", "),
-                k.created_at.format("%Y-%m-%d").to_string(),
+                k.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
                 k.last_used_at
-                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
                     .unwrap_or_else(|| "never".into()),
                 k.revoked_at
-                    .map(|t| t.format("%Y-%m-%d").to_string())
+                    .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
                     .unwrap_or_default(),
             ));
         }

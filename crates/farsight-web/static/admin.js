@@ -191,9 +191,12 @@
         // A time marked data-abs is a table row's: the instant alone,
         // without the zone the page states once.
         var bare = el.hasAttribute("data-abs") && !el.closest(".pc");
+        // A time inside a sentence (data-plain) is the instant with its
+        // zone and nothing after it.
+        var plain = el.hasAttribute("data-plain");
         var t = { el: el, then: then, abs: local(new Date(then), bare), updated: !!el.closest(".updated") };
         // A card states the age on its own line.
-        var fixed = !!el.closest(".pc") || el.hasAttribute("data-abs");
+        var fixed = !!el.closest(".pc") || el.hasAttribute("data-abs") || plain;
         var text = fixed ? t.abs : reading(t, now);
         var utc = bare ? el.textContent + " UTC" : el.textContent;
         el.setAttribute("title", utc);
@@ -754,10 +757,10 @@
     });
   }
 
-  // The guide in the bar closes when something outside it is clicked
-  // or Escape is pressed. Its heading opens and closes it without this.
+  // The bar's Alerts closes when something outside it is clicked or
+  // Escape is pressed. Its heading opens and closes it without this.
   function guide() {
-    var box = document.querySelector("details.nav-guide");
+    var box = document.querySelector("details.nav-alerts");
     if (!box) {
       return;
     }
@@ -1159,7 +1162,7 @@
   var pendingRun = 0;
 
   // A section swapped in by htmx carries new times.
-  document.addEventListener("htmx:afterSwap", function (event) {
-    times(event.target && event.target.parentNode ? event.target.parentNode : document);
+  document.addEventListener("htmx:afterSwap", function () {
+    times(document);
   });
 })();
