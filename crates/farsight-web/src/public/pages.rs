@@ -693,7 +693,144 @@ struct HomePage {
     /// What this instance holds, as `getStats` counts it: block records,
     /// tracked lists, accounts seen.
     totals: Vec<(&'static str, String)>,
+    /// The top lists the operator has switched on.
+    top: Vec<TopGroup>,
     updated: Option<Stamp>,
+}
+
+/// One row of a top list.
+struct TopRow {
+    rank: usize,
+    who: Who,
+    count: String,
+}
+
+/// One top list: a period's ranking.
+struct TopTable {
+    period: &'static str,
+    rows: Vec<TopRow>,
+    /// What an empty list says.
+    empty: &'static str,
+    /// When it was counted.
+    computed: Option<Stamp>,
+}
+
+/// The two lists of one ranking, the last 24 hours and all time.
+struct TopGroup {
+    id: &'static str,
+    title: &'static str,
+    note: &'static str,
+    /// What the number counts.
+    unit: &'static str,
+    tables: Vec<TopTable>,
+}
+
+/// The home page's top lists, as stored by the background task, and how
+/// many of their accounts are still waiting for a handle check. The
+/// page's own rule applies to the rows: excluded, deactivated, deleted
+/// and taken-down accounts are left out, and the next ones move up.
+async fn top_groups(
+    r: &Req<'_>,
+    cfg: &farsight_core::Config,
+) -> Result<(Vec<TopGroup>, usize), Fail> {
+    use farsight_storage::top::{self, Kind};
+    let p = &cfg.public_ui;
+    let wanted = |k: Kind| {
+        if k.blockers() {
+            p.show_top_blockers
+        } else {
+            p.show_top_blocked
+        }
+    };
+    if !Kind::ALL.into_iter().any(wanted) {
+        return Ok((Vec::new(), 0));
+    }
+    let mut stored = Vec::new();
+    {
+        let mut tx = r.st.api.read_tx().await?;
+        for kind in Kind::ALL.into_iter().filter(|k| wanted(*k)) {
+            stored.push((kind, top::load(&mut tx, kind).await?));
+        }
+        tx.rollback().await?;
+    }
+    let withheld = r.withheld().await?;
+    let mut dids: Vec<String> = stored
+        .iter()
+        .filter_map(|(_, s)| s.as_ref())
+        .flat_map(|s| s.rows.iter().map(|(did, _)| did.clone()))
+        .collect();
+    dids.sort();
+    dids.dedup();
+    recall(r.st, cfg, &dids).await;
+    let shown = Shown::load(r, &withheld, dids, false).await?;
+    let mut asked = Asked::new(cfg);
+    let mut held = 0;
+    let mut table = |kind: Kind| -> Option<TopTable> {
+        let (_, list) = stored.iter().find(|(k, _)| *k == kind)?;
+        let rows = list
+            .iter()
+            .flat_map(|s| s.rows.iter())
+            .filter(|(did, _)| shown.ok(did))
+            .take(super::top::SHOWN)
+            .enumerate()
+            .map(|(i, (did, n))| TopRow {
+                rank: i + 1,
+                // An account not checked yet shows as its DID meanwhile.
+                who: who(r, &mut asked, &shown, did).unwrap_or_else(|| {
+                    held += 1;
+                    Who {
+                        did: did.clone(),
+                        href: did_href(did),
+                        card: card_href(did),
+                        handle: None,
+                        tag: shown.tag(did),
+                    }
+                }),
+                count: thousands(*n),
+            })
+            .collect();
+        Some(TopTable {
+            period: if matches!(kind, Kind::BlockersDay | Kind::BlockedDay) {
+                "Last 24 hours"
+            } else {
+                "All time"
+            },
+            rows,
+            empty: if list.is_some() {
+                "None."
+            } else {
+                "Not counted yet."
+            },
+            computed: list.as_ref().map(|s| Stamp::of(s.computed_at)),
+        })
+    };
+    let mut groups = Vec::new();
+    if p.show_top_blockers {
+        groups.push(TopGroup {
+            id: "top-blockers",
+            title: "Top blockers",
+            note: "The accounts that have made the most blocks.",
+            unit: "Blocks",
+            tables: [Kind::BlockersDay, Kind::BlockersAll]
+                .into_iter()
+                .filter_map(&mut table)
+                .collect(),
+        });
+    }
+    if p.show_top_blocked {
+        groups.push(TopGroup {
+            id: "top-blocked",
+            title: "Most blocked",
+            note: "The accounts that the most others block directly. Blocks through lists are not counted.",
+            unit: "Blockers",
+            tables: [Kind::BlockedDay, Kind::BlockedAll]
+                .into_iter()
+                .filter_map(&mut table)
+                .collect(),
+        });
+    }
+    asked.submit(r.st);
+    Ok((groups, held))
 }
 
 /// `/public`.
@@ -704,6 +841,7 @@ pub async fn home(r: &Req<'_>) -> Result<Response, Fail> {
         .await?
         .body;
     let description = paragraphs(&cfg.public_ui.instance_description);
+    let (top, held) = top_groups(r, cfg).await?;
     let host = &cfg.server.hostname;
     Ok(page(
         &HomePage {
@@ -724,11 +862,17 @@ pub async fn home(r: &Req<'_>) -> Result<Response, Fail> {
             .into_iter()
             .filter_map(|(label, key)| stats["counts"][key].as_i64().map(|n| (label, thousands(n))))
             .collect(),
+            top,
             updated: last_updated(&[&stats["freshness"]]),
         },
         StatusCode::OK,
         cfg,
-        Cache::Public(60),
+        // A list still waiting for handles is about to change.
+        if held == 0 {
+            Cache::Public(60)
+        } else {
+            Cache::NoStore
+        },
         true,
     ))
 }

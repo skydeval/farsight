@@ -833,6 +833,66 @@ dl.home-totals dd {
   color: var(--fg-strong);
   font-variant-numeric: tabular-nums;
 }
+/* The home page's top lists: a ranking's two periods side by side, one
+   under the other on a narrow screen. */
+.top-group {
+  max-width: 60rem;
+  margin: 0 auto 2.5rem;
+}
+.top-group h2 {
+  margin: 0;
+  font-size: 1.25rem;
+  color: var(--fg-strong);
+  text-align: center;
+}
+.top-group .top-note {
+  margin: 0.3rem 0 1.1rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+  text-align: center;
+}
+.top-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem 2.5rem;
+}
+.top-list h3 {
+  margin: 0 0 0.4rem;
+  font-size: 0.78rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.top-table {
+  table-layout: fixed;
+}
+.top-table .th-rank, .top-table .td-rank {
+  width: 2.6rem;
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.top-table .th-count, .top-table .td-count {
+  width: 6.5rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.top-table .td-account {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.top-list .top-empty, .top-list .top-asof {
+  margin: 0.6rem 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+@media (max-width: 44rem) {
+  .top-pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 /* The guide: a heading that opens and closes it, with an arrow that
    turns. In place on the home page; in the bar on the other pages,
    where it drops down over the page. */

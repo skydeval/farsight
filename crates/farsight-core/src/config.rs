@@ -499,6 +499,10 @@ pub struct PublicUiConfig {
     pub contact: String,
     /// The DID page shows the subject's own blocks.
     pub show_outgoing_blocks: bool,
+    /// The home page lists the accounts that block the most.
+    pub show_top_blockers: bool,
+    /// The home page lists the accounts that are blocked the most.
+    pub show_top_blocked: bool,
     /// Retired (§16): history pages are admin-only. Accepted so that a
     /// file written by an earlier version still loads; the value has no
     /// effect, a warning is logged, and the key is never written back.
@@ -572,6 +576,8 @@ impl Default for PublicUiConfig {
             instance_description: String::new(),
             contact: String::new(),
             show_outgoing_blocks: false,
+            show_top_blockers: false,
+            show_top_blocked: false,
             show_history: None,
             show_opengraph_image: true,
             dark_mode_default: ThemeDefault::System,

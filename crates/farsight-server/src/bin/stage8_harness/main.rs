@@ -2014,6 +2014,166 @@ async fn set_pass(a: &Srv, cookie: &str, rps: u32) -> Result<Resp, String> {
         .await
 }
 
+/// One table of a top list on the home page: `(DID, count)` per row.
+fn top_rows(table: &str) -> Vec<(String, i64)> {
+    table
+        .split("<tr class=\"data-row")
+        .skip(1)
+        .map(|row| {
+            let did = between(row, "title=\"", "\"")
+                .first()
+                .copied()
+                .unwrap_or("");
+            let count = between(row, "td-count\">", "</td>")
+                .first()
+                .map(|n| n.replace(',', ""))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(-1);
+            (did.to_owned(), count)
+        })
+        .collect()
+}
+
+/// The two tables of a top group, last 24 hours then all time.
+fn top_tables(home: &str, id: &str) -> Vec<Vec<(String, i64)>> {
+    let Some(i) = home.find(&format!("id=\"{id}\"")) else {
+        return Vec::new();
+    };
+    let rest = &home[i..];
+    let group = &rest[..rest.find("</section>").unwrap_or(rest.len())];
+    group
+        .split("<div class=\"top-list\">")
+        .skip(1)
+        .map(top_rows)
+        .collect()
+}
+
+/// The home page's top lists: off by default, computed in the background
+/// once a switch is on, read from the stored lists.
+async fn check_top_lists(
+    c: &mut Checks,
+    a: &Srv,
+    pool: &PgPool,
+    cookie: &str,
+) -> Result<(), String> {
+    c.section("19e. the home page's top lists (show_top_blockers, show_top_blocked)");
+    let home = a.get("/").await?;
+    let stored = n(pool, "SELECT count(*) FROM top_lists").await?;
+    c.check(
+        "off by default: the home page has no top list and nothing is computed",
+        home.status == 200 && !home.text.contains("top-group") && stored == 0,
+        format!("{stored} stored lists"),
+    );
+    // The seeded blocks were written past the apply path: give the
+    // authors their counts, log 400 of the blocks as recent, and log 900
+    // more under one author that have no stored block.
+    seed::exec(
+        pool,
+        "UPDATE actors a SET authored_blocks = t.n
+         FROM (SELECT author_id, count(*)::int AS n FROM blocks GROUP BY 1) t WHERE a.id = t.author_id",
+    )
+    .await?;
+    seed::exec(
+        pool,
+        "INSERT INTO block_recent (at, author_id, rkey, subject_id)
+         SELECT now(), author_id, rkey, subject_id FROM blocks ORDER BY author_id, rkey LIMIT 400",
+    )
+    .await?;
+    let phantom = did("hpq", 2);
+    seed::exec(
+        pool,
+        &format!(
+            "INSERT INTO block_recent (at, author_id, rkey, subject_id)
+             SELECT now(), (SELECT id FROM actors WHERE did = '{phantom}'), 'gone' || g, 1
+             FROM generate_series(1, 900) g"
+        ),
+    )
+    .await?;
+    let save = |on: bool| async move {
+        let page = a.admin_get(cookie, "/admin/settings").await?;
+        let csrf = csrf_of(&page.text).ok_or("no csrf on /admin/settings")?;
+        let mut form = warming_form(&csrf, false);
+        if on {
+            form.push(("show_top_blockers", "on".into()));
+            form.push(("show_top_blocked", "on".into()));
+        }
+        let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        a.admin
+            .post_form(
+                &format!("{}/admin/settings/public-ui", a.base),
+                &[("cookie", cookie)],
+                &pairs,
+            )
+            .await
+    };
+    let saved = save(true).await?;
+    let started = Instant::now();
+    while n(pool, "SELECT count(*) FROM top_lists").await? < 4
+        && started.elapsed() < Duration::from_secs(150)
+    {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let lists = n(pool, "SELECT count(*) FROM top_lists").await?;
+    let home = a.get("/").await?;
+    let blockers = top_tables(&home.text, "top-blockers");
+    let blocked = top_tables(&home.text, "top-blocked");
+    let ranked = |t: &Vec<(String, i64)>| {
+        !t.is_empty() && t.len() <= 20 && t.windows(2).all(|w| w[0].1 >= w[1].1) && t[0].1 > 0
+    };
+    let top_of = |sql: &str| {
+        let sql = sql.to_owned();
+        async move {
+            sqlx::query_scalar::<_, String>(&sql)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let most_blocked = top_of(
+        "SELECT a.did FROM (SELECT subject_id, count(*) AS n FROM blocks GROUP BY 1) t
+         JOIN actors a ON a.id = t.subject_id WHERE a.status IN (0, 3)
+         ORDER BY t.n DESC, a.id LIMIT 1",
+    )
+    .await?;
+    let most_blocks = top_of(
+        "SELECT did FROM actors WHERE status IN (0, 3) ORDER BY authored_blocks DESC, id LIMIT 1",
+    )
+    .await?;
+    c.check(
+        "switched on (saved from Settings, no restart): within the task's next look the four lists are stored, and the home page shows each ranking's two tables, last 24 hours and all time, at most 20 rows each, largest count first",
+        saved.status < 400
+            && lists == 4
+            && blockers.len() == 2
+            && blocked.len() == 2
+            && blockers.iter().chain(blocked.iter()).all(ranked),
+        format!(
+            "{lists} lists after {} s; rows {:?} and {:?}",
+            started.elapsed().as_secs(),
+            blockers.iter().map(Vec::len).collect::<Vec<_>>(),
+            blocked.iter().map(Vec::len).collect::<Vec<_>>()
+        ),
+    );
+    c.check(
+        "the all-time tables lead with the account that made the most blocks and the account the most others block; a logged block that is no longer stored does not count as recent",
+        blockers.get(1).and_then(|t| t.first()).map(|r| r.0.as_str()) == Some(most_blocks.as_str())
+            && blocked.get(1).and_then(|t| t.first()).map(|r| r.0.as_str()) == Some(most_blocked.as_str())
+            && !blockers.first().is_some_and(|t| t.iter().any(|r| r.0 == phantom)),
+        format!(
+            "all time: {:?} and {:?}; expected {most_blocks} and {most_blocked}",
+            blockers.get(1).and_then(|t| t.first()),
+            blocked.get(1).and_then(|t| t.first())
+        ),
+    );
+    let off = save(false).await?;
+    let home = a.get("/").await?;
+    c.check(
+        "switched off again, the home page has no top list",
+        off.status < 400 && !home.text.contains("top-group"),
+        format!("save {}", off.status),
+    );
+    Ok(())
+}
+
 /// The lists an account subscribes to as block lists: always a tab of the
 /// admin lookup; a tab of the public page with `show_outgoing_blocks`.
 async fn check_blocking_lists(
@@ -2585,11 +2745,11 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let building = log.find("sort index: building");
     let migrations: i64 = n(&pool, "SELECT count(*) FROM _sqlx_migrations").await?;
     c.check(
-        "a fresh database: the server is live in its normal start-up time, the twelve migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
+        "a fresh database: the server is live in its normal start-up time, the thirteen migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
         have == 4
             && health.status == 200
             && e.came_up < Duration::from_secs(60)
-            && migrations == 12
+            && migrations == 13
             && serving.is_some()
             && building.is_some()
             && serving < building
@@ -3168,6 +3328,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     check_warming(c, &a, &pool, &cookie, &plc, &w).await?;
     check_pass(c, &a, &pool, &cookie, &plc).await?;
     check_thumbnails(c, &a, &pool, &cookie, &plc).await?;
+    check_top_lists(c, &a, &pool, &cookie).await?;
     check_blocking_lists(c, &a, &pool, &cookie, &w).await?;
     check_representative(c, &pool, &w).await?;
     drop(b);

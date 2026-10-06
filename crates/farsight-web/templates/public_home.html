@@ -32,5 +32,21 @@
 </details>
 
 </div>
-{% endblock %}
+{% for g in top %}<section class="top-group" id="{{ g.id }}">
+<h2>{{ g.title }}</h2>
+<p class="top-note">{{ g.note }}</p>
+<div class="top-pair">
+{% for t in g.tables %}<div class="top-list">
+<h3>{{ t.period }}</h3>
+{% if t.rows.is_empty() %}<p class="top-empty">{{ t.empty }}</p>{% else %}<table class="data-table free top-table">
+<thead><tr><th scope="col" class="th-rank">#</th><th scope="col">Account</th><th scope="col" class="th-count">{{ g.unit }}</th></tr></thead>
+<tbody>
+{% for r in t.rows %}<tr class="data-row{% if r.who.tag.is_some() %} tagged{% endif %}"><td class="td-rank">{{ r.rank }}</td><td class="td-account">{{ r.who|safe }}</td><td class="td-count">{{ r.count }}</td></tr>
+{% endfor %}</tbody>
+</table>{% endif %}
+{% if let Some(s) = t.computed %}<p class="top-asof">Counted <time datetime="{{ s.iso }}">{{ s.text }}</time>.</p>{% endif %}
+</div>
+{% endfor %}</div>
+</section>
+{% endfor %}{% endblock %}
 {% block updated %}{% if let Some(t) = updated %}<div class="pill footer-updated updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}{% endblock %}

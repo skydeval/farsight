@@ -52,6 +52,12 @@ how long, or how to reach you about their data, say it here.</div>
 <label><input type="checkbox" name="show_outgoing_blocks"{% if p.show_outgoing_blocks %} checked{% endif %}> Show the blocks an account has made, and the lists it subscribes to as block lists (<code>show_outgoing_blocks</code>)</label>
 <div class="hint">Adds a "Blocks by this account" section to account pages.</div>
 
+<label><input type="checkbox" name="show_top_blockers"{% if p.show_top_blockers %} checked{% endif %}> List the accounts that block the most on the home page (<code>show_top_blockers</code>)</label>
+<div class="hint">"Top blockers": the 20 accounts that made the most blocks, for the last 24 hours and for all time. Counted in the background; the first lists appear within a few minutes of saving.</div>
+
+<label><input type="checkbox" name="show_top_blocked"{% if p.show_top_blocked %} checked{% endif %}> List the accounts that are blocked the most on the home page (<code>show_top_blocked</code>)</label>
+<div class="hint">"Most blocked": the 20 accounts that the most others block directly, for the last 24 hours and for all time. This names accounts on the instance's front page; consider whether you want that. The all-time list is counted once a day, because counting it reads every stored block.</div>
+
 <label for="record_viewer_url">Record viewer URL (<code>record_viewer_url</code>)</label>
 <input type="text" id="record_viewer_url" name="record_viewer_url" maxlength="500" spellcheck="false" placeholder="https://viewer.example/at/{authority}/{collection}/{rkey}" value="{{ p.record_viewer_url }}">
 <div class="hint">Used on the admin lookup pages; the public pages show no record addresses. Empty: block, listblock and

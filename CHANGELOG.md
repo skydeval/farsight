@@ -31,6 +31,13 @@ commits it covers.
 
 ### Added
 
+- Public home page: "Top blockers" and "Most blocked", each the 20
+  accounts with the most blocks made or received, for the last 24
+  hours and for all time. Both are off by default and switched on
+  separately in Settings → Public UI (`show_top_blockers`,
+  `show_top_blocked`). The lists are counted in the background and the
+  page reads the stored result; the all-time "Most blocked" list is
+  counted once a day. Schema version 13.
 - Admin dashboard: a "Catching up" block at the top says how far the
   history sweep, the handle pass and the reading of list descriptions
   have got and about how long each has left. A line goes away when its

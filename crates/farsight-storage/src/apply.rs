@@ -677,6 +677,11 @@ async fn block_insert(
     .bind(seen)
     .execute(&mut *t.conn)
     .await?;
+    // For the "last 24 hours" top lists: history read by the backfill
+    // is not recent.
+    if crate::top::is_recent(r.created_at, seen) {
+        crate::top::log(&mut *t.conn, seen, author.id, w.rkey.as_str(), subject_id).await?;
+    }
     t.deltas.stat(stat::BLOCKS, 1);
     t.deltas.host(&author.buckets, CapKind::Blocks, 1);
     Ok(Ok(()))

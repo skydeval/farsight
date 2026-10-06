@@ -23,6 +23,9 @@ a short guide to the tabs and the account tags, which its heading
 ("How to read a page") opens and closes. The other public pages have
 the same guide behind a button of that name in the bar.
 
+With `show_top_blockers` or `show_top_blocked` on, the home page also
+has top lists: see "Top lists" below.
+
 With the public UI off, `/` redirects to `/admin`, or, on an instance
 with neither interface, shows a few lines of text.
 
@@ -66,6 +69,39 @@ with neither interface, shows a few lines of text.
   Search, cards and error pages are never offered.
 - **Link previews** carry a title, a fixed description and one static
   image, never data: a count in a preview is a stale claim with no date.
+
+## Top lists
+
+Two rankings for the home page, each off by default and switched on
+separately:
+
+- **Top blockers** (`show_top_blockers`): the 20 accounts that have
+  made the most blocks.
+- **Most blocked** (`show_top_blocked`): the 20 accounts that the most
+  others block directly. Blocks through lists are not counted. This
+  names accounts on the instance's front page; consider whether you
+  want that.
+
+Each has two tables, "Last 24 hours" and "All time".
+
+- **They are counted in the background.** The page reads the stored
+  result and says when it was counted. The 24-hour tables are counted
+  every 10 minutes and "Top blockers" of all time every hour. "Most
+  blocked" of all time reads every stored block (about a minute and a
+  half, and a few GB of temporary files, for 150 million blocks), so it
+  is counted once a day. Nothing is counted while both switches are
+  off; after switching one on, the first lists appear within a few
+  minutes.
+- **"Last 24 hours"** means blocks this instance stored in the last 24
+  hours whose own date is also within a day of when they arrived, and
+  that are still stored. Old blocks read by the backfill do not count,
+  nor does a block that was made and removed again. The count starts
+  with the version that has this feature: its first day is partial.
+- **Counts are of what this instance stores.** An account past its
+  per-author storage cap has made more blocks than the list shows.
+- **The page's usual rule applies.** Excluded, deactivated, deleted and
+  taken-down accounts are left out and the next ones move up; a
+  suspended account is shown with its tag.
 
 ## What visitors' browsers and Farsight fetch from others
 
@@ -217,6 +253,8 @@ public_ui = false                 # the toggle
 instance_description = ""         # plain text on the home page
 contact = ""                      # "" = server.contact; no public page shows it
 show_outgoing_blocks = false
+show_top_blockers = false         # home page: the accounts that block the most
+show_top_blocked = false          # home page: the accounts that are blocked the most
 record_viewer_url = ""            # admin lookup pages; "" = records are not links
 show_avatars = true               # false = cards carry no image
 avatar_thumbnails = false         # true = small thumbnails from cdn.bsky.app, not originals from each account's server

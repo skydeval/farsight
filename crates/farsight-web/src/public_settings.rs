@@ -49,6 +49,10 @@ pub struct Settings {
     pub contact: String,
     /// `show_outgoing_blocks`.
     pub show_outgoing_blocks: bool,
+    /// `show_top_blockers`.
+    pub show_top_blockers: bool,
+    /// `show_top_blocked`.
+    pub show_top_blocked: bool,
     /// `show_opengraph_image`.
     pub show_opengraph_image: bool,
     /// `record_viewer_url`.
@@ -97,6 +101,10 @@ pub struct View {
     pub contact: String,
     /// Outgoing section.
     pub show_outgoing_blocks: bool,
+    /// The home page's "Top blockers" lists.
+    pub show_top_blockers: bool,
+    /// The home page's "Most blocked" lists.
+    pub show_top_blocked: bool,
     /// Preview image tag.
     pub show_opengraph_image: bool,
     /// Record viewer URL template.
@@ -142,6 +150,8 @@ impl View {
             instance_description: p.instance_description.clone(),
             contact: p.contact.clone(),
             show_outgoing_blocks: p.show_outgoing_blocks,
+            show_top_blockers: p.show_top_blockers,
+            show_top_blocked: p.show_top_blocked,
             show_opengraph_image: p.show_opengraph_image,
             record_viewer_url: p.record_viewer_url.clone(),
             show_avatars: p.show_avatars,
@@ -171,6 +181,8 @@ impl View {
             instance_description: s("instance_description"),
             contact: s("contact"),
             show_outgoing_blocks: b("show_outgoing_blocks"),
+            show_top_blockers: b("show_top_blockers"),
+            show_top_blocked: b("show_top_blocked"),
             show_opengraph_image: b("show_opengraph_image"),
             record_viewer_url: s("record_viewer_url"),
             show_avatars: b("show_avatars"),
@@ -293,6 +305,8 @@ impl Settings {
             instance_description: v.instance_description.replace("\r\n", "\n"),
             contact: v.contact.trim().to_owned(),
             show_outgoing_blocks: v.show_outgoing_blocks,
+            show_top_blockers: v.show_top_blockers,
+            show_top_blocked: v.show_top_blocked,
             show_opengraph_image: v.show_opengraph_image,
             dark_mode_default: v.dark_mode_default.clone(),
             crawlable: v.crawlable,
@@ -328,6 +342,8 @@ impl Settings {
             "show_outgoing_blocks".into(),
             self.show_outgoing_blocks.into(),
         );
+        p.insert("show_top_blockers".into(), self.show_top_blockers.into());
+        p.insert("show_top_blocked".into(), self.show_top_blocked.into());
         // Retired: accepted by the loader, never written back.
         p.remove("show_history");
         p.insert(
@@ -410,6 +426,10 @@ pub struct Exposure {
     pub record_viewer: Option<String>,
     /// The outgoing section will be shown.
     pub show_outgoing: bool,
+    /// The home page will list the accounts that block the most.
+    pub top_blockers: bool,
+    /// The home page will list the accounts that are blocked the most.
+    pub top_blocked: bool,
     /// Crawlers will be allowed.
     pub crawlable: bool,
 }
@@ -426,6 +446,8 @@ impl Exposure {
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_owned)),
             show_outgoing: c.public_ui.show_outgoing_blocks,
+            top_blockers: c.public_ui.show_top_blockers,
+            top_blocked: c.public_ui.show_top_blocked,
             crawlable: c.public_ui.crawlable,
         }
     }
