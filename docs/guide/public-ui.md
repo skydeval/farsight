@@ -182,63 +182,33 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
 
 ## How the pages behave
 
-- **A bar on every page** with search, the guide and a light / dark /
-  system theme toggle; the home page's bar has the toggle only, since
-  the page has its own search box and guide. Public pages link only to
-  other public pages: no login link, no admin route.
-- **Tabs and times.** An account or list page shows one table at a
-  time, chosen with tabs under its header (`?tab=…`). Row times carry
-  no zone; one line under the header names it ("All times are in
-  EDT."; UTC without the page's script).
-  A list page has "Members" and "Subscribers" (`?tab=subscribers`):
-  the accounts that subscribe to the list as a block list. Mute
-  subscriptions are private and never appear.
-- **Tabs.** Every page's browser tab is titled "Farsight" and carries
-  the same icon; the title does not name the account or list on
-  screen. The preview tags of a shared link still do.
-- **Header.** The account page's header shows the account's avatar,
-  when its DID was created, with its age ("1 year, 11 months ago"), and
-  which host holds the account. The
-  page's script takes all three from the account's profile card (the
-  avatar only with `show_avatars`); the visitor's browser fetches the
-  image.
-- **Headings.** A table's heading is its count: accounts that block
-  the account, accounts it blocks, and, for "Blocked By Lists", the
-  listblock records on the lists that name it, added up (an account
-  that blocks two of the lists counts twice).
-- **Newest first.** Tables that show a creation time are sorted by it.
-  The time is the author's own claim, so the order uses the earlier of
-  that and the moment Farsight first stored the record: a record dated
-  in the future sits where it arrived, not at the top of the page.
-- **Pages.** Every table shows 50 rows and ends with numbered page
-  controls above and below it (`← 1 2 3 … 21 →`): as many page numbers
-  as the row holds, with the first and last page and the arrows at the
-  two edges. They are plain links with the page in
-  the address (`?page=2`, and `lists`, `out`, `outlists`,
-  `subscribers` for a page's other tables). The count in a table's heading and its last page are
-  the real numbers, counted with the page's filters on every view; if
-  that count cannot be read in time the heading shows none and the
-  controls end in the next arrow. Turning a page changes the table in
-  place when the page's script runs.
-- **Filter box.** Each table of an account page has a small box that
-  filters it (`?find=…`), across all its pages. A DID keeps that
-  account's rows. Part of a handle keeps the accounts whose stored
-  handle contains it, so an account whose handle this instance has
-  never verified is not found that way; pressing Enter on a whole
-  handle resolves it (one lookup from the handle budget) and finds the
-  account either way. On "Blocked By Lists" the text is matched
-  against the list's name and its owner.
-- **History.** A "History" tab, at the right end of an account page's
-  tabs, lists the handles and hosts the account has had, as the PLC
-  directory's log records them, in two tables side by side, newest
-  first. The handles are what
-  the account claimed at the time; they are not verified. The log is
-  read only when the tab is opened (`?tab=history`): one request to
-  the PLC directory, under the profile-card budget.
-- **Avatars** are rounded squares (squircles where the browser draws
-  them), in the header and on the cards.
-- **Times** are sent as absolute UTC and shown in the visitor's own
-  timezone by the page's script.
+- **Tabs.** An account or list page shows one table at a time, chosen
+  with tabs under its header (`?tab=…`). A list page has "Members" and
+  "Subscribers": the accounts that subscribe to the list as a block
+  list. Mute subscriptions are private and never appear.
+- **Pages.** Every table shows 50 rows with numbered page controls.
+  They are plain links with the page in the address (`?page=2`, and
+  `lists`, `out`, `outlists`, `subscribers` for a page's other tables).
+  The count in a table's heading is the real number, counted with the
+  page's filters on every view.
+- **Newest first.** Tables are sorted by creation time. That time is
+  the author's own claim, so the order uses the earlier of it and the
+  moment Farsight first stored the record: a record dated in the future
+  sits where it arrived, not at the top.
+- **Filter box.** Each table of an account page has a box that filters
+  it (`?find=…`) across all its pages, by DID or by part of a handle.
+  Only handles this instance has verified are matched; pressing Enter
+  on a whole handle resolves it and finds the account either way.
+- **History.** A "History" tab lists the handles and hosts the account
+  has had, as the PLC directory's log records them. The handles are
+  what the account claimed at the time; they are not verified. The log
+  is read only when the tab is opened: one request to the PLC
+  directory, under the profile-card budget.
+- **Browser tab.** Every page's browser tab is titled "Farsight" with
+  the same icon; it does not name the account or list on screen. The
+  preview tags of a shared link still do.
+- **Times** are sent as UTC and shown in the visitor's own timezone by
+  the page's script.
 - Pages are safe to cache at the edge (they do not depend on the
   visitor), carry a strict Content-Security-Policy with no inline
   script, and need no JavaScript to read.

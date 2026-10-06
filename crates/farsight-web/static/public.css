@@ -32,6 +32,8 @@
   --warn-bg: #fffbeb;
   --warn-border: #fde68a;
   --bad: #e11d48;
+  /* Small text on the tinted fill: 5.7:1, where --bad gives 4.3. */
+  --bad-text: #be123c;
   --bad-fg: #ffffff;
   --bad-bg: #fff1f2;
   --bad-border: #fecdd3;
@@ -97,6 +99,7 @@
     --warn-bg: rgba(245, 158, 11, 0.12);
     --warn-border: rgba(245, 158, 11, 0.32);
     --bad: #f77b90;
+  --bad-text: #f77b90;
     --bad-fg: #161616;
     --bad-bg: rgba(244, 63, 94, 0.12);
     --bad-border: rgba(244, 63, 94, 0.32);
@@ -151,6 +154,7 @@
   --warn-bg: rgba(245, 158, 11, 0.12);
   --warn-border: rgba(245, 158, 11, 0.32);
   --bad: #f77b90;
+  --bad-text: #f77b90;
   --bad-fg: #161616;
   --bad-bg: rgba(244, 63, 94, 0.12);
   --bad-border: rgba(244, 63, 94, 0.32);
@@ -779,7 +783,11 @@ a.toggle.on .box {
 .acct-tag.acct-takendown {
   border-color: var(--bad-border);
   background: var(--bad-bg);
-  color: var(--bad);
+  color: var(--bad-text);
+}
+/* The History tab's handle or host keeps its "current" tag beside it. */
+#history .td-account {
+  white-space: nowrap;
 }
 .data-row.tagged a.who {
   opacity: 0.7;

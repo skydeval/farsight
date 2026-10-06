@@ -60,6 +60,12 @@ commits it covers.
 
 ### Changed
 
+- The public list page's tables, the list lookup's facts and
+  Operations' API keys are frameless like the other tables.
+- Dashboard: the Index counts have thousands separators.
+- Public pages: the "taken down" tag is darker in the light theme
+  (contrast 5.7:1, from 4.3:1), and the History tab's "current" tag
+  stays beside its handle or host.
 - Admin pages: the dashboard's warnings and its coverage sentence moved
   into an "Alerts" drop-down in the bar, next to the theme selector, on
   every admin page. A number on it counts the warnings.

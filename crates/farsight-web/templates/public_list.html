@@ -39,8 +39,8 @@
 {% if let Some(t) = members.toggle %}<p class="table-options"><a class="toggle{% if t.on %} on{% endif %}" role="checkbox" aria-checked="{% if t.on %}true{% else %}false{% endif %}" href="{{ t.href }}#members" rel="nofollow" data-swap><span class="box" aria-hidden="true"></span>Show taken down accounts</a></p>{% endif %}
 {% if !members.rows.is_empty() %}
 {{ members.pager|safe }}
-<div class="table-responsive">
-<table class="data-table">
+<div class="table-responsive free">
+<table class="data-table free">
 <thead>
 <tr>
 <th scope="col" class="th-account">Account</th>
@@ -83,8 +83,8 @@
 {% if let Some(t) = blockers.toggle %}<p class="table-options"><a class="toggle{% if t.on %} on{% endif %}" role="checkbox" aria-checked="{% if t.on %}true{% else %}false{% endif %}" href="{{ t.href }}#subscribers" rel="nofollow" data-swap><span class="box" aria-hidden="true"></span>Show taken down accounts</a></p>{% endif %}
 {% if !blockers.rows.is_empty() %}
 {{ blockers.pager|safe }}
-<div class="table-responsive">
-<table class="data-table">
+<div class="table-responsive free">
+<table class="data-table free">
 <thead>
 <tr>
 <th scope="col" class="th-account">Account</th>

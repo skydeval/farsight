@@ -1459,6 +1459,10 @@ table.free td:last-child {
 table.free tr:last-child td {
   border-bottom: 0;
 }
+/* A table of facts has its labels down the side. */
+table.free.facts tr:last-child th {
+  border-bottom: 0;
+}
 table.free tbody tr:hover {
   background: none;
 }

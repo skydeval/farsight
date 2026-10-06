@@ -40,7 +40,7 @@
 <span>API keys</span>
 </h2>
 {% if keys.is_empty() %}<p class="empty">No keys issued yet.</p>{% else %}
-<table><tr><th>Id</th><th>Name</th><th>Scopes</th><th>Created</th><th>Last used</th><th>Revoked</th><th></th></tr>
+<table class="free"><tr><th>Id</th><th>Name</th><th>Scopes</th><th>Created</th><th>Last used</th><th>Revoked</th><th></th></tr>
 {% for k in keys %}<tr><td><code>{{ k.0 }}</code></td><td><strong>{{ k.1 }}</strong></td><td><span class="pill">{{ k.2 }}</span></td><td>{{ crate::common::local_times(k.3)|safe }}</td><td>{{ crate::common::local_times(k.4)|safe }}</td><td>{{ crate::common::local_times(k.5)|safe }}</td>
 <td>{% if k.5.is_empty() %}<form method="post" action="/admin/ops/keys-revoke"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ k.0 }}"><button class="danger" type="submit" style="padding:0.25rem 0.6rem; font-size:0.8rem;">Revoke</button></form>{% endif %}</td></tr>{% endfor %}
 </table>{% endif %}

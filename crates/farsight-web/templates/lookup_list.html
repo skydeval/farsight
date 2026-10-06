@@ -10,7 +10,7 @@
 <div class="card" style="margin-bottom: 1.25rem;">
 <p style="margin: 0; font-size: 1.05rem;"><strong><code>{{ s.uri }}</code></strong> · <a href="{{ s.history }}" class="pill" style="font-size:0.85rem;">View history →</a></p>
 </div>
-<div class="card"><table>{% for f in s.facts %}<tr><th>{{ f.label }}</th><td>{{ f.value }}</td></tr>{% endfor %}</table></div>
+<div class="card"><table class="free facts">{% for f in s.facts %}<tr><th>{{ f.label }}</th><td>{{ f.value }}</td></tr>{% endfor %}</table></div>
 
 <nav class="tabs" role="tablist" aria-label="Tables">
 {% for t in s.tabs %}<a class="tab{% if t.active %} active{% endif %}" role="tab" href="{{ t.href }}" data-tab="{{ t.id }}" aria-controls="{{ t.id }}" aria-selected="{% if t.active %}true{% else %}false{% endif %}">{{ t.label }}</a>

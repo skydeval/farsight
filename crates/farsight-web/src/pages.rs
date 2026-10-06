@@ -544,7 +544,10 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
         ("listItems", "List items"),
         ("actors", "Accounts known"),
     ] {
-        d.counts.push(stat(l, c[k].as_i64().unwrap_or(0)));
+        d.counts.push(stat(
+            l,
+            crate::public::text::thousands(c[k].as_i64().unwrap_or(0)),
+        ));
     }
     let f = &stats["firehose"];
     let connected = f["connected"].as_bool().unwrap_or(false);
