@@ -195,6 +195,7 @@ pub async fn run(
         counters: counters.clone(),
         gates: gates.clone(),
         version: VERSION,
+        usage: Arc::default(),
     });
     let status = Arc::new(farsight_web::ServerStatus::default());
     let (reset_tx, mut reset_rx) = watch::channel(false);

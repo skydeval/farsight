@@ -320,8 +320,14 @@ h3 {
 .stat {
   gap: 1rem;
 }
-/* The figure is no larger than leaves room for its name on the line. */
+/* The figure stands at the right. Where it does not fit beside its
+   name it goes to a line of its own, still at the right. */
+.stat {
+  flex-wrap: wrap;
+  row-gap: 0.15rem;
+}
 .stat .n {
+  margin-left: auto;
   text-align: right;
   font-size: 1.15rem;
   white-space: nowrap;
@@ -1458,6 +1464,15 @@ table.free td:last-child {
 }
 table.free tr:last-child td {
   border-bottom: 0;
+}
+/* An endpoint nobody has called is set back. */
+table.api-usage tr.unused td,
+table.api-usage tr.unused code {
+  color: var(--muted);
+}
+table.api-usage td.num {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 /* A table of facts has its labels down the side. */
 table.free.facts tr:last-child th {

@@ -21,7 +21,8 @@ use farsight_storage::ui_rows::{Filter, Section as Rows};
 
 use super::admin_did::{COUNT_CAP, PAGE_ROWS, Pager};
 use super::{
-    Nav, Stat, WebState, coverage_words, gate, nav, parse_list_ref, permit, resolve_handle, stat,
+    Nav, Stat, WebState, count, coverage_words, gate, nav, parse_list_ref, permit, resolve_handle,
+    stat,
 };
 use crate::cells;
 use crate::common::render_private;
@@ -354,7 +355,10 @@ pub async fn lookup_list(
                 },
             ));
             facts.push(stat("State", b["state"].as_str().unwrap_or("—")));
-            facts.push(stat("Listblocks", b["listblockCount"].clone()));
+            facts.push(match b["listblockCount"].as_i64() {
+                Some(n) => count("Listblocks", n),
+                None => stat("Listblocks", "—"),
+            });
             facts.push(stat(
                 "Capped",
                 if b["capped"].as_bool().unwrap_or(false) {
@@ -374,7 +378,7 @@ pub async fn lookup_list(
         Err(e) => members.error = Some(e.message),
     }
     if let Some(info) = &info {
-        facts.push(stat("Stored items", info.item_count));
+        facts.push(count("Stored items", i64::from(info.item_count)));
         if serves {
             table(
                 &st,

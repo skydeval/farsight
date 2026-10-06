@@ -58,6 +58,10 @@ commits it covers.
 
 ### Added
 
+- Dashboard: an "API usage" block lists every API endpoint with the
+  requests it has answered since the server started, its errors, its
+  rate-limited requests and when it was last called. Endpoints nobody
+  has called are set back.
 - Gap repairs can be paused, cancelled and kept from starting by
   themselves. Operations has "Pause repair", "Cancel repair" and a
   switch for automatic repairs; the API has `admin.pauseRepair` and
@@ -93,6 +97,13 @@ commits it covers.
 
 ### Changed
 
+- Home and search pages on a narrow screen: the search box no longer
+  shows the magnifier or the "/" key hint, which each took a line.
+- Admin pages: every count has thousands separators (the dashboard's
+  queues, exceptions, lists by state and host buckets; the list
+  lookup's listblocks and stored items). In the Index block a
+  figure too long to sit beside its name goes to a line of its own, at
+  the right.
 - The default Jetstream is `wss://jetstream.us-east.bsky.network`,
   Bluesky's public v2 instance, in place of `jetstream2.us-east`, which
   serves v1 only. The setup wizard's note says which public instances

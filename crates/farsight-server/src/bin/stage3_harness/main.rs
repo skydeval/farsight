@@ -234,6 +234,40 @@ async fn check_repair_controls(
     );
     seed::exec(pool, &format!("DELETE FROM firehose_gaps WHERE id = {gap}")).await?;
     seed::notify(pool).await?;
+
+    // The dashboard's "API usage" has counted what the checks above asked.
+    let cookie = admin_session(pool, ADMIN_DID).await?;
+    let dash = ctx
+        .http
+        .get(
+            &format!("{base}/admin/dashboard/fragment"),
+            &[("cookie", &cookie)],
+        )
+        .await?;
+    let row = |name: &str| -> Option<Vec<String>> {
+        let at = dash.text.find(&format!("<code>{name}</code>"))?;
+        let rest = &dash.text[at..];
+        let row = &rest[..rest.find("</tr>")?];
+        Some(
+            row.split("<td class=\"num\">")
+                .skip(1)
+                .map(|c| c.split("</td>").next().unwrap_or("").to_owned())
+                .collect(),
+        )
+    };
+    let cancel = row("admin.cancelRepair").unwrap_or_default();
+    let blocks = row("query.getIncomingBlocks").unwrap_or_default();
+    c.check(
+        "the dashboard's \"API usage\" lists every endpoint with what it has answered since start: admin.cancelRepair twice, with a time; query.getIncomingBlocks with its errors counted apart",
+        dash.status == 200
+            && dash.text.matches("<tr").count() > farsight_api::Endpoint::ALL.len()
+            && cancel.first().map(String::as_str) == Some("2")
+            && cancel.get(1).map(String::as_str) == Some("0")
+            && cancel.get(3).is_some_and(|t| t.contains("<time datetime="))
+            && blocks.first().and_then(|n| n.replace(',', "").parse::<u64>().ok()).is_some_and(|n| n > 0)
+            && blocks.get(1).and_then(|n| n.parse::<u64>().ok()).is_some_and(|n| n > 0),
+        format!("cancelRepair {cancel:?}; getIncomingBlocks {blocks:?}"),
+    );
     Ok(())
 }
 

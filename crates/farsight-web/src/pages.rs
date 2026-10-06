@@ -431,6 +431,23 @@ pub struct Stat {
     pub value: String,
 }
 
+/// One API endpoint on the dashboard.
+#[derive(Debug, Clone)]
+pub struct ApiRow {
+    /// `query.checkBlocks`.
+    pub name: &'static str,
+    /// Requests answered.
+    pub requests: String,
+    /// Errors other than rate limits.
+    pub errors: String,
+    /// Rate-limited requests.
+    pub limited: String,
+    /// When it was last called.
+    pub last: Option<crate::public::text::Stamp>,
+    /// It has been called at all.
+    pub used: bool,
+}
+
 /// A warning banner.
 #[derive(Debug, Clone)]
 pub struct Warning {
@@ -463,6 +480,10 @@ pub struct DashboardData {
     pub storage: Vec<Stat>,
     /// Lists per state.
     pub lists: Vec<Stat>,
+    /// API endpoints and what each has been asked since start.
+    pub api: Vec<ApiRow>,
+    /// When that counting began.
+    pub api_since: Option<crate::public::text::Stamp>,
     /// Top buckets by lifetime interning.
     pub buckets: Vec<(String, String, String, String)>,
 }
@@ -591,6 +612,11 @@ fn lists_line(rps: u32, unread: i64, total: i64, rounds: u64) -> Option<String> 
     Some(catching_line(total - unread, total, "read", Some(unread)))
 }
 
+/// A count for an admin page, with thousands separators.
+pub(crate) fn count(label: &str, n: i64) -> Stat {
+    stat(label, crate::public::text::thousands(n))
+}
+
 fn stat(label: &str, value: impl ToString) -> Stat {
     Stat {
         label: label.into(),
@@ -613,10 +639,7 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
         ("listItems", "List items"),
         ("actors", "Accounts known"),
     ] {
-        d.counts.push(stat(
-            l,
-            crate::public::text::thousands(c[k].as_i64().unwrap_or(0)),
-        ));
+        d.counts.push(count(l, c[k].as_i64().unwrap_or(0)));
     }
     let f = &stats["firehose"];
     let connected = f["connected"].as_bool().unwrap_or(false);
@@ -660,9 +683,9 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
             ));
         }
     }
-    d.firehose.push(stat("Gaps to repair", repairable));
+    d.firehose.push(count("Gaps to repair", repairable));
     d.firehose
-        .push(stat("Gaps still open", v1_open + other_open));
+        .push(count("Gaps still open", v1_open + other_open));
     let b = &stats["backfill"];
     if let Some(s) = b.get("sweep") {
         d.backfill.push(stat(
@@ -706,23 +729,39 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
         .enumerate()
     {
         d.backfill
-            .push(stat(l, q.get(i).and_then(Value::as_i64).unwrap_or(0)));
+            .push(count(l, q.get(i).and_then(Value::as_i64).unwrap_or(0)));
     }
     d.backfill
-        .push(stat("Repos/hour", b["reposPerHour"].as_i64().unwrap_or(0)));
+        .push(count("Repos/hour", b["reposPerHour"].as_i64().unwrap_or(0)));
     let ex = &stats["freshness"]["coverage"]["exceptions"];
     if let Some(m) = ex.as_object() {
         for (k, v) in m {
-            d.exceptions.push(stat(k, v.as_i64().unwrap_or(0)));
+            d.exceptions.push(count(k, v.as_i64().unwrap_or(0)));
         }
     }
-    d.exceptions.push(stat(
+    d.exceptions.push(count(
         "pendingLists",
         stats["freshness"]["coverage"]["pendingLists"]
             .as_i64()
             .unwrap_or(0),
     ));
     d.coverage = coverage_words(&stats["freshness"]);
+    let thousands = |n: u64| crate::public::text::thousands(i64::try_from(n).unwrap_or(i64::MAX));
+    d.api = st
+        .api
+        .usage
+        .snapshot()
+        .into_iter()
+        .map(|u| ApiRow {
+            name: u.endpoint.name(),
+            requests: thousands(u.requests),
+            errors: thousands(u.errors),
+            limited: thousands(u.limited),
+            last: u.last.map(crate::public::text::Stamp::of),
+            used: u.requests > 0,
+        })
+        .collect();
+    d.api_since = Some(crate::public::text::Stamp::of(st.api.usage.since));
 
     let mut conn = st.api.pool.acquire().await.map_err(|e| e.to_string())?;
     let repair = farsight_storage::queries::repair_running(&mut conn)
@@ -765,7 +804,7 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
         .await
         .map_err(|e| e.to_string())?
     {
-        d.lists.push(stat(s.api_name(), n));
+        d.lists.push(count(s.api_name(), n));
     }
     for (bucket, interned, blocks, items, _, _, mask) in
         farsight_storage::queries::top_buckets(&mut conn, 10)
@@ -774,8 +813,12 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
     {
         d.buckets.push((
             bucket,
-            interned.to_string(),
-            format!("{blocks} blocks · {items} items"),
+            crate::public::text::thousands(interned),
+            format!(
+                "{} blocks · {} items",
+                crate::public::text::thousands(blocks),
+                crate::public::text::thousands(items)
+            ),
             if mask != 0 {
                 "capped".into()
             } else {

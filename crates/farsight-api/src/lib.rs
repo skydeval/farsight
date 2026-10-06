@@ -20,6 +20,7 @@ pub mod params;
 pub mod public_ui;
 pub mod ratelimit;
 pub mod snapshot;
+pub mod usage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -89,6 +90,8 @@ pub struct ApiState {
     pub gates: Arc<SharedGates>,
     /// Binary version.
     pub version: &'static str,
+    /// Requests answered per endpoint since start, for the dashboard.
+    pub usage: Arc<usage::Usage>,
 }
 
 /// Endpoint classes for access, limits and caching.
@@ -464,6 +467,7 @@ async fn dispatch(
     if cors_on {
         cors(resp.headers_mut());
     }
+    st.usage.record(ep, resp.status().as_u16());
     let status = resp.status().as_u16().to_string();
     ::metrics::counter!(m::QUERY_REQUESTS, "endpoint" => ep.label(), "status" => status)
         .increment(1);

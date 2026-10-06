@@ -54,6 +54,16 @@
 {% for s in d.lists %}<div class="fact"><div class="l">{{ s.label }}</div><div class="v num">{{ s.value }}</div></div>{% endfor %}
 </div>
 </div>
+<div class="card" id="api-usage">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+<span>API usage</span>
+</h2>
+<p class="muted">Requests each endpoint has answered{% if let Some(s) = d.api_since %} since this server started, <time datetime="{{ s.iso }}" data-plain>{{ s.text }}</time>{% endif %}. The admin pages' own reads are not counted.</p>
+<table class="free api-usage"><tr><th>Endpoint</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">Rate limited</th><th class="num">Last called</th></tr>
+{% for a in d.api %}<tr{% if !a.used %} class="unused"{% endif %}><td><code>{{ a.name }}</code></td><td class="num">{{ a.requests }}</td><td class="num">{{ a.errors }}</td><td class="num">{{ a.limited }}</td><td class="num">{% if let Some(t) = a.last %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% else %}never{% endif %}</td></tr>
+{% endfor %}</table>
+</div>
 <div class="card">
 <h2>
 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>

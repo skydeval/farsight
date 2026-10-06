@@ -785,9 +785,13 @@ a.toggle.on .box {
   background: var(--bad-bg);
   color: var(--bad-text);
 }
-/* The History tab's handle or host keeps its "current" tag beside it. */
-#history .td-account {
-  white-space: nowrap;
+/* The History tab's handle or host keeps its "current" tag beside it,
+   where there is room: on a narrow screen the tag may go under it, so
+   that the date stays in view. */
+@media (min-width: 44rem) {
+  #history .td-account {
+    white-space: nowrap;
+  }
 }
 .data-row.tagged a.who {
   opacity: 0.7;
@@ -2004,6 +2008,9 @@ footer {
   th, td { padding: 0.55rem 0.75rem; }
   form.home-search .search-box { flex-direction: column; align-items: stretch; padding: 0.5rem; }
   form.home-search .search-box button { width: 100%; }
+  /* The box is stacked here, and a touch screen has no "/" key: the
+     magnifier and the key hint would each take a line of their own. */
+  form.home-search .search-icon, form.home-search .search-kbd-hint { display: none; }
   .footer-inner { flex-direction: column; align-items: flex-start; }
 }
 
