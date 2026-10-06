@@ -21,6 +21,11 @@ commits it covers.
 
 ### Fixed
 
+- Start-up no longer waits minutes on a large index. The check for
+  deleted accounts whose purge was interrupted walked every account
+  through the primary key; it now reads the deleted accounts in one
+  pass (13 seconds where it had not finished after six minutes, with
+  11.7 million accounts).
 - Admin alerts no longer tell you to start a repair for a gap that
   cannot be repaired. The interval of a v1 firehose is one open gap
   until a v2 Jetstream takes over; it is now part of the v1 alert, and

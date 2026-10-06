@@ -618,8 +618,16 @@ pub async fn purge_account(
 /// runs these at start-up.
 pub async fn accounts_pending_purge(pool: &PgPool, limit: i64) -> Result<Vec<Did>> {
     let dids: Vec<String> = sqlx::query_scalar(
-        "SELECT did FROM actors a WHERE a.status = $1
-           AND (a.authored_blocks > 0 OR a.authored_listblocks > 0 OR a.owned_items > 0
+        // The deleted accounts are read first, in one pass over `actors`.
+        // Written as one SELECT with `ORDER BY id LIMIT`, the planner
+        // walks the whole table through its primary key looking for
+        // matches that are rarely there: minutes for ten million
+        // accounts, before the server serves.
+        "WITH d AS MATERIALIZED (
+           SELECT id, did, authored_blocks, authored_listblocks, owned_items
+           FROM actors WHERE status = $1)
+         SELECT did FROM d a
+         WHERE (a.authored_blocks > 0 OR a.authored_listblocks > 0 OR a.owned_items > 0
                 OR EXISTS (SELECT 1 FROM lists l WHERE l.owner_id = a.id AND l.record_state <> 2)
                 OR EXISTS (SELECT 1 FROM blocks_history h WHERE h.author_id = a.id)
                 OR EXISTS (SELECT 1 FROM list_blocks_history h WHERE h.author_id = a.id)
