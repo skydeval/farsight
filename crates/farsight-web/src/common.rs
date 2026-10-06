@@ -49,12 +49,48 @@ pub const NO_STORE: &str = "no-store, private";
 /// Renders a template; a render failure is a 500.
 pub fn render<T: Template>(t: &T) -> Response {
     match t.render() {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => {
+            let mut r = Html(html).into_response();
+            r.headers_mut().insert(
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(PAGE_CSP),
+            );
+            r
+        }
         Err(e) => {
             tracing::error!(error = %e, "template render failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
     }
+}
+
+/// `Content-Security-Policy` of every page rendered here: the admin
+/// pages, the setup wizard and the sign-in. No inline script or style,
+/// nothing loaded from another origin but images over `https` (profile
+/// cards show avatars from the accounts' own servers), no framing, forms
+/// that post only to this origin. A public page replaces it with its own
+/// (`public::csp`).
+pub const PAGE_CSP: &str = "default-src 'none'; style-src 'self'; script-src 'self'; \
+                            img-src 'self' https:; connect-src 'self'; base-uri 'none'; \
+                            form-action 'self'; frame-ancestors 'none'";
+/// The same for the sign-in page, whose form is answered with a redirect
+/// to the account's own authorization server: browsers apply
+/// `form-action` to that redirect too, so it allows any `https` origin,
+/// and plain `http` to the hosts the operator has allowed it for
+/// (`net.allow_http_hosts`, which exists for development and tests).
+pub fn sign_in_csp(allow_http_hosts: &[String]) -> HeaderValue {
+    let mut form = String::from("'self' https:");
+    for h in allow_http_hosts {
+        // A host name or address and nothing else goes into the header.
+        if !h.is_empty()
+            && h.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+        {
+            form.push_str(&format!(" http://{h} http://{h}:*"));
+        }
+    }
+    let policy = PAGE_CSP.replace("form-action 'self'", &format!("form-action {form}"));
+    HeaderValue::from_str(&policy).unwrap_or_else(|_| HeaderValue::from_static(PAGE_CSP))
 }
 
 /// [`render`] with `Cache-Control: no-store, private`.
@@ -349,6 +385,20 @@ pub fn local_times(text: impl AsRef<str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sign_in_policy_lets_its_form_reach_an_authorization_server() {
+        let p = sign_in_csp(&[]);
+        let p = p.to_str().unwrap();
+        assert!(p.contains("form-action 'self' https:;"));
+        assert!(p.contains("script-src 'self'") && !p.contains("unsafe"));
+        // Plain http only where the operator allowed it, and never from
+        // a value that is more than a host.
+        let p = sign_in_csp(&["198.51.100.1".into(), "bad host; script-src *".into()]);
+        let p = p.to_str().unwrap();
+        assert!(p.contains("form-action 'self' https: http://198.51.100.1 http://198.51.100.1:*;"));
+        assert!(!p.contains("bad host"));
+    }
 
     #[test]
     fn utc_times_in_a_sentence_become_time_elements() {

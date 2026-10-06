@@ -935,8 +935,9 @@ async fn resolve(r: &Req<'_>, handle: &str, typed: &str) -> Result<Did, Fail> {
     }
 }
 
-/// `/search?q=…`: resolves the input and redirects under
-/// `/public/`. Every request is charged to the lookup rate class.
+/// `/search?q=…`: resolves the input and redirects to the account's
+/// page (`/did/…`) or the list's (`/list/…`). Every request is charged
+/// to the lookup rate class.
 pub async fn search(r: &Req<'_>, q: &Params) -> Result<Response, Fail> {
     let typed = q.get("q").unwrap_or("").trim().to_owned();
     let target = search::parse(&typed).map_err(|message| Fail::Bad {

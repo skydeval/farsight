@@ -115,14 +115,21 @@ fn sign_in_page(
     } else {
         "elsewhere"
     };
-    render_private(&EnterPage {
+    let mut r = render_private(&EnterPage {
         nav: Nav::default(),
         kind,
         hostname,
         hosted_url: hosted_url(cfg),
         error,
         notice,
-    })
+    });
+    // The form on this page is answered with a redirect to the account's
+    // authorization server.
+    r.headers_mut().insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        common::sign_in_csp(&cfg.config.net.allow_http_hosts),
+    );
+    r
 }
 
 fn unconfigured_page(cfg: &LoadedConfig) -> Response {

@@ -1410,7 +1410,7 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
         enter.status == 200
             && enter
                 .text
-                .contains("<form class=\"stack card\" method=\"post\" action=\"/enter\"")
+                .contains("<form class=\"stack card enter-card\" method=\"post\" action=\"/enter\"")
             && !enter.text.contains("type=\"password\"")
             && enter.header("cache-control").as_deref() == Some("no-store, private"),
         enter.short(),
@@ -2337,7 +2337,9 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
             && page
                 .text
                 .contains(&format!("Removed records naming <code>{}</code>", w.s))
-            && page.header("content-security-policy").is_none(),
+            && page
+                .header("content-security-policy")
+                .is_some_and(|p| p.contains("script-src 'self'") && !p.contains("unsafe")),
         page.short(),
     );
     let tied = h

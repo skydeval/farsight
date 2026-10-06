@@ -23,7 +23,9 @@
 //! client has just read the profile record from, and only while
 //! `public_ui.show_avatars` is on.
 //!
-//! Nothing but the handle cache is stored.
+//! Two things are stored: the verified handle (`handle_cache`) and which
+//! image the profile uses (`avatar_cache`, the blob's CID, read again
+//! after a day). The image itself is never stored or fetched.
 //!
 //! `GET /admin/card/{did}` serves the same fragment to a signed-in admin
 //! from the admin tables ([`admin_route`]). It differs in three ways:

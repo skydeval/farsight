@@ -97,6 +97,10 @@ commits it covers.
 
 ### Changed
 
+- The admin pages, the setup wizard and the sign-in page now send a
+  `Content-Security-Policy` like the public pages': no inline script or
+  style, nothing from another origin except avatar images over https,
+  no framing. Their inline style attributes moved into the stylesheet.
 - Home and search pages on a narrow screen: the search box no longer
   shows the magnifier or the "/" key hint, which each took a line.
 - Admin pages: every count has thousands separators (the dashboard's

@@ -21,7 +21,7 @@
 <span>Firehose</span>
 </h2>
 {% for s in d.firehose %}<div class="fact"><div class="l">{{ s.label }}</div><div class="v">{% if s.label == "Connected" && s.value == "yes" %}<span class="ok"><span class="pulse-dot" aria-hidden="true"></span> yes</span>{% else %}{{ s.value }}{% endif %}</div></div>{% endfor %}
-{% if !d.gaps.is_empty() %}<h3 style="margin-top:1rem; color:var(--warn);">Gaps not healed</h3><ul>{% for g in d.gaps %}<li>{{ crate::common::local_times(g)|safe }}</li>{% endfor %}</ul>{% endif %}
+{% if !d.gaps.is_empty() %}<h3 class="gaps-title">Gaps not healed</h3><ul>{% for g in d.gaps %}<li>{{ crate::common::local_times(g)|safe }}</li>{% endfor %}</ul>{% endif %}
 </div>
 <div class="card">
 <h2>

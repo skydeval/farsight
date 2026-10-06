@@ -7,8 +7,8 @@
 </form>
 {% if let Some(e) = error %}<div class="banner bad">{{ e }}</div>{% endif %}
 {% if let Some(s) = subject %}
-<div class="card" style="margin-bottom: 1.25rem;">
-<p style="margin: 0; font-size: 1.05rem;"><strong><code>{{ s.uri }}</code></strong> · <a href="{{ s.history }}" class="pill" style="font-size:0.85rem;">View history →</a></p>
+<div class="card u-mb-125">
+<p class="u-uri-line"><strong><code>{{ s.uri }}</code></strong> · <a href="{{ s.history }}" class="pill u-small">View history →</a></p>
 </div>
 <div class="card"><table class="free facts">{% for f in s.facts %}<tr><th>{{ f.label }}</th><td>{{ f.value }}</td></tr>{% endfor %}</table></div>
 

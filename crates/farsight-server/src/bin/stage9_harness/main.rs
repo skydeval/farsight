@@ -458,6 +458,37 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
         |r| r.status == 200 && cc(r) == "no-store, private",
     )
     .await?;
+    let mut loose = Vec::new();
+    for path in ADMIN_PAGES
+        .iter()
+        .copied()
+        .chain(["/admin/dashboard/fragment", "/admin/alerts"])
+    {
+        let r = a.admin_get(cookie, path).await?;
+        let csp = r.header("content-security-policy").unwrap_or_default();
+        if r.status != 200
+            || !csp.contains("default-src 'none'")
+            || !csp.contains("script-src 'self'")
+            || !csp.contains("style-src 'self'")
+            || !csp.contains("frame-ancestors 'none'")
+            || csp.contains("unsafe")
+            || r.text.contains(" style=\"")
+            || r.text.contains("<style")
+            || r.text.contains(" onclick=")
+        {
+            loose.push(format!("{path}: {} {csp:?}", r.status));
+        }
+    }
+    let enter = a.get("/enter").await?;
+    let enter_csp = enter.header("content-security-policy").unwrap_or_default();
+    c.check(
+        "every admin page and fragment carries a Content-Security-Policy that allows no inline script or style and no framing, and has neither a style attribute nor a style element; the sign-in page's differs only in letting its form be answered by a redirect to an https origin",
+        loose.is_empty()
+            && enter_csp.contains("form-action 'self' https:")
+            && enter_csp.contains("script-src 'self'")
+            && !enter.text.contains(" style=\""),
+        format!("{loose:?}; /enter: {enter_csp:?}"),
+    );
     let dash = a.admin_get(cookie, "/admin").await?;
     c.check(
         "the dashboard's links, poll and logout form all name /admin paths; the page loads the admin pages' own script, /static/admin.js",

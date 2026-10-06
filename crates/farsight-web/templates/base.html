@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false}'>
 <title>Farsight</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{ crate::common::asset_version() }}">
 <link rel="stylesheet" href="/static/farsight.css?v={{ crate::common::asset_version() }}">
@@ -21,7 +22,7 @@
 <a href="/admin/lookup/did">DID lookup</a><a href="/admin/lookup/list">List lookup</a>
 <a href="/admin/ops">Operations</a><a href="/admin/settings">Settings</a>
 </nav>
-<span style="margin-left:auto; display:flex; gap:0.75rem; align-items:center;">
+<span class="bar-end">
 <details class="nav-alerts">
 <summary title="Alerts"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span>Alerts</span><span id="alerts-count" class="alerts-count" hidden>0</span></summary>
 <div class="alerts-panel" hx-get="/admin/alerts" hx-trigger="load, every 30s" hx-swap="innerHTML"><p class="alerts-none">Loading…</p></div>
@@ -37,10 +38,10 @@
 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 1 0 20z" fill="currentColor"/></svg>
 </button>
 </div>
-<form method="post" action="/admin/logout" style="display:inline"><input type="hidden" name="csrf" value="{{ nav.csrf }}"><button class="secondary" type="submit">Log out</button></form>
+<form class="u-inline" method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{{ nav.csrf }}"><button class="secondary" type="submit">Log out</button></form>
 </span>
 {% else %}
-<span style="margin-left:auto; display:flex; gap:0.75rem; align-items:center;">
+<span class="bar-end">
 <div class="theme-toggle" role="group" aria-label="Theme" hidden>
 <button type="button" data-theme-choice="light" aria-label="Light theme" aria-pressed="false" title="Light">
 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>

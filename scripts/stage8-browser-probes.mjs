@@ -151,14 +151,13 @@ for (const [name, engine] of [
     });
     await other.hover();
     const gone = page.locator(".who-wrap.open .profile-card");
-    await page.waitForFunction(
-      () => {
-        const c = document.querySelector(".who-wrap.open .profile-card");
-        return c && !/Loading/.test(c.textContent);
-      },
-      null,
-      { timeout: 8000 },
-    ).catch(() => {});
+    // The page's policy allows no evaluated script, so this waits on a
+    // locator, not on a function run in the page.
+    await gone
+      .filter({ hasNotText: /Loading/ })
+      .first()
+      .waitFor({ state: "visible", timeout: 8000 })
+      .catch(() => {});
     const goneText = (await gone.count()) ? await gone.innerText() : "";
     const leaked = await gone.locator("form, header, nav, button").count();
     out(

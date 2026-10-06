@@ -1,4 +1,4 @@
-//! `/public/search?q=…`: what a visitor may type, and where it leads.
+//! `/search?q=…`: what a visitor may type, and where it leads.
 //!
 //! Input classes, tried in this order: a DID; an `at://` URI of an account
 //! or a list; a `https://bsky.app/profile/…` link; otherwise a handle.

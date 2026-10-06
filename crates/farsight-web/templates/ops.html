@@ -15,7 +15,7 @@
 <input type="text" id="actor" name="actor" placeholder="handle.example.com or did:plc:...">
 <label for="priority">Priority</label>
 <select id="priority" name="priority"><option value="normal">normal</option><option value="high">high</option></select>
-<label style="display:flex; align-items:center; gap:0.5rem; margin-top:0.75rem;"><input type="checkbox" name="force" class="switch"> Force (even if running or recently done)</label>
+<label class="u-check-spaced"><input type="checkbox" name="force" class="switch"> Force (even if running or recently done)</label>
 <div class="row"><button type="submit">Enqueue backfill</button></div>
 </form>
 
@@ -24,25 +24,25 @@
 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
 <span>Firehose, sweep and repair</span>
 </h2>
-<div class="row" style="margin-top: 0.5rem;">
-<form method="post" action="/admin/ops/restart-firehose" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">Restart firehose</button></form>
+<div class="row u-mt-05">
+<form class="u-inline" method="post" action="/admin/ops/restart-firehose"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">Restart firehose</button></form>
 {% if env_managed %}<span class="muted">The sweep toggle is managed through the environment.</span>{% else %}
-<form method="post" action="/admin/ops/sweep" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}">
+<form class="u-inline" method="post" action="/admin/ops/sweep"><input type="hidden" name="csrf" value="{{ csrf }}">
 {% if sweep_enabled %}<input type="hidden" name="paused" value="true"><button type="submit" class="secondary">Pause sweep</button>{% else %}<input type="hidden" name="paused" value="false"><button type="submit">Resume sweep</button>{% endif %}
 </form>{% endif %}
 </div>
-<h3 style="margin-top: 1.25rem;">Gap repair</h3>
+<h3 class="u-mt-125">Gap repair</h3>
 <p class="muted">A repair re-reads every account whose records changed during a firehose gap. After a long gap it runs for days.
 {% if let Some(r) = repair %}Repair cycle {{ r.0 }} is {% if repair_paused %}paused{% else %}running{% endif %}: {{ r.1 }} accounts re-read so far.{% else %}No repair is under way.{% endif %}
 Repairs {% if repair_auto %}start by themselves when a gap closes{% else %}do not start by themselves{% endif %}{% if repair_paused && repair.is_none() %}, and are paused{% endif %}.</p>
-<div class="row" style="margin-top: 0.5rem;">
-<form method="post" action="/admin/ops/repair" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit" class="secondary">Start repair</button></form>
+<div class="row u-mt-05">
+<form class="u-inline" method="post" action="/admin/ops/repair"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit" class="secondary">Start repair</button></form>
 {% if env_managed %}<span class="muted">Pausing, cancelling and the automatic start are managed through the environment (<code>FARSIGHT__BACKFILL__REPAIR__PAUSED</code>, <code>FARSIGHT__BACKFILL__REPAIR__AUTO_START</code>).</span>{% else %}
-<form method="post" action="/admin/ops/repair-pause" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}">
+<form class="u-inline" method="post" action="/admin/ops/repair-pause"><input type="hidden" name="csrf" value="{{ csrf }}">
 {% if repair_paused %}<input type="hidden" name="paused" value="false"><button type="submit">Resume repair</button>{% else %}<input type="hidden" name="paused" value="true"><button type="submit" class="secondary">Pause repair</button>{% endif %}
 </form>
-{% if repair.is_some() %}<form method="post" action="/admin/ops/repair-cancel" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit" class="danger">Cancel repair</button></form>{% endif %}
-<form method="post" action="/admin/ops/repair-auto" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}">
+{% if repair.is_some() %}<form class="u-inline" method="post" action="/admin/ops/repair-cancel"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit" class="danger">Cancel repair</button></form>{% endif %}
+<form class="u-inline" method="post" action="/admin/ops/repair-auto"><input type="hidden" name="csrf" value="{{ csrf }}">
 {% if repair_auto %}<input type="hidden" name="on" value="false"><button type="submit" class="secondary">Turn automatic repairs off</button>{% else %}<input type="hidden" name="on" value="true"><button type="submit" class="secondary">Turn automatic repairs on</button>{% endif %}
 </form>{% endif %}
 </div>
@@ -56,17 +56,17 @@ Repairs {% if repair_auto %}start by themselves when a gap closes{% else %}do no
 {% if keys.is_empty() %}<p class="empty">No keys issued yet.</p>{% else %}
 <table class="free"><tr><th>Id</th><th>Name</th><th>Scopes</th><th>Created</th><th>Last used</th><th>Revoked</th><th></th></tr>
 {% for k in keys %}<tr><td><code>{{ k.0 }}</code></td><td><strong>{{ k.1 }}</strong></td><td><span class="pill">{{ k.2 }}</span></td><td>{{ crate::common::local_times(k.3)|safe }}</td><td>{{ crate::common::local_times(k.4)|safe }}</td><td>{{ crate::common::local_times(k.5)|safe }}</td>
-<td>{% if k.5.is_empty() %}<form method="post" action="/admin/ops/keys-revoke"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ k.0 }}"><button class="danger" type="submit" style="padding:0.25rem 0.6rem; font-size:0.8rem;">Revoke</button></form>{% endif %}</td></tr>{% endfor %}
+<td>{% if k.5.is_empty() %}<form method="post" action="/admin/ops/keys-revoke"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ k.0 }}"><button class="danger u-btn-small" type="submit">Revoke</button></form>{% endif %}</td></tr>{% endfor %}
 </table>{% endif %}
-<form class="stack" method="post" action="/admin/ops/keys-create" style="margin-top: 1.5rem; border-top: 1px solid var(--line); padding-top: 1rem;">
-<h3 style="margin-top:0;">Create API Key</h3>
+<form class="stack u-divided" method="post" action="/admin/ops/keys-create">
+<h3 class="u-mt-0">Create API Key</h3>
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="name">Name</label><input type="text" id="name" name="name" placeholder="app-name or integration-id">
 <label>Scopes</label>
-<div style="display:flex; gap:1.25rem; flex-wrap:wrap; margin-top:0.4rem;">
-<label style="display:flex; align-items:center; gap:0.4rem; margin:0;"><input type="checkbox" name="scope" value="read" checked> read</label>
-<label style="display:flex; align-items:center; gap:0.4rem; margin:0;"><input type="checkbox" name="scope" value="backfill"> backfill</label>
-<label style="display:flex; align-items:center; gap:0.4rem; margin:0;"><input type="checkbox" name="scope" value="backfill:high"> backfill:high</label>
+<div class="u-check-group">
+<label class="u-check"><input type="checkbox" name="scope" value="read" checked> read</label>
+<label class="u-check"><input type="checkbox" name="scope" value="backfill"> backfill</label>
+<label class="u-check"><input type="checkbox" name="scope" value="backfill:high"> backfill:high</label>
 </div>
 <label for="read_rps">Read rate override (requests/s, optional)</label><input type="number" id="read_rps" name="read_rps" min="1">
 <div class="row"><button type="submit">Create key</button></div>
