@@ -21,6 +21,11 @@ commits it covers.
 
 ### Fixed
 
+- The nightly rebuild of the approximate counters failed with
+  "deadlock detected" on a busy instance, every time it ran: it
+  rewrote every row of the host buckets while the writers were
+  updating them. It now takes a brief table lock, so the host buckets'
+  "Stored" figures and the totals are corrected nightly again.
 - Start-up no longer waits minutes on a large index. The check for
   deleted accounts whose purge was interrupted walked every account
   through the primary key; it now reads the deleted accounts in one

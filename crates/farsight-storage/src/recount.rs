@@ -211,7 +211,6 @@ pub async fn recount_actors(
 /// `stored_listblocks` are not reconstructed (see the stage-1 terminal
 /// report).
 pub async fn rebuild_approximate_counters(pool: &PgPool, batch: i64) -> Result<()> {
-    let mut tx = pool.begin().await?;
     let exact: [(&str, &str); 5] = [
         (stat::BLOCKS, "SELECT count(*) FROM blocks"),
         (stat::LIST_BLOCKS, "SELECT count(*) FROM list_blocks"),
@@ -222,8 +221,23 @@ pub async fn rebuild_approximate_counters(pool: &PgPool, batch: i64) -> Result<(
         (stat::LIST_ITEMS, "SELECT count(*) FROM list_items"),
         (stat::ACTORS, "SELECT count(*) FROM actors"),
     ];
+    // Counted first, outside the transaction that writes them: counting
+    // the large tables takes a minute, and the lock below is not held
+    // that long.
+    let mut counts = Vec::with_capacity(exact.len());
     for (name, sql) in exact {
-        let n: i64 = sqlx::query_scalar(sql).fetch_one(&mut *tx).await?;
+        let n: i64 = sqlx::query_scalar(sql).fetch_one(pool).await?;
+        counts.push((name, n));
+    }
+    let mut tx = pool.begin().await?;
+    // The writers' flushes update these rows one at a time, in their own
+    // order, and replacing them all at once under row locks deadlocks
+    // with a flush in progress. The table lock waits for flushes under
+    // way and holds back new ones for the moment the rows are replaced.
+    sqlx::query("LOCK TABLE stats_counters IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    for (name, n) in counts {
         sqlx::query("DELETE FROM stats_counters WHERE name = $1")
             .bind(name)
             .execute(&mut *tx)
@@ -291,6 +305,10 @@ pub async fn rebuild_approximate_counters(pool: &PgPool, batch: i64) -> Result<(
         }
     }
     let mut tx = pool.begin().await?;
+    // As above: every row is rewritten, so flushes wait for the moment.
+    sqlx::query("LOCK TABLE host_usage IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE host_usage SET stored_blocks = 0, stored_items = 0, stored_listblocks = 0,
                                stored_lists = 0",
