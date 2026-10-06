@@ -736,11 +736,12 @@ const API_ONLY: &str = "Farsight\n\nThis instance exposes an ATProto block-graph
 /// the dashboard while the admin UI is on; else a few lines of text, so
 /// that an API-only instance does not look broken. Decided per request.
 /// Only the first is a public UI request (rate class, metrics).
-async fn root(State(st): St, client: Client) -> Response {
+async fn root(State(st): St, client: Client, RawQuery(q): RawQuery) -> Response {
     let cfg = st.api.config.current();
     if cfg.config.access.public_ui {
+        let q = Params::parse(q.as_deref().unwrap_or(""));
         return serve(&st, Page::Home, client, Class::PublicUi, |r| async move {
-            pages::home(&r).await
+            pages::home(&r, &q).await
         })
         .await;
     }

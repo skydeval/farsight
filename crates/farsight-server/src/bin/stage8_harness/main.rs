@@ -2034,9 +2034,10 @@ fn top_rows(table: &str) -> Vec<(String, i64)> {
         .collect()
 }
 
-/// The two tables of a top group, last 24 hours then all time.
+/// The two tables of a top list's tab, the last day then all time, each
+/// with the rows behind "Show more" after its first ten.
 fn top_tables(home: &str, id: &str) -> Vec<Vec<(String, i64)>> {
-    let Some(i) = home.find(&format!("id=\"{id}\"")) else {
+    let Some(i) = home.find(&format!("<section id=\"{id}\"")) else {
         return Vec::new();
     };
     let rest = &home[i..];
@@ -2048,8 +2049,8 @@ fn top_tables(home: &str, id: &str) -> Vec<Vec<(String, i64)>> {
         .collect()
 }
 
-/// The home page's top lists: off by default, computed in the background
-/// once a switch is on, read from the stored lists.
+/// The home page's top lists: off by default, counted in the background
+/// once a switch is on, for the day that ended at 05:00 EST.
 async fn check_top_lists(
     c: &mut Checks,
     a: &Srv,
@@ -2060,13 +2061,16 @@ async fn check_top_lists(
     let home = a.get("/").await?;
     let stored = n(pool, "SELECT count(*) FROM top_lists").await?;
     c.check(
-        "off by default: the home page has no top list and nothing is computed",
+        "off by default: the home page has no top list and nothing is counted",
         home.status == 200 && !home.text.contains("top-group") && stored == 0,
         format!("{stored} stored lists"),
     );
     // The seeded blocks were written past the apply path: give the
-    // authors their counts, log 400 of the blocks as recent, and log 900
-    // more under one author that have no stored block.
+    // authors their counts. Then, around the day that ended at the last
+    // 10:00 UTC: 400 of the blocks are logged inside it, 300 others
+    // after it, and 900 rows inside it, under one author, have no stored
+    // block.
+    const DAY_END: &str = "(date_trunc('day', now() - interval '10 hours') + interval '10 hours')";
     seed::exec(
         pool,
         "UPDATE actors a SET authored_blocks = t.n
@@ -2075,8 +2079,20 @@ async fn check_top_lists(
     .await?;
     seed::exec(
         pool,
-        "INSERT INTO block_recent (at, author_id, rkey, subject_id)
-         SELECT now(), author_id, rkey, subject_id FROM blocks ORDER BY author_id, rkey LIMIT 400",
+        &format!(
+            "INSERT INTO block_recent (at, author_id, rkey, subject_id)
+             SELECT {DAY_END} - interval '1 hour', author_id, rkey, subject_id FROM blocks
+             ORDER BY subject_id, author_id, rkey LIMIT 400"
+        ),
+    )
+    .await?;
+    seed::exec(
+        pool,
+        &format!(
+            "INSERT INTO block_recent (at, author_id, rkey, subject_id)
+             SELECT {DAY_END} + interval '1 second', author_id, rkey, subject_id FROM blocks
+             ORDER BY subject_id DESC, author_id, rkey LIMIT 300"
+        ),
     )
     .await?;
     let phantom = did("hpq", 2);
@@ -2084,7 +2100,7 @@ async fn check_top_lists(
         pool,
         &format!(
             "INSERT INTO block_recent (at, author_id, rkey, subject_id)
-             SELECT now(), (SELECT id FROM actors WHERE did = '{phantom}'), 'gone' || g, 1
+             SELECT {DAY_END} - interval '2 hours', (SELECT id FROM actors WHERE did = '{phantom}'), 'gone' || g, 1
              FROM generate_series(1, 900) g"
         ),
     )
@@ -2113,39 +2129,61 @@ async fn check_top_lists(
     {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    let lists = n(pool, "SELECT count(*) FROM top_lists").await?;
+    let lists = n(
+        pool,
+        &format!("SELECT count(*) FROM top_lists WHERE computed_at = {DAY_END}"),
+    )
+    .await?;
     let home = a.get("/").await?;
-    let blockers = top_tables(&home.text, "top-blockers");
-    let blocked = top_tables(&home.text, "top-blocked");
+    let other = a.get("/?tab=topblocked").await?;
+    let blockers = top_tables(&home.text, "topblockers");
+    let blocked = top_tables(&home.text, "topblocked");
     let ranked = |t: &Vec<(String, i64)>| {
         !t.is_empty() && t.len() <= 20 && t.windows(2).all(|w| w[0].1 >= w[1].1) && t[0].1 > 0
     };
-    let top_of = |sql: &str| {
-        let sql = sql.to_owned();
-        async move {
-            sqlx::query_scalar::<_, String>(&sql)
-                .fetch_one(pool)
-                .await
-                .map_err(|e| e.to_string())
-        }
+    let first = |sql: String| async move {
+        sqlx::query_as::<_, (String, i64)>(&sql)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())
     };
-    let most_blocked = top_of(
-        "SELECT a.did FROM (SELECT subject_id, count(*) AS n FROM blocks GROUP BY 1) t
-         JOIN actors a ON a.id = t.subject_id WHERE a.status IN (0, 3)
-         ORDER BY t.n DESC, a.id LIMIT 1",
+    let of_day = |by: &str| {
+        format!(
+            "SELECT a.did, t.n FROM (
+               SELECT r.{by} AS id, count(*) AS n FROM block_recent r
+               JOIN blocks b ON b.author_id = r.author_id AND b.rkey = r.rkey AND b.subject_id = r.subject_id
+               WHERE r.at >= {DAY_END} - interval '24 hours' AND r.at < {DAY_END} GROUP BY 1) t
+             JOIN actors a ON a.id = t.id WHERE a.status IN (0, 3)
+             ORDER BY t.n DESC, a.id LIMIT 1"
+        )
+    };
+    let day_blocks = first(of_day("author_id")).await?;
+    let day_blocked = first(of_day("subject_id")).await?;
+    let all_blocks = first(
+        "SELECT did, authored_blocks::bigint FROM actors WHERE status IN (0, 3)
+         ORDER BY authored_blocks DESC, id LIMIT 1"
+            .into(),
     )
     .await?;
-    let most_blocks = top_of(
-        "SELECT did FROM actors WHERE status IN (0, 3) ORDER BY authored_blocks DESC, id LIMIT 1",
+    let all_blocked = first(
+        "SELECT a.did, t.n FROM (SELECT subject_id, count(*) AS n FROM blocks GROUP BY 1) t
+         JOIN actors a ON a.id = t.subject_id WHERE a.status IN (0, 3)
+         ORDER BY t.n DESC, a.id LIMIT 1"
+            .into(),
     )
     .await?;
     c.check(
-        "switched on (saved from Settings, no restart): within the task's next look the four lists are stored, and the home page shows each ranking's two tables, last 24 hours and all time, at most 20 rows each, largest count first",
+        "switched on (saved from Settings, no restart): within the task's next look the four lists are stored for the day that ended at 05:00 EST; the home page has a tab for each ranking, the first in view and ?tab=topblocked the other; each tab has two tables, the last day and all time, at most 20 rows each, largest count first, with no description and one line naming the day",
         saved.status < 400
             && lists == 4
             && blockers.len() == 2
             && blocked.len() == 2
-            && blockers.iter().chain(blocked.iter()).all(ranked),
+            && blockers.iter().chain(blocked.iter()).all(ranked)
+            && home.text.contains("data-active=\"topblockers\"")
+            && other.text.contains("data-active=\"topblocked\"")
+            && home.text.contains("data-tab=\"topblocked\"")
+            && !home.text.contains("top-note")
+            && home.text.contains("Last counted for the day up to <time datetime=\""),
         format!(
             "{lists} lists after {} s; rows {:?} and {:?}",
             started.elapsed().as_secs(),
@@ -2153,16 +2191,32 @@ async fn check_top_lists(
             blocked.iter().map(Vec::len).collect::<Vec<_>>()
         ),
     );
+    let lead = |t: &[Vec<(String, i64)>], i: usize| t.get(i).and_then(|t| t.first()).cloned();
     c.check(
-        "the all-time tables lead with the account that made the most blocks and the account the most others block; a logged block that is no longer stored does not count as recent",
-        blockers.get(1).and_then(|t| t.first()).map(|r| r.0.as_str()) == Some(most_blocks.as_str())
-            && blocked.get(1).and_then(|t| t.first()).map(|r| r.0.as_str()) == Some(most_blocked.as_str())
-            && !blockers.first().is_some_and(|t| t.iter().any(|r| r.0 == phantom)),
+        "each table leads with the right account and number: the most blocks made and received in that day, and of all time; a block logged after the day ended does not count, nor one that is no longer stored",
+        lead(&blockers, 0) == Some(day_blocks.clone())
+            && lead(&blocked, 0) == Some(day_blocked.clone())
+            && lead(&blockers, 1) == Some(all_blocks.clone())
+            && lead(&blocked, 1) == Some(all_blocked.clone())
+            && !blockers.iter().flatten().any(|r| r.0 == phantom),
         format!(
-            "all time: {:?} and {:?}; expected {most_blocks} and {most_blocked}",
-            blockers.get(1).and_then(|t| t.first()),
-            blocked.get(1).and_then(|t| t.first())
+            "day {:?} / {:?}, expected {day_blocks:?} / {day_blocked:?}; all time {:?} / {:?}, expected {all_blocks:?} / {all_blocked:?}",
+            lead(&blockers, 0),
+            lead(&blocked, 0),
+            lead(&blockers, 1),
+            lead(&blocked, 1)
         ),
+    );
+    let long = blockers.iter().chain(blocked.iter()).any(|t| t.len() > 10);
+    c.check(
+        "a table shows ten rows; the rest are behind \"Show more\", which only a table of more than ten has",
+        long == home.text.contains("<details class=\"top-more\">")
+            && home
+                .text
+                .split("<div class=\"top-list\">")
+                .skip(1)
+                .all(|t| top_rows(t.split("<details").next().unwrap_or("")).len() <= 10),
+        format!("a table of more than ten: {long}"),
     );
     let off = save(false).await?;
     let home = a.get("/").await?;

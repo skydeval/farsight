@@ -32,9 +32,13 @@
 </details>
 
 </div>
-{% for g in top %}<section class="top-group" id="{{ g.id }}">
-<h2>{{ g.title }}</h2>
-<p class="top-note">{{ g.note }}</p>
+{% if !top.is_empty() %}<div class="top-lists">
+{% if tabs.len() > 1 %}<nav class="tabs" role="tablist" aria-label="Top lists">
+{% for t in tabs %}<a class="tab{% if t.active %} active{% endif %}" role="tab" href="{{ t.href }}" data-tab="{{ t.id }}" aria-controls="{{ t.id }}" aria-selected="{% if t.active %}true{% else %}false{% endif %}">{{ t.label }}</a>
+{% endfor %}</nav>{% endif %}
+<div class="tabbed" data-active="{{ active }}">
+{% for g in top %}<section id="{{ g.id }}" class="card data-section tab-panel top-group">
+{% if tabs.len() < 2 %}{% for t in tabs %}<h2 class="top-title">{{ t.label }}</h2>{% endfor %}{% endif %}
 <div class="top-pair">
 {% for t in g.tables %}<div class="top-list">
 <h3>{{ t.period }}</h3>
@@ -43,10 +47,20 @@
 <tbody>
 {% for r in t.rows %}<tr class="data-row{% if r.who.tag.is_some() %} tagged{% endif %}"><td class="td-rank">{{ r.rank }}</td><td class="td-account">{{ r.who|safe }}</td><td class="td-count">{{ r.count }}</td></tr>
 {% endfor %}</tbody>
-</table>{% endif %}
-{% if let Some(s) = t.computed %}<p class="top-asof">Counted <time datetime="{{ s.iso }}">{{ s.text }}</time>.</p>{% endif %}
+</table>
+{% if !t.more.is_empty() %}<details class="top-more">
+<summary><svg class="guide-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 6 15 12 9 18"/></svg><span class="when-closed">Show {{ t.more.len() }} more</span><span class="when-open">Show fewer</span></summary>
+<table class="data-table free top-table" aria-label="{{ t.period }}, continued">
+<tbody>
+{% for r in t.more %}<tr class="data-row{% if r.who.tag.is_some() %} tagged{% endif %}"><td class="td-rank">{{ r.rank }}</td><td class="td-account">{{ r.who|safe }}</td><td class="td-count">{{ r.count }}</td></tr>
+{% endfor %}</tbody>
+</table>
+</details>{% endif %}{% endif %}
 </div>
 {% endfor %}</div>
 </section>
-{% endfor %}{% endblock %}
+{% endfor %}</div>
+{% if let Some(s) = top_day %}<p class="top-asof">Counted once a day, at 05:00 EST. Last counted for the day up to <time datetime="{{ s.iso }}">{{ s.text }}</time>.</p>{% endif %}
+</div>
+{% endif %}{% endblock %}
 {% block updated %}{% if let Some(t) = updated %}<div class="pill footer-updated updated"><span class="pulse-dot" aria-hidden="true"></span> Last updated <time datetime="{{ t.iso }}">{{ t.text }}</time>.</div>{% endif %}{% endblock %}

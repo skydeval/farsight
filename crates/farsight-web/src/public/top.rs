@@ -1,9 +1,10 @@
-//! The task that computes the home page's top lists (design §8.6).
+//! The task that counts the home page's top lists (design §8.6).
 //!
-//! It runs while the server does. A list is computed only while one of
-//! `public_ui.show_top_blockers` / `show_top_blocked` asks for it, and
-//! only when the stored one is older than its period. The log the "last
-//! 24 hours" lists count from is trimmed either way.
+//! It runs while the server does. Once a day, at 05:00 EST, the lists
+//! that `public_ui.show_top_blockers` / `show_top_blocked` ask for are
+//! counted. A switch turned on during the day gets its lists at the
+//! task's next look. The log the day's lists count from is trimmed
+//! either way.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,27 +21,16 @@ pub const EVERY: Duration = Duration::from_secs(60);
 pub const COMPUTED: i64 = 60;
 /// How many accounts a list shows.
 pub const SHOWN: usize = 20;
+/// How many of them before "Show more".
+pub const FIRST: usize = 10;
 /// The longest a list's query may run.
 pub const QUERY_LIMIT: Duration = Duration::from_secs(20 * 60);
 
-/// How old a stored list may be before it is computed again. The
-/// all-time "most blocked" list reads every stored block, so it is
-/// computed once a day; the others cost seconds.
-pub fn period(kind: Kind) -> Duration {
-    match kind {
-        Kind::BlockedAll => Duration::from_secs(24 * 3600),
-        Kind::BlockersAll => Duration::from_secs(3600),
-        Kind::BlockersDay | Kind::BlockedDay => Duration::from_secs(600),
-    }
-}
-
 async fn refresh(st: &WebState, kind: Kind) -> farsight_storage::Result<bool> {
     let mut conn = st.api.pool.acquire().await?;
-    if let Some(at) = top::computed_at(&mut conn, kind).await? {
-        let age = (chrono::Utc::now() - at).to_std().unwrap_or_default();
-        if age < period(kind) {
-            return Ok(false);
-        }
+    let end = top::day_end(chrono::Utc::now());
+    if top::stored_day(&mut conn, kind).await? == Some(end) {
+        return Ok(false);
     }
     let started = std::time::Instant::now();
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
@@ -50,14 +40,14 @@ async fn refresh(st: &WebState, kind: Kind) -> farsight_storage::Result<bool> {
     ))
     .execute(&mut *tx)
     .await?;
-    let rows = top::compute(&mut tx, kind, COMPUTED).await?;
-    top::save(&mut tx, kind, &rows).await?;
+    let rows = top::compute(&mut tx, kind, end, COMPUTED).await?;
+    top::save(&mut tx, kind, end, &rows).await?;
     tx.commit().await?;
     tracing::info!(
         list = kind.key(),
         accounts = rows.len(),
         secs = started.elapsed().as_secs(),
-        "top lists: computed"
+        "top lists: counted"
     );
     Ok(true)
 }
@@ -112,10 +102,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_list_that_reads_every_block_is_computed_least_often() {
-        assert!(period(Kind::BlockedAll) > period(Kind::BlockersAll));
-        assert!(period(Kind::BlockersAll) > period(Kind::BlockersDay));
-        assert_eq!(period(Kind::BlockersDay), period(Kind::BlockedDay));
+    fn a_list_is_counted_with_room_for_hidden_accounts() {
         assert!(COMPUTED as usize >= SHOWN * 2);
+        assert_eq!(SHOWN, FIRST * 2);
     }
 }

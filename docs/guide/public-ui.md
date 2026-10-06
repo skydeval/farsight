@@ -73,7 +73,7 @@ with neither interface, shows a few lines of text.
 ## Top lists
 
 Two rankings for the home page, each off by default and switched on
-separately:
+separately. With both on they are two tabs.
 
 - **Top blockers** (`show_top_blockers`): the 20 accounts that have
   made the most blocks.
@@ -82,21 +82,22 @@ separately:
   names accounts on the instance's front page; consider whether you
   want that.
 
-Each has two tables, "Last 24 hours" and "All time".
+Each has two tables side by side, "Last 24 hours" and "All time", with
+ten rows and the other ten behind "Show more".
 
-- **They are counted in the background.** The page reads the stored
-  result and says when it was counted. The 24-hour tables are counted
-  every 10 minutes and "Top blockers" of all time every hour. "Most
-  blocked" of all time reads every stored block (about a minute and a
-  half, and a few GB of temporary files, for 150 million blocks), so it
-  is counted once a day. Nothing is counted while both switches are
-  off; after switching one on, the first lists appear within a few
-  minutes.
-- **"Last 24 hours"** means blocks this instance stored in the last 24
-  hours whose own date is also within a day of when they arrived, and
-  that are still stored. Old blocks read by the backfill do not count,
-  nor does a block that was made and removed again. The count starts
-  with the version that has this feature: its first day is partial.
+- **They are counted once a day, at 05:00 EST** (10:00 UTC; 06:00
+  during daylight time), in the background. The page reads the stored
+  result and says which day it was counted for. Nothing is counted
+  while both switches are off; after switching one on, the lists appear
+  within a few minutes. "Most blocked" of all time reads every stored
+  block: about a minute and a half, and a few GB of temporary files,
+  for 150 million blocks.
+- **"Last 24 hours"** is the day that ended at the last 05:00 EST:
+  blocks this instance stored during it whose own date is within a day
+  of when they arrived, and that are still stored when it is counted.
+  Old blocks read by the backfill do not count, nor does a block that
+  was made and removed again. Counting starts with the version that has
+  this feature: its first day is partial.
 - **Counts are of what this instance stores.** An account past its
   per-author storage cap has made more blocks than the list shows.
 - **The page's usual rule applies.** Excluded, deactivated, deleted and

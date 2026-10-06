@@ -693,8 +693,13 @@ struct HomePage {
     /// What this instance holds, as `getStats` counts it: block records,
     /// tracked lists, accounts seen.
     totals: Vec<(&'static str, String)>,
-    /// The top lists the operator has switched on.
+    /// The top lists the operator has switched on, one tab each.
     top: Vec<TopGroup>,
+    /// Their tabs, and the one in view.
+    tabs: Vec<Tab>,
+    active: &'static str,
+    /// The end of the day they were counted for.
+    top_day: Option<Stamp>,
     updated: Option<Stamp>,
 }
 
@@ -708,31 +713,38 @@ struct TopRow {
 /// One top list: a period's ranking.
 struct TopTable {
     period: &'static str,
+    /// The first ten.
     rows: Vec<TopRow>,
+    /// The rest, behind "Show more".
+    more: Vec<TopRow>,
     /// What an empty list says.
     empty: &'static str,
-    /// When it was counted.
-    computed: Option<Stamp>,
 }
 
-/// The two lists of one ranking, the last 24 hours and all time.
+/// The two lists of one ranking, the last 24 hours and all time: one
+/// tab of the home page.
 struct TopGroup {
     id: &'static str,
-    title: &'static str,
-    note: &'static str,
     /// What the number counts.
     unit: &'static str,
     tables: Vec<TopTable>,
 }
 
-/// The home page's top lists, as stored by the background task, and how
-/// many of their accounts are still waiting for a handle check. The
+/// The home page's tabs, first to last.
+const HOME_TABS: [(&str, &str); 2] = [
+    ("topblockers", "Top blockers"),
+    ("topblocked", "Most blocked"),
+];
+
+/// The home page's top lists, as stored by the background task, the end
+/// of the day they were counted for, and how many of their accounts are
+/// still waiting for a handle check. The
 /// page's own rule applies to the rows: excluded, deactivated, deleted
 /// and taken-down accounts are left out, and the next ones move up.
 async fn top_groups(
     r: &Req<'_>,
     cfg: &farsight_core::Config,
-) -> Result<(Vec<TopGroup>, usize), Fail> {
+) -> Result<(Vec<TopGroup>, Option<Stamp>, usize), Fail> {
     use farsight_storage::top::{self, Kind};
     let p = &cfg.public_ui;
     let wanted = |k: Kind| {
@@ -743,7 +755,7 @@ async fn top_groups(
         }
     };
     if !Kind::ALL.into_iter().any(wanted) {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), None, 0));
     }
     let mut stored = Vec::new();
     {
@@ -765,9 +777,14 @@ async fn top_groups(
     let shown = Shown::load(r, &withheld, dids, false).await?;
     let mut asked = Asked::new(cfg);
     let mut held = 0;
+    let day = stored
+        .iter()
+        .filter_map(|(_, s)| s.as_ref().map(|s| s.day_end))
+        .max()
+        .map(Stamp::of);
     let mut table = |kind: Kind| -> Option<TopTable> {
         let (_, list) = stored.iter().find(|(k, _)| *k == kind)?;
-        let rows = list
+        let mut rows: Vec<TopRow> = list
             .iter()
             .flat_map(|s| s.rows.iter())
             .filter(|(did, _)| shown.ok(did))
@@ -789,6 +806,7 @@ async fn top_groups(
                 count: thousands(*n),
             })
             .collect();
+        let more = rows.split_off(rows.len().min(super::top::FIRST));
         Some(TopTable {
             period: if matches!(kind, Kind::BlockersDay | Kind::BlockedDay) {
                 "Last 24 hours"
@@ -796,20 +814,18 @@ async fn top_groups(
                 "All time"
             },
             rows,
+            more,
             empty: if list.is_some() {
                 "None."
             } else {
                 "Not counted yet."
             },
-            computed: list.as_ref().map(|s| Stamp::of(s.computed_at)),
         })
     };
     let mut groups = Vec::new();
     if p.show_top_blockers {
         groups.push(TopGroup {
-            id: "top-blockers",
-            title: "Top blockers",
-            note: "The accounts that have made the most blocks.",
+            id: HOME_TABS[0].0,
             unit: "Blocks",
             tables: [Kind::BlockersDay, Kind::BlockersAll]
                 .into_iter()
@@ -819,9 +835,7 @@ async fn top_groups(
     }
     if p.show_top_blocked {
         groups.push(TopGroup {
-            id: "top-blocked",
-            title: "Most blocked",
-            note: "The accounts that the most others block directly. Blocks through lists are not counted.",
+            id: HOME_TABS[1].0,
             unit: "Blockers",
             tables: [Kind::BlockedDay, Kind::BlockedAll]
                 .into_iter()
@@ -830,18 +844,23 @@ async fn top_groups(
         });
     }
     asked.submit(r.st);
-    Ok((groups, held))
+    Ok((groups, day, held))
 }
 
-/// `/public`.
-pub async fn home(r: &Req<'_>) -> Result<Response, Fail> {
+/// `/`. `q` may name the top list in view (`?tab=topblocked`).
+pub async fn home(r: &Req<'_>, q: &Params) -> Result<Response, Fail> {
     let cfg = r.config();
     let (_slot, _permit) = r.render_slots().await?;
     let stats = handlers::get_stats(&r.st.api, &Params::default())
         .await?
         .body;
     let description = paragraphs(&cfg.public_ui.instance_description);
-    let (top, held) = top_groups(r, cfg).await?;
+    let (top, top_day, held) = top_groups(r, cfg).await?;
+    let shown: Vec<(&'static str, &'static str)> = HOME_TABS
+        .into_iter()
+        .filter(|(id, _)| top.iter().any(|g| g.id == *id))
+        .collect();
+    let (tabs, active) = tabs("/", q, &[], &[HOME_TABS[0].0, HOME_TABS[1].0], &shown);
     let host = &cfg.server.hostname;
     Ok(page(
         &HomePage {
@@ -863,6 +882,9 @@ pub async fn home(r: &Req<'_>) -> Result<Response, Fail> {
             .filter_map(|(label, key)| stats["counts"][key].as_i64().map(|n| (label, thousands(n))))
             .collect(),
             top,
+            tabs,
+            active,
+            top_day,
             updated: last_updated(&[&stats["freshness"]]),
         },
         StatusCode::OK,
