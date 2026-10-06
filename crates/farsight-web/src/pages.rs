@@ -467,6 +467,32 @@ pub struct DashboardData {
     pub buckets: Vec<(String, String, String, String)>,
 }
 
+/// The warning about firehose gaps, if one is due. A closed gap is healed
+/// by a repair cycle; one that is open because the firehose is down
+/// closes when it reconnects, and only then can be repaired. The open
+/// interval of a v1 firehose is the v1 warning's subject, not this one's.
+fn gap_warning(repairable: i64, open: i64) -> Option<String> {
+    let s = |n: i64| if n == 1 { "" } else { "s" };
+    match (repairable, open) {
+        (0, 0) => None,
+        (r, 0) => Some(format!(
+            "{r} firehose gap{} can be repaired: start a repair cycle (Operations → start repair).",
+            s(r)
+        )),
+        (0, o) => Some(format!(
+            "{o} firehose gap{} still open: it closes when the firehose reconnects, and can be \
+             repaired after that.",
+            if o == 1 { " is" } else { "s are" }
+        )),
+        (r, o) => Some(format!(
+            "{r} firehose gap{} can be repaired: start a repair cycle (Operations → start \
+             repair). {o} more {} still open and cannot be repaired yet.",
+            s(r),
+            if o == 1 { "is" } else { "are" }
+        )),
+    }
+}
+
 /// A duration in words, to two units and no less than a minute: "1 day
 /// 4 hours".
 fn long_secs(s: i64) -> String {
@@ -567,10 +593,19 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
             .as_f64()
             .map_or("—".into(), |s| format!("{s:.1} s")),
     ));
-    let open_gaps = f["openGaps"].as_i64().unwrap_or(0);
-    d.firehose.push(stat("Open gaps", open_gaps));
+    // Unhealed gaps are of three kinds: closed ones, which a repair
+    // cycle heals; the interval of a v1 firehose, open until a v2
+    // session takes over; and one open because the firehose is down.
+    let (mut repairable, mut v1_open, mut other_open) = (0, 0, 0);
     if let Some(gaps) = stats["detail"]["gaps"].as_array() {
         for g in gaps {
+            if g["to"].is_string() {
+                repairable += 1;
+            } else if g["cause"] == "SyncUnavailable" {
+                v1_open += 1;
+            } else {
+                other_open += 1;
+            }
             d.gaps.push(format!(
                 "{} → {} ({})",
                 g["from"].as_str().map(short_ts).unwrap_or_default(),
@@ -582,6 +617,9 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
             ));
         }
     }
+    d.firehose.push(stat("Gaps to repair", repairable));
+    d.firehose
+        .push(stat("Gaps still open", v1_open + other_open));
     let b = &stats["backfill"];
     if let Some(s) = b.get("sweep") {
         d.backfill.push(stat(
@@ -762,18 +800,14 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
         d.warnings.push(Warning {
             class: "",
             text: "The firehose is v1: coverage is capped at partial (sync_events_unavailable). \
-                   Use a v2 Jetstream for complete coverage."
+                   Use a v2 Jetstream for complete coverage. The time spent on v1 is recorded \
+                   as one gap, which stays open, and cannot be repaired, until a v2 Jetstream \
+                   takes over."
                 .into(),
         });
     }
-    if open_gaps > 0 {
-        d.warnings.push(Warning {
-            class: "",
-            text: format!(
-                "{open_gaps} firehose gap(s) are not repaired; a repair cycle heals them \
-                 (Operations → start repair)."
-            ),
-        });
+    if let Some(text) = gap_warning(repairable, other_open) {
+        d.warnings.push(Warning { class: "", text });
     }
     Ok(d)
 }
@@ -1152,9 +1186,13 @@ async fn ops_action(
             }
         }
         "repair" => match api_admin::start_repair_cycle(&st.api).await {
-            Ok(r) if r.gaps == 0 => {
-                Ok(("No closed, unhealed gaps: nothing to repair.".into(), None))
-            }
+            Ok(r) if r.gaps == 0 => Ok((
+                "Nothing to repair: no gap is closed and not yet healed. A gap that is \
+                     still open (a v1 firehose's, or a disconnection in progress) can be \
+                     repaired only once it has closed."
+                    .into(),
+                None,
+            )),
             Ok(r) => Ok((
                 format!(
                     "Repair cycle {} requested for {} gap(s); the backfill process runs it.",
@@ -1573,6 +1611,24 @@ async fn reset_submit(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn gap_warnings() {
+        // The open interval of a v1 firehose alone raises none.
+        assert_eq!(gap_warning(0, 0), None);
+        assert_eq!(
+            gap_warning(1, 0).as_deref(),
+            Some(
+                "1 firehose gap can be repaired: start a repair cycle (Operations → start repair)."
+            )
+        );
+        assert!(
+            gap_warning(0, 1)
+                .unwrap()
+                .starts_with("1 firehose gap is still open")
+        );
+        assert!(gap_warning(2, 1).unwrap().contains("1 more is still open"));
+    }
 
     #[test]
     fn catching_up_lines() {

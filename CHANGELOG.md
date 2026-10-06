@@ -21,6 +21,11 @@ commits it covers.
 
 ### Fixed
 
+- Admin alerts no longer tell you to start a repair for a gap that
+  cannot be repaired. The interval of a v1 firehose is one open gap
+  until a v2 Jetstream takes over; it is now part of the v1 alert, and
+  the gap alert counts only gaps a repair cycle can heal. The
+  dashboard's Firehose block shows the two counts separately.
 - Turning a page of a table no longer makes the page jump. A page
   number or arrow used to load the whole page, after which the browser
   scrolled to the table; now the table is replaced where it stands and
