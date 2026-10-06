@@ -1,0 +1,59 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.admin.pauseRepair",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Pauses or resumes gap repairs (sets `backfill.repair.paused`; the backfill process reloads its config). A paused repair keeps its place. Unstable: admin token only, outside the stability contract.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "paused"
+          ],
+          "properties": {
+            "paused": {
+              "type": "boolean",
+              "description": "True to pause, false to resume."
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ],
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "paused"
+          ],
+          "properties": {
+            "paused": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    }
+  }
+}

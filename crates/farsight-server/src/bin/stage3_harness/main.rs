@@ -139,6 +139,104 @@ async fn create_key(
     ))
 }
 
+/// Pausing and cancelling a gap repair over the API.
+async fn check_repair_controls(
+    c: &mut Checks,
+    ctx: &Ctx,
+    base: &str,
+    pool: &sqlx::PgPool,
+) -> Result<(), String> {
+    c.section("1b. pausing and cancelling a gap repair");
+    let auth = bearer(&ctx.admin);
+    let h = [("authorization", auth.as_str())];
+    let count = |sql: &'static str| async move {
+        sqlx::query_scalar::<_, i64>(sql)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())
+    };
+    for paused in [true, false] {
+        let r = ctx
+            .http
+            .post_json(
+                &x(base, "admin.pauseRepair", ""),
+                &h,
+                &json!({ "paused": paused }),
+            )
+            .await?;
+        validate(c, ctx, "admin.pauseRepair", &r, 200).await;
+        c.check(
+            if paused {
+                "admin.pauseRepair pauses"
+            } else {
+                "admin.pauseRepair resumes"
+            },
+            r.body["paused"] == paused,
+            r.short(),
+        );
+    }
+    // A closed, unhealed gap of this check's own, and a repair requested
+    // for it (the world may hold other unhealed gaps).
+    let gap: i64 = sqlx::query_scalar(
+        "INSERT INTO firehose_gaps (from_at, to_at, cause)
+         VALUES (now() - interval '1 hour', now() - interval '30 minutes', 3) RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let unhealed = "SELECT count(*) FROM firehose_gaps WHERE healed_at IS NULL";
+    let unhealed_before = count(unhealed).await?;
+    let started = ctx
+        .http
+        .post_json(&x(base, "admin.startRepair", ""), &h, &json!({}))
+        .await?;
+    let cycle = started.body["cycle"].as_i64();
+    seed::exec(
+        pool,
+        &format!(
+            "UPDATE firehose_gaps SET repair_cycle_id = {} WHERE id = {gap}",
+            cycle.unwrap_or(0)
+        ),
+    )
+    .await?;
+    let open = "SELECT count(*) FROM sweep_cycles WHERE kind = 2 AND completed_at IS NULL";
+    let claimed = "SELECT count(*) FROM firehose_gaps WHERE repair_cycle_id IS NOT NULL AND healed_at IS NULL";
+    let before = (count(open).await?, count(claimed).await?);
+    let r = ctx
+        .http
+        .post_json(&x(base, "admin.cancelRepair", ""), &h, &json!({}))
+        .await?;
+    validate(c, ctx, "admin.cancelRepair", &r, 200).await;
+    let after = (count(open).await?, count(claimed).await?);
+    let unhealed_after = count(unhealed).await?;
+    c.check(
+        "admin.cancelRepair removes the repair cycle under way, releases its gap unhealed, names the cycle and says automatic repairs are now off",
+        cycle.is_some()
+            && before == (1, 1)
+            && after == (0, 0)
+            && unhealed_after == unhealed_before
+            && r.body["cycle"].as_i64() == cycle
+            && r.body["autoStart"] == false,
+        format!(
+            "cycle {cycle:?}; open/claimed {before:?} → {after:?}; unhealed {unhealed_before} → {unhealed_after}; {}",
+            r.short()
+        ),
+    );
+    let again = ctx
+        .http
+        .post_json(&x(base, "admin.cancelRepair", ""), &h, &json!({}))
+        .await?;
+    validate(c, ctx, "admin.cancelRepair", &again, 200).await;
+    c.check(
+        "with no repair under way it cancels nothing and names no cycle",
+        again.body.get("cycle").is_none() && again.body["autoStart"] == false,
+        again.short(),
+    );
+    seed::exec(pool, &format!("DELETE FROM firehose_gaps WHERE id = {gap}")).await?;
+    seed::notify(pool).await?;
+    Ok(())
+}
+
 async fn check_lexicons(
     c: &mut Checks,
     ctx: &Ctx,
@@ -1972,6 +2070,7 @@ async fn phase_live(c: &mut Checks, ctx: &Ctx, pg: &Pg) -> Result<(), String> {
     .await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     check_lexicons(c, ctx, &server.base, &p, &key_read).await?;
+    check_repair_controls(c, ctx, &server.base, &pool).await?;
     check_pagination(c, ctx, &server.base, &pool, &p).await?;
     check_backfill(
         c,

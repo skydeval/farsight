@@ -137,6 +137,8 @@ endpoints! {
     RestartFirehose => "admin.restartFirehose", Admin, POST;
     PauseSweep => "admin.pauseSweep", Admin, POST;
     StartRepair => "admin.startRepair", Admin, POST;
+    PauseRepair => "admin.pauseRepair", Admin, POST;
+    CancelRepair => "admin.cancelRepair", Admin, POST;
     CreateApiKey => "admin.createApiKey", Admin, POST;
     RevokeApiKey => "admin.revokeApiKey", Admin, POST;
 }
@@ -528,6 +530,8 @@ async fn run(
         Endpoint::RestartFirehose => admin::restart_firehose(st).await,
         Endpoint::PauseSweep => admin::pause_sweep(st, body).await,
         Endpoint::StartRepair => admin::start_repair(st).await,
+        Endpoint::PauseRepair => admin::pause_repair(st, body).await,
+        Endpoint::CancelRepair => admin::cancel_repair(st).await,
         Endpoint::CreateApiKey => admin::create_api_key(st, body).await,
         Endpoint::RevokeApiKey => admin::revoke_api_key(st, body).await,
     }

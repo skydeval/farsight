@@ -22,7 +22,7 @@
 <div class="card">
 <h2>
 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-<span>Firehose and sweep</span>
+<span>Firehose, sweep and repair</span>
 </h2>
 <div class="row" style="margin-top: 0.5rem;">
 <form method="post" action="/admin/ops/restart-firehose" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">Restart firehose</button></form>
@@ -30,7 +30,21 @@
 <form method="post" action="/admin/ops/sweep" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}">
 {% if sweep_enabled %}<input type="hidden" name="paused" value="true"><button type="submit" class="secondary">Pause sweep</button>{% else %}<input type="hidden" name="paused" value="false"><button type="submit">Resume sweep</button>{% endif %}
 </form>{% endif %}
+</div>
+<h3 style="margin-top: 1.25rem;">Gap repair</h3>
+<p class="muted">A repair re-reads every account whose records changed during a firehose gap. After a long gap it runs for days.
+{% if let Some(r) = repair %}Repair cycle {{ r.0 }} is {% if repair_paused %}paused{% else %}running{% endif %}: {{ r.1 }} accounts re-read so far.{% else %}No repair is under way.{% endif %}
+Repairs {% if repair_auto %}start by themselves when a gap closes{% else %}do not start by themselves{% endif %}{% if repair_paused && repair.is_none() %}, and are paused{% endif %}.</p>
+<div class="row" style="margin-top: 0.5rem;">
 <form method="post" action="/admin/ops/repair" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit" class="secondary">Start repair</button></form>
+{% if env_managed %}<span class="muted">Pausing, cancelling and the automatic start are managed through the environment (<code>FARSIGHT__BACKFILL__REPAIR__PAUSED</code>, <code>FARSIGHT__BACKFILL__REPAIR__AUTO_START</code>).</span>{% else %}
+<form method="post" action="/admin/ops/repair-pause" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}">
+{% if repair_paused %}<input type="hidden" name="paused" value="false"><button type="submit">Resume repair</button>{% else %}<input type="hidden" name="paused" value="true"><button type="submit" class="secondary">Pause repair</button>{% endif %}
+</form>
+{% if repair.is_some() %}<form method="post" action="/admin/ops/repair-cancel" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit" class="danger">Cancel repair</button></form>{% endif %}
+<form method="post" action="/admin/ops/repair-auto" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}">
+{% if repair_auto %}<input type="hidden" name="on" value="false"><button type="submit" class="secondary">Turn automatic repairs off</button>{% else %}<input type="hidden" name="on" value="true"><button type="submit" class="secondary">Turn automatic repairs on</button>{% endif %}
+</form>{% endif %}
 </div>
 </div>
 

@@ -61,6 +61,14 @@ pub const FILES: &[(&str, &str)] = &[
         include_str!("../../../lexicons/app/nearhorizon/farsight/admin/startRepair.json"),
     ),
     (
+        "app.nearhorizon.farsight.admin.pauseRepair",
+        include_str!("../../../lexicons/app/nearhorizon/farsight/admin/pauseRepair.json"),
+    ),
+    (
+        "app.nearhorizon.farsight.admin.cancelRepair",
+        include_str!("../../../lexicons/app/nearhorizon/farsight/admin/cancelRepair.json"),
+    ),
+    (
         "app.nearhorizon.farsight.admin.createApiKey",
         include_str!("../../../lexicons/app/nearhorizon/farsight/admin/createApiKey.json"),
     ),

@@ -1,0 +1,57 @@
+{
+  "lexicon": 1,
+  "id": "app.nearhorizon.farsight.admin.cancelRepair",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Cancels the repair cycle under way, if there is one: its remaining work is dropped and its gaps are left unhealed. Also turns automatic repairs off (`backfill.repair.auto_start = false`), or the cancelled repair would start again at once; `admin.startRepair` still starts one. Unstable: admin token only, outside the stability contract.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [],
+          "properties": {}
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AuthRequired"
+        },
+        {
+          "name": "Forbidden"
+        },
+        {
+          "name": "RateLimitExceeded"
+        },
+        {
+          "name": "Overloaded"
+        },
+        {
+          "name": "SetupRequired"
+        }
+      ],
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "autoStart"
+          ],
+          "properties": {
+            "cycle": {
+              "type": "integer",
+              "description": "The cancelled cycle; absent when none was under way."
+            },
+            "autoStart": {
+              "type": "boolean",
+              "description": "Always false after a cancel."
+            }
+          }
+        }
+      }
+    }
+  }
+}

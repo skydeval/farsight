@@ -32,9 +32,9 @@ indexes, so it misses everyone else. Farsight closes that gap.
   - `query.getBackfillStatus` and `admin.requestBackfill`: the
     on-demand backfill hook. Both need a token.
   - `admin.listErrors`, `admin.restartFirehose`, `admin.pauseSweep`,
-    `admin.startRepair`, `admin.createApiKey` and
-    `admin.revokeApiKey`: what the Operations page does, for an
-    instance run without the admin UI.
+    `admin.startRepair`, `admin.pauseRepair`, `admin.cancelRepair`,
+    `admin.createApiKey` and `admin.revokeApiKey`: what the Operations
+    page does, for an instance run without the admin UI.
 - A freshness watermark on every response. It reports how current the
   answer is and whether Farsight can claim it is complete.
 - A first-run setup wizard, and an optional server-rendered **admin

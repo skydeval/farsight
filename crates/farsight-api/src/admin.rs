@@ -235,6 +235,107 @@ pub async fn pause_sweep(st: &Arc<ApiState>, body: &Bytes) -> Result<Reply, Xrpc
     Ok(Reply::ok(json!({ "paused": input.paused })))
 }
 
+/// Sets one key of `[backfill.repair]` in the config file.
+async fn set_repair_key(st: &ApiState, key: &'static str, value: bool) -> Result<(), XrpcError> {
+    st.config
+        .edit(|t| {
+            let backfill = t
+                .entry("backfill")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .ok_or("`backfill` is not a table")?;
+            let repair = backfill
+                .entry("repair")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .ok_or("`backfill.repair` is not a table")?;
+            repair.insert(key.into(), toml::Value::Boolean(value));
+            Ok(())
+        })
+        .await
+        .map_err(edit_error)?;
+    config_store::notify_config(&st.pool).await?;
+    Ok(())
+}
+
+/// Holds or releases gap repairs (`backfill.repair.paused`). A repair
+/// under way keeps its place.
+pub async fn set_repair_paused(st: &ApiState, paused: bool) -> Result<(), XrpcError> {
+    set_repair_key(st, "paused", paused).await
+}
+
+/// Whether a repair starts by itself when a gap has closed
+/// (`backfill.repair.auto_start`).
+pub async fn set_repair_auto_start(st: &ApiState, on: bool) -> Result<(), XrpcError> {
+    set_repair_key(st, "auto_start", on).await
+}
+
+/// `admin.pauseRepair`.
+pub async fn pause_repair(st: &Arc<ApiState>, body: &Bytes) -> Result<Reply, XrpcError> {
+    let input: PauseInput = parse_body(body)?;
+    set_repair_paused(st, input.paused).await?;
+    Ok(Reply::ok(json!({ "paused": input.paused })))
+}
+
+/// Cancels the repair cycle under way: its queued and outstanding work
+/// is dropped, its gaps are released unhealed, and the cycle is removed.
+/// Automatic repairs are switched off first, or the backfill process
+/// would start the same repair again at its next look; if that cannot
+/// be written (a config managed through the environment), nothing is
+/// cancelled. Jobs already running finish; what they wrote is kept.
+/// Returns the cancelled cycle, if there was one.
+pub async fn cancel_repair_cycle(st: &ApiState) -> Result<Option<i64>, XrpcError> {
+    set_repair_auto_start(st, false).await?;
+    let mut tx = st.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('farsight:start_repair'))")
+        .execute(&mut *tx)
+        .await?;
+    let cycle: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM sweep_cycles WHERE kind = 2 AND completed_at IS NULL
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(id) = cycle else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    sqlx::query("DELETE FROM backfill_queue WHERE requester = 'system:repair'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM cycle_outstanding WHERE cycle_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE firehose_gaps SET repair_cycle_id = NULL
+         WHERE repair_cycle_id = $1 AND healed_at IS NULL",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM sweep_cycles WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_notify('farsight_coverage', '')")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(id))
+}
+
+/// `admin.cancelRepair`.
+pub async fn cancel_repair(st: &Arc<ApiState>) -> Result<Reply, XrpcError> {
+    let cycle = cancel_repair_cycle(st).await?;
+    let mut m = Map::new();
+    if let Some(c) = cycle {
+        m.insert("cycle".into(), json!(c));
+    }
+    m.insert("autoStart".into(), json!(false));
+    Ok(Reply::ok(Value::Object(m)))
+}
+
 /// What a repair request did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepairStart {

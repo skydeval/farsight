@@ -294,6 +294,8 @@ pub struct BackfillConfig {
     pub tier_shares: Vec<u32>,
     /// `[backfill.sweep]`.
     pub sweep: SweepConfig,
+    /// `[backfill.repair]`.
+    pub repair: RepairConfig,
     /// `[backfill.backlinks]`.
     pub backlinks: BacklinksConfig,
 }
@@ -334,6 +336,7 @@ impl Default for BackfillConfig {
             per_host_concurrency: 4,
             tier_shares: vec![60, 25, 15],
             sweep: SweepConfig::default(),
+            repair: RepairConfig::default(),
             backlinks: BacklinksConfig::default(),
         }
     }
@@ -349,6 +352,29 @@ pub enum SweepSource {
     RelayRepos,
     /// PLC `/export`.
     Plc,
+}
+
+/// `[backfill.repair]`: repairs of firehose gaps (§7.5). A repair
+/// re-reads every account whose repository changed during the gap, so
+/// after a long gap it runs for days.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RepairConfig {
+    /// Whether a repair starts by itself when a gap has closed. Off, a
+    /// closed gap waits for `admin.startRepair`.
+    pub auto_start: bool,
+    /// Whether a repair under way is held: it reads nothing new and
+    /// keeps its place.
+    pub paused: bool,
+}
+
+impl Default for RepairConfig {
+    fn default() -> Self {
+        RepairConfig {
+            auto_start: true,
+            paused: false,
+        }
+    }
 }
 
 /// `[backfill.sweep]`.

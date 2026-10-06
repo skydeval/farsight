@@ -33,10 +33,41 @@ included) until the restart.
 - **List lookup.** The list's facts and description, then "Members"
   and "Subscribers".
 - **Operations.** Queue a backfill, restart the firehose, pause the
-  sweep or start a repair; API keys; recent errors.
+  sweep; API keys; recent errors. And gap repair: see below.
 - **Settings.**
 
 Times on every admin page are shown in the browser's timezone.
+
+## Gap repair
+
+When the firehose loses its place (a disconnection, or time spent on a
+v1 Jetstream), Farsight records a gap. Once the gap has closed, a
+repair re-reads every account whose records changed during it, found
+by walking the relay's account list. After a long gap that is a great
+many accounts: a three-day gap is days to weeks of work at the default
+per-host rate. Coverage stays `partial` until the repair finishes.
+
+Operations has the controls, and `[backfill.repair]` the settings:
+
+```toml
+[backfill.repair]
+auto_start = true   # a repair starts by itself when a gap has closed
+paused = false      # true holds repairs; one under way keeps its place
+```
+
+- **Start repair** starts one for every closed gap. With `auto_start`
+  on you never need it.
+- **Pause repair / Resume repair** sets `paused`. A paused repair reads
+  nothing new and continues where it stopped when resumed.
+- **Cancel repair** drops the repair under way and leaves its gaps
+  unrepaired. It also turns `auto_start` off, since otherwise the same
+  repair would begin again at once.
+- **Turn automatic repairs off / on** sets `auto_start`.
+
+The same over the API: `admin.startRepair`, `admin.pauseRepair`,
+`admin.cancelRepair`. With a config managed through the environment,
+set `FARSIGHT__BACKFILL__REPAIR__PAUSED` and
+`FARSIGHT__BACKFILL__REPAIR__AUTO_START` instead.
 
 ## Signing in
 

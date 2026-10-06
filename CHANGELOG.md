@@ -58,6 +58,12 @@ commits it covers.
 
 ### Added
 
+- Gap repairs can be paused, cancelled and kept from starting by
+  themselves. Operations has "Pause repair", "Cancel repair" and a
+  switch for automatic repairs; the API has `admin.pauseRepair` and
+  `admin.cancelRepair`; the settings are `backfill.repair.paused` and
+  `backfill.repair.auto_start` (on by default, as before). Cancelling
+  turns automatic repairs off so the repair does not start again.
 - Public home page: "Top blockers" and "Most blocked", side by side,
   on two tabs: "Last 24H" and "All Time". Each lists the 20 accounts
   with the most blocks made or received: ten rows, and ten more behind

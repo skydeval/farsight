@@ -331,7 +331,7 @@ impl Scheduler {
         let row: Option<(String, i16)> = sqlx::query_as(
             "SELECT o.did, c.kind FROM cycle_outstanding o JOIN sweep_cycles c ON c.id = o.cycle_id
              WHERE o.state = 1 AND c.completed_at IS NULL AND o.did > $1 AND o.did <> ALL($2)
-               AND ($3 OR c.kind = 2)
+               AND ($3 OR c.kind = 2) AND ($4 OR c.kind <> 2)
                AND NOT EXISTS (SELECT 1 FROM job_leases j WHERE j.did = o.did AND j.lease_until > now())
                AND NOT EXISTS (SELECT 1 FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
                                WHERE a.did = o.did AND q.kind = 1)
@@ -340,6 +340,7 @@ impl Scheduler {
         .bind(&cursor)
         .bind(&inflight)
         .bind(full_enabled)
+        .bind(!self.ctx.cfg().backfill.repair.paused)
         .fetch_optional(&self.ctx.pool)
         .await?;
         match row {

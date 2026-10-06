@@ -483,16 +483,32 @@ async fn repair_under_way(st: &WebState) -> Option<(i64, i64)> {
 /// re-read so far). A gap that is open because the firehose is down
 /// closes when it reconnects, and only then can be repaired. The open
 /// interval of a v1 firehose is the v1 warning's subject, not this one's.
-fn gap_warning(repairable: i64, open: i64, repair: Option<(i64, i64)>) -> Option<String> {
+fn gap_warning(
+    repairable: i64,
+    open: i64,
+    repair: Option<(i64, i64)>,
+    switches: (bool, bool),
+) -> Option<String> {
+    let (paused, auto) = switches;
     let s = |n: i64| if n == 1 { "" } else { "s" };
     let closed = match (repairable, repair) {
         (0, _) => None,
+        (r, Some((id, done))) if paused => Some(format!(
+            "{r} firehose gap{} waiting on repair cycle {id}, which is paused after re-reading \
+             {} accounts (Operations → resume repair).",
+            if r == 1 { " is" } else { "s are" },
+            crate::public::text::thousands(done)
+        )),
         (r, Some((id, done))) => Some(format!(
             "{r} firehose gap{} being repaired: repair cycle {id} has re-read {} accounts so \
              far. A repair re-reads every account that changed during the gap, so a long gap \
              takes days; this alert clears when it finishes.",
             if r == 1 { " is" } else { "s are" },
             crate::public::text::thousands(done)
+        )),
+        (r, None) if auto => Some(format!(
+            "{r} firehose gap{} can be repaired: a repair cycle starts by itself shortly.",
+            s(r)
         )),
         (r, None) => Some(format!(
             "{r} firehose gap{} can be repaired: start a repair cycle (Operations → start repair).",
@@ -852,7 +868,14 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
                 .into(),
         });
     }
-    if let Some(text) = gap_warning(repairable, other_open, repair.map(|r| (r.0, r.1))) {
+    let switches = {
+        let cfg = st.api.config.current();
+        (
+            cfg.config.backfill.repair.paused,
+            cfg.config.backfill.repair.auto_start,
+        )
+    };
+    if let Some(text) = gap_warning(repairable, other_open, repair.map(|r| (r.0, r.1)), switches) {
         d.warnings.push(Warning { class: "", text });
     }
     Ok(d)
@@ -1082,7 +1105,13 @@ pub struct OpsPage {
     pub keys: Vec<(i32, String, String, String, String, String)>,
     /// The sweep is enabled.
     pub sweep_enabled: bool,
-    /// Config is env-managed (sweep toggle unavailable).
+    /// The repair cycle under way: (id, accounts re-read so far).
+    pub repair: Option<(i64, String)>,
+    /// Repairs are held (`backfill.repair.paused`).
+    pub repair_paused: bool,
+    /// Repairs start by themselves (`backfill.repair.auto_start`).
+    pub repair_auto: bool,
+    /// Config is env-managed (the toggles are unavailable).
     pub env_managed: bool,
 }
 
@@ -1103,6 +1132,11 @@ async fn ops_render(
         errors: Vec::new(),
         keys: Vec::new(),
         sweep_enabled: cfg.config.backfill.sweep.enabled,
+        repair: repair_under_way(st)
+            .await
+            .map(|(id, done)| (id, crate::public::text::thousands(done))),
+        repair_paused: cfg.config.backfill.repair.paused,
+        repair_auto: cfg.config.backfill.repair.auto_start,
         env_managed: cfg.from_env_only,
     };
     if let Ok(mut conn) = st.api.pool.acquire().await {
@@ -1231,6 +1265,52 @@ async fn ops_action(
                 Err(e) => Err(e.message),
             }
         }
+        "repair-pause" => {
+            let paused = get("paused") == "true";
+            match api_admin::set_repair_paused(&st.api, paused).await {
+                Ok(()) => Ok((
+                    if paused {
+                        "Repairs paused. A repair under way keeps its place."
+                    } else {
+                        "Repairs resumed."
+                    }
+                    .into(),
+                    None,
+                )),
+                Err(e) => Err(e.message),
+            }
+        }
+        "repair-auto" => {
+            let on = get("on") == "true";
+            match api_admin::set_repair_auto_start(&st.api, on).await {
+                Ok(()) => Ok((
+                    if on {
+                        "Repairs start automatically: a closed gap gets one at the backfill \
+                         process's next look."
+                    } else {
+                        "Repairs no longer start automatically. A closed gap waits for \
+                         \"Start repair\"."
+                    }
+                    .into(),
+                    None,
+                )),
+                Err(e) => Err(e.message),
+            }
+        }
+        "repair-cancel" => match api_admin::cancel_repair_cycle(&st.api).await {
+            Ok(Some(id)) => Ok((
+                format!(
+                    "Repair cycle {id} cancelled. Its gaps are left unrepaired, and automatic \
+                     repairs are now off so that it does not start again."
+                ),
+                None,
+            )),
+            Ok(None) => Ok((
+                "No repair was under way. Automatic repairs are now off.".into(),
+                None,
+            )),
+            Err(e) => Err(e.message),
+        },
         "repair" => match (
             repair_under_way(&st).await,
             api_admin::start_repair_cycle(&st.api).await,
@@ -1674,32 +1754,41 @@ mod tests {
 
     #[test]
     fn gap_warnings() {
+        let (manual, auto) = ((false, false), (false, true));
         // The open interval of a v1 firehose alone raises none.
-        assert_eq!(gap_warning(0, 0, None), None);
+        assert_eq!(gap_warning(0, 0, None, auto), None);
         assert_eq!(
-            gap_warning(1, 0, None).as_deref(),
+            gap_warning(1, 0, None, manual).as_deref(),
             Some(
                 "1 firehose gap can be repaired: start a repair cycle (Operations → start repair)."
             )
         );
+        // With automatic repairs on there is nothing for the admin to do.
+        assert_eq!(
+            gap_warning(1, 0, None, auto).as_deref(),
+            Some("1 firehose gap can be repaired: a repair cycle starts by itself shortly.")
+        );
         assert!(
-            gap_warning(0, 1, None)
+            gap_warning(0, 1, None, auto)
                 .unwrap()
                 .starts_with("1 firehose gap is still open")
         );
         assert!(
-            gap_warning(2, 1, None)
+            gap_warning(2, 1, None, manual)
                 .unwrap()
                 .ends_with("1 more is still open and cannot be repaired yet.")
         );
         // A repair under way is not something to start.
-        let running = gap_warning(2, 0, Some((2, 136_442))).unwrap();
+        let running = gap_warning(2, 0, Some((2, 136_442)), auto).unwrap();
         assert!(running.starts_with(
             "2 firehose gaps are being repaired: repair cycle 2 has re-read 136,442 accounts"
         ));
         assert!(!running.contains("start a repair"));
+        // Held, it says so.
+        let held = gap_warning(2, 0, Some((2, 136_442)), (true, true)).unwrap();
+        assert!(held.contains("repair cycle 2, which is paused") && held.contains("resume repair"));
         // A repair with nothing closed to heal says nothing.
-        assert_eq!(gap_warning(0, 0, Some((2, 5))), None);
+        assert_eq!(gap_warning(0, 0, Some((2, 5)), auto), None);
     }
 
     #[test]

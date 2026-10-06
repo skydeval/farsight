@@ -168,8 +168,12 @@ pub async fn tick(ctx: &Ctx, sweep: &Sweep) -> Res<()> {
         }
         // A full cycle pauses with the sweep (operator toggle) or at 90% of
         // the budget; its members also stop being dispatched (tier 3).
-        let paused =
-            c.kind == FULL && (!ctx.cfg().backfill.sweep.enabled || ctx.sweep_paused_by_storage());
+        // A repair pauses with its own switch.
+        let paused = if c.kind == FULL {
+            !ctx.cfg().backfill.sweep.enabled || ctx.sweep_paused_by_storage()
+        } else {
+            ctx.cfg().backfill.repair.paused
+        };
         if c.enumerated_at.is_none() && !paused {
             let outstanding: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM cycle_outstanding WHERE cycle_id = $1 AND state = 1",
@@ -215,7 +219,7 @@ async fn maybe_start(ctx: &Ctx, sweep: &Sweep, first_applied: DateTime<Utc>) -> 
             start_cycle(ctx, FULL, source, first_applied, None).await?;
         }
     }
-    if !open_repair {
+    if !open_repair && cfg.backfill.repair.auto_start {
         // One repair covers every closed, unhealed gap not yet claimed
         // (coalesced); an open gap waits for its stream to come back.
         let from: Option<DateTime<Utc>> = sqlx::query_scalar(
