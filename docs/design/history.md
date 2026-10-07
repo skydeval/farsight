@@ -60,10 +60,7 @@ listitem's (list, subject) pair.
 The bounds ride on statements the write path issues anyway and cost no
 extra round trip. They are stamped whether or not history is enabled.
 `last_seen` is therefore a lower bound on when the record was last
-known to exist, not the time of the last listing that showed it. A row
-stored before the columns existed has NULL in both and keeps a NULL
-`first_seen` for life: the columns were added as nullable and nothing
-fills them in afterwards.
+known to exist, not the time of the last listing that showed it.
 
 Neither column is `list_blocks.witnessed_at`, which alone is used by
 coverage.
@@ -149,8 +146,7 @@ start, and only then, the server opens a row if history is enabled and
 none is open, and closes the open row if history is disabled.
 
 The windows tell a reader which silence means "nothing was removed" and
-which means "nothing was being recorded". A live row with a NULL
-`first_seen` was stored before the first window opened.
+which means "nothing was being recorded".
 
 ## Configuration
 

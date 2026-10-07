@@ -373,94 +373,6 @@ pub struct CommitOp {
     pub action: CommitAction,
 }
 
-/// A Jetstream event, reduced to what Farsight uses.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JetstreamEvent {
-    /// A commit on one of the four collections.
-    Commit {
-        /// Jetstream's `time_us` (witness time, microseconds).
-        time_us: i64,
-        /// The validated operation.
-        op: CommitOp,
-    },
-    /// A commit on some other collection (not subscribed; ignored).
-    OtherCommit {
-        /// Jetstream's `time_us`.
-        time_us: i64,
-    },
-    /// An `identity` event.
-    Identity {
-        /// The DID whose identity changed.
-        did: Did,
-        /// Jetstream's `time_us`.
-        time_us: i64,
-    },
-    /// An `account` event.
-    Account {
-        /// The account.
-        did: Did,
-        /// Jetstream's `time_us`.
-        time_us: i64,
-        /// Whether the account is active.
-        active: bool,
-        /// Upstream status string when inactive (`deactivated`,
-        /// `takendown`, …), if given.
-        status: Option<String>,
-    },
-}
-
-/// Parses one Jetstream (v1 `/subscribe`) JSON event.
-///
-/// Commits on the four collections are fully validated; a commit that
-/// fails validation is an error (the caller counts it as dropped,
-/// `reason="invalid"` or `"foreign_listitem"`). The v2 envelope is handled
-/// by the ingest crate, which hands the inner commit object to
-/// [`parse_commit`].
-pub fn parse_jetstream_event(json: &str) -> Result<JetstreamEvent, RecordError> {
-    let v: Value = serde_json::from_str(json).map_err(|e| RecordError::Json(e.to_string()))?;
-    let did_str = str_field(&v, "did")?;
-    let time_us = v
-        .get("time_us")
-        .and_then(Value::as_i64)
-        .ok_or(RecordError::Field("time_us"))?;
-    let kind = str_field(&v, "kind")?;
-    match kind {
-        "commit" => {
-            let commit = v.get("commit").ok_or(RecordError::Field("commit"))?;
-            let collection = str_field(commit, "collection")?;
-            if Collection::from_nsid(collection).is_none() {
-                return Ok(JetstreamEvent::OtherCommit { time_us });
-            }
-            let op = parse_commit(did_str, commit)?;
-            Ok(JetstreamEvent::Commit { time_us, op })
-        }
-        "identity" => Ok(JetstreamEvent::Identity {
-            did: Did::parse(did_str).map_err(|_| RecordError::RepoDid(did_str.to_owned()))?,
-            time_us,
-        }),
-        "account" => {
-            let account = v.get("account").ok_or(RecordError::Field("account"))?;
-            let active = account
-                .get("active")
-                .and_then(Value::as_bool)
-                .ok_or(RecordError::Field("active"))?;
-            let status = account
-                .get("status")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            Ok(JetstreamEvent::Account {
-                did: Did::parse(did_str).map_err(|_| RecordError::RepoDid(did_str.to_owned()))?,
-                time_us,
-                active,
-                status,
-            })
-        }
-        other => Err(RecordError::Operation(format!(
-            "unknown event kind {other}"
-        ))),
-    }
-}
-
 /// Parses a Jetstream commit object (`{rev, operation, collection, rkey,
 /// record?}`) for repo `did`. The collection must be one of the four.
 pub fn parse_commit(did: &str, commit: &Value) -> Result<CommitOp, RecordError> {
@@ -652,19 +564,12 @@ mod tests {
 
     #[test]
     fn jetstream_commit() {
-        let ev = json!({
-            "did": A, "time_us": 1_725_911_162_329_308i64, "kind": "commit",
-            "commit": {"rev": "3l3qo2vutsw2b", "operation": "create",
-                       "collection": "app.bsky.graph.block", "rkey": "3l3qo2vuowo2b",
-                       "record": {"$type": "app.bsky.graph.block", "subject": B,
-                                  "createdAt": "2024-09-09T19:46:02.102Z"},
-                       "cid": "bafyreidc6sydkkbchcyg62v77wbhzvb2mvytlmsychqgwf2xojjtirmzj4"}
-        });
-        let parsed = parse_jetstream_event(&ev.to_string()).unwrap();
-        let JetstreamEvent::Commit { time_us, op } = parsed else {
-            panic!()
-        };
-        assert_eq!(time_us, 1_725_911_162_329_308);
+        let commit = json!({"rev": "3l3qo2vutsw2b", "operation": "create",
+            "collection": "app.bsky.graph.block", "rkey": "3l3qo2vuowo2b",
+            "record": {"$type": "app.bsky.graph.block", "subject": B,
+                       "createdAt": "2024-09-09T19:46:02.102Z"},
+            "cid": "bafyreidc6sydkkbchcyg62v77wbhzvb2mvytlmsychqgwf2xojjtirmzj4"});
+        let op = parse_commit(A, &commit).unwrap();
         assert_eq!(op.rev, Tid::parse("3l3qo2vutsw2b").unwrap());
         assert!(matches!(
             op.action,
@@ -674,77 +579,38 @@ mod tests {
             }
         ));
 
-        let del = json!({
-            "did": A, "time_us": 1, "kind": "commit",
-            "commit": {"rev": "3l3qo2vutsw2c", "operation": "delete",
-                       "collection": "app.bsky.graph.listitem", "rkey": "3l3qo2vuowo2b"}
-        });
-        let JetstreamEvent::Commit { op, .. } = parse_jetstream_event(&del.to_string()).unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(op.action, CommitAction::Delete);
+        let del = json!({"rev": "3l3qo2vutsw2c", "operation": "delete",
+            "collection": "app.bsky.graph.listitem", "rkey": "3l3qo2vuowo2b"});
+        assert_eq!(parse_commit(A, &del).unwrap().action, CommitAction::Delete);
     }
 
     #[test]
     fn jetstream_rejections() {
-        let bad_rev = json!({
-            "did": A, "time_us": 1, "kind": "commit",
-            "commit": {"rev": "not-a-tid", "operation": "delete",
-                       "collection": "app.bsky.graph.block", "rkey": "3l3qo2vuowo2b"}
-        });
+        let bad_rev = json!({"rev": "not-a-tid", "operation": "delete",
+            "collection": "app.bsky.graph.block", "rkey": "3l3qo2vuowo2b"});
         assert!(matches!(
-            parse_jetstream_event(&bad_rev.to_string()),
+            parse_commit(A, &bad_rev),
             Err(RecordError::Rev(_))
         ));
-        let foreign = json!({
-            "did": B, "time_us": 1, "kind": "commit",
-            "commit": {"rev": "3l3qo2vutsw2b", "operation": "create",
-                       "collection": "app.bsky.graph.listitem", "rkey": "3l3qo2vuowo2b",
-                       "record": {"subject": B,
-                                  "list": format!("at://{A}/app.bsky.graph.list/3k2abc")}}
-        });
+        let foreign = json!({"rev": "3l3qo2vutsw2b", "operation": "create",
+            "collection": "app.bsky.graph.listitem", "rkey": "3l3qo2vuowo2b",
+            "record": {"subject": B,
+                       "list": format!("at://{A}/app.bsky.graph.list/3k2abc")}});
         assert!(matches!(
-            parse_jetstream_event(&foreign.to_string()),
+            parse_commit(B, &foreign),
             Err(RecordError::ForeignListItem { .. })
         ));
-        let bad_repo = json!({
-            "did": "alice.test", "time_us": 1, "kind": "commit",
-            "commit": {"rev": "3l3qo2vutsw2b", "operation": "delete",
-                       "collection": "app.bsky.graph.block", "rkey": "3l3qo2vuowo2b"}
-        });
+        let delete = json!({"rev": "3l3qo2vutsw2b", "operation": "delete",
+            "collection": "app.bsky.graph.block", "rkey": "3l3qo2vuowo2b"});
         assert!(matches!(
-            parse_jetstream_event(&bad_repo.to_string()),
+            parse_commit("alice.test", &delete),
             Err(RecordError::RepoDid(_))
         ));
-        let other = json!({
-            "did": A, "time_us": 7, "kind": "commit",
-            "commit": {"rev": "3l3qo2vutsw2b", "operation": "create",
-                       "collection": "app.bsky.feed.post", "rkey": "x", "record": {}}
-        });
-        assert_eq!(
-            parse_jetstream_event(&other.to_string()).unwrap(),
-            JetstreamEvent::OtherCommit { time_us: 7 }
-        );
-    }
-
-    #[test]
-    fn jetstream_account_and_identity() {
-        let acc = json!({"did": A, "time_us": 5, "kind": "account",
-                         "account": {"active": false, "status": "takendown", "seq": 1}});
-        assert_eq!(
-            parse_jetstream_event(&acc.to_string()).unwrap(),
-            JetstreamEvent::Account {
-                did: did(A),
-                time_us: 5,
-                active: false,
-                status: Some("takendown".to_owned())
-            }
-        );
-        let id = json!({"did": A, "time_us": 6, "kind": "identity", "identity": {}});
+        let other = json!({"rev": "3l3qo2vutsw2b", "operation": "create",
+            "collection": "app.bsky.feed.post", "rkey": "x", "record": {}});
         assert!(matches!(
-            parse_jetstream_event(&id.to_string()).unwrap(),
-            JetstreamEvent::Identity { .. }
+            parse_commit(A, &other),
+            Err(RecordError::Field("collection"))
         ));
     }
 }

@@ -1,15 +1,15 @@
 //! `farsight-stage8-harness`: integration tests of tables that sort by
 //! their rows' shown time, the four sort indexes and their background
 //! build, queue-driven handle warming, and the admin tables (sticky
-//! header, handles, profile cards, record cells, "First seen").
+//! header, handles, profile cards, record cells, columns).
 //!
 //! Sections:
 //!
 //! - 1–6: sort key and clamp (order, future dates, missing dates, paging
-//!   through ties, index use, cursors);
+//!   through ties, index use, page numbers);
 //! - 7–8: public pages (no Record column; handles after warming);
 //! - 9–15: admin pages (sticky header and cards in a browser, handles,
-//!   `/admin/card/{did}` with and without a session, record cells, "First seen",
+//!   `/admin/card/{did}` with and without a session, record cells, columns,
 //!   the shared card budget);
 //! - 16–20: handle warming (queue, drain, cap, toggle, no duplicates),
 //!   and 20b: handles stored in `handle_cache`;
@@ -51,7 +51,7 @@ use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Write, WriteAction}
 use farsight_storage::counters::CounterSink;
 use farsight_storage::keys::Limits;
 use farsight_storage::txn::Gates;
-use farsight_storage::ui_rows::{self, Filter, Order, Position, Section};
+use farsight_storage::ui_rows::{self, Filter, Order, Section};
 use serde_json::Value;
 use sqlx::PgPool;
 
@@ -78,7 +78,6 @@ const BROWSER_IMAGE: &str = "mcr.microsoft.com/playwright:v1.48.0-jammy";
 const BROWSER_SCRIPT: &str = include_str!("../../../../../scripts/stage8-browser-probes.mjs");
 /// The instant the seeded rows are dated around.
 const BASE: &str = "'2026-09-01T00:00:00Z'::timestamptz";
-const NO_FIRST_SEEN: &str = "Stored before Farsight kept this date";
 const SHORT_CARD: &str = "Profile not available right now.";
 
 /// SQL for [`did`] of a generate_series column.
@@ -554,8 +553,7 @@ async fn expected(
     };
     let by_party = section.ties_by_party();
     rows.sort_by(|x, y| {
-        // Newest first; a row with neither time last; then the rest of the
-        // primary key, descending.
+        // Newest first; then the rest of the primary key, descending.
         shown(y)
             .cmp(&shown(x))
             .then_with(|| {
@@ -613,10 +611,9 @@ async fn n(pool: &PgPool, q: &str) -> Result<i64, String> {
 async fn seed_list(pool: &PgPool, owner_id: i64, rkey: &str, items: i64) -> Result<i64, String> {
     sqlx::query_scalar(
         "INSERT INTO lists (owner_id, rkey, record_state, purpose, name, listblock_count,
-                            track_state, item_count, admitted_at, fetched_at, fetched_witness,
-                            about_read)
+                            track_state, item_count, admitted_at, fetched_at, fetched_witness)
          VALUES ($1, $2, 1, 1, $2, $3, 2, $3, now() - interval '1 hour', now() - interval '1 hour',
-                 now() - interval '1 hour', true) RETURNING id",
+                 now() - interval '1 hour') RETURNING id",
     )
     .bind(owner_id)
     .bind(rkey)
@@ -662,7 +659,9 @@ async fn seed_world(pool: &PgPool) -> Result<World, String> {
         let id = seed::actor(pool, &d).await?;
         Ok::<(String, i64), String>((d, id))
     };
-    // S: five kinds of row.
+    // S: five kinds of row — no stated date and stored lately; a date in
+    // the future; an honest date; a date long before it was stored; no
+    // stated date and stored long ago.
     let (s, s_id) = actor(did("sub", 1)).await?;
     let when = format!(
         "CASE g % 5 WHEN 0 THEN NULL
@@ -671,7 +670,11 @@ async fn seed_world(pool: &PgPool) -> Result<World, String> {
                     WHEN 3 THEN {BASE} - make_interval(hours => g)
                     ELSE NULL END"
     );
-    let seen = format!("CASE WHEN g % 5 IN (0, 1, 2) THEN {BASE} - make_interval(mins => g) END");
+    let seen = format!(
+        "CASE g % 5 WHEN 3 THEN {BASE}
+                    WHEN 4 THEN {BASE} - interval '20 days' - make_interval(mins => g)
+                    ELSE {BASE} - make_interval(mins => g) END"
+    );
     seed_blockers(pool, "sbl", 300, s_id, &when, &seen).await?;
     // One account with several records naming S, at one instant.
     seed::exec(
@@ -904,7 +907,7 @@ async fn check_order(
     let want = expected(pool, Section::IncomingBlocks, w.s_id, true).await?;
     let (got, pages) = walk(a, &public_did(&w.s), "blockers").await?;
     c.check(
-        "the public \"Blocked by\" table lists 305 records with stated dates in the future, in the past, missing, and rows without a first_seen in exactly the order of the shown time, then blocker id, then record key, all descending",
+        "the public \"Blocked by\" table lists 305 records with stated dates in the future, in the past and missing in exactly the order of the shown time, then blocker id, then record key, all descending",
         got == want && got.len() == 305,
         format!("{} rows over {pages} pages; first differing position: {:?}", got.len(), got.iter().zip(&want).position(|(x, y)| x != y)),
     );
@@ -960,12 +963,12 @@ async fn check_order(
     );
     let honest = did("sbl", 2);
     let undated = did("sbl", 5);
-    let neither = did("sbl", 4);
+    let long_ago = did("sbl", 4);
     let pos = |d: &str| got.iter().position(|x| x == d);
     c.section("3. a missing created_at falls back to first_seen");
     c.check(
-        "a record that states no createdAt sorts at its first_seen — among the dated rows, ahead of every row that has neither time — and rows with neither time come last",
-        pos(&undated) < pos(&neither)
+        "a record that states no createdAt sorts at its first_seen: among the dated rows when it was stored lately, and after all of them when it was stored before any of their dates (the last 60 rows)",
+        pos(&undated) < pos(&long_ago)
             && pos(&undated).is_some()
             && pos(&honest).is_some()
             && got.len() >= 60
@@ -974,31 +977,7 @@ async fn check_order(
                     .filter(|g| g % 5 == 4)
                     .map(|g| did("sbl", g))
                     .collect::<BTreeSet<_>>(),
-        format!("undated at {:?}, neither at {:?}", pos(&undated), pos(&neither)),
-    );
-    // The database's own reading of the expression: never NULL.
-    let nulls = n(
-        pool,
-        &format!(
-            "SELECT count(*) FROM blocks WHERE subject_id = {} AND {} IS NULL",
-            w.s_id,
-            ui_rows::SHOWN_TIME
-        ),
-    )
-    .await?;
-    let last = n(
-        pool,
-        &format!(
-            "SELECT count(*) FROM blocks WHERE subject_id = {} AND {} = '-infinity'",
-            w.s_id,
-            ui_rows::SHOWN_TIME
-        ),
-    )
-    .await?;
-    c.check(
-        "the sort expression is never NULL: LEAST ignores a NULL argument, and a row with neither time is '-infinity' (60 such rows)",
-        nulls == 0 && last == 60,
-        format!("{nulls} NULL, {last} at -infinity"),
+        format!("undated at {:?}, stored long ago at {:?}", pos(&undated), pos(&long_ago)),
     );
     Ok(())
 }
@@ -1107,7 +1086,7 @@ async fn check_future_dates(
 }
 
 async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result<(), String> {
-    c.section("4. keyset paging through rows with one shown time");
+    c.section("4. paging through rows with one shown time");
     let mut ok = true;
     let mut detail = Vec::new();
     for (name, first, id, section_, key, want_pages) in [
@@ -1184,12 +1163,8 @@ async fn check_plans(c: &mut Checks, pool: &PgPool, w: &World) -> Result<(), Str
             find: None,
             excluded: &[],
         };
-        let first = ui_rows::rows(&mut conn, section_, key, Order::Shown, filter, None, 50)
-            .await
-            .map_err(|e| e.to_string())?;
-        let after = first.last().map(farsight_storage::ui_rows::Row::position);
-        for cursor in [None, after.as_ref()] {
-            let plan = ui_rows::explain(&mut conn, section_, key, Order::Shown, filter, cursor, 50)
+        for offset in [0, 50] {
+            let plan = ui_rows::explain(&mut conn, section_, key, Order::Shown, filter, offset, 50)
                 .await
                 .map_err(|e| e.to_string())?;
             let text = plan.join("\n");
@@ -1198,13 +1173,13 @@ async fn check_plans(c: &mut Checks, pool: &PgPool, w: &World) -> Result<(), Str
             detail.push(format!(
                 "{}{}: {}",
                 section_.index(),
-                if cursor.is_some() { " (cursor)" } else { "" },
+                if offset > 0 { " (page 2)" } else { "" },
                 if good { order_of(&text) } else { text.as_str() }
             ));
         }
     }
     c.check(
-        "EXPLAIN ANALYZE of the four section queries, first page and with a cursor: each reads its table through the section's shown-time index, never by a sequential scan",
+        "EXPLAIN ANALYZE of the four section queries, first page and second: each reads its table through the section's shown-time index, never by a sequential scan",
         ok,
         detail.join("; "),
     );
@@ -1228,10 +1203,9 @@ fn order_of(plan: &str) -> &'static str {
     }
 }
 
-async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<(), String> {
-    c.section("6. cursors (admin tables) and page numbers (public tables)");
-    // No admin table pages by cursor: the lookups page by number, each
-    // with its own address.
+async fn check_pages(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<(), String> {
+    c.section("6. page numbers");
+    // The lookups page by number, each page with its own address.
     let filler_uri = format!("at://{}/app.bsky.graph.list/filler", did("flo", 1));
     let page = a.admin_get(cookie, &lookup_list(&filler_uri)).await?;
     let msec = admin_section(&page.text, "Members").unwrap_or("");
@@ -1262,7 +1236,7 @@ async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Resu
         .unwrap_or_default();
     let zero = a.get(&format!("{}?page=0", public_did(&w.s))).await?;
     c.check(
-        "the public tables carry no cursor: the next page is ?page=2; a page number that is not one gets the 400 page with its \"Open the first page\" link — never a 500",
+        "the public tables page by number: the next page is ?page=2; a page number that is not one gets the 400 page with its \"Open the first page\" link — never a 500",
         public_next == format!("{}?page=2", public_did(&w.s))
             && zero.status == 400
             && zero.text.contains("Open the first page")
@@ -1433,98 +1407,49 @@ async fn check_admin_history_tab(
     Ok(())
 }
 
-/// A list stored before its description was kept has its record read on
-/// the first view of its page, once.
+/// A list's page shows the description and the image its record states,
+/// from the stored row.
 async fn check_list_about(c: &mut Checks, a: &Srv, pool: &PgPool, plc: &Plc) -> Result<(), String> {
     c.section("7d. a list's description and image");
     const CID: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
-    let (owner, lost) = (did("abo", 1), did("abn", 1));
+    let owner = did("abo", 1);
     seed::exec(
         pool,
-        &format!("INSERT INTO actors (did) VALUES ('{owner}'), ('{lost}') ON CONFLICT DO NOTHING"),
+        &format!("INSERT INTO actors (did) VALUES ('{owner}') ON CONFLICT DO NOTHING"),
     )
     .await?;
-    let id_of = |d: &str| format!("SELECT id FROM actors WHERE did = '{d}'");
-    let (oid, lid) = (
-        n(pool, &id_of(&owner)).await?,
-        n(pool, &id_of(&lost)).await?,
-    );
-    let mut ids = Vec::new();
-    for (o, rkey) in [(oid, "told"), (oid, "blank"), (lid, "lost")] {
-        let id = seed_list(pool, o, rkey, 0).await?;
-        seed::exec(
-            pool,
-            &format!("UPDATE lists SET about_read = false WHERE id = {id}"),
-        )
-        .await?;
-        ids.push(id);
-    }
-    plc.host(&owner);
-    plc.set_list(
-        &owner,
-        "told",
-        serde_json::json!({
-            "$type": "app.bsky.graph.list",
-            "name": "told",
-            "purpose": "app.bsky.graph.defs#modlist",
-            "description": "First line <b>bold</b>\n\nhttps://example.com second\u{202e}",
-            "avatar": {"$type": "blob", "ref": {"$link": CID}, "mimeType": "image/png", "size": 1},
-            "createdAt": "2024-01-01T00:00:00Z"
-        }),
-    );
-    let page = |o: &str, rkey: &str| format!("/list/{o}/{rkey}");
-    let state = |id: i64| {
-        format!(
-            "SELECT (about_read::int * 4 + (description IS NOT NULL)::int * 2 + (avatar_cid IS NOT NULL)::int)::bigint FROM lists WHERE id = {id}"
-        )
-    };
-    let (r0, a0) = (plc.record_total(), plc.audit_total());
-    let first = a.get(&page(&owner, "told")).await?;
-    let (r1, a1) = (plc.record_total(), plc.audit_total());
-    let again = a.get(&page(&owner, "told")).await?;
-    let (r2, a2) = (plc.record_total(), plc.audit_total());
+    let oid = n(
+        pool,
+        &format!("SELECT id FROM actors WHERE did = '{owner}'"),
+    )
+    .await?;
+    let told = seed_list(pool, oid, "told", 0).await?;
+    seed_list(pool, oid, "blank", 0).await?;
+    sqlx::query("UPDATE lists SET description = $2, avatar_cid = $3 WHERE id = $1")
+        .bind(told)
+        .bind("First line <b>bold</b>\n\nhttps://example.com second\u{202e}")
+        .bind(CID)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let page = |rkey: &str| format!("/list/{owner}/{rkey}");
+    let r0 = plc.record_total();
+    let first = a.get(&page("told")).await?;
+    let blank = a.get(&page("blank")).await?;
+    let r1 = plc.record_total();
     let want = "<p class=\"list-description\">First line &lt;b&gt;bold&lt;/b&gt;<br>https://example.com second</p>";
     let image = format!("data-list-image=\"{CID}\" data-owner=\"{owner}\"");
     c.check(
-        "a list whose record was never read for it: the first view of its page reads the record from the owner's server (one identity lookup, one getRecord), shows the description as escaped plain text, line by line, with no link made of an address in it, and names the image by its CID for the page's script; the row keeps both, and the next view asks nobody",
+        "a list's page shows the description its record states as escaped plain text, line by line, with no link made of an address in it, and names the image by its CID for the page's script; a list whose record states neither has neither; both come from the stored row, and no record is read for the page",
         first.status == 200
             && first.text.contains(want)
             && first.text.contains(&image)
             && !first.text.contains("href=\"https://example.com")
-            && (r1, a1) == (r0 + 1, a0 + 1)
-            && again.text.contains(want)
-            && again.text.contains(&image)
-            && (r2, a2) == (r1, a1)
-            && n(pool, &state(ids[0])).await? == 7,
-        format!(
-            "getRecord {r0} → {r1} → {r2}, audit {a0} → {a1} → {a2}, row {}",
-            n(pool, &state(ids[0])).await?
-        ),
-    );
-    let blank = a.get(&page(&owner, "blank")).await?;
-    let (r3, a3) = (plc.record_total(), plc.audit_total());
-    let unreachable = a.get(&page(&lost, "lost")).await?;
-    let a4 = plc.audit_total();
-    let unreachable_again = a.get(&page(&lost, "lost")).await?;
-    let (r5, a5) = (plc.record_total(), plc.audit_total());
-    c.check(
-        "a record the owner's server does not have settles the row with nothing to show (read, no description, no image); an owner whose server cannot be found leaves the row unread, the page complete without a description, and is not asked about again on the next view",
-        blank.status == 200
+            && blank.status == 200
             && !blank.text.contains("list-description")
             && !blank.text.contains("data-list-image")
-            && (r3, a3) == (r2 + 1, a2 + 1)
-            && n(pool, &state(ids[1])).await? == 4
-            && unreachable.status == 200
-            && !unreachable.text.contains("list-description")
-            && a4 == a3 + 1
-            && unreachable_again.status == 200
-            && (r5, a5) == (r3, a4)
-            && n(pool, &state(ids[2])).await? == 0,
-        format!(
-            "getRecord {r2} → {r3} → {r5}, audit {a2} → {a3} → {a4} → {a5}, rows {} and {}",
-            n(pool, &state(ids[1])).await?,
-            n(pool, &state(ids[2])).await?
-        ),
+            && r1 == r0,
+        format!("getRecord {r0} → {r1}"),
     );
     Ok(())
 }
@@ -1768,19 +1693,19 @@ async fn check_admin_card(
     let public_js = a.get("/static/public.js").await?;
     let page = a.admin_get(cookie, &lookup_did(&w.s)).await?;
     c.check(
-        "what the browser gets: admin pages load /static/admin.js and not /static/public.js; each of the two scripts asks with credentials \"same-origin\" only for a link marked data-card-session and never injects an answer that is not a 200 or was reached through a redirect; neither names an admin path",
-        // The admin pages have their own script, a copy of the public one
-        // that changes separately; neither names an admin path.
+        "what the browser gets: admin pages load /static/admin.js and not /static/public.js; the admin script asks for a card with credentials \"same-origin\" only for a link marked data-card-session, the public script always without cookies; neither injects an answer that is not a 200 or was reached through a redirect, and neither names an admin path",
+        // The admin pages have their own script, which changes separately
+        // from the public one.
         js.status == 200
             && public_js.status == 200
             && page.text.contains("<script src=\"/static/admin.js?v=")
             && !page.text.contains("/static/public.js")
+            && js.text.contains("link.hasAttribute(\"data-card-session\")")
+            && js.text.contains("credentials: session ? \"same-origin\" : \"omit\"")
+            && public_js.text.contains("fetch(link.getAttribute(\"data-card\"), { credentials: \"omit\" })")
+            && !public_js.text.contains("data-card-session")
             && [&js, &public_js].iter().all(|j| {
-                j.text.contains("link.hasAttribute(\"data-card-session\")")
-                    && j.text.contains("credentials: session ? \"same-origin\" : \"omit\"")
-                    && j.text.contains("r.status !== 200 || r.redirected")
-                    && !j.text.contains("/admin/")
-                    && !j.text.contains("/lookup")
+                j.text.contains("r.status !== 200 || r.redirected") && !j.text.contains("/admin/")
             }),
         format!("admin.js {} / public.js {}", js.status, public_js.status),
     );
@@ -1860,7 +1785,6 @@ async fn check_admin_columns(
                 && !r.text.contains("did:plc:")
                 && !r.text.contains("2026-08-31T23:5")
                 && !r.text.contains("2026-08-31 23:5")
-                && !r.text.contains(NO_FIRST_SEEN)
         }),
         format!("{} / {}", anon.status, lanon.status),
     );
@@ -2392,11 +2316,10 @@ async fn check_pass(
         .map(|v| v.to_string())
     };
     c.check(
-        "off by default: Settings shows handle_pass_rps = 0, nothing is checked in the background and the dashboard's \"Catching up\" has no line for handles or list descriptions",
+        "off by default: Settings shows handle_pass_rps = 0, nothing is checked in the background and the dashboard's \"Catching up\" has no line for handles",
         settings.text.contains("name=\"handle_pass_rps\" min=\"0\" max=\"200\" value=\"0\"")
             && dash_off.status == 200
             && caught(&dash_off.text, "Handles").is_none()
-            && caught(&dash_off.text, "List descriptions").is_none()
             && n(pool, stored).await? == before,
         format!("{before} stored answers"),
     );
@@ -2458,10 +2381,7 @@ async fn check_pass(
         dash_on.text.contains("<span>Catching up</span>")
             && line.contains("% of accounts checked, about ")
             && line.ends_with(" left"),
-        format!(
-            "Handles: {line:?}; List descriptions: {:?}",
-            caught(&dash_on.text, "List descriptions")
-        ),
+        format!("Handles: {line:?}"),
     );
     set_pass(a, cookie, 0).await?;
     tokio::time::sleep(Duration::from_secs(8)).await;
@@ -2879,8 +2799,8 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
             && !home.text.contains("Sorting by creation time"),
         support::truncate(between(&dash.text, "Sorting by creation time", "</div>").first().unwrap_or(&""), 200),
     );
-    // The section without its index keeps the order it had: blocker id,
-    // then record key, ascending — and the cursor of that order.
+    // The section without its index is in blocker id order, then record
+    // key, ascending.
     let stored: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT a.did FROM blocks b JOIN actors a ON a.id = b.author_id WHERE b.subject_id = {sid} ORDER BY b.author_id, b.rkey"
     ))
@@ -2892,7 +2812,7 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let (admin_walked, _) =
         admin_walk(&h, &cookie, &lookup_did(&subject), "Incoming blocks").await?;
     c.check(
-        "until its index is valid a section keeps its previous order, with the same columns and filters: the public table and the admin table both page in the old order",
+        "until its index is valid a section lists its rows by account, with the same columns and filters: the public table and the admin table both page in that order",
         walked == stored
             && walked.len() == 250
             && admin_walked == stored
@@ -3150,46 +3070,34 @@ async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Resul
         find: None,
         excluded: &[],
     };
-    let deep = ui_rows::rows(
-        &mut conn,
-        Section::IncomingBlocks,
-        w.w18_id,
-        Order::Shown,
-        shown,
-        None,
-        1000,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    let middle: Option<Position> = deep.last().map(farsight_storage::ui_rows::Row::position);
-    let cases: [(&str, Section, i64, Filter<'_>, Option<&Position>); 5] = [
+    let cases: [(&str, Section, i64, Filter<'_>, i64); 5] = [
         (
             "dense subject (2,300 blockers)",
             Section::IncomingBlocks,
             w.w18_id,
             shown,
-            None,
+            0,
         ),
         (
             "sparse subject (1 blocker)",
             Section::IncomingBlocks,
             w.sparse_id,
             shown,
-            None,
+            0,
         ),
         (
             "dense author (3,000 blocks)",
             Section::OutgoingBlocks,
             w.dense_author_id,
             shown,
-            None,
+            0,
         ),
         (
             "paginated (page 21 of the dense subject)",
             Section::IncomingBlocks,
             w.w18_id,
             shown,
-            middle.as_ref(),
+            1000,
         ),
         (
             "filtered (hidden statuses and 500 excluded accounts)",
@@ -3202,17 +3110,25 @@ async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Resul
                 find: None,
                 excluded: &excluded,
             },
-            None,
+            0,
         ),
     ];
     let mut ok = true;
     let mut detail = Vec::new();
-    for (name, section_, key, filter, after) in cases {
-        let plan = ui_rows::explain(&mut conn, section_, key, Order::Shown, filter, after, 50)
+    for (name, section_, key, filter, offset) in cases {
+        let plan = ui_rows::explain(&mut conn, section_, key, Order::Shown, filter, offset, 50)
             .await
             .map_err(|e| e.to_string())?;
         let text = plan.join("\n");
-        let good = uses_index(&text, section_);
+        // A page deep into a section may read the section's rows through
+        // another index on its key and sort them; it never scans the
+        // table.
+        let by_index = uses_index(&text, section_);
+        let good = if offset > 0 {
+            !text.contains(&format!("Seq Scan on {}", section_.table()))
+        } else {
+            by_index
+        };
         ok &= good;
         let time = plan
             .iter()
@@ -3221,15 +3137,17 @@ async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Resul
             .unwrap_or_default();
         detail.push(format!(
             "{name}: {} — {time}",
-            if good {
+            if by_index {
                 format!("{}, {}", section_.index(), order_of(&text))
+            } else if good {
+                "an index on the section's key, then a sort".to_owned()
             } else {
                 text.clone()
             }
         ));
     }
     c.check(
-        "five realistic queries each read the table through the shown-time index, never by a sequential scan",
+        "four realistic first pages each read the table through the shown-time index, and a page deep into a dense section (page 21) reads it through an index too: never a sequential scan",
         ok,
         detail.join("; "),
     );
@@ -3333,7 +3251,7 @@ async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     check_future_dates(c, &a, &pool, &w).await?;
     check_ties(c, &a, &pool, &w).await?;
     check_plans(c, &pool, &w).await?;
-    check_cursors(c, &a, &cookie, &w).await?;
+    check_pages(c, &a, &cookie, &w).await?;
     check_public_columns(c, &a, &w).await?;
     check_history_tab(c, &a, &plc, &w).await?;
     check_admin_history_tab(c, &a, &pool, &cookie, &plc, &w).await?;

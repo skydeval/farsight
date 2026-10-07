@@ -177,8 +177,7 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
   `farsight_handle_pass_total{outcome}` and
   `farsight_handle_pass_laps_total` on the metrics listener. A restart
   begins the walk again and passes over answered accounts without a
-  request. While the pass is on, lists stored before descriptions were
-  kept have their record read too, one a second.
+  request.
 
 ## How the pages behave
 

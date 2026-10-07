@@ -54,7 +54,8 @@ impl Tid {
     }
 
     /// Builds a TID from its decoded value. `None` if negative.
-    pub fn from_i64(v: i64) -> Option<Tid> {
+    #[cfg(test)]
+    fn from_i64(v: i64) -> Option<Tid> {
         if v >= 0 { Some(Tid(v)) } else { None }
     }
 

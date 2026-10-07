@@ -14,6 +14,7 @@ pub mod cursor;
 pub mod error;
 pub mod freshness;
 pub mod handlers;
+#[cfg(any(test, feature = "harness"))]
 pub mod lexicon;
 pub mod metrics;
 pub mod params;

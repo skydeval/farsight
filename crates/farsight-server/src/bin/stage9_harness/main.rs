@@ -8,7 +8,7 @@
 //!
 //! - 1: routing in the four switch combinations, sessions;
 //! - 2: config;
-//! - 3: one address for each page;
+//! - 3: unknown paths;
 //! - 4: static assets;
 //! - 5: `/` of an API-only instance;
 //! - 6: the wizard;
@@ -397,9 +397,7 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
             && cc(&home) == "public, max-age=60"
             && home.text.contains("action=\"/search\"")
             && !home.text.contains("/admin")
-            && !home.text.contains("/enter")
-            && !home.text.contains("/public/")
-            && !home.text.contains("\"/public\""),
+            && !home.text.contains("/enter"),
         brief(&home),
     );
     let did = a.get(&format!("/did/{}", w.subject)).await?;
@@ -408,8 +406,7 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
         did.status == 200
             && did.text.contains(&format!("href=\"/did/{}\"", w.blocker))
             && did.text.contains("/static/public.css")
-            && did.text.contains("/static/public.js")
-            && !did.text.contains("/public/"),
+            && did.text.contains("/static/public.js"),
         brief(&did),
     );
     // The fingerprint the page asks for its stylesheet under.
@@ -445,7 +442,7 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
     let card = a.get(&format!("/card/{}", w.subject)).await?;
     c.check(
         "/card/{did} answers with a card fragment",
-        card.status == 200 && !card.text.contains("<html") && !card.text.contains("/public/"),
+        card.status == 200 && !card.text.contains("<html"),
         brief(&card),
     );
     all(
@@ -599,15 +596,10 @@ async fn check_public_only(c: &mut Checks, b: &Srv, cookie: &str, w: &World) -> 
         "/enter",
         "/enter/callback",
         "/.well-known/atproto-oauth-client-metadata",
-        "/lookup/did",
-        "/lookup/list",
-        "/ops",
-        "/settings",
-        "/reset",
     ]);
     all(
         c,
-        "every admin page, the sign-in, its callback, the client metadata and an admin page's path at the root: the bare 404",
+        "every admin page, the sign-in, its callback and the client metadata: the bare 404",
         b,
         None,
         &gone,
@@ -660,10 +652,9 @@ async fn check_admin_only(c: &mut Checks, s: &Srv, cookie: &str, w: &World) -> R
     let did = format!("/did/{}", w.subject);
     let card = format!("/card/{}", w.subject);
     let list = format!("/list/{}/3kaaaaaaaaaa2", w.subject);
-    let prefixed = format!("/public/did/{}", w.subject);
     all(
         c,
-        "every public page, a path under /public and an unknown path: the bare 404",
+        "every public page and an unknown path: the bare 404",
         s,
         None,
         &[
@@ -671,11 +662,6 @@ async fn check_admin_only(c: &mut Checks, s: &Srv, cookie: &str, w: &World) -> R
             card.as_str(),
             list.as_str(),
             "/search?q=x",
-            "/public",
-            "/public/search?q=x",
-            prefixed.as_str(),
-            "/public/static/public.css",
-            "/public/nonsense",
             "/nonsense",
         ],
         bare,
@@ -704,12 +690,6 @@ async fn check_admin_only(c: &mut Checks, s: &Srv, cookie: &str, w: &World) -> R
         "/enter is the sign-in page",
         enter.status == 200,
         brief(&enter),
-    );
-    let old_admin = s.get("/settings").await?;
-    c.check(
-        "an admin page has no address at the root: /settings is an unknown path",
-        bare(&old_admin) && old_admin.header("location").is_none(),
-        brief(&old_admin),
     );
     Ok(())
 }
@@ -749,9 +729,7 @@ async fn check_api_only(c: &mut Checks, d: &Srv, w: &World) -> Result<(), String
         card.as_str(),
         did.as_str(),
         "/search?q=x",
-        "/public",
-        "/lookup/did",
-        "/settings",
+        "/nonsense",
     ]);
     all(
         c,
@@ -840,18 +818,12 @@ async fn check_config(c: &mut Checks, pg: &Pg, a: &Srv, cookie: &str) -> Result<
     );
     let mut bad = Vec::new();
     for (name, section, key, line) in [
-        ("g", "[access]\n", "`ui`", "ui = \"disabled\"\n"),
+        ("g", "[access]\n", "`uis`", "uis = \"none\"\n"),
         (
             "h",
             "[public_ui]\n",
-            "`show_history`",
-            "show_history = true\n",
-        ),
-        (
-            "i",
-            "[auth]\n",
-            "`admin_password_bcrypt`",
-            "admin_password_bcrypt = \"$2b$04$x\"\n",
+            "`show_everything`",
+            "show_everything = true\n",
         ),
     ] {
         let text = good.replace(section, &format!("{section}{line}"));
@@ -864,7 +836,7 @@ async fn check_config(c: &mut Checks, pg: &Pg, a: &Srv, cookie: &str) -> Result<
         }
     }
     c.check(
-        "a config file with a key that does not exist — access.ui, public_ui.show_history, auth.admin_password_bcrypt — does not load: the process exits non-zero naming the key",
+        "a config file with a key that does not exist does not load: the process exits non-zero naming the key",
         bad.is_empty(),
         bad.join(" | "),
     );
@@ -924,52 +896,29 @@ async fn check_config(c: &mut Checks, pg: &Pg, a: &Srv, cookie: &str) -> Result<
     Ok(())
 }
 
-// ------------------------------------------------- 3. one address per page
+// ------------------------------------------------- 3. unknown paths
 
-/// The pages have one address each. Any other path, such as one under
-/// `/public` or an admin page's path at the root, is not a route: it gets
-/// what any unknown path gets.
+/// A path that is not a route gets what any unknown path gets, and a
+/// parameter a page does not have changes nothing.
 async fn check_unknown_paths(
     c: &mut Checks,
     a: &Srv,
     cookie: &str,
     w: &World,
 ) -> Result<(), String> {
-    c.section("3. one address for each page");
+    c.section("3. unknown paths");
     let s = &w.subject;
     let paths: Vec<String> = vec![
-        "/public".into(),
-        "/public?x=1".into(),
-        "/public/".into(),
-        format!("/public/search?q={}", enc(s)),
-        format!("/public/did/{s}"),
-        format!("/public/did/{s}/history"),
-        format!("/public/list/{s}/3kaaaaaaaaaa2"),
-        format!("/public/card/{s}"),
-        "/public/about".into(),
-        "/public/nonsense".into(),
-        "/public/static/public.css".into(),
-        "/public/static/public.js".into(),
-        "/public/static/htmx.min.js".into(),
-        "/public/static/og-default.png".into(),
-        "/lookup/did".into(),
-        "/lookup/did?q=did%3Aplc%3Ax".into(),
-        "/lookup/list?q=at%3A%2F%2Fx".into(),
-        "/ops".into(),
-        "/settings".into(),
-        "/reset".into(),
-        "/dashboard/fragment".into(),
-        "/logout".into(),
-        "/ops/backfill".into(),
-        "/settings/token".into(),
         "/nonsense".into(),
-        // Paths that would name another host if a prefix were stripped.
-        "/public//evil.example.com/x".into(),
+        "/nonsense?x=1".into(),
+        "/static/nonsense.css".into(),
+        format!("/did/{s}/more"),
+        "/admin/nonsense".into(),
+        // Paths that name another host.
         "//evil.example.com/x".into(),
-        "/public/%2F%2Fevil.example.com".into(),
-        "/public/did/%2F%2Fevil.example.com".into(),
-        "/public/did/a%0D%0ALocation:%20https:%2F%2Fevil.example.com".into(),
-        "/lookup//evil.example.com".into(),
+        "/%2F%2Fevil.example.com".into(),
+        "/did/%2F%2Fevil.example.com/x".into(),
+        "/a%0D%0ALocation:%20https:%2F%2Fevil.example.com".into(),
     ];
     let mut bad = Vec::new();
     for p in &paths {
@@ -980,7 +929,7 @@ async fn check_unknown_paths(
         }
     }
     c.check(
-        "a path under /public, an admin page's path at the root and a path that would name another host if a prefix were stripped are unknown paths: the bare 404, no Location, with or without a session",
+        "an unknown path, and one that names another host, is the bare 404, no Location, with or without a session",
         bad.is_empty(),
         if bad.is_empty() {
             format!("{} paths", paths.len())
@@ -988,9 +937,9 @@ async fn check_unknown_paths(
             bad.join(" | ")
         },
     );
-    let extra = a.get(&format!("/did/{s}?bc=x")).await?;
+    let extra = a.get(&format!("/did/{s}?x=1")).await?;
     c.check(
-        "a parameter an account page does not have (?bc=x) is not a reason to redirect: the page is served, 200",
+        "a parameter an account page does not have (?x=1) is not a reason to redirect: the page is served, 200",
         extra.status == 200 && extra.header("location").is_none(),
         brief(&extra),
     );
@@ -1496,8 +1445,7 @@ async fn check_contracts(
     // request.
     let before = a.metrics_text().await?;
     a.get("/").await?;
-    a.get("/public").await?;
-    a.get("/public/nonsense").await?;
+    a.get("/nonsense").await?;
     a.get("/robots.txt").await?;
     let after = a.metrics_text().await?;
     let name = "farsight_public_ui_requests_total";
@@ -1513,7 +1461,7 @@ async fn check_contracts(
     labels.sort_unstable();
     labels.dedup();
     c.check(
-        "farsight_public_ui_requests_total has one label per page; / counts as home, robots as robots, and an unknown path such as /public is counted under none",
+        "farsight_public_ui_requests_total has one label per page; / counts as home, robots as robots, and an unknown path is counted under none",
         labels == ["card", "did", "home", "list", "robots", "search"]
             && delta("home", "2xx") == 1.0
             && delta("robots", "2xx") == 1.0,

@@ -274,8 +274,8 @@ async fn check_one(st: Arc<WebState>, item: Item) -> Option<(String, Option<Stri
     None
 }
 
-/// How far the pass and the list filler have got since the server
-/// started, for the dashboard.
+/// How far the pass has got since the server started, for the
+/// dashboard.
 #[derive(Debug, Default)]
 pub struct Progress {
     /// The `actors.id` the walk has reached.
@@ -284,8 +284,6 @@ pub struct Progress {
     pub last: AtomicI64,
     /// Walks completed.
     pub laps: AtomicU64,
-    /// Rounds of the list filler completed.
-    pub list_rounds: AtomicU64,
 }
 
 /// Where the walk is.
@@ -467,82 +465,6 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
             }
         } else if all > 0 {
             backoff = Duration::ZERO;
-        }
-    }
-}
-
-/// How long the list filler waits between two lists.
-pub const LIST_EVERY: Duration = Duration::from_secs(1);
-/// How long it rests after the last list.
-pub const LIST_LAP_REST: Duration = Duration::from_secs(3600);
-
-/// Reads the record of every list stored before descriptions were kept
-/// (`lists.about_read = false`), one a second, while the handle pass is
-/// on. A list whose owner's server does not answer is left for the next
-/// round, an hour after this one ends.
-pub async fn run_lists(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
-    let mut cursor = 0i64;
-    loop {
-        if *stop.borrow() {
-            return;
-        }
-        let cfg = st.api.config.current();
-        if cfg.config.public_ui.handle_pass_rps == 0 {
-            if pause(&mut stop, IDLE_POLL).await {
-                return;
-            }
-            continue;
-        }
-        let batch = match st.api.pool.acquire().await {
-            Ok(mut conn) => farsight_storage::queries::lists_unread(&mut conn, cursor, 50).await,
-            Err(e) => Err(e.into()),
-        };
-        let batch = match batch {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "list filler: the next lists could not be read");
-                Vec::new()
-            }
-        };
-        if batch.is_empty() {
-            cursor = 0;
-            st.public
-                .progress
-                .list_rounds
-                .fetch_add(1, Ordering::Relaxed);
-            if pause(&mut stop, LIST_LAP_REST).await {
-                return;
-            }
-            continue;
-        }
-        for (id, owner, rkey) in batch {
-            cursor = id;
-            if pause(&mut stop, LIST_EVERY).await {
-                return;
-            }
-            let Ok(did) = Did::parse(&owner) else {
-                continue;
-            };
-            let Some((description, avatar)) =
-                super::card::list_about_unbudgeted(&st, &cfg.config, &did, &rkey).await
-            else {
-                continue;
-            };
-            let stored = match st.api.pool.acquire().await {
-                Ok(mut conn) => {
-                    farsight_storage::queries::list_about_fill(
-                        &mut conn,
-                        id,
-                        description.as_deref(),
-                        avatar.as_deref(),
-                    )
-                    .await
-                }
-                Err(e) => Err(e.into()),
-            };
-            if let Err(e) = stored {
-                tracing::warn!(error = %e, "list filler: a description could not be stored");
-            }
         }
     }
 }

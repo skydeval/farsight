@@ -7,7 +7,6 @@
 //! barrier) first flushes the events before it, so gaps and the connected
 //! flag are recorded in stream order.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -606,13 +605,4 @@ impl Writer {
             }
         }
     }
-}
-
-/// Per-collection counts of a batch's writes, for logs.
-pub fn summarize(writes: &[Write]) -> BTreeMap<&'static str, usize> {
-    let mut m = BTreeMap::new();
-    for w in writes {
-        *m.entry(w.collection.nsid()).or_insert(0) += 1;
-    }
-    m
 }

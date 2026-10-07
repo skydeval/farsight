@@ -81,12 +81,9 @@ impl Kind {
     }
 }
 
-/// A stored list: the end of the day it was counted for and its `(DID,
-/// count)` rows, the largest count first.
+/// A stored list: its `(DID, count)` rows, the largest count first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
-    /// The end of the day the list was counted for.
-    pub day_end: DateTime<Utc>,
     /// `(DID, count)`.
     pub rows: Vec<(String, i64)>,
 }
@@ -220,13 +217,11 @@ pub async fn stored_day(conn: &mut PgConnection, kind: Kind) -> Result<Option<Da
 /// A stored list, if it has been computed. A row that does not parse
 /// reads as an empty list.
 pub async fn load(conn: &mut PgConnection, kind: Kind) -> Result<Option<Stored>> {
-    let row: Option<(DateTime<Utc>, String)> =
-        sqlx::query_as("SELECT computed_at, rows FROM top_lists WHERE kind = $1")
-            .bind(kind.key())
-            .fetch_optional(conn)
-            .await?;
-    Ok(row.map(|(day_end, text)| Stored {
-        day_end,
+    let row: Option<String> = sqlx::query_scalar("SELECT rows FROM top_lists WHERE kind = $1")
+        .bind(kind.key())
+        .fetch_optional(conn)
+        .await?;
+    Ok(row.map(|text| Stored {
         rows: serde_json::from_str(&text).unwrap_or_default(),
     }))
 }

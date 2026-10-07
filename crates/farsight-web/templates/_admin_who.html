@@ -1,1 +1,1 @@
-<span class="who-wrap"><a class="who" href="{{ href }}" title="{{ did }}"{% if let Some(c) = card %} data-card="{{ c }}" data-card-session{% endif %}>{% if let Some(h) = handle %}{{ h }}{% else %}<code>{{ did }}</code>{% endif %}</a></span>
+<span class="who-wrap"><a class="who" href="{{ href }}" title="{{ did }}" data-card="{{ card }}" data-card-session>{% if let Some(h) = handle %}{{ h }}{% else %}<code>{{ did }}</code>{% endif %}</a></span>

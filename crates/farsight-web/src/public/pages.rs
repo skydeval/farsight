@@ -19,8 +19,7 @@
 //! ([`crate::history`]).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use askama::Template;
 use axum::http::StatusCode;
@@ -503,7 +502,7 @@ async fn naming_total(r: &Req<'_>, subject: i64, w: &Withheld, find: Option<&Fin
 }
 
 /// Parameters for a handler that is called for its freshness only: the
-/// section's rows and cursor come from [`crate::rows`].
+/// section's rows come from [`crate::rows`].
 fn freshness_params(pairs: &[(&str, &str)]) -> Params {
     let mut p: Vec<(String, String)> = pairs
         .iter()
@@ -1442,76 +1441,6 @@ fn description_lines(s: &str) -> Vec<String> {
     lines
 }
 
-/// How long a list whose record could not be read is left alone.
-const ABOUT_RETRY: Duration = Duration::from_secs(600);
-/// Lists whose record could not be read, and when. Memory only.
-static ABOUT_FAILED: Mutex<Option<HashMap<i64, Instant>>> = Mutex::new(None);
-
-/// Whether the record of `list` may be asked for now; `failed` notes an
-/// attempt that established nothing.
-fn about_due(list: i64, failed: bool) -> bool {
-    let mut g = ABOUT_FAILED.lock().unwrap_or_else(|e| e.into_inner());
-    let map = g.get_or_insert_with(HashMap::new);
-    if failed {
-        if map.len() >= 10_000 {
-            map.clear();
-        }
-        map.insert(list, Instant::now());
-        return false;
-    }
-    match map.get(&list) {
-        Some(at) if at.elapsed() < ABOUT_RETRY => false,
-        _ => {
-            map.remove(&list);
-            true
-        }
-    }
-}
-
-/// What the list says about itself. A row older than the columns has its
-/// record read here, once, on the first view that can reach the owner's
-/// server; until then the page has no description.
-async fn list_about(
-    r: &Req<'_>,
-    owner: &Did,
-    rkey: &RecordKey,
-    info: &queries::ListInfo,
-) -> Result<queries::ListAbout, Fail> {
-    let about = {
-        let mut conn = r.st.api.pool.acquire().await?;
-        queries::list_about(&mut conn, info.id).await?
-    };
-    if about.read || info.record_state != 1 || !about_due(info.id, false) {
-        return Ok(about);
-    }
-    match card::list_about(r.st, r.config(), owner, rkey.as_str()).await {
-        Some((description, avatar_cid)) => {
-            let mut conn = r.st.api.pool.acquire().await?;
-            let stored = queries::list_about_fill(
-                &mut conn,
-                info.id,
-                description.as_deref(),
-                avatar_cid.as_deref(),
-            )
-            .await?;
-            if stored {
-                Ok(queries::ListAbout {
-                    description,
-                    avatar_cid,
-                    read: true,
-                })
-            } else {
-                // Applied from the network in the meantime: that is newer.
-                Ok(queries::list_about(&mut conn, info.id).await?)
-            }
-        }
-        None => {
-            about_due(info.id, true);
-            Ok(about)
-        }
-    }
-}
-
 /// `/list/{did}/{rkey}`.
 pub async fn list(
     r: &Req<'_>,
@@ -1545,7 +1474,10 @@ pub async fn list(
         });
     };
     let handle = page_handle(r.st, cfg, owner).await.map(|h| clean(&h));
-    let about = list_about(r, owner, rkey, &info).await?;
+    let about = {
+        let mut conn = r.st.api.pool.acquire().await?;
+        queries::list_about(&mut conn, info.id).await?
+    };
     let (_slot, _permit) = r.render_slots().await?;
     let api = &r.st.api;
 

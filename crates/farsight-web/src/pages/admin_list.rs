@@ -333,9 +333,8 @@ pub async fn lookup_list(
             facts.push(stat("Owner", owner.as_str()));
             facts.push(stat("Purpose", b["purpose"].as_str().unwrap_or("—")));
             facts.push(stat("Name", b["name"].as_str().unwrap_or("—")));
-            // What the list says about itself, as stored: read from the
-            // record when it was applied, or on the first view of the
-            // list's public page.
+            // What the list says about itself, as stored when its record
+            // was applied.
             let about = match (&info, st.api.pool.acquire().await) {
                 (Some(i), Ok(mut conn)) => farsight_storage::queries::list_about(&mut conn, i.id)
                     .await
@@ -344,15 +343,11 @@ pub async fn lookup_list(
             };
             facts.push(stat(
                 "Description",
-                match about {
-                    Some(a) if a.read => a
-                        .description
-                        .map(|d| clean(&d.replace(['\r', '\n'], " ")))
-                        .filter(|d| !d.trim().is_empty())
-                        .unwrap_or_else(|| "—".to_owned()),
-                    Some(_) => "Not read yet".to_owned(),
-                    None => "—".to_owned(),
-                },
+                about
+                    .and_then(|a| a.description)
+                    .map(|d| clean(&d.replace(['\r', '\n'], " ")))
+                    .filter(|d| !d.trim().is_empty())
+                    .unwrap_or_else(|| "—".to_owned()),
             ));
             facts.push(stat("State", b["state"].as_str().unwrap_or("—")));
             facts.push(match b["listblockCount"].as_i64() {

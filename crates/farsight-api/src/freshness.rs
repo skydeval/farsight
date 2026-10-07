@@ -327,7 +327,6 @@ mod tests {
         let s = snap(Protocol::V2, false);
         let v = View { snap: &s, lag: LAG };
         let x = ActorCoverage {
-            discovery_state: Some(3),
             discovered_witness: Some(t(900)),
             subject_block: true,
             ..ActorCoverage::default()

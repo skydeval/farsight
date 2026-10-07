@@ -282,16 +282,6 @@ async fn flush_deltas(
     Ok(report)
 }
 
-/// Sum of a stat across shards.
-pub async fn read_stat(pool: &PgPool, name: &str) -> Result<i64> {
-    let v: Option<i64> =
-        sqlx::query_scalar("SELECT sum(value)::BIGINT FROM stats_counters WHERE name = $1")
-            .bind(name)
-            .fetch_one(pool)
-            .await?;
-    Ok(v.unwrap_or(0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

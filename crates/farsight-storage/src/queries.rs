@@ -557,15 +557,12 @@ pub struct ListAbout {
     pub description: Option<String>,
     /// CID of the record's avatar blob.
     pub avatar_cid: Option<String>,
-    /// Whether the record has been read for the two fields above (false
-    /// on rows older than the columns).
-    pub read: bool,
 }
 
 /// [`ListAbout`] of the list `list_id`.
 pub async fn list_about(conn: &mut PgConnection, list_id: i64) -> Result<ListAbout> {
-    let row: Option<(Option<String>, Option<String>, bool)> =
-        sqlx::query_as("SELECT description, avatar_cid, about_read FROM lists WHERE id = $1")
+    let row: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT description, avatar_cid FROM lists WHERE id = $1")
             .bind(list_id)
             .fetch_optional(conn)
             .await?;
@@ -573,59 +570,8 @@ pub async fn list_about(conn: &mut PgConnection, list_id: i64) -> Result<ListAbo
         .map(|r| ListAbout {
             description: r.0,
             avatar_cid: r.1,
-            read: r.2,
         })
         .unwrap_or_default())
-}
-
-/// Present lists whose record has not been read for its description,
-/// after `after` in id order: `(id, owner DID, rkey)`.
-pub async fn lists_unread(
-    conn: &mut PgConnection,
-    after: i64,
-    limit: i64,
-) -> Result<Vec<(i64, String, String)>> {
-    Ok(sqlx::query_as(
-        "SELECT l.id, o.did, l.rkey FROM lists l JOIN actors o ON o.id = l.owner_id
-         WHERE l.id > $1 AND l.record_state = 1 AND NOT l.about_read
-         ORDER BY l.id LIMIT $2",
-    )
-    .bind(after)
-    .bind(limit)
-    .fetch_all(conn)
-    .await?)
-}
-
-/// Present lists: how many have not been read for their description, and
-/// how many there are.
-pub async fn lists_unread_count(conn: &mut PgConnection) -> Result<(i64, i64)> {
-    Ok(sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE NOT about_read), count(*) FROM lists
-         WHERE record_state = 1",
-    )
-    .fetch_one(conn)
-    .await?)
-}
-
-/// Stores what a list's record says about itself, read for a row older
-/// than the columns. Only a present record that has not been read is
-/// written: a record applied in the meantime is newer than this read.
-pub async fn list_about_fill(
-    conn: &mut PgConnection,
-    list_id: i64,
-    description: Option<&str>,
-    avatar_cid: Option<&str>,
-) -> Result<bool> {
-    let done = sqlx::query(
-        "UPDATE lists SET description = $2, avatar_cid = $3, about_read = true
-         WHERE id = $1 AND NOT about_read AND record_state = 1",
-    )
-    .bind(list_id)
-    .bind(description)
-    .bind(avatar_cid)
-    .execute(conn)
-    .await?;
-    Ok(done.rows_affected() == 1)
 }
 
 /// One list member (`getListMembers`).
@@ -815,8 +761,6 @@ pub async fn check_rows(conn: &mut PgConnection, x: i64, others: &[i64]) -> Resu
 /// Per-actor coverage inputs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActorCoverage {
-    /// `discovery_state.state` code.
-    pub discovery_state: Option<i16>,
     /// `discovered_witness`: the discovery coverage point `D`.
     pub discovered_witness: Option<DateTime<Utc>>,
     /// The last discovery was truncated.
@@ -832,7 +776,6 @@ pub struct ActorCoverage {
 /// Reads [`ActorCoverage`] for one actor.
 pub async fn actor_coverage(conn: &mut PgConnection, actor_id: i64) -> Result<ActorCoverage> {
     type Row = (
-        Option<i16>,
         Option<DateTime<Utc>>,
         Option<bool>,
         bool,
@@ -840,7 +783,7 @@ pub async fn actor_coverage(conn: &mut PgConnection, actor_id: i64) -> Result<Ac
         Option<DateTime<Utc>>,
     );
     let r: Row = sqlx::query_as(
-        "SELECT d.state, d.discovered_witness, d.truncated,
+        "SELECT d.discovered_witness, d.truncated,
                 EXISTS (SELECT 1 FROM subject_coverage c WHERE c.actor_id = $1 AND c.scope = 1),
                 EXISTS (SELECT 1 FROM subject_coverage c WHERE c.actor_id = $1 AND c.scope = 2),
                 (SELECT s.clean_witness FROM backfill_state s WHERE s.actor_id = $1)
@@ -851,12 +794,11 @@ pub async fn actor_coverage(conn: &mut PgConnection, actor_id: i64) -> Result<Ac
     .fetch_one(conn)
     .await?;
     Ok(ActorCoverage {
-        discovery_state: r.0,
-        discovered_witness: r.1,
-        truncated: r.2.unwrap_or(false),
-        subject_block: r.3,
-        subject_list_chain: r.4,
-        clean_witness: r.5,
+        discovered_witness: r.0,
+        truncated: r.1.unwrap_or(false),
+        subject_block: r.2,
+        subject_list_chain: r.3,
+        clean_witness: r.4,
     })
 }
 
@@ -989,20 +931,6 @@ pub async fn lists_by_state(conn: &mut PgConnection) -> Result<Vec<(TrackState, 
         .into_iter()
         .filter_map(|(s, n)| TrackState::from_code(s).map(|s| (s, n)))
         .collect())
-}
-
-/// The oldest pending lists (dashboard): (owner DID, rkey, admitted_at).
-pub async fn oldest_pending(
-    conn: &mut PgConnection,
-    limit: i64,
-) -> Result<Vec<(String, String, Option<DateTime<Utc>>)>> {
-    Ok(sqlx::query_as(
-        "SELECT o.did, l.rkey, l.admitted_at FROM lists l JOIN actors o ON o.id = l.owner_id
-         WHERE l.track_state = 1 ORDER BY l.admitted_at NULLS LAST, l.id LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(conn)
-    .await?)
 }
 
 /// Recent `op_errors` rows: (id, at, component, did, host, message).

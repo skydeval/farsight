@@ -267,8 +267,6 @@ pub struct Pager {
     pub section: &'static str,
     /// What the section lists, for the label.
     pub label: &'static str,
-    /// The current page.
-    pub current: i64,
     /// The numbers and gaps.
     pub controls: Vec<Control>,
     /// The previous page, on every page but the first.
@@ -308,7 +306,6 @@ impl Pager {
         Pager {
             section,
             label,
-            current,
             controls: items
                 .into_iter()
                 .map(|i| match i {
@@ -333,11 +330,6 @@ impl Pager {
             next: (more || (!open && current < last)).then(|| to(current + 1)),
             open,
         }
-    }
-
-    /// Whether there is anything to turn: more than the one page.
-    pub fn shown(&self) -> bool {
-        self.prev.is_some() || self.next.is_some()
     }
 }
 
@@ -439,7 +431,6 @@ mod tests {
         let c = |s: &str| canonical(&Params::parse(s), &keys, &tabs);
         assert_eq!(c("lists=3&utm=x"), None);
         assert_eq!(c("page=1&lists=3").as_deref(), Some("lists=3"));
-        assert_eq!(c("bc=abc"), None);
         // The tab: kept when it names another table, dropped when it
         // names the first or none.
         assert_eq!(c("tab=lists&lists=2"), None);
@@ -525,11 +516,11 @@ mod tests {
         };
         let first = p(1, Total::Rows(120), true);
         assert!(first.prev.is_none() && first.next.as_deref() == Some("/b?page=2"));
-        assert!(first.shown());
         let last = p(3, Total::Rows(120), false);
         assert!(last.prev.as_deref() == Some("/b?page=2") && last.next.is_none());
         assert_eq!(p(2, Total::Rows(120), true).prev.as_deref(), Some("/b"));
-        assert!(!p(1, Total::Rows(50), false).shown());
+        let one = p(1, Total::Rows(50), false);
+        assert!(one.prev.is_none() && one.next.is_none());
         // Open-ended: next for as long as rows follow.
         assert!(p(30, Total::MoreThan(1_000), true).next.is_some());
         assert!(p(30, Total::MoreThan(1_000), false).next.is_none());

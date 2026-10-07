@@ -6,7 +6,7 @@
 //!
 //! For the accounts a probe names it also stands in for their own server:
 //! their audit log names it as the PDS, and it answers `getRecord` for
-//! the list and profile records it was given (an error for any other).
+//! the profile records it was given (an error for any other).
 //!
 //! It listens on a TEST-NET-2 address (a bridge the harness creates), an
 //! address the safe outbound client treats as public, so no rule of that
@@ -28,8 +28,6 @@ struct Inner {
     audits: HashMap<String, u32>,
     /// Accounts whose audit log names this stand-in as their PDS.
     hosted: Vec<String>,
-    /// List records by (owner, rkey).
-    lists: HashMap<(String, String), serde_json::Value>,
     /// Profile records by account.
     profiles: HashMap<String, serde_json::Value>,
     /// Accounts whose audit log has a history: the handle they claim now.
@@ -85,12 +83,6 @@ impl Plc {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.claims.insert(did.to_owned(), handle.to_owned());
         g.hosted.push(did.to_owned());
-    }
-
-    /// The list record `getRecord` answers with for `did`/`rkey`.
-    pub fn set_list(&self, did: &str, rkey: &str, value: serde_json::Value) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.lists.insert((did.to_owned(), rkey.to_owned()), value);
     }
 
     /// The profile record `getRecord` answers with for `did`.
@@ -185,7 +177,6 @@ async fn record(State(p): State<Arc<Plc>>, Query(q): Query<HashMap<String, Strin
         let mut g = p.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.records += 1;
         match collection.as_str() {
-            "app.bsky.graph.list" => g.lists.get(&(repo.clone(), rkey.clone())).cloned(),
             "app.bsky.actor.profile" if rkey == "self" => g.profiles.get(&repo).cloned(),
             _ => None,
         }

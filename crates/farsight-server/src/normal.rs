@@ -313,10 +313,6 @@ pub async fn run(
         web.clone(),
         stop_rx.clone(),
     ));
-    let list_filler = tokio::spawn(farsight_web::public::pass::run_lists(
-        web.clone(),
-        stop_rx.clone(),
-    ));
     let top_lists = tokio::spawn(farsight_web::public::top::run(web.clone(), stop_rx.clone()));
     let index_builder = tokio::spawn(
         sort_indexes::Builder {
@@ -356,7 +352,6 @@ pub async fn run(
     housekeeping.abort();
     warming.abort();
     pass.abort();
-    list_filler.abort();
     top_lists.abort();
     // An interrupted build leaves an invalid index; the next start drops
     // it and builds again.

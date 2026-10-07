@@ -25,9 +25,13 @@ commits it covers.
   parameters. A config file with one of these keys does not load.
 - The dashboard's "Oldest pending lists" block. The number of pending
   lists is still under Exceptions.
-
-### Fixed
-
+- Code that only a database from before any release could reach: the
+  background read of list descriptions for lists stored without one
+  (and the "List descriptions" line under "Catching up"), and the
+  wording for rows without a "first seen" time.
+- Unused code: cursor paging of the row tables, which all turn by page
+  number, history queries no page showed, and style rules and script
+  functions no page used.
 - The admin DID lookup no longer times out on an account that is on
   hundreds of lists. Its "Incoming listblocks" table read every
   listblock's author before cutting a page; it now cuts the page first.

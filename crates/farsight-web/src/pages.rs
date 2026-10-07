@@ -528,14 +528,14 @@ fn long_secs(s: i64) -> String {
 }
 
 /// One line of the dashboard's "Catching up": the share done of `total`
-/// and, when a rate is known, the time the rest takes.
-fn catching_line(done: i64, total: i64, what: &str, left_secs: Option<i64>) -> String {
+/// and the time the rest takes.
+fn catching_line(done: i64, total: i64, what: &str, left_secs: i64) -> String {
     // Never "100.0%" while something is left.
     let share = (done.max(0) as f64 / total.max(1) as f64 * 100.0).min(99.9);
-    match left_secs {
-        Some(s) => format!("{share:.1}% {what}, about {} left", long_secs(s.max(0))),
-        None => format!("{share:.1}% {what}"),
-    }
+    format!(
+        "{share:.1}% {what}, about {} left",
+        long_secs(left_secs.max(0))
+    )
 }
 
 /// The handle pass's line: none while it is off, before its first step
@@ -550,18 +550,8 @@ fn handles_line(rps: u32, cursor: i64, last: i64, laps: u64) -> Option<String> {
         cursor,
         last,
         "of accounts checked",
-        Some((last - cursor) / i64::from(rps)),
+        (last - cursor) / i64::from(rps),
     ))
-}
-
-/// The list filler's line (one list a second while the pass is on): none
-/// once every list is read or a round has ended, after which only lists
-/// whose owner's server does not answer are left.
-fn lists_line(rps: u32, unread: i64, total: i64, rounds: u64) -> Option<String> {
-    if rps == 0 || rounds > 0 || unread <= 0 {
-        return None;
-    }
-    Some(catching_line(total - unread, total, "read", Some(unread)))
 }
 
 /// A count for an admin page, with thousands separators.
@@ -743,15 +733,6 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, String> {
     ) {
         d.catching.push(stat("Handles", line));
     }
-    let rounds = at.list_rounds.load(Ordering::Relaxed);
-    if rps > 0 && rounds == 0 {
-        let (unread, total) = farsight_storage::queries::lists_unread_count(&mut conn)
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Some(line) = lists_line(rps, unread, total, rounds) {
-            d.catching.push(stat("List descriptions", line));
-        }
-    }
     for (s, n) in farsight_storage::queries::lists_by_state(&mut conn)
         .await
         .map_err(|e| e.to_string())?
@@ -925,13 +906,13 @@ fn sort_warning(st: &WebState, d: &mut DashboardData) {
     let text = match st.status.get().sort_held_bytes {
         Some(need) => format!(
             "Sorting by creation time: {ready} of 4 indexes ready; the rest are not built, the \
-             storage budget has no room (needs ~{}). Tables without their index keep their \
-             previous order. Raise storage.budget_bytes after adding disk.",
+             storage budget has no room (needs ~{}). A table without its index lists its \
+             rows by account, not by creation time. Raise storage.budget_bytes after adding disk.",
             common::human_bytes(need)
         ),
         None => format!(
             "Sorting by creation time: {ready} of 4 indexes ready. They build in the \
-             background; a table keeps its previous order until its index is ready."
+             background; until its index is ready a table lists its rows by account."
         ),
     };
     d.warnings.push(Warning { class: "", text });
@@ -1562,13 +1543,13 @@ async fn settings_save(
     render_private(&page)
 }
 
-fn set_auth(t: &mut toml::Table, key: &str, value: String) -> Result<(), String> {
+fn set_admin_token(t: &mut toml::Table, hash: String) -> Result<(), String> {
     let auth = t
         .entry("auth")
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
         .ok_or("`auth` is not a table")?;
-    auth.insert(key.into(), toml::Value::String(value));
+    auth.insert("admin_token_sha256".into(), toml::Value::String(hash));
     Ok(())
 }
 
@@ -1587,12 +1568,7 @@ async fn settings_token(
     let token = farsight_api::auth::generate(farsight_api::auth::ADMIN_PREFIX);
     let hash = farsight_api::auth::hex(&farsight_api::auth::sha256(&token));
     let mut page = settings_base(&st, &s);
-    if let Err(e) = st
-        .api
-        .config
-        .edit(|t| set_auth(t, "admin_token_sha256", hash))
-        .await
-    {
+    if let Err(e) = st.api.config.edit(|t| set_admin_token(t, hash)).await {
         page.error = Some(e.to_string());
         return render_private(&page);
     }
@@ -1779,17 +1755,10 @@ mod tests {
         assert_eq!(handles_line(10, 0, 0, 0), None);
         assert_eq!(handles_line(10, 10, 10, 0), None);
         assert_eq!(handles_line(10, 5, 10, 1), None);
-        assert_eq!(
-            lists_line(10, 7_200, 10_000, 0).as_deref(),
-            Some("28.0% read, about 2 hours left")
-        );
-        assert_eq!(lists_line(10, 0, 10_000, 0), None);
-        assert_eq!(lists_line(10, 3, 10_000, 1), None);
-        assert_eq!(lists_line(0, 3, 10_000, 0), None);
         // Something left is never shown as all done.
         assert_eq!(
-            lists_line(10, 1, 1_000_000, 0).as_deref(),
-            Some("99.9% read, about 1 minute left")
+            handles_line(10, 9_999_999, 10_000_000, 0).as_deref(),
+            Some("99.9% of accounts checked, about 1 minute left")
         );
     }
 

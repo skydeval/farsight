@@ -131,17 +131,11 @@ pub async fn touch_tokens<'e>(ex: impl PgExecutor<'e>, ids: &[i32]) -> Result<()
     Ok(())
 }
 
-/// One admin session row.
+/// A live admin session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminSession {
-    /// SHA-256 of the session id (the cookie value).
-    pub id_sha256: Vec<u8>,
     /// Per-session CSRF token.
     pub csrf: Vec<u8>,
-    /// Login time (absolute expiry base).
-    pub created_at: DateTime<Utc>,
-    /// Last request (idle expiry base).
-    pub last_seen: DateTime<Utc>,
 }
 
 /// Creates a session.
@@ -174,9 +168,8 @@ pub async fn touch_session(
     idle: std::time::Duration,
     absolute: std::time::Duration,
 ) -> Result<Option<AdminSession>> {
-    type Row = (Vec<u8>, Vec<u8>, DateTime<Utc>, DateTime<Utc>, bool);
-    let row: Option<Row> = sqlx::query_as(
-        "SELECT id_sha256, csrf, created_at, last_seen,
+    let row: Option<(Vec<u8>, bool)> = sqlx::query_as(
+        "SELECT csrf,
                 (last_seen < now() - make_interval(secs => $2)
                  OR created_at < now() - make_interval(secs => $3))
          FROM admin_sessions WHERE id_sha256 = $1",
@@ -186,23 +179,18 @@ pub async fn touch_session(
     .bind(absolute.as_secs_f64())
     .fetch_optional(pool)
     .await?;
-    let Some((id, csrf, created_at, last_seen, expired)) = row else {
+    let Some((csrf, expired)) = row else {
         return Ok(None);
     };
     if expired {
-        delete_session(pool, &id).await?;
+        delete_session(pool, id_sha256).await?;
         return Ok(None);
     }
     sqlx::query("UPDATE admin_sessions SET last_seen = now() WHERE id_sha256 = $1")
-        .bind(&id)
+        .bind(id_sha256)
         .execute(pool)
         .await?;
-    Ok(Some(AdminSession {
-        id_sha256: id,
-        csrf,
-        created_at,
-        last_seen,
-    }))
+    Ok(Some(AdminSession { csrf }))
 }
 
 /// Ends one session (logout).

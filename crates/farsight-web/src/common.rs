@@ -129,9 +129,8 @@ pub async fn public_css() -> Response {
     asset(crate::public::PUBLIC_CSS, "text/css; charset=utf-8")
 }
 
-/// `GET /static/public.js`: the script of the public and the admin pages.
-/// It does nothing where its elements are absent and names no admin
-/// path.
+/// `GET /static/public.js`: the script of the public pages. It names no
+/// admin path.
 pub async fn js() -> Response {
     asset(crate::public::PUBLIC_JS, "text/javascript; charset=utf-8")
 }
@@ -182,12 +181,11 @@ pub fn redirect(path: &str) -> Response {
     r
 }
 
-/// A permanent redirect to another path on this host. `to` is built by
-/// the caller from a fixed prefix and re-encoded path parameters — never
-/// from the request's raw path, which could name another host
-/// (`//host/…`). The request's query is carried over. A target that is
-/// not a path on this host, or not a valid header value, is answered with
-/// [`not_found`].
+/// A permanent redirect to another path on this host, with `query` as
+/// its query string. `to` is built by the caller from re-encoded path
+/// parameters — never from the request's raw path, which could name
+/// another host (`//host/…`). A target that is not a path on this host,
+/// or not a valid header value, is answered with [`not_found`].
 pub fn moved(to: &str, query: Option<&str>) -> Response {
     if !to.starts_with('/') || to.starts_with("//") || to.contains('\\') {
         return not_found();
@@ -445,9 +443,12 @@ mod tests {
 
     #[test]
     fn moved_stays_on_this_host() {
-        let r = moved("/did/did:plc:abc", Some("bc=x&nc=y"));
+        let r = moved("/did/did:plc:abc", Some("tab=lists&lists=2"));
         assert_eq!(r.status(), StatusCode::MOVED_PERMANENTLY);
-        assert_eq!(r.headers()[header::LOCATION], "/did/did:plc:abc?bc=x&nc=y");
+        assert_eq!(
+            r.headers()[header::LOCATION],
+            "/did/did:plc:abc?tab=lists&lists=2"
+        );
         assert_eq!(r.headers()[header::CACHE_CONTROL], "public, max-age=3600");
         assert_eq!(moved("/", None).headers()[header::LOCATION], "/");
         assert_eq!(

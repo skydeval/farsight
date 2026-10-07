@@ -1,8 +1,7 @@
-// Farsight UI: the theme toggle, times in the visitor's timezone, profile
-// cards and the "/" search shortcut. Nothing here is needed
-// to read a page: without it the times stay in UTC, the links work and
-// there are no cards. The admin pages load the same file; it does nothing
-// where its elements are absent.
+// Farsight public UI script: the theme toggle, times in the visitor's
+// timezone, profile cards and the "/" search shortcut. Nothing here is
+// needed to read a page: without it the times stay in UTC, the links work
+// and there are no cards. The admin pages have a script of their own.
 (function () {
   "use strict";
   var root = document.documentElement;
@@ -53,8 +52,7 @@
     }
   }
 
-  // The public pages carry one toggle; an admin page carries one in its
-  // header. Every toggle on the page shows the same choice.
+  // Every toggle on the page shows the same choice.
   function themeToggle() {
     var boxes = document.querySelectorAll(".theme-toggle");
     if (!boxes.length) {
@@ -302,10 +300,8 @@
       placeholder(card, did, "Profile not available.");
     };
     // A public card is the same for every caller and is requested without
-    // cookies. A link that says so asks with the session cookie: the page
-    // that carries it was rendered for a signed-in admin.
-    var session = link.hasAttribute("data-card-session");
-    fetch(link.getAttribute("data-card"), { credentials: session ? "same-origin" : "omit" })
+    // cookies.
+    fetch(link.getAttribute("data-card"), { credentials: "omit" })
       .then(function (r) {
         // Only the card itself is shown. Anything else — a refusal, or an
         // answer reached through a redirect, which would be some other

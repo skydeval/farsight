@@ -8,9 +8,11 @@
 //! the same path, so an unknown key is an error rather than silently
 //! ignored.
 //!
-//! Every key has a default except those that differ per deployment
-//! (`hostname`, `database_url`, the `auth` hashes): these are required;
-//! see [`REQUIRED_KEYS`]. A fresh install trusts no proxy until the
+//! Every key has a default except those that differ per deployment:
+//! `server.hostname`, `server.contact`, `storage.database_url` and
+//! `auth.admin_token_sha256` are required. `access.admin_did` is not: a
+//! value used only at sign-in never stops the process. A fresh install
+//! trusts no proxy until the
 //! operator says so: the `[proxy]` defaults are `mode = "none"`,
 //! `trusted = []`.
 
@@ -31,15 +33,6 @@ pub const ENV_PREFIX: &str = "FARSIGHT__";
 /// `FARSIGHT_SKIP_WIZARD`: build config from the environment when no file
 /// exists, never entering setup mode.
 pub const SKIP_WIZARD_ENV: &str = "FARSIGHT_SKIP_WIZARD";
-
-/// Keys with no usable default. `access.admin_did` is not among them: a
-/// value used only at sign-in never stops the process.
-pub const REQUIRED_KEYS: [&str; 4] = [
-    "server.hostname",
-    "server.contact",
-    "storage.database_url",
-    "auth.admin_token_sha256",
-];
 
 /// Configuration errors. Any of these makes the process exit non-zero
 /// (an invalid config never enters setup mode and is never rewritten).
@@ -508,7 +501,8 @@ pub const MAX_PUBLIC_CONTACT: usize = 200;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PublicUiConfig {
-    /// Plain text shown on `/public`; empty = the default text.
+    /// Plain text shown on the public home page; empty = the default
+    /// text.
     pub instance_description: String,
     /// Contact shown on public pages; empty = `server.contact`.
     pub contact: String,
@@ -953,15 +947,6 @@ impl LoadedConfig {
     }
 }
 
-/// Where a config is coming from; determines which checks apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigSource {
-    /// `config.toml` (plus env overrides).
-    File,
-    /// `FARSIGHT_SKIP_WIZARD=1` with no file.
-    EnvOnly,
-}
-
 /// Decides the start mode from the config path and the environment.
 pub fn load(path: &Path, env: &[(String, String)]) -> Result<StartMode, ConfigError> {
     if path.exists() {
@@ -996,17 +981,12 @@ pub fn load_from_parts(
     let config: Config = toml::Value::Table(table)
         .try_into()
         .map_err(|e: toml::de::Error| ConfigError::Schema(e.to_string()))?;
-    let source = if file.is_some() {
-        ConfigSource::File
-    } else {
-        ConfigSource::EnvOnly
-    };
     let warnings = config.validate()?;
     let mut loaded = LoadedConfig {
         config,
         env_keys,
         warnings,
-        from_env_only: source == ConfigSource::EnvOnly,
+        from_env_only: file.is_none(),
     };
     if loaded.admin_auth() == AdminAuth::Unconfigured {
         loaded.warnings.push(UNCONFIGURED_WARNING.to_owned());
@@ -1584,22 +1564,10 @@ gap_threshold = "300s"
         assert!(matches!(e, ConfigError::Schema(_)));
         let e = load_from_parts(Some("[nope]\n"), &[]).unwrap_err();
         assert!(matches!(e, ConfigError::Schema(_)));
-        for (text, key) in [
-            ("[access]\nui = \"disabled\"\n", "ui"),
-            ("[public_ui]\nshow_history = true\n", "show_history"),
-            (
-                "[auth]\nadmin_password_bcrypt = \"x\"\n",
-                "admin_password_bcrypt",
-            ),
-            (
-                "[rate_limit]\nbcrypt_concurrency = 2\n",
-                "bcrypt_concurrency",
-            ),
-        ] {
-            let e = load_from_parts(Some(text), &[]).unwrap_err();
-            assert!(matches!(e, ConfigError::Schema(_)), "{key}");
-            assert!(e.to_string().contains(&format!("`{key}`")), "{key}: {e}");
-        }
+        // The message names the key.
+        let e = load_from_parts(Some("[public_ui]\nshow_everything = true\n"), &[]).unwrap_err();
+        assert!(matches!(e, ConfigError::Schema(_)));
+        assert!(e.to_string().contains("`show_everything`"), "{e}");
     }
 
     #[test]
@@ -1658,9 +1626,7 @@ gap_threshold = "300s"
             ("FARSIGHT__BACKFILL__NOPE", "1"),
             ("FARSIGHT__BACKFILL__SWEEP", "1"),
             ("FARSIGHT____X", "1"),
-            ("FARSIGHT__ACCESS__UI", "disabled"),
-            ("FARSIGHT__PUBLIC_UI__SHOW_HISTORY", "false"),
-            ("FARSIGHT__AUTH__ADMIN_PASSWORD_BCRYPT", "x"),
+            ("FARSIGHT__ACCESS__NOPE", "disabled"),
         ] {
             assert!(matches!(
                 load_from_parts(Some(&text), &env(&[(k, v)])),
@@ -1818,8 +1784,8 @@ gap_threshold = "300s"
         assert!(c.validate().is_ok());
         let mut c = complete();
         c.public_ui.query_concurrency = c.rate_limit.query_concurrency + 1;
-        // Not a load failure while the public UI is off: an older config
-        // with a lowered global bound keeps loading.
+        // Not a load failure while the public UI is off: a config that
+        // lowers the global bound and does not use the public UI loads.
         assert!(c.validate().is_ok());
         c.access.public_ui = true;
         assert!(c.validate().is_err());

@@ -957,19 +957,6 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
         path_did(&w.s),
         w.list.clone(),
         format!("/card/{}", w.s),
-        // Paths under a prefix are unknown paths.
-        "/public".to_owned(),
-        "/public/about".to_owned(),
-        "/public/search?q=x.example".to_owned(),
-        format!("/public{}", path_did(&w.s)),
-        format!("/public{}/history", path_did(&w.s)),
-        format!("/public{}", w.list),
-        format!("/public{}/history", w.list),
-        format!("/public/card/{}", w.s),
-        "/public/static/public.css".to_owned(),
-        "/public/static/public.js".to_owned(),
-        "/public/static/og-default.png".to_owned(),
-        "/public/anything/else".to_owned(),
     ] {
         let r = h.get(&p).await?;
         let ok = r.status == 404
@@ -982,7 +969,7 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
         }
     }
     c.check(
-        "public_ui = false ⇒ every public route, the card route included, and every path under /public answers 404, byte-identical to an unknown route",
+        "public_ui = false ⇒ every public route, the card route included, answers 404, byte-identical to an unknown route",
         same && unknown.status == 404,
         if detail.is_empty() {
             unknown.short()
@@ -1211,16 +1198,9 @@ fn check_validation(c: &mut Checks, dsn: &str) -> Result<(), String> {
 }
 
 /// Once the public UI is on and the Public UI settings have been saved
-/// once: history has no public path, and the file holds the form's keys.
-async fn check_first_save(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
+/// once: the file holds the form's keys.
+async fn check_first_save(c: &mut Checks, h: &H) -> Result<(), String> {
     c.section("1b. after the first save of the Public UI settings");
-    let hist = h.get(&format!("{}/history", path_did(&w.s))).await?;
-    let old_hist = h.get(&format!("/public{}/history", path_did(&w.s))).await?;
-    c.check(
-        "there is no public history path with the public UI on — 404 under the account's page and under /public",
-        hist.status == 404 && old_hist.status == 404,
-        format!("{} / {}", hist.short(), old_hist.short()),
-    );
     let file = h.config_text()?;
     c.check(
         "the first save of the Public UI settings wrote the form's keys to config.toml, those the file did not have included",
@@ -1354,12 +1334,11 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
     c.section("2a. the admin sign-in is at /enter");
     let enter = h.get("/enter").await?;
     c.check(
-        "/enter serves the admin sign-in form, posting to /enter, with no password field, never cached",
+        "/enter serves the admin sign-in form, posting to /enter, never cached",
         enter.status == 200
-            && enter
-                .text
-                .contains("<form class=\"stack card enter-card\" method=\"post\" action=\"/enter\"")
-            && !enter.text.contains("type=\"password\"")
+            && enter.text.contains(
+                "<form class=\"stack card enter-card\" method=\"post\" action=\"/enter\"",
+            )
             && enter.header("cache-control").as_deref() == Some("no-store, private"),
         enter.short(),
     );
@@ -1434,23 +1413,14 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
         png.header("content-type").as_deref() == Some("image/png") && png.text.contains("PNG"),
         png.header("content-type").unwrap_or_default(),
     );
-    // A page has one address: nothing answers under /public.
     let unknown = h.get("/no-such-route").await?;
     let mut bad = Vec::new();
     for p in [
         "/about".to_owned(),
         "/nonsense".to_owned(),
-        "/public".to_owned(),
-        "/public/search?q=x.example".to_owned(),
-        format!("/public{}", path_did(&w.s)),
-        format!("/public{}/history", path_did(&w.s)),
-        format!("/public{}", w.list),
-        format!("/public/card/{}", w.s),
-        "/public/about".to_owned(),
-        "/public/static/public.css".to_owned(),
-        "/public/nothing/here".to_owned(),
-        format!("{}/history", path_did(&w.s)),
-        format!("{}/history", w.list),
+        "/static/nothing.css".to_owned(),
+        format!("{}/more", path_did(&w.s)),
+        format!("{}/more", w.list),
     ] {
         let r = h.get(&p).await?;
         if r.status != 404
@@ -1462,7 +1432,7 @@ async fn check_routes(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
         }
     }
     c.check(
-        "an unknown path — /about, anything under /public, a history path under an account or list page — is the bare 404 with the public UI on, not a redirect and not the public not-found page",
+        "an unknown path — /about, a static file that does not exist, a path below an account or list page — is the bare 404 with the public UI on, not a redirect and not the public not-found page",
         bad.is_empty() && unknown.status == 404 && unknown.text == "not found",
         bad.join("; "),
     );
@@ -2246,9 +2216,8 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
         format!("leaked {leaked:?}"),
     );
     c.check(
-        "live-row mark, NULL first_seen wording and cause wording, with the uncertainty of a reconcile",
+        "live-row mark and cause wording, with the uncertainty of a reconcile",
         sec.contains("blocks this account again")
-            && sec.contains("before this instance kept dates")
             && sec.contains("Block deleted.")
             && sec.contains("Found missing when the author&#x27;s records were re-read. Removed some time between &#x27;last seen&#x27; and this time."),
         "marks present",
@@ -2282,8 +2251,7 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
                 .text
                 .contains("href=\"/admin/lookup/list?q=at%3A%2F%2F")
             && !page.text.contains("href=\"/did/")
-            && !page.text.contains("href=\"/list/")
-            && !page.text.contains("href=\"/public"),
+            && !page.text.contains("href=\"/list/"),
         "lookup links",
     );
 
@@ -2382,38 +2350,6 @@ async fn check_admin_history(c: &mut Checks, h: &H, w: &World) -> Result<(), Str
             "{} / {}; without a session {} / {}",
             with.status, lwith.status, without.status, lwithout.status
         ),
-    );
-
-    // The storage queries directly: the two no page uses, too.
-    let mut conn = h.pool.acquire().await.map_err(|e| e.to_string())?;
-    let mut all = Vec::new();
-    let mut after = None;
-    loop {
-        let rows = farsight_storage::public::blocks_history_by_author(
-            &mut conn,
-            sid,
-            farsight_storage::public::HistoryArgs {
-                excluded: &[],
-                horizon: None,
-                after,
-                limit: 7,
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        after = farsight_storage::public::next_cursor(&rows, 7);
-        all.extend(rows.into_iter().map(|r| r.id));
-        if after.is_none() {
-            break;
-        }
-    }
-    let stored = h.n(&format!("SELECT count(*) FROM blocks_history hh JOIN actors a ON a.id = hh.subject_id WHERE hh.author_id = {sid} AND a.status NOT IN (1,2,3,4)")).await?;
-    c.check(
-        "the by-author history query (not shown by any page) still pages",
-        all.len() as i64 == stored
-            && stored == 20
-            && all.iter().collect::<BTreeSet<_>>().len() == 20,
-        format!("{} by-author block rows", all.len()),
     );
     Ok(())
 }
@@ -2768,7 +2704,7 @@ async fn check_cache_and_headers(c: &mut Checks, h: &H, w: &World) -> Result<(),
         }
     }
     c.check(
-        "Cache-Control per class (home 60, data pages 30, search, errors, removed paths and incomplete cards no-store, robots 300); CSP, nosniff and Referrer-Policy on every response; no cookie, CORS or RateLimit header",
+        "Cache-Control per class (home 60, data pages 30, search, errors and incomplete cards no-store, robots 300); CSP, nosniff and Referrer-Policy on every response; no cookie, CORS or RateLimit header",
         bad.is_empty(),
         bad.join("; "),
     );
@@ -4263,7 +4199,7 @@ async fn phase_ui(
     check_gates_off(c, &h, &w).await?;
     check_validation(c, &pg.url("stage6_ui"))?;
     check_enable_flow(c, &mut h, &w).await?;
-    check_first_save(c, &h, &w).await?;
+    check_first_save(c, &h).await?;
     check_settings_refusals(c, &mut h).await?;
     check_login_route(c, &h).await?;
     check_routes(c, &h, &w).await?;

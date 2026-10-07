@@ -1,10 +1,9 @@
-// Farsight admin UI script. It began as a copy of public.js and is the
-// admin pages' own from here on: the two change separately.
-// Farsight UI: the theme toggle, times in the visitor's timezone, profile
-// cards and the "/" search shortcut. Nothing here is needed
+// Farsight admin UI script: the theme toggle, times in the viewer's
+// timezone, profile cards, and the tabs, page controls and filter boxes of
+// the lookup pages. It is the admin pages' own: the public pages' script
+// is a separate file and the two change separately. Nothing here is needed
 // to read a page: without it the times stay in UTC, the links work and
-// there are no cards. The admin pages load the same file; it does nothing
-// where its elements are absent.
+// there are no cards.
 (function () {
   "use strict";
   var root = document.documentElement;
@@ -31,18 +30,12 @@
     }
   }
 
-  // The visitor's choice, or the operator's default the server wrote.
+  // The viewer's choice, or the system's.
   function current() {
-    var s = stored();
-    if (s) {
-      return s;
-    }
-    var d = root.getAttribute("data-theme-default");
-    return d === "light" || d === "dark" ? d : "system";
+    return stored() || "system";
   }
 
-  // Runs before the page paints: a stored choice overrides the default
-  // in <html data-theme>, and a stored "system" removes it.
+  // Runs before the page paints.
   var chosen = stored();
   if (chosen) {
     apply(chosen);
@@ -55,8 +48,7 @@
     }
   }
 
-  // The public pages carry one toggle; an admin page carries one in its
-  // header. Every toggle on the page shows the same choice.
+  // Every toggle on the page shows the same choice.
   function themeToggle() {
     var boxes = document.querySelectorAll(".theme-toggle");
     if (!boxes.length) {
@@ -312,9 +304,8 @@
     var failed = function () {
       placeholder(card, did, "Profile not available.");
     };
-    // A public card is the same for every caller and is requested without
-    // cookies. A link that says so asks with the session cookie: the page
-    // that carries it was rendered for a signed-in admin.
+    // A link marked data-card-session asks with the session cookie: the
+    // page that carries it was rendered for a signed-in admin.
     var session = link.hasAttribute("data-card-session");
     fetch(link.getAttribute("data-card"), { credentials: session ? "same-origin" : "omit" })
       .then(function (r) {
@@ -426,27 +417,11 @@
     });
   }
 
-  // ---- Micro-interactions: '/' key to focus search --------------------
+  // ---- Escape leaves the field that has the keyboard --------------------
 
   function shortcuts() {
     document.addEventListener("keydown", function (event) {
-      if (event.key === "/" && !event.ctrlKey && !event.metaKey && !event.altKey) {
-        var active = document.activeElement;
-        var isInput = active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable);
-        if (!isInput) {
-          // The page's own search box where it has one, else the bar's.
-          var searchInput =
-            document.querySelector("form.home-search input") ||
-            document.querySelector("nav.public-nav form.search input");
-          if (searchInput) {
-            event.preventDefault();
-            searchInput.focus();
-            if (searchInput.select) {
-              searchInput.select();
-            }
-          }
-        }
-      } else if (event.key === "Escape" || event.key === "Esc") {
+      if (event.key === "Escape" || event.key === "Esc") {
         var activeInput = document.activeElement;
         if (activeInput && (activeInput.tagName === "INPUT" || activeInput.tagName === "TEXTAREA")) {
           activeInput.blur();
@@ -466,12 +441,9 @@
     shortcuts();
     zoneNote();
     tabs();
-    pending();
-    swaps();
     pagers();
     finds();
     heroAvatar();
-    listImage();
     copies();
     guide();
     fitPagers();
@@ -777,69 +749,6 @@
     });
   }
 
-  // The list page's header shows the list's image. The server stores
-  // which image (its CID) and never fetches it; the owner's profile card
-  // says which host holds the owner's data, and the image is named there.
-  function listImage() {
-    var row = document.querySelector("[data-list-image]");
-    if (!row || !window.fetch) {
-      return;
-    }
-    var cid = row.getAttribute("data-list-image");
-    var owner = row.getAttribute("data-owner");
-    if (!/^b[a-z2-7]{7,127}$/.test(cid) || !owner) {
-      return;
-    }
-    var place = function (src) {
-      var img = document.createElement("img");
-      img.className = "hero-avatar";
-      img.alt = "";
-      img.width = 88;
-      img.height = 88;
-      img.referrerPolicy = "no-referrer";
-      img.onerror = function () {
-        if (img.parentNode) {
-          img.parentNode.removeChild(img);
-        }
-      };
-      img.src = src;
-      row.insertBefore(img, row.firstChild);
-    };
-    // The server names the image itself where it is a thumbnail on the
-    // image service; otherwise the owner's card says which host has it.
-    var named = row.getAttribute("data-list-image-src");
-    if (named) {
-      place(named);
-      return;
-    }
-    fetch(row.getAttribute("data-owner-card"), { credentials: "same-origin" })
-      .then(function (r) {
-        if (r.status !== 200 || r.redirected) {
-          throw new Error("no card");
-        }
-        return r.text();
-      })
-      .then(function (html) {
-        var card = new DOMParser().parseFromString(html, "text/html");
-        var pc = card.querySelector(".pc[data-pds]");
-        var host = pc && pc.getAttribute("data-pds");
-        if (!host || !/^[a-z0-9.-]+(:[0-9]+)?$/i.test(host)) {
-          return;
-        }
-        place(
-          "https://" +
-            host +
-            "/xrpc/com.atproto.sync.getBlob?did=" +
-            encodeURIComponent(owner) +
-            "&cid=" +
-            encodeURIComponent(cid)
-        );
-      })
-      .catch(function () {
-        // No image: the header is complete without one.
-      });
-  }
-
   // Puts the tabs and tables of the page at `href` in place of the ones
   // shown, without a page load, and shows that address. `done` runs once
   // they are in place; `fallback` if the page could not be read.
@@ -889,17 +798,15 @@
         zoneNote();
         fitPagers();
         try {
-          var shown = href.replace(/([?&])go=1(&|$)/, "$1").replace(/[?&]$/, "");
           // A turned page is a step Back returns from; a filter is not.
           if (push) {
-            history.pushState({ swapped: true }, "", shown);
+            history.pushState({ swapped: true }, "", href);
           } else {
-            history.replaceState(history.state, "", shown);
+            history.replaceState(history.state, "", href);
           }
         } catch (e) {
           // The tables are in place either way.
         }
-        pending();
         if (done) {
           done();
         }
@@ -912,11 +819,10 @@
       });
   }
 
-  // A turned page can come back shorter than the one before it: rows
-  // whose accounts are still being checked are left out and arrive a
-  // moment later. A shorter page would pull the window up, and each
-  // arrival would push it down again. The tables' box keeps the height
-  // it had until its rows are all there and letting go moves nothing.
+  // A turned page can come back shorter than the one before it, and a
+  // shorter page would pull the window up. The tables' box keeps the
+  // height it had until the new rows are in place and letting go moves
+  // nothing.
   function hold(box) {
     if (box) {
       // As a flow root the box contains its last table's bottom margin,
@@ -927,7 +833,7 @@
     }
   }
   function release(box) {
-    if (!box || !box.style.minHeight || box.querySelector("[data-pending]")) {
+    if (!box || !box.style.minHeight) {
       return;
     }
     var kept = box.style.minHeight;
@@ -1016,31 +922,12 @@
     });
   }
 
-  // A link marked data-swap (the "Show taken down accounts" switch) changes
-  // what the tables hold. Without this script the link is followed.
-  function swaps() {
-    document.addEventListener("click", function (event) {
-      var a = event.target.closest ? event.target.closest("a[data-swap]") : null;
-      if (!a || !window.fetch || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button) {
-        return;
-      }
-      if (!document.querySelector(".tabbed")) {
-        return;
-      }
-      event.preventDefault();
-      var href = a.getAttribute("href");
-      swapTo(href, null, function () {
-        location.href = href;
-      });
-    });
-  }
-
   // The filter box of a table: what is typed filters the page's tables
-  // in place, a moment after the typing stops; Enter also looks up a
-  // whole handle. Without this script the form is sent as it is.
+  // in place, a moment after the typing stops. Without this script the
+  // form is sent as it is.
   function finds() {
     var timer = null;
-    function send(form, go) {
+    function send(form) {
       var input = form.querySelector('input[name="find"]');
       var typed = input.value;
       var pairs = [];
@@ -1050,9 +937,6 @@
         if (v) {
           pairs.push(encodeURIComponent(fields[i].name) + "=" + encodeURIComponent(v));
         }
-      }
-      if (go && typed.trim()) {
-        pairs.push("go=1");
       }
       var action = form.getAttribute("action");
       var hash = action.indexOf("#");
@@ -1091,7 +975,7 @@
       clearTimeout(timer);
       var form = input.form;
       timer = setTimeout(function () {
-        send(form, false);
+        send(form);
       }, 350);
     });
     document.addEventListener("submit", function (event) {
@@ -1102,64 +986,9 @@
       event.preventDefault();
       clearTimeout(timer);
       lastTyped = form.querySelector('input[name="find"]').value;
-      send(form, true);
+      send(form);
     });
   }
-
-  // Rows held back until their account's handle is checked (a table says
-  // how many in [data-pending]): read the page again until they are
-  // there, and put each table that was waiting in place. Quick at first,
-  // then every three seconds, for about a minute; after that the line
-  // stays and a reload shows the rest.
-  function pending() {
-    // One reader at a time: a call made after the tables changed (the
-    // taken-down switch) retires the reader before it.
-    var run = ++pendingRun;
-    var tries = 0;
-    function again() {
-      if (run !== pendingRun || tries >= 20 || !document.querySelector("section[id] [data-pending]")) {
-        return;
-      }
-      tries++;
-      setTimeout(function () {
-        if (run !== pendingRun) {
-          return;
-        }
-        var asked = location.href;
-        fetch(asked, { credentials: "same-origin", cache: "no-store" })
-          .then(function (r) {
-            if (r.status !== 200 || r.redirected) {
-              throw new Error("not the page");
-            }
-            return r.text();
-          })
-          .then(function (html) {
-            // An answer for an address the page has since left (the
-            // switch was used meanwhile) is not put in place.
-            if (run !== pendingRun || location.href !== asked) {
-              again();
-              return;
-            }
-            var doc = new DOMParser().parseFromString(html, "text/html");
-            var sections = document.querySelectorAll("section[id]");
-            for (var i = 0; i < sections.length; i++) {
-              var here = sections[i];
-              var fresh = doc.getElementById(here.id);
-              if (here.querySelector("[data-pending]") && fresh && fresh.tagName === "SECTION") {
-                here.innerHTML = fresh.innerHTML;
-                times(here);
-                zoneNote();
-                fitPagers();
-              }
-            }
-            again();
-          })
-          .catch(again);
-      }, tries <= 4 ? 1200 : 3000);
-    }
-    again();
-  }
-  var pendingRun = 0;
 
   // A section swapped in by htmx carries new times.
   document.addEventListener("htmx:afterSwap", function () {

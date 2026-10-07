@@ -62,9 +62,9 @@ const CONSISTENCY: [(&str, &str); 9] = [
         "SELECT count(*) FROM lists WHERE track_state IN (1, 2, 4) AND listblock_count = 0",
     ),
     (
-        "a present list holds its record's description and image, read; any other holds neither",
+        "a present list holds its record's description and image; any other holds neither",
         "SELECT count(*) FROM lists WHERE
-           (record_state = 1 AND (NOT about_read OR avatar_cid IS NULL
+           (record_state = 1 AND (avatar_cid IS NULL
               OR description IS DISTINCT FROM 'about ' || rkey))
            OR (record_state <> 1 AND (description IS NOT NULL OR avatar_cid IS NOT NULL))",
     ),

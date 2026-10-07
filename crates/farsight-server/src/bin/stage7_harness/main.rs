@@ -1358,38 +1358,11 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             enter.status, cb.status, meta.status, css.status, public.status
         ),
     );
-    // An admin page has no address at the root.
-    let mut moved = Vec::new();
-    for p in [
-        "/lookup/did?q=x.example",
-        "/lookup/list",
-        "/ops",
-        "/settings",
-        "/reset",
-        "/dashboard/fragment",
-        "/logout",
-    ] {
-        let r = http.get(&format!("{}{p}", s.base), &[]).await?;
-        if !bare(&r) {
-            moved.push(format!("{p}: {}", r.short()));
-        }
-    }
-    let old_logout = http
-        .post_form(&format!("{}/logout", s.base), &[], &[])
-        .await?;
     let slash = http.get(&format!("{}/admin/", s.base), &[]).await?;
     c.check(
-        "an admin page has no address at the root: /lookup/did, /lookup/list, /ops, /settings, /reset, /dashboard/fragment and /logout (GET and POST) are unknown paths; /admin/ redirects to /admin",
-        moved.is_empty()
-            && bare(&old_logout)
-            && slash.status == 303
-            && slash.header("location").as_deref() == Some("/admin"),
-        format!(
-            "{moved:?}; POST /logout {}; /admin/ {} → {:?}",
-            old_logout.status,
-            slash.status,
-            slash.header("location")
-        ),
+        "/admin/ redirects to /admin",
+        slash.status == 303 && slash.header("location").as_deref() == Some("/admin"),
+        format!("/admin/ {} → {:?}", slash.status, slash.header("location")),
     );
     let signed = ctx.sign_in(&s, &http, &s.loopback()).await?;
     let cookie = set_cookie(&signed, "farsight_admin").unwrap_or_default();
@@ -1495,9 +1468,6 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             ("/enter", ""),
             ("/enter/callback?state=x", ""),
             ("/.well-known/atproto-oauth-client-metadata", HOSTNAME),
-            // Nor does an admin page answer at the root.
-            ("/settings", ""),
-            ("/lookup/did", ""),
         ] {
             let headers: Vec<(&str, &str)> = if host.is_empty() {
                 vec![]
@@ -1540,7 +1510,7 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         ctx.retire(s);
     }
     c.check(
-        "admin_ui = false: every admin page, /admin/card, /enter (GET and POST), /enter/callback, the client metadata, logout and an admin page's path at the root are the bare 404, with or without the public UI",
+        "admin_ui = false: every admin page, /admin/card, /enter (GET and POST), /enter/callback, the client metadata and logout are the bare 404, with or without the public UI",
         disabled.is_empty(),
         disabled.join("; "),
     );

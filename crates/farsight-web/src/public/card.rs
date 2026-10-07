@@ -31,8 +31,8 @@
 //!
 //! `GET /admin/card/{did}` serves the same fragment to a signed-in admin
 //! from the admin tables ([`admin_route`]). It differs in three ways:
-//! without a valid session it is the bare 404 of an unknown path in every
-//! `ui` mode — never a redirect, because the caller is a script and a
+//! without a valid session it is the bare 404 of an unknown path —
+//! never a redirect, because the caller is a script and a
 //! redirect would put the sign-in page into the card; the withheld rule
 //! is not applied (the operator's tables show those accounts); and every
 //! answer is `no-store, private`. It draws on the same per-address class
@@ -289,67 +289,6 @@ pub async fn history(st: &WebState, cfg: &Config, did: &Did) -> History {
         }
         _ => History::Unavailable,
     }
-}
-
-/// How long a list page waits for a list record it has not read yet.
-pub const LIST_ABOUT_DEADLINE: Duration = Duration::from_millis(1500);
-
-/// Reads a list's record from its owner's server for the description and
-/// the avatar CID (rows stored before those were kept): the identity
-/// lookup and one `getRecord`, through the safe client, under the card
-/// budget and [`LIST_ABOUT_DEADLINE`]. `Some`: what the record says, or
-/// two `None`s where the server says there is no such record. `None`:
-/// nothing could be established; the caller asks again later.
-pub async fn list_about(
-    st: &WebState,
-    cfg: &Config,
-    did: &Did,
-    rkey: &str,
-) -> Option<(Option<String>, Option<String>)> {
-    let budget = Class::PublicCardBudget.limit(cfg, None);
-    if st
-        .api
-        .limiter
-        .check(Class::PublicCardBudget, BUDGET_KEY, budget)
-        .is_err()
-    {
-        return None;
-    }
-    list_about_unbudgeted(st, cfg, did, rkey).await
-}
-
-/// [`list_about`] without the card budget, for the background filler,
-/// which keeps its own pace.
-pub async fn list_about_unbudgeted(
-    st: &WebState,
-    cfg: &Config,
-    did: &Did,
-    rkey: &str,
-) -> Option<(Option<String>, Option<String>)> {
-    let deadline = tokio::time::Instant::now() + LIST_ABOUT_DEADLINE;
-    let ident = identity(&st.safe, cfg, did, deadline).await?;
-    let base = ident.pds.as_deref().and_then(|p| Url::parse(p).ok())?;
-    let url = xrpc(
-        &base,
-        "com.atproto.repo.getRecord",
-        &[
-            ("repo", did.as_str()),
-            ("collection", "app.bsky.graph.list"),
-            ("rkey", rkey),
-        ],
-    )?;
-    let r = match tokio::time::timeout_at(deadline, st.safe.get(&url)).await {
-        Ok(Ok(r)) => r,
-        _ => return None,
-    };
-    match r.status {
-        200 => {}
-        400 | 404 => return Some((None, None)),
-        _ => return None,
-    }
-    let v: Value = serde_json::from_slice(&r.body).ok()?;
-    let value = v.get("value").filter(|x| x.is_object())?;
-    Some(farsight_core::record::list_about(value))
 }
 
 /// Reads a did:web document. There is no creation time to read.

@@ -11,12 +11,11 @@
 //!   claim; `first_seen` is on the witness clock. A record dated in the
 //!   future therefore sorts where it arrived, not at the top. The order
 //!   needs the section's index ([`Section::index`]).
-//! - [`Order::Stored`]: the order the section had before those indexes
-//!   existed, on the indexes the API uses. A section keeps it until its
-//!   index is valid ([`SortIndexes`]).
+//! - [`Order::Stored`]: the order a section has while its index is not
+//!   valid ([`SortIndexes`]), on the indexes the API uses.
 //!
 //! Columns and filters are the same in both orders. The API's queries
-//! ([`crate::queries`]) are not touched: their order is part of the stable
+//! ([`crate::queries`]) have their own order, which is part of the stable
 //! contract.
 //!
 //! A fifth section, the lists naming an account ([`lists_naming`]), sorts
@@ -38,7 +37,7 @@ use sqlx::{PgConnection, Postgres, QueryBuilder};
 use crate::error::Result;
 
 /// The shown time of a row, exactly as the indexes spell it. `LEAST`
-/// ignores a NULL argument; a row with neither time sorts last.
+/// ignores a NULL argument (a record may state no `createdAt`).
 pub const SHOWN_TIME: &str = "COALESCE(LEAST(created_at, first_seen), '-infinity'::timestamptz)";
 
 /// The same on the row alias the queries use.
@@ -200,7 +199,7 @@ impl SortIndexes {
 /// What a section's rows are ordered by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
-    /// The order before the sort indexes: the listed account's
+    /// The order without the section's sort index: the listed account's
     /// `actors.id` then the record key, ascending (outgoing blocks: the
     /// record key alone).
     Stored,
@@ -212,50 +211,12 @@ pub enum Order {
 /// One row of a section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
-    /// `actors.id` of the account the row lists.
-    pub party_id: i64,
-    /// Its DID.
+    /// DID of the account the row lists.
     pub did: String,
     /// Record key of the block, listblock or listitem.
     pub rkey: String,
     /// Author-claimed `createdAt`.
     pub created_at: Option<DateTime<Utc>>,
-    /// When Farsight first stored the record; `None`: before it kept the
-    /// date.
-    pub first_seen: Option<DateTime<Utc>>,
-}
-
-impl Row {
-    /// The row's shown time; `None` when it has neither time and sorts
-    /// last.
-    pub fn shown_time(&self) -> Option<DateTime<Utc>> {
-        match (self.created_at, self.first_seen) {
-            (Some(c), Some(f)) => Some(c.min(f)),
-            (c, f) => c.or(f),
-        }
-    }
-
-    /// The position after this row.
-    pub fn position(&self) -> Position {
-        Position {
-            time: self.shown_time(),
-            party_id: self.party_id,
-            rkey: self.rkey.clone(),
-        }
-    }
-}
-
-/// A keyset position: the last row of the page before. Which fields count
-/// depends on the section and the order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Position {
-    /// Its shown time ([`Order::Shown`] only); `None` = "last".
-    pub time: Option<DateTime<Utc>>,
-    /// The listed account's `actors.id` (unused where the section orders
-    /// by record key alone).
-    pub party_id: i64,
-    /// Its record key.
-    pub rkey: String,
 }
 
 /// What a visitor typed into a table's filter box, as the queries use
@@ -308,7 +269,8 @@ pub struct Filter<'a> {
     pub find: Option<&'a Find>,
 }
 
-/// Whether `section` in `order` compares the listed account in its keyset.
+/// Whether `section` in `order` sorts by the listed account before the
+/// record key.
 fn keyed_by_party(section: Section, order: Order) -> bool {
     match order {
         Order::Stored => section != Section::OutgoingBlocks,
@@ -322,12 +284,12 @@ fn build<'a>(
     key: i64,
     order: Order,
     filter: Filter<'a>,
-    after: Option<&'a Position>,
+    offset: i64,
     limit: i64,
 ) -> QueryBuilder<'a, Postgres> {
     let party = section.party();
     let mut q = QueryBuilder::new(format!(
-        "{prefix}SELECT b.{party}, a.did, b.rkey, b.created_at, b.first_seen \
+        "{prefix}SELECT a.did, b.rkey, b.created_at \
          FROM {} b JOIN actors a ON a.id = b.{party} WHERE b.{} = ",
         section.table(),
         section.key()
@@ -360,34 +322,6 @@ fn build<'a>(
         q.push(")");
     }
     let by_party = keyed_by_party(section, order);
-    // The keyset is a row comparison on the index's own columns, so it is
-    // an index boundary, never a filter.
-    if let Some(p) = after {
-        match order {
-            Order::Stored => {
-                q.push(if by_party {
-                    format!(" AND (b.{party}, b.rkey) > (")
-                } else {
-                    " AND (b.rkey) > (".to_owned()
-                });
-            }
-            Order::Shown => {
-                q.push(if by_party {
-                    format!(" AND ({SHOWN_B}, b.{party}, b.rkey) < (COALESCE(")
-                } else {
-                    format!(" AND ({SHOWN_B}, b.rkey) < (COALESCE(")
-                });
-                q.push_bind(p.time);
-                q.push("::timestamptz, '-infinity'::timestamptz), ");
-            }
-        }
-        if by_party {
-            q.push_bind(p.party_id);
-            q.push(", ");
-        }
-        q.push_bind(p.rkey.as_str());
-        q.push(")");
-    }
     q.push(match (order, by_party) {
         (Order::Stored, true) => format!(" ORDER BY b.{party}, b.rkey"),
         (Order::Stored, false) => " ORDER BY b.rkey".to_owned(),
@@ -396,45 +330,17 @@ fn build<'a>(
     });
     q.push(" LIMIT ");
     q.push_bind(limit);
+    q.push(" OFFSET ");
+    q.push_bind(offset);
     q
 }
 
-type Raw = (
-    i64,
-    String,
-    String,
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
-);
+type Raw = (String, String, Option<DateTime<Utc>>);
 
-/// One page of `section` for `key` (the subject, the author or the list),
-/// in `order`, after `after`.
-pub async fn rows(
-    conn: &mut PgConnection,
-    section: Section,
-    key: i64,
-    order: Order,
-    filter: Filter<'_>,
-    after: Option<&Position>,
-    limit: i64,
-) -> Result<Vec<Row>> {
-    let mut q = build("", section, key, order, filter, after, limit);
-    let rows: Vec<Raw> = q.build_query_as().fetch_all(conn).await?;
-    Ok(rows
-        .into_iter()
-        .map(|(party_id, did, rkey, created_at, first_seen)| Row {
-            party_id,
-            did,
-            rkey,
-            created_at,
-            first_seen,
-        })
-        .collect())
-}
-
-/// `limit` rows of `section` for `key` in `order`, skipping the first
-/// `offset`: a numbered page of the public tables. The cost grows with
-/// the offset; the order is total, so pages do not overlap.
+/// `limit` rows of `section` for `key` (the subject, the author or the
+/// list) in `order`, skipping the first `offset`: a numbered page of a
+/// table. The cost grows with the offset; the order is total, so pages do
+/// not overlap.
 pub async fn rows_at(
     conn: &mut PgConnection,
     section: Section,
@@ -444,18 +350,14 @@ pub async fn rows_at(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<Row>> {
-    let mut q = build("", section, key, order, filter, None, limit);
-    q.push(" OFFSET ");
-    q.push_bind(offset);
+    let mut q = build("", section, key, order, filter, offset, limit);
     let rows: Vec<Raw> = q.build_query_as().fetch_all(conn).await?;
     Ok(rows
         .into_iter()
-        .map(|(party_id, did, rkey, created_at, first_seen)| Row {
-            party_id,
+        .map(|(did, rkey, created_at)| Row {
             did,
             rkey,
             created_at,
-            first_seen,
         })
         .collect())
 }
@@ -466,8 +368,6 @@ const SHOWN_X: &str = "COALESCE(LEAST(x.created_at, x.first_seen), '-infinity'::
 /// One list naming an account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamingRow {
-    /// `lists.id`.
-    pub list_id: i64,
     /// The list owner's DID.
     pub owner_did: String,
     /// The list's record key.
@@ -481,19 +381,6 @@ pub struct NamingRow {
     /// Owner-claimed `createdAt` of the listitem naming the account (the
     /// one with the lowest record key if it is named twice).
     pub added_at: Option<DateTime<Utc>>,
-    /// When Farsight first stored that listitem.
-    pub first_seen: Option<DateTime<Utc>>,
-}
-
-impl NamingRow {
-    /// The row's shown time; `None` when it has neither time and sorts
-    /// last.
-    pub fn shown_time(&self) -> Option<DateTime<Utc>> {
-        match (self.added_at, self.first_seen) {
-            (Some(c), Some(f)) => Some(c.min(f)),
-            (c, f) => c.or(f),
-        }
-    }
 }
 
 /// Which lists name `$1` and may be shown; `$2` is the excluded owners.
@@ -517,8 +404,7 @@ fn naming_from(ids: u8, pattern: u8) -> String {
 
 fn naming_sql() -> String {
     format!(
-        "SELECT l.id, o.did, l.rkey, l.name, l.listblock_count, x.created_at, x.first_seen,
-                l.purpose
+        "SELECT o.did, l.rkey, l.name, l.listblock_count, x.created_at, l.purpose
          FROM (SELECT DISTINCT ON (li.list_id) li.list_id, li.created_at, li.first_seen
                FROM list_items li WHERE li.subject_id = $1
                ORDER BY li.list_id, li.rkey) x
@@ -544,12 +430,10 @@ pub async fn lists_naming(
     limit: i64,
 ) -> Result<Vec<NamingRow>> {
     type Raw = (
-        i64,
         String,
         String,
         Option<String>,
         i32,
-        Option<DateTime<Utc>>,
         Option<DateTime<Utc>>,
         Option<i16>,
     );
@@ -565,17 +449,13 @@ pub async fn lists_naming(
     Ok(rows
         .into_iter()
         .map(
-            |(list_id, owner_did, rkey, name, listblock_count, added_at, first_seen, purpose)| {
-                NamingRow {
-                    list_id,
-                    owner_did,
-                    rkey,
-                    name,
-                    listblock_count,
-                    purpose,
-                    added_at,
-                    first_seen,
-                }
+            |(owner_did, rkey, name, listblock_count, added_at, purpose)| NamingRow {
+                owner_did,
+                rkey,
+                name,
+                listblock_count,
+                purpose,
+                added_at,
             },
         )
         .collect())
@@ -611,8 +491,6 @@ pub async fn lists_naming_count(
 /// own listblock records and the list it points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockedList {
-    /// `lists.id`.
-    pub list_id: i64,
     /// The list owner's DID.
     pub owner_did: String,
     /// The list's record key.
@@ -625,8 +503,6 @@ pub struct BlockedList {
     pub block_rkey: String,
     /// The listblock's stated `createdAt`.
     pub created_at: Option<DateTime<Utc>>,
-    /// When Farsight first stored the listblock.
-    pub first_seen: Option<DateTime<Utc>>,
 }
 
 /// The `WHERE` of [`lists_blocked`] and its count. `$1` the author, `$2`
@@ -661,17 +537,15 @@ pub async fn lists_blocked(
     limit: i64,
 ) -> Result<Vec<BlockedList>> {
     type Raw = (
-        i64,
         String,
         String,
         Option<String>,
         Option<i16>,
         String,
         Option<DateTime<Utc>>,
-        Option<DateTime<Utc>>,
     );
     let rows: Vec<Raw> = sqlx::query_as(&format!(
-        "SELECT l.id, o.did, l.rkey, l.name, l.purpose, b.rkey, b.created_at, b.first_seen
+        "SELECT o.did, l.rkey, l.name, l.purpose, b.rkey, b.created_at
          FROM list_blocks b
          JOIN lists l ON l.id = b.list_id
          JOIN actors o ON o.id = l.owner_id
@@ -691,17 +565,13 @@ pub async fn lists_blocked(
     Ok(rows
         .into_iter()
         .map(
-            |(list_id, owner_did, rkey, name, purpose, block_rkey, created_at, first_seen)| {
-                BlockedList {
-                    list_id,
-                    owner_did,
-                    rkey,
-                    name,
-                    purpose,
-                    block_rkey,
-                    created_at,
-                    first_seen,
-                }
+            |(owner_did, rkey, name, purpose, block_rkey, created_at)| BlockedList {
+                owner_did,
+                rkey,
+                name,
+                purpose,
+                block_rkey,
+                created_at,
             },
         )
         .collect())
@@ -759,7 +629,7 @@ pub async fn lists_naming_listblocks(
     .await?)
 }
 
-/// The plan of the query [`rows`] runs, one line per plan node
+/// The plan of the query [`rows_at`] runs, one line per plan node
 /// (`EXPLAIN (ANALYZE, COSTS OFF)`). The harness checks that each
 /// section's shown-time order runs on its index.
 #[cfg(feature = "harness")]
@@ -769,7 +639,7 @@ pub async fn explain(
     key: i64,
     order: Order,
     filter: Filter<'_>,
-    after: Option<&Position>,
+    offset: i64,
     limit: i64,
 ) -> Result<Vec<String>> {
     let mut q = build(
@@ -778,7 +648,7 @@ pub async fn explain(
         key,
         order,
         filter,
-        after,
+        offset,
         limit,
     );
     Ok(q.build_query_scalar().fetch_all(conn).await?)
@@ -881,17 +751,9 @@ pub async fn drop_index(conn: &mut PgConnection, section: Section) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn sql(section: Section, order: Order, cursor: bool, filter: Filter<'_>) -> String {
-        let p = Position {
-            time: None,
-            party_id: 1,
-            rkey: "k".into(),
-        };
-        build("", section, 1, order, filter, cursor.then_some(&p), 50)
-            .sql()
-            .to_owned()
+    fn sql(section: Section, order: Order, filter: Filter<'_>) -> String {
+        build("", section, 1, order, filter, 0, 50).sql().to_owned()
     }
 
     #[test]
@@ -927,63 +789,37 @@ mod tests {
     #[test]
     fn shown_order_never_sorts_by_the_stated_time_alone() {
         for s in Section::ALL {
-            let first = sql(s, Order::Shown, false, Filter::default());
-            assert!(
-                first.contains(&format!("ORDER BY {SHOWN_B} DESC")),
-                "{first}"
-            );
-            assert!(!first.contains("ORDER BY b.created_at"), "{first}");
-            let next = sql(s, Order::Shown, true, Filter::default());
-            // The keyset compares the index's own columns.
-            assert!(next.contains(&format!("AND ({SHOWN_B}, b.")), "{next}");
-            assert!(next.contains("< (COALESCE($2::timestamptz, '-infinity'::timestamptz), "));
+            let q = sql(s, Order::Shown, Filter::default());
+            assert!(q.contains(&format!("ORDER BY {SHOWN_B} DESC")), "{q}");
+            assert!(!q.contains("ORDER BY b.created_at"), "{q}");
         }
-        let q = sql(
-            Section::IncomingBlocks,
-            Order::Shown,
-            true,
-            Filter::default(),
+        let q = sql(Section::IncomingBlocks, Order::Shown, Filter::default());
+        assert!(
+            q.ends_with("b.author_id DESC, b.rkey DESC LIMIT $2 OFFSET $3"),
+            "{q}"
         );
-        assert!(q.ends_with("b.author_id DESC, b.rkey DESC LIMIT $5"), "{q}");
-        let q = sql(
-            Section::OutgoingBlocks,
-            Order::Shown,
-            true,
-            Filter::default(),
-        );
-        assert!(q.contains("b.rkey) < (COALESCE($2"), "{q}");
-        assert!(q.ends_with("DESC, b.rkey DESC LIMIT $4"), "{q}");
-        let q = sql(Section::ListMembers, Order::Shown, false, Filter::default());
+        let q = sql(Section::OutgoingBlocks, Order::Shown, Filter::default());
+        assert!(q.ends_with("DESC, b.rkey DESC LIMIT $2 OFFSET $3"), "{q}");
+        assert!(!q.contains("b.subject_id DESC"), "{q}");
+        let q = sql(Section::ListMembers, Order::Shown, Filter::default());
         assert!(q.contains("FROM list_items b JOIN actors a ON a.id = b.subject_id"));
         assert!(q.contains("WHERE b.list_id = $1"));
     }
 
     #[test]
-    fn stored_order_is_the_previous_one() {
-        let q = sql(
-            Section::IncomingBlocks,
-            Order::Stored,
-            true,
-            Filter::default(),
-        );
-        assert!(q.contains("AND (b.author_id, b.rkey) > ($2, $3) ORDER BY b.author_id, b.rkey"));
-        let q = sql(
-            Section::OutgoingBlocks,
-            Order::Stored,
-            true,
-            Filter::default(),
-        );
+    fn stored_order_is_by_account_and_record_key() {
+        let q = sql(Section::IncomingBlocks, Order::Stored, Filter::default());
         assert!(
-            q.contains("AND (b.rkey) > ($2) ORDER BY b.rkey LIMIT $3"),
+            q.ends_with("ORDER BY b.author_id, b.rkey LIMIT $2 OFFSET $3"),
             "{q}"
         );
-        let q = sql(
-            Section::ListMembers,
-            Order::Stored,
-            false,
-            Filter::default(),
+        let q = sql(Section::OutgoingBlocks, Order::Stored, Filter::default());
+        assert!(q.ends_with("ORDER BY b.rkey LIMIT $2 OFFSET $3"), "{q}");
+        let q = sql(Section::ListMembers, Order::Stored, Filter::default());
+        assert!(
+            q.ends_with("ORDER BY b.subject_id, b.rkey LIMIT $2 OFFSET $3"),
+            "{q}"
         );
-        assert!(q.ends_with("ORDER BY b.subject_id, b.rkey LIMIT $2"), "{q}");
     }
 
     #[test]
@@ -996,35 +832,11 @@ mod tests {
             find: None,
             excluded: &ids,
         };
-        let q = sql(Section::ListBlockers, Order::Shown, false, f);
+        let q = sql(Section::ListBlockers, Order::Shown, f);
         assert!(q.contains("a.status NOT IN (1, 2, 3, 4)"));
         assert!(q.contains("NOT (a.id = ANY($2))"));
-        let q = sql(
-            Section::ListBlockers,
-            Order::Shown,
-            false,
-            Filter::default(),
-        );
+        let q = sql(Section::ListBlockers, Order::Shown, Filter::default());
         assert!(!q.contains("a.status") && !q.contains("ANY("));
-    }
-
-    #[test]
-    fn shown_time_is_the_earlier_of_the_two() {
-        let t = |h| Utc.with_ymd_and_hms(2026, 10, 3, h, 0, 0).unwrap();
-        let row = |c, f| Row {
-            party_id: 1,
-            did: String::new(),
-            rkey: String::new(),
-            created_at: c,
-            first_seen: f,
-        };
-        // An honest row: stated before it arrived.
-        assert_eq!(row(Some(t(1)), Some(t(2))).shown_time(), Some(t(1)));
-        // Stated after it arrived (a future date): where it arrived.
-        assert_eq!(row(Some(t(9)), Some(t(2))).shown_time(), Some(t(2)));
-        assert_eq!(row(None, Some(t(2))).shown_time(), Some(t(2)));
-        assert_eq!(row(Some(t(1)), None).shown_time(), Some(t(1)));
-        assert_eq!(row(None, None).shown_time(), None);
     }
 
     #[test]
@@ -1039,20 +851,6 @@ mod tests {
         // The filter box: wildcards typed by a visitor are literal.
         assert_eq!(Find::containing("Al_ice%"), "%al\\_ice\\%%");
         assert_eq!(Find::containing(""), "%%");
-        let t = |h| Utc.with_ymd_and_hms(2026, 10, 3, h, 0, 0).unwrap();
-        let row = |c, f| NamingRow {
-            purpose: None,
-            list_id: 1,
-            owner_did: String::new(),
-            rkey: String::new(),
-            name: None,
-            listblock_count: 0,
-            added_at: c,
-            first_seen: f,
-        };
-        assert_eq!(row(Some(t(9)), Some(t(2))).shown_time(), Some(t(2)));
-        assert_eq!(row(Some(t(1)), Some(t(2))).shown_time(), Some(t(1)));
-        assert_eq!(row(None, None).shown_time(), None);
     }
 
     #[test]

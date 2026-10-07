@@ -233,7 +233,7 @@
 <td class="td-account">{% if let Some(w) = r.who %}{{ w|safe }}{% endif %}</td>
 <td class="td-record"><button type="button" class="copy-uri" data-copy="{{ r.record }}" title="{{ r.record }}">Copy at:// URL</button></td>
 <td class="td-date">{% if let Some(t) = r.created_at %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time><span class="ago" data-ago></span>{% else %}<span class="time-none" aria-hidden="true">—</span><span class="ago"></span>{% endif %}</td>
-<td class="td-date td-seen">{% if let Some(t) = r.first_seen_at %}<time datetime="{{ t.iso }}" class="time-badge" data-abs title="First seen">{{ t.bare }}</time>{% else %}<span class="time-none" title="Stored before this instance kept dates">—</span>{% endif %}<span class="to">{% if let Some(t) = r.last_seen_at %}to <time datetime="{{ t.iso }}" data-abs>{{ t.bare }}</time>{% endif %}</span></td>
+<td class="td-date td-seen">{% if let Some(t) = r.first_seen_at %}<time datetime="{{ t.iso }}" class="time-badge" data-abs title="First seen">{{ t.bare }}</time>{% else %}<span class="time-none" aria-hidden="true">—</span>{% endif %}<span class="to">{% if let Some(t) = r.last_seen_at %}to <time datetime="{{ t.iso }}" data-abs>{{ t.bare }}</time>{% endif %}</span></td>
 <td class="td-date"><time datetime="{{ r.removed_at.iso }}" class="time-badge" data-abs>{{ r.removed_at.bare }}</time><span class="ago" data-ago></span></td>
 <td class="td-cause">{{ r.cause }}{% if let Some(m) = r.mark %} <span class="pill">{{ m }}</span>{% endif %}</td>
 </tr>
@@ -257,7 +257,7 @@
 <td class="td-list">{% if let Some(l) = r.list %}<a href="{{ l.href }}" class="list-link"><span>{% if let Some(n) = l.name %}{{ n }}{% else %}{{ l.uri }}{% endif %}</span></a>{% if let Some(p) = l.purpose %} <span class="muted">({{ p }})</span>{% endif %}{% if let Some(st) = l.state %} <span class="muted">{{ st }}</span>{% endif %}{% endif %}</td>
 <td class="td-record"><button type="button" class="copy-uri" data-copy="{{ r.record }}" title="{{ r.record }}">Copy at:// URL</button></td>
 <td class="td-date">{% if let Some(t) = r.created_at %}<time datetime="{{ t.iso }}" class="time-badge" data-abs>{{ t.bare }}</time><span class="ago" data-ago></span>{% else %}<span class="time-none" aria-hidden="true">—</span><span class="ago"></span>{% endif %}</td>
-<td class="td-date td-seen">{% if let Some(t) = r.first_seen_at %}<time datetime="{{ t.iso }}" class="time-badge" data-abs title="First seen">{{ t.bare }}</time>{% else %}<span class="time-none" title="Stored before this instance kept dates">—</span>{% endif %}<span class="to">{% if let Some(t) = r.last_seen_at %}to <time datetime="{{ t.iso }}" data-abs>{{ t.bare }}</time>{% endif %}</span></td>
+<td class="td-date td-seen">{% if let Some(t) = r.first_seen_at %}<time datetime="{{ t.iso }}" class="time-badge" data-abs title="First seen">{{ t.bare }}</time>{% else %}<span class="time-none" aria-hidden="true">—</span>{% endif %}<span class="to">{% if let Some(t) = r.last_seen_at %}to <time datetime="{{ t.iso }}" data-abs>{{ t.bare }}</time>{% endif %}</span></td>
 <td class="td-date"><time datetime="{{ r.removed_at.iso }}" class="time-badge" data-abs>{{ r.removed_at.bare }}</time><span class="ago" data-ago></span></td>
 <td class="td-cause">{{ r.cause }}{% if let Some(m) = r.mark %} <span class="pill">{{ m }}</span>{% endif %}</td>
 </tr>

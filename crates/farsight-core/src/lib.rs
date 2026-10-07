@@ -20,8 +20,8 @@ pub use did::{Did, DidError, DidMethod};
 pub use duration::ConfigDuration;
 pub use nsid::{Collection, Nsid, NsidError};
 pub use record::{
-    BlockRecord, CommitAction, CommitOp, JetstreamEvent, ListBlockRecord, ListItemRecord,
-    ListPurpose, ListRecord, Operation, Record, RecordError,
+    BlockRecord, CommitAction, CommitOp, ListBlockRecord, ListItemRecord, ListPurpose, ListRecord,
+    Operation, Record, RecordError,
 };
 pub use tid::{Tid, TidError};
 

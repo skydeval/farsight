@@ -423,9 +423,8 @@ by the 10-second poll.
   each with its share done and, where a rate is known, the time left:
   the history sweep; the handle pass (the walk's position over the
   newest account id, at the configured rate, which is an upper bound
-  because answered accounts are passed over); list descriptions
-  (unread over all lists, one a second); and a gap repair under way
-  (accounts re-read so far). A line disappears when its work is done,
+  because answered accounts are passed over); and a gap repair under
+  way (accounts re-read so far). A line disappears when its work is done,
   and the block disappears with its last line.
 - **Index**: blocks, listblocks, lists, tracked lists, list items,
   accounts known.
@@ -703,10 +702,8 @@ address, purpose, state, owner, its description (plain text, at most 300
 characters, no links) and its image, under the same avatar rules.
 
 `lists.description` and `lists.avatar_cid` are written when the list
-record is applied and cleared when it is deleted. For a list row
-whose record has not been read for them (`lists.about_read = false`)
-the record is read once, on the first view of its page or by the list
-filler that runs beside the handle pass.
+record is applied and cleared when it is deleted. The page shows what
+is stored and reads no record.
 
 ### The home page
 
@@ -936,9 +933,6 @@ at most 200), a pace of its own that does not draw on `handle_rps`.
 5. **The memory cache** is written only where it already holds the
    account, so the pass does not push the accounts pages are showing
    out of it.
-6. **The list filler.** While the pass is on, a second loop reads the
-   record of each list with `about_read = false`, one a second,
-   outside the card budget, and rests an hour after the last.
 
 Metrics: `farsight_handle_pass_total{outcome}`,
 `farsight_handle_pass_position`, `farsight_handle_pass_laps_total`.

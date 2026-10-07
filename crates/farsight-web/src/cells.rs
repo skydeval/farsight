@@ -1,5 +1,5 @@
-//! Cells of the admin tables (see `docs/design/web-ui.md`): accounts,
-//! records and times on the lookup and history pages.
+//! The account cell of the admin tables (see `docs/design/web-ui.md`), on
+//! the lookup and history pages.
 //!
 //! An account cell renders as on the public pages — `@handle` when the
 //! handle cache holds a verified one, the DID otherwise — as a link to the
@@ -7,10 +7,9 @@
 //! on need a session, so every cell carries the card.
 
 use askama::Template;
-use chrono::{DateTime, Utc};
 
 use crate::pages::WebState;
-use crate::public::text::{Record, Stamp, clean, seg};
+use crate::public::text::{clean, seg};
 use crate::public::warming::Asked;
 
 /// `/admin/lookup/did?q=…`.
@@ -35,7 +34,7 @@ pub struct Account {
     /// Its lookup page.
     pub href: String,
     /// Its profile-card fragment.
-    pub card: Option<String>,
+    pub card: String,
     /// A verified handle, if cached.
     pub handle: Option<String>,
 }
@@ -47,122 +46,33 @@ pub fn account(st: &WebState, asked: &mut Asked, did: &str) -> Account {
     Account {
         did: did.to_owned(),
         href: lookup_did_href(did),
-        card: Some(admin_card_href(did)),
+        card: admin_card_href(did),
         handle: asked.handle(st, did).map(|h| clean(&h)),
-    }
-}
-
-#[derive(Template)]
-#[template(source = "{{ text }}", ext = "html")]
-struct TextCell<'a> {
-    text: &'a str,
-}
-
-#[derive(Template)]
-#[template(
-    source = r#"{% if let Some(t) = t %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% endif %}"#,
-    ext = "html"
-)]
-struct TimeCell {
-    t: Option<Stamp>,
-}
-
-/// What the "First seen" cell says for a row stored before the date was
-/// kept.
-pub const NO_FIRST_SEEN: &str = "Stored before Farsight kept this date";
-
-#[derive(Template)]
-#[template(
-    source = r#"{% if let Some(t) = t %}<time datetime="{{ t.iso }}">{{ t.text }}</time>{% else %}<span class="muted" title="{{ none }}">—</span>{% endif %}"#,
-    ext = "html"
-)]
-struct FirstSeenCell {
-    t: Option<Stamp>,
-    none: &'static str,
-}
-
-/// One table cell, rendered and escaped.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Cell {
-    /// Its markup.
-    pub html: String,
-}
-
-impl Cell {
-    fn of<T: Template>(t: &T) -> Cell {
-        Cell {
-            html: t.render().unwrap_or_default(),
-        }
-    }
-
-    /// Plain text.
-    pub fn text(text: &str) -> Cell {
-        Cell::of(&TextCell { text })
-    }
-
-    /// An account.
-    pub fn account(a: &Account) -> Cell {
-        Cell::of(a)
-    }
-
-    /// A record: its at-uri, a link when a viewer is configured.
-    pub fn record(r: &Record) -> Cell {
-        Cell::of(r)
-    }
-
-    /// A time; empty when the record states none.
-    pub fn time(t: Option<DateTime<Utc>>) -> Cell {
-        Cell::of(&TimeCell {
-            t: t.map(Stamp::of),
-        })
-    }
-
-    /// When Farsight first stored the row.
-    pub fn first_seen(t: Option<DateTime<Utc>>) -> Cell {
-        Cell::of(&FirstSeenCell {
-            t: t.map(Stamp::of),
-            none: NO_FIRST_SEEN,
-        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
-
-    #[test]
-    fn cells_escape_and_mark_up() {
-        assert_eq!(Cell::text("<b>&").html, "&lt;b&gt;&amp;");
-        let t = Utc.with_ymd_and_hms(2026, 10, 3, 4, 5, 6).unwrap();
-        assert_eq!(
-            Cell::time(Some(t)).html,
-            "<time datetime=\"2026-10-03T04:05:06Z\">2026-10-03 04:05:06 UTC</time>"
-        );
-        assert_eq!(Cell::time(None).html, "");
-        assert!(Cell::first_seen(Some(t)).html.starts_with("<time "));
-        let none = Cell::first_seen(None).html;
-        assert!(none.contains("—") && none.contains(NO_FIRST_SEEN));
-    }
 
     #[test]
     fn an_account_cell() {
-        let a = |card: bool, handle: Option<&str>| {
+        let a = |handle: Option<&str>| {
             let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
-            Cell::account(&Account {
+            Account {
                 did: did.into(),
                 href: lookup_did_href(did),
-                card: card.then(|| admin_card_href(did)),
+                card: admin_card_href(did),
                 handle: handle.map(str::to_owned),
-            })
-            .html
+            }
+            .render()
+            .unwrap()
         };
-        let bare = a(false, None);
+        let bare = a(None);
         assert!(bare.contains("href=\"/admin/lookup/did?q=did%3Aplc%3Aaaaaaaaaaaaaaaaaaaaaaaaa\""));
         assert!(bare.contains("title=\"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\""));
         assert!(bare.contains("<code>did:plc:aaaaaaaaaaaaaaaaaaaaaaaa</code>"));
-        assert!(!bare.contains("data-card"), "{bare}");
-        let full = a(true, Some("alice.example"));
+        let full = a(Some("alice.example"));
         assert!(full.contains("data-card=\"/admin/card/did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\""));
         assert!(full.contains("data-card-session"));
         assert!(full.contains(">alice.example</a>"));

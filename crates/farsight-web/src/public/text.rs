@@ -110,11 +110,10 @@ pub const LISTBLOCK: &str = "app.bsky.graph.listblock";
 /// The collection of a listitem record.
 pub const LISTITEM: &str = "app.bsky.graph.listitem";
 
-/// A record as a table cell of the admin lookup pages shows it: its
-/// at-uri, and a link to the operator's record viewer when one is
+/// A record as the admin lookup pages name it: its at-uri, and the
+/// address of its page on the operator's record viewer when one is
 /// configured. The public pages have no record cells.
-#[derive(Debug, Clone, PartialEq, Eq, askama::Template)]
-#[template(path = "_record.html")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     /// `at://{authority}/{collection}/{rkey}`.
     pub uri: String,
@@ -129,31 +128,6 @@ impl Record {
         Record {
             uri: format!("at://{authority}/{collection}/{rkey}"),
             href: record_href(viewer, authority, collection, rkey),
-        }
-    }
-
-    /// A record named by an at-uri the API returned. One that does not
-    /// parse to a block or a listblock is shown as plain text.
-    pub fn of_uri(viewer: &str, uri: &str) -> Record {
-        match farsight_core::AtUri::parse(uri) {
-            Ok(u) => {
-                let collection = match u.collection.as_str() {
-                    BLOCK => Some(BLOCK),
-                    LISTBLOCK => Some(LISTBLOCK),
-                    _ => None,
-                };
-                match collection {
-                    Some(c) => Record::of(viewer, u.authority.as_str(), c, u.rkey.as_str()),
-                    None => Record {
-                        uri: clean(uri),
-                        href: None,
-                    },
-                }
-            }
-            Err(_) => Record {
-                uri: clean(uri),
-                href: None,
-            },
         }
     }
 }
@@ -294,7 +268,7 @@ mod tests {
             )
         );
         let d = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
-        let r = Record::of_uri(v, &format!("at://{d}/app.bsky.graph.block/3k"));
+        let r = Record::of(v, d, BLOCK, "3k");
         assert_eq!(r.uri, format!("at://{d}/app.bsky.graph.block/3k"));
         assert_eq!(
             r.href,
@@ -303,16 +277,7 @@ mod tests {
             ))
         );
         // No viewer: the same text, no link.
-        assert_eq!(
-            Record::of_uri("", &format!("at://{d}/app.bsky.graph.block/3k")).href,
-            None
-        );
-        // Another collection, or something that is not an at-uri: text.
-        assert_eq!(
-            Record::of_uri(v, &format!("at://{d}/app.bsky.feed.post/3k")).href,
-            None
-        );
-        assert_eq!(Record::of_uri(v, "https://x.example/").href, None);
+        assert_eq!(Record::of("", d, BLOCK, "3k").href, None);
         assert_eq!(
             card_href("did:web:example.com%3A8080"),
             "/card/did:web:example.com%253A8080"

@@ -17,8 +17,8 @@
 //! 3. a failed build is retried later and recorded in `op_errors` once per
 //!    run of failures.
 //!
-//! Each section switches to its new order when its flag is set
-//! ([`SortIndexes`]); until then it keeps the order it had.
+//! Each section sorts by shown time once its flag is set
+//! ([`SortIndexes`]); until then it lists its rows by account.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -147,8 +147,8 @@ impl Builder {
                     estimate_bytes = estimate,
                     database_bytes = database,
                     budget_bytes = budget,
-                    "sort index: not built, the storage budget has no room; the table keeps its \
-                     previous order"
+                    "sort index: not built, the storage budget has no room; the table lists its \
+                     rows by account meanwhile"
                 );
                 return Err(Stop::Held(estimate));
             }

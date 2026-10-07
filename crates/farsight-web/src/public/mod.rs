@@ -13,8 +13,7 @@
 //! - **No way out.** A public page links only to public pages and, when
 //!   the operator configures one, to the record viewer. It carries no
 //!   login link and names no admin route. Removed records are an admin
-//!   page ([`crate::history`]); the paths that once served them here
-//!   are not found.
+//!   page ([`crate::history`]).
 //! - **Responses do not depend on the caller.** A response is a function
 //!   of the path, the query string and the instance's state: no cookie is
 //!   read or set, and no request header changes the body. That is what
@@ -253,7 +252,7 @@ pub struct PublicState {
     excluded: Mutex<Option<ExcludedCache>>,
     /// Enable requests awaiting confirmation, by confirmation token.
     pub pending: Mutex<HashMap<String, PendingEnable>>,
-    /// How far the handle pass and the list filler have got.
+    /// How far the handle pass has got.
     pub progress: pass::Progress,
 }
 
@@ -380,7 +379,7 @@ pub enum Fail {
     Absent,
     /// Rate limited; `Retry-After` seconds.
     Limited(u64),
-    /// Unparseable path, query or cursor.
+    /// Unparseable path or query.
     Bad {
         /// What was wrong.
         message: String,
@@ -419,10 +418,6 @@ impl From<farsight_storage::StorageError> for Fail {
 impl From<farsight_api::error::XrpcError> for Fail {
     fn from(e: farsight_api::error::XrpcError) -> Fail {
         match e.status {
-            StatusCode::BAD_REQUEST => Fail::Bad {
-                message: "This link carries a position that can no longer be read.".into(),
-                link: None,
-            },
             StatusCode::SERVICE_UNAVAILABLE => Fail::Busy,
             _ => Fail::Internal,
         }

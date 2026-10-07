@@ -235,8 +235,8 @@ CREATE INDEX tombstones_by_age ON tombstones (deleted_at);
   2 curation, 3 reference), `name`, `created_at`, `rev`, `description`
   (the record's text, truncated to 300 characters) and `avatar_cid`
   (the CID of the record's avatar blob; the image is never stored).
-  `about_read` is false while a row's record has not yet been read for
-  the last two. Everything else is tracking state: `track_state`
+  `about_read` is set when a record is applied and is not read.
+  Everything else is tracking state: `track_state`
   (0 untracked, 1 pending, 2 ready, 3 retained, 4 unavailable,
   5 purging, 6 missing, 7 dead, 8 deferred), `deferred_by` (1 budget,
   2 ceiling, 3 host cap, 4 lists cap, 5 owner re-admissions), the two
@@ -252,8 +252,7 @@ CREATE INDEX tombstones_by_age ON tombstones (deleted_at);
 `first_seen` and `last_seen` on the three record tables are witness
 bounds: when Farsight first stored the row and when it last applied a
 write to it. They are display data, set by the write path as described
-in [history](history.md); a row stored before the columns existed has
-NULL in both.
+in [history](history.md).
 
 ### Firehose state and gaps
 
@@ -778,11 +777,12 @@ when the server begins serving and works as follows.
 3. A failed build is retried after 10 minutes and recorded in
    `op_errors` once per run of failures.
 
-Until its index is valid, a UI table keeps the order of the older index
-that serves it; each table switches by itself when its index becomes
-valid. `farsight_ui_sort_indexes_ready` is the number of valid ones.
-The older indexes all stay: they serve the API's orders and cursors
-(which the sort indexes do not change), `checkBlocks`, and the counts.
+Until its index is valid, a UI table lists its rows in the order of
+the index the API uses for it (by account, then record key); each table
+switches by itself when its index becomes valid.
+`farsight_ui_sort_indexes_ready` is the number of valid ones. The other
+indexes serve the API's orders and cursors (which the sort indexes do
+not change), `checkBlocks`, and the counts.
 
 ## The write path
 

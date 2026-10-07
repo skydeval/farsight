@@ -95,7 +95,7 @@ pub struct RemovedRow {
     pub record: String,
     /// Created, as stated by the author.
     pub created: Option<String>,
-    /// First seen; `None`: before this instance kept dates.
+    /// First seen.
     pub first_seen: Option<String>,
     /// Last seen.
     pub last_seen: Option<String>,
@@ -447,8 +447,6 @@ async fn load(
     hz: Option<DateTime<Utc>>,
 ) -> Result<HistoryData, farsight_api::error::XrpcError> {
     let args = |after| HistoryArgs {
-        // `excluded_dids` governs the public pages only.
-        excluded: &[],
         horizon: hz,
         after,
         limit: PAGE_ROWS,

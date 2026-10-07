@@ -3,22 +3,24 @@
 //! blocks, listblocks and list memberships, bounded counts and recording
 //! windows. The rows of the live sections are read in [`crate::ui_rows`].
 //!
-//! Two filters are part of every query here and run at query time, so a
-//! status change or a settings change shows on the next page view:
+//! Two filters run at query time, so a status change or a settings change
+//! shows on the next page view:
 //!
 //! - **hidden status** (see `docs/design/api.md` and
-//!   `docs/design/storage.md`): rows whose relevant account — the author,
-//!   the list owner or the subject, whichever the page lists — is
-//!   `deactivated`, `takendown`, `suspended` or `deleted` are left out.
-//!   For `deleted` accounts this filter, not the purge, is the guarantee.
-//! - **operator exclusion**: rows whose relevant account is in `excluded`
-//!   (`actors.id` values of `public_ui.excluded_dids`) are left out the
-//!   same way.
+//!   `docs/design/storage.md`), in every query here: rows whose relevant
+//!   account — the author, the list owner or the subject, whichever the
+//!   page lists — is `deactivated`, `takendown`, `suspended` or `deleted`
+//!   are left out. For `deleted` accounts this filter, not the purge, is
+//!   the guarantee.
+//! - **operator exclusion**, in the counts of the live sections: rows
+//!   whose relevant account is in `excluded` (`actors.id` values of
+//!   `public_ui.excluded_dids`) are left out the same way. It governs the
+//!   public pages; the history pages are the admin's.
 //!
 //! History pages order by (`removed_at`, `id`) descending and the cursor
 //! carries both: one reconcile gives many rows the same `removed_at`, and
-//! `id` tells them apart. Every history query is an index range on one of
-//! the six history indexes, which all end in `id`.
+//! `id` tells them apart. Every history query is an index range on a
+//! history index, which all end in `id`.
 //!
 //! All functions take a connection so the caller can run them inside one
 //! read transaction with `statement_timeout` set.
@@ -43,9 +45,7 @@ pub struct HistoryCursor {
 
 /// What every history query takes besides its key.
 #[derive(Debug, Clone, Copy)]
-pub struct HistoryArgs<'a> {
-    /// `actors.id` values the operator excludes.
-    pub excluded: &'a [i64],
+pub struct HistoryArgs {
     /// Retention horizon: rows removed before it are not returned, whether
     /// or not the janitor has deleted them yet. `None` = keep forever.
     pub horizon: Option<DateTime<Utc>>,
@@ -79,9 +79,8 @@ pub struct Removed {
     pub id: i64,
     /// When Farsight applied the removal (first cursor key).
     pub removed_at: DateTime<Utc>,
-    /// The other account of the row: the blocker on a by-subject or
-    /// by-list page, the blocked account or the member on a by-author or
-    /// by-list membership page. Empty for rows identified by `list` alone.
+    /// The other account of the row: the blocker, or the member on a
+    /// list's page. Empty for rows identified by `list` alone.
     pub party: String,
     /// The list, for rows that point at one from an account's page.
     pub list: Option<RemovedList>,
@@ -89,7 +88,7 @@ pub struct Removed {
     pub rkey: String,
     /// Author-claimed `createdAt`.
     pub created_at: Option<DateTime<Utc>>,
-    /// When Farsight first stored the record; `None`: before it kept dates.
+    /// When Farsight first stored the record.
     pub first_seen: Option<DateTime<Utc>>,
     /// When Farsight last saw the record.
     pub last_seen: Option<DateTime<Utc>>,
@@ -119,21 +118,21 @@ pub fn next_cursor(rows: &[Removed], limit: i64) -> Option<HistoryCursor> {
 }
 
 /// The `WHERE` tail shared by the history queries: retention horizon and
-/// keyset. `$3` is the horizon, `$4`/`$5` the cursor, `$6` the limit. The
+/// keyset. `$2` is the horizon, `$3`/`$4` the cursor, `$5` the limit. The
 /// fragments are chosen by which arguments are present so that the keyset
 /// is always an index boundary, never a filter.
-fn tail(a: &HistoryArgs<'_>) -> String {
+fn tail(a: &HistoryArgs) -> String {
     let horizon = if a.horizon.is_some() {
-        "AND h.removed_at >= $3"
+        "AND h.removed_at >= $2"
     } else {
-        "AND $3::timestamptz IS NULL"
+        "AND $2::timestamptz IS NULL"
     };
     let keyset = if a.after.is_some() {
-        "AND (h.removed_at, h.id) < ($4, $5)"
+        "AND (h.removed_at, h.id) < ($3, $4)"
     } else {
-        "AND $4::timestamptz IS NULL AND $5::bigint IS NULL"
+        "AND $3::timestamptz IS NULL AND $4::bigint IS NULL"
     };
-    format!("{horizon} {keyset} ORDER BY h.removed_at DESC, h.id DESC LIMIT $6")
+    format!("{horizon} {keyset} ORDER BY h.removed_at DESC, h.id DESC LIMIT $5")
 }
 
 type PartyRow = (
@@ -167,12 +166,12 @@ fn party_rows(rows: Vec<PartyRow>) -> Vec<Removed> {
 
 /// Removed blocks naming `subject_id`, newest removal first
 /// (`blocks_history_by_subject`). `party` is the blocker; rows whose
-/// blocker is hidden or excluded are left out. `live`: the blocker has a
+/// blocker is hidden are left out. `live`: the blocker has a
 /// block on the subject now.
 pub async fn blocks_history_by_subject(
     conn: &mut PgConnection,
     subject_id: i64,
-    a: HistoryArgs<'_>,
+    a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let sql = format!(
         "SELECT h.id, h.removed_at, p.did, h.rkey, h.created_at, h.first_seen, h.last_seen,
@@ -180,42 +179,20 @@ pub async fn blocks_history_by_subject(
                 EXISTS (SELECT 1 FROM blocks b
                         WHERE b.subject_id = h.subject_id AND b.author_id = h.author_id)
          FROM blocks_history h JOIN actors p ON p.id = h.author_id
-         WHERE h.subject_id = $1 AND p.status NOT IN {HIDDEN} AND NOT (p.id = ANY($2)) {}",
+         WHERE h.subject_id = $1 AND p.status NOT IN {HIDDEN} {}",
         tail(&a)
     );
     fetch_party(conn, &sql, subject_id, a).await
-}
-
-/// Removed blocks authored by `author_id`, newest removal first
-/// (`blocks_history_by_author`). `party` is the blocked account; rows
-/// whose blocked account is hidden or excluded are left out. `live`: the
-/// author blocks that account now.
-pub async fn blocks_history_by_author(
-    conn: &mut PgConnection,
-    author_id: i64,
-    a: HistoryArgs<'_>,
-) -> Result<Vec<Removed>> {
-    let sql = format!(
-        "SELECT h.id, h.removed_at, p.did, h.rkey, h.created_at, h.first_seen, h.last_seen,
-                h.cause,
-                EXISTS (SELECT 1 FROM blocks b
-                        WHERE b.subject_id = h.subject_id AND b.author_id = h.author_id)
-         FROM blocks_history h JOIN actors p ON p.id = h.subject_id
-         WHERE h.author_id = $1 AND p.status NOT IN {HIDDEN} AND NOT (p.id = ANY($2)) {}",
-        tail(&a)
-    );
-    fetch_party(conn, &sql, author_id, a).await
 }
 
 async fn fetch_party(
     conn: &mut PgConnection,
     sql: &str,
     key: i64,
-    a: HistoryArgs<'_>,
+    a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let rows: Vec<PartyRow> = sqlx::query_as(sql)
         .bind(key)
-        .bind(a.excluded)
         .bind(a.horizon)
         .bind(a.after.map(|c| c.removed_at))
         .bind(a.after.map(|c| c.id))
@@ -227,14 +204,14 @@ async fn fetch_party(
 
 /// Removed listblocks on the list (`owner_id`, `list_rkey`), newest
 /// removal first (`list_blocks_history_by_list`). `party` is the
-/// listblocker; rows whose listblocker is hidden or excluded are left out
+/// listblocker; rows whose listblocker is hidden are left out
 /// (the caller withholds the whole page when the owner is). `live`: the
 /// listblocker has a listblock on the list now. Needs no `lists` row.
 pub async fn list_blocks_history_by_list(
     conn: &mut PgConnection,
     owner_id: i64,
     list_rkey: &str,
-    a: HistoryArgs<'_>,
+    a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let sql = format!(
         "SELECT h.id, h.removed_at, p.did, h.rkey, h.created_at, h.first_seen, h.last_seen,
@@ -243,13 +220,12 @@ pub async fn list_blocks_history_by_list(
                         WHERE l.owner_id = h.list_owner_id AND l.rkey = h.list_rkey
                           AND b.author_id = h.author_id)
          FROM list_blocks_history h JOIN actors p ON p.id = h.author_id
-         WHERE h.list_owner_id = $1 AND h.list_rkey = $7
-           AND p.status NOT IN {HIDDEN} AND NOT (p.id = ANY($2)) {}",
+         WHERE h.list_owner_id = $1 AND h.list_rkey = $6
+           AND p.status NOT IN {HIDDEN} {}",
         tail(&a)
     );
     let rows: Vec<PartyRow> = sqlx::query_as(&sql)
         .bind(owner_id)
-        .bind(a.excluded)
         .bind(a.horizon)
         .bind(a.after.map(|c| c.removed_at))
         .bind(a.after.map(|c| c.id))
@@ -322,38 +298,14 @@ fn list_rows(rows: Vec<ListRow>) -> Vec<Removed> {
         .collect()
 }
 
-/// Removed listblocks authored by `author_id`, newest removal first
-/// (`list_blocks_history_by_author`). Each row names the list; rows whose
-/// list owner is hidden or excluded are left out. `lists` is outer-joined:
-/// the row can be missing.
-pub async fn list_blocks_history_by_author(
-    conn: &mut PgConnection,
-    author_id: i64,
-    a: HistoryArgs<'_>,
-) -> Result<Vec<Removed>> {
-    let sql = format!(
-        "SELECT h.id, h.removed_at, o.did, h.list_rkey, h.rkey, h.created_at, h.first_seen,
-                h.last_seen, h.cause,
-                EXISTS (SELECT 1 FROM list_blocks b
-                        WHERE b.author_id = h.author_id AND b.list_id = l.id),
-                {LIST_COLS}
-         FROM list_blocks_history h
-         JOIN actors o ON o.id = h.list_owner_id
-         LEFT JOIN lists l ON l.owner_id = h.list_owner_id AND l.rkey = h.list_rkey
-         WHERE h.author_id = $1 AND o.status NOT IN {HIDDEN} AND NOT (o.id = ANY($2)) {}",
-        tail(&a)
-    );
-    fetch_list(conn, &sql, author_id, a).await
-}
-
 /// Removed list memberships naming `subject_id`, newest removal first
 /// (`list_items_history_by_subject`). Each row names the list; rows whose
-/// list owner is hidden or excluded are left out. `lists` is outer-joined.
+/// list owner is hidden are left out. `lists` is outer-joined.
 /// `live`: the list has a live listitem naming the subject now.
 pub async fn list_items_history_by_subject(
     conn: &mut PgConnection,
     subject_id: i64,
-    a: HistoryArgs<'_>,
+    a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let sql = format!(
         "SELECT h.id, h.removed_at, o.did, h.list_rkey, h.rkey, h.created_at, h.first_seen,
@@ -364,7 +316,7 @@ pub async fn list_items_history_by_subject(
          FROM list_items_history h
          JOIN actors o ON o.id = h.owner_id
          LEFT JOIN lists l ON l.owner_id = h.owner_id AND l.rkey = h.list_rkey
-         WHERE h.subject_id = $1 AND o.status NOT IN {HIDDEN} AND NOT (o.id = ANY($2)) {}",
+         WHERE h.subject_id = $1 AND o.status NOT IN {HIDDEN} {}",
         tail(&a)
     );
     fetch_list(conn, &sql, subject_id, a).await
@@ -374,11 +326,10 @@ async fn fetch_list(
     conn: &mut PgConnection,
     sql: &str,
     key: i64,
-    a: HistoryArgs<'_>,
+    a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let rows: Vec<ListRow> = sqlx::query_as(sql)
         .bind(key)
-        .bind(a.excluded)
         .bind(a.horizon)
         .bind(a.after.map(|c| c.removed_at))
         .bind(a.after.map(|c| c.id))
@@ -390,13 +341,13 @@ async fn fetch_list(
 
 /// Removed members of the list (`owner_id`, `list_rkey`), newest removal
 /// first (`list_items_history_by_list`). `party` is the removed member;
-/// rows whose member is hidden or excluded are left out. `live`: the
+/// rows whose member is hidden are left out. `live`: the
 /// member has a live listitem on the list now. Needs no `lists` row.
 pub async fn list_items_history_by_list(
     conn: &mut PgConnection,
     owner_id: i64,
     list_rkey: &str,
-    a: HistoryArgs<'_>,
+    a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let sql = format!(
         "SELECT h.id, h.removed_at, p.did, h.rkey, h.created_at, h.first_seen, h.last_seen,
@@ -405,13 +356,12 @@ pub async fn list_items_history_by_list(
                         WHERE l.owner_id = h.owner_id AND l.rkey = h.list_rkey
                           AND li.subject_id = h.subject_id)
          FROM list_items_history h JOIN actors p ON p.id = h.subject_id
-         WHERE h.owner_id = $1 AND h.list_rkey = $7
-           AND p.status NOT IN {HIDDEN} AND NOT (p.id = ANY($2)) {}",
+         WHERE h.owner_id = $1 AND h.list_rkey = $6
+           AND p.status NOT IN {HIDDEN} {}",
         tail(&a)
     );
     let rows: Vec<PartyRow> = sqlx::query_as(&sql)
         .bind(owner_id)
-        .bind(a.excluded)
         .bind(a.horizon)
         .bind(a.after.map(|c| c.removed_at))
         .bind(a.after.map(|c| c.id))
@@ -521,10 +471,9 @@ pub async fn actor_ids(conn: &mut PgConnection, dids: &[String]) -> Result<Vec<i
 mod tests {
     use super::*;
 
-    fn args(horizon: bool, after: bool) -> HistoryArgs<'static> {
+    fn args(horizon: bool, after: bool) -> HistoryArgs {
         let t = DateTime::<Utc>::UNIX_EPOCH;
         HistoryArgs {
-            excluded: &[],
             horizon: horizon.then_some(t),
             after: after.then_some(HistoryCursor {
                 removed_at: t,
@@ -537,11 +486,11 @@ mod tests {
     #[test]
     fn keyset_is_a_boundary_only_with_a_cursor() {
         let first = tail(&args(false, false));
-        assert!(first.contains("$4::timestamptz IS NULL") && first.contains("$3::timestamptz"));
+        assert!(first.contains("$3::timestamptz IS NULL") && first.contains("$2::timestamptz"));
         let next = tail(&args(true, true));
-        assert!(next.contains("(h.removed_at, h.id) < ($4, $5)"));
-        assert!(next.contains("h.removed_at >= $3"));
-        assert!(next.ends_with("ORDER BY h.removed_at DESC, h.id DESC LIMIT $6"));
+        assert!(next.contains("(h.removed_at, h.id) < ($3, $4)"));
+        assert!(next.contains("h.removed_at >= $2"));
+        assert!(next.ends_with("ORDER BY h.removed_at DESC, h.id DESC LIMIT $5"));
     }
 
     #[test]

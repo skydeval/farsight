@@ -69,7 +69,6 @@
 <p class="muted">Moderation Lists which this user has been added to.</p>
 </div>
 {% if let Some(n) = lists.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
-{% if let Some(t) = lists.toggle %}<p class="table-options"><a class="toggle{% if t.on %} on{% endif %}" role="checkbox" aria-checked="{% if t.on %}true{% else %}false{% endif %}" href="{{ t.href }}#lists" rel="nofollow" data-swap><span class="box" aria-hidden="true"></span>Show taken down accounts</a></p>{% endif %}
 {% if !lists.rows.is_empty() %}
 {{ lists.pager|safe }}
 <div class="table-responsive free">

@@ -337,8 +337,6 @@ pub fn router(state: Arc<SetupState>) -> Router {
 /// A row of the step navigation.
 #[derive(Debug, Clone)]
 pub struct StepNav {
-    /// Slug.
-    pub slug: &'static str,
     /// Title.
     pub title: &'static str,
     /// `cur`, `done` or empty.
@@ -464,7 +462,6 @@ fn nav(cur: &str, done: &[bool; 10]) -> Vec<StepNav> {
         .iter()
         .enumerate()
         .map(|(i, (slug, title))| StepNav {
-            slug,
             title,
             class: if *slug == cur {
                 "cur"

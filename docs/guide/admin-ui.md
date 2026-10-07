@@ -17,9 +17,8 @@ included) until the restart.
 - **Dashboard.** Index counts, firehose and backfill state, storage,
   exceptions, lists by state and the largest host buckets, refreshed
   every 10 seconds. A "Catching up" block at the top says how far the
-  history sweep, the handle pass and the reading of list descriptions
-  have got and about how long each has left; a line goes away when its
-  work is done.
+  history sweep and the handle pass have got and about how long each
+  has left; a line goes away when its work is done.
 - **Alerts**, a drop-down in the bar of every admin page: the warnings
   (such as a full storage budget, a v1 firehose, unrepaired gaps or
   sort indexes not yet built) and the coverage sentence, with the

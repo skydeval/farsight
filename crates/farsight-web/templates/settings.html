@@ -107,8 +107,7 @@ has seen is complete in about three seconds. Lower it if those hosts start refus
 <div class="hint">0 = off. Above 0, Farsight works through every account it holds in the background and checks its handle,
 so that a page's rows have their handles before anyone opens it; accounts whose identity changes on the network are checked
 first. This is separate from the rate above and runs around the clock: at 10 a second, ten million accounts take about twelve
-days, and each check is up to two requests to servers Farsight does not run. It waits by itself when most checks fail. While
-it is on, lists stored before descriptions were kept also have theirs read, one a second.</div>
+days, and each check is up to two requests to servers Farsight does not run. It waits by itself when most checks fail.</div>
 
 <label><input type="checkbox" name="show_opengraph_image"{% if p.show_opengraph_image %} checked{% endif %}> Offer the preview image (<code>show_opengraph_image</code>)</label>
 <div class="hint">Link previews carry a title, a fixed description and one static image; never data.</div>
