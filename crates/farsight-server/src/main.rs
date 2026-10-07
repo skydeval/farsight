@@ -11,6 +11,7 @@
 
 #![warn(missing_docs)]
 
+mod error;
 mod health;
 mod metrics_http;
 mod normal;
@@ -34,12 +35,14 @@ pub const CONFIG_PATH_ENV: &str = "FARSIGHT_CONFIG";
 /// Restricts the setup listener, e.g. `127.0.0.1` or `127.0.0.1:8080`.
 pub const SETUP_BIND_ENV: &str = "FARSIGHT_SETUP_BIND";
 
-/// How a mode ended.
+/// How a mode ended without an error: what `main`'s loop does next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeEnd {
     /// The process is stopping (signal).
     Shutdown,
-    /// Switch to the other mode.
+    /// Enter the other mode in this process: setup mode ends this way
+    /// when the wizard has written the config, normal mode when the
+    /// config was reset.
     Switch,
 }
 
@@ -230,13 +233,13 @@ fn set_admin_did_command(args: &[String]) -> ExitCode {
 fn resolve_for_cli(
     cfg: &config::Config,
     did: &str,
-) -> Result<farsight_web::oauth::Identity, String> {
+) -> Result<farsight_web::oauth::Identity, error::LookupError> {
     use farsight_core::net::{SafeClient, SafeClientConfig};
-    let parsed = farsight_core::Did::parse(did).map_err(|e| e.to_string())?;
+    use farsight_web::oauth::OAuthError;
+    let parsed = farsight_core::Did::parse(did).map_err(OAuthError::from)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
+        .build()?;
     rt.block_on(async {
         let safe = SafeClient::new(SafeClientConfig::from_config(cfg, VERSION));
         match tokio::time::timeout(
@@ -245,8 +248,8 @@ fn resolve_for_cli(
         )
         .await
         {
-            Ok(r) => r,
-            Err(_) => Err("the lookup timed out".into()),
+            Ok(r) => Ok(r?),
+            Err(_) => Err(OAuthError::TimedOut.into()),
         }
     })
 }

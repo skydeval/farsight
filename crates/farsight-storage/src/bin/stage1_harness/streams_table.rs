@@ -238,14 +238,14 @@ fn cases() -> Vec<Case> {
 struct L {
     owner: Did,
     rkey: String,
-    id: i64,
+    id: ListId,
     blockers: Vec<(Did, String)>,
     next_rev: u64,
     tag: u64,
 }
 
 impl L {
-    fn rev(&mut self) -> i64 {
+    fn rev(&mut self) -> Stamp {
         self.next_rev += 1;
         rev(self.next_rev)
     }
@@ -256,7 +256,7 @@ async fn new_list(env: &Env, tag: u64) -> Result<L> {
     let mut l = L {
         owner,
         rkey: format!("t{tag}"),
-        id: 0,
+        id: ListId::new(0),
         blockers: Vec::new(),
         next_rev: 1000,
         tag,

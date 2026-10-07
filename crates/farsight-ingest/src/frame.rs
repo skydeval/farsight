@@ -16,7 +16,7 @@ use farsight_core::record::{CommitOp, RecordError, parse_commit};
 use farsight_core::{Collection, Did};
 use serde_json::Value;
 
-/// The two protocols.
+/// The two Jetstream protocols an instance may speak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protocol {
     /// v1 `/subscribe`.
@@ -26,7 +26,7 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    /// Metric / log label.
+    /// The `v1` / `v2` label used in metrics and logs.
     pub fn label(self) -> &'static str {
         match self {
             Protocol::V1 => "v1",
@@ -34,7 +34,8 @@ impl Protocol {
         }
     }
 
-    /// The storage code.
+    /// The same protocol as the storage crate's enum, whose code is
+    /// persisted in `firehose_state.protocol`.
     pub fn storage(self) -> farsight_storage::codes::Protocol {
         match self {
             Protocol::V1 => farsight_storage::codes::Protocol::V1,
@@ -53,7 +54,7 @@ pub enum DropReason {
 }
 
 impl DropReason {
-    /// Metric label.
+    /// The `reason` label of `farsight_ingest_dropped_total`.
     pub fn label(self) -> &'static str {
         match self {
             DropReason::Invalid => "invalid",
@@ -69,7 +70,8 @@ pub enum Body {
     Commit(CommitOp),
     /// A commit that failed validation; dropped, but its position counts.
     Rejected {
-        /// Why.
+        /// Which rule the commit broke; the `reason` label of the drop
+        /// counter.
         reason: DropReason,
         /// The collection if it was readable (metric label).
         collection: Option<Collection>,
@@ -82,9 +84,9 @@ pub enum Body {
     Identity(Did),
     /// `account`.
     Account {
-        /// The account.
+        /// The account whose status changed.
         did: Did,
-        /// `active`.
+        /// The event's `active` flag; false when the field is absent.
         active: bool,
         /// Upstream status when inactive.
         status: Option<String>,
@@ -102,7 +104,7 @@ pub struct InEvent {
     pub seq: Option<i64>,
     /// Witness time, microseconds since the epoch.
     pub witness_us: i64,
-    /// The payload.
+    /// What the event carries, already validated.
     pub body: Body,
 }
 
@@ -113,16 +115,16 @@ pub enum Frame {
     Event(InEvent),
     /// v2 `#info` advisory (e.g. `OutdatedCursor`).
     Info {
-        /// Name.
+        /// The advisory's `name`; empty if the frame has none.
         name: String,
-        /// Message.
+        /// Its free-text `message`, if any.
         message: Option<String>,
     },
     /// v2 error frame; the server closes the stream after it.
     Error {
-        /// Error name.
+        /// The frame's `error` name; `Unknown` if it has none.
         error: String,
-        /// Message.
+        /// Its free-text `message`, if any.
         message: Option<String>,
     },
 }
@@ -157,7 +159,8 @@ pub fn check_seq(seq: i64) -> Result<i64, FrameError> {
     Ok(seq)
 }
 
-fn now_us() -> i64 {
+/// This machine's clock, microseconds since the epoch.
+pub(crate) fn now_us() -> i64 {
     chrono::Utc::now().timestamp_micros()
 }
 
@@ -504,5 +507,308 @@ mod tests {
         assert!(decode_v2(&event(-3, "2026-09-30T16:00:00Z")).is_err());
         assert!(decode_v2(&event(5, "9999-12-31T23:59:59Z")).is_err());
         assert!(decode_v2(&event(5, "0001-01-01T00:00:00Z")).is_err());
+    }
+
+    mod properties {
+        use super::*;
+        use farsight_core::{RecordKey, Tid};
+        use proptest::prelude::*;
+
+        /// What a peer may put where a number belongs.
+        fn number() -> impl Strategy<Value = String> {
+            prop_oneof![
+                any::<i64>().prop_map(|n| n.to_string()),
+                any::<u64>().prop_map(|n| n.to_string()),
+                (0i64..4_000_000_000_000_000).prop_map(|n| n.to_string()),
+                any::<f64>().prop_map(|x| format!("{x:?}")),
+                "-?[0-9]{1,40}",
+                "-?[0-9]{1,5}(\\.[0-9]{1,5})?[eE][+-]?[0-9]{1,4}",
+                "\"-?[0-9]{1,20}\"",
+                Just("null".to_owned()),
+                Just("true".to_owned()),
+                Just("[1]".to_owned()),
+                Just("{}".to_owned()),
+            ]
+        }
+
+        /// The value of a token that is an integer written the one way
+        /// JSON and `i64` agree on.
+        fn plain_i64(token: &str) -> Option<i64> {
+            token.parse::<i64>().ok().filter(|n| n.to_string() == token)
+        }
+
+        fn rfc3339(us: i64) -> Option<String> {
+            DateTime::from_timestamp_micros(us)
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        }
+
+        fn time() -> impl Strategy<Value = String> {
+            prop_oneof![
+                (-100_000_000_000_000_000i64..300_000_000_000_000_000)
+                    .prop_filter_map("representable", rfc3339),
+                (0i64..2_000_000_000_000_000).prop_filter_map("representable", rfc3339),
+                "[0-9]{4,6}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,12})?(Z|[+-][0-9]{2}:[0-9]{2})",
+                "\\PC{0,24}",
+            ]
+        }
+
+        const WORDS: [&str; 24] = [
+            A,
+            "did:web:example.com",
+            "handle.test",
+            "commit",
+            "identity",
+            "account",
+            "message",
+            "error",
+            "network.bsky.jetstream.subscribeEvents#commit",
+            "network.bsky.jetstream.subscribeEvents#account",
+            "network.bsky.jetstream.subscribeEvents#info",
+            "network.bsky.jetstream.subscribeEvents#sync",
+            "app.bsky.graph.block",
+            "app.bsky.graph.listitem",
+            "app.bsky.graph.list",
+            "create",
+            "delete",
+            "3l3qo2vutsw2b",
+            "2026-09-30T16:00:00Z",
+            "9999-12-31T23:59:59Z",
+            "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.list/x",
+            "app.bsky.graph.defs#modlist",
+            "",
+            "self",
+        ];
+
+        const KEYS: [&str; 24] = [
+            "did",
+            "time_us",
+            "kind",
+            "commit",
+            "identity",
+            "account",
+            "$type",
+            "payload",
+            "seq",
+            "time",
+            "witnessedAt",
+            "rev",
+            "operation",
+            "collection",
+            "rkey",
+            "record",
+            "subject",
+            "list",
+            "purpose",
+            "name",
+            "error",
+            "message",
+            "active",
+            "status",
+        ];
+
+        /// JSON built from the names the decoders look for, holding
+        /// anything.
+        fn json_value() -> impl Strategy<Value = Value> {
+            let leaf = prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::from),
+                any::<i64>().prop_map(Value::from),
+                any::<u64>().prop_map(Value::from),
+                any::<f64>().prop_map(
+                    |x| serde_json::Number::from_f64(x).map_or(Value::Null, Value::Number)
+                ),
+                prop::sample::select(WORDS.to_vec()).prop_map(Value::from),
+                "\\PC{0,12}".prop_map(Value::from),
+            ];
+            leaf.prop_recursive(4, 48, 8, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                    prop::collection::vec((prop::sample::select(KEYS.to_vec()), inner), 0..8)
+                        .prop_map(|kv| {
+                            Value::Object(kv.into_iter().map(|(k, v)| (k.to_owned(), v)).collect())
+                        }),
+                ]
+            })
+        }
+
+        fn in_range(ev: &InEvent, after: i64) -> bool {
+            (0..=after.saturating_add(MAX_WITNESS_AHEAD_US)).contains(&ev.witness_us)
+                && ev.seq.is_none_or(|s| (0..i64::MAX).contains(&s))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Bytes of any kind: both decoders return.
+            #[test]
+            fn decoding_arbitrary_bytes_is_total(
+                bytes in prop_oneof![
+                    prop::collection::vec(any::<u8>(), 0..256),
+                    "\\PC{0,128}".prop_map(String::into_bytes),
+                ],
+            ) {
+                let _ = decode_v1(&bytes);
+                let _ = decode_v2(&bytes);
+            }
+
+            /// JSON of any shape under the names the decoders read: both
+            /// return, and an event either one yields has a position in
+            /// range.
+            #[test]
+            fn decoding_arbitrary_json_yields_only_positions_in_range(v in json_value()) {
+                let bytes = serde_json::to_vec(&v).unwrap();
+                let (one, two) = (decode_v1(&bytes), decode_v2(&bytes));
+                let after = now_us();
+                for frame in [one, two].into_iter().flatten() {
+                    if let Frame::Event(ev) = frame {
+                        prop_assert!(in_range(&ev, after), "{:?}", ev);
+                    }
+                }
+            }
+
+            /// A v1 event with anything where `time_us` belongs is an
+            /// event exactly when that is a plain integer from the epoch
+            /// to a day past the clock, and then carries that integer.
+            #[test]
+            fn v1_time_us_is_taken_only_as_a_plain_integer_in_range(
+                t in number(),
+                kind in prop::sample::select(vec!["commit", "identity", "account", "other"]),
+            ) {
+                let text = format!(
+                    r#"{{"did":"{A}","time_us":{t},"kind":"{kind}","account":{{"active":true}}}}"#
+                );
+                let before = now_us();
+                let decoded = decode_v1(text.as_bytes());
+                let after = now_us();
+                match (&decoded, plain_i64(&t)) {
+                    (Ok(Frame::Event(ev)), Some(n)) => {
+                        prop_assert_eq!((ev.seq, ev.witness_us), (None, n));
+                        prop_assert!(in_range(ev, after));
+                    }
+                    (Ok(other), _) => prop_assert!(false, "{} gave {:?}", t, other),
+                    (Err(_), Some(n)) => {
+                        prop_assert!(!(0..=before.saturating_add(MAX_WITNESS_AHEAD_US)).contains(&n));
+                    }
+                    (Err(_), None) => {}
+                }
+            }
+
+            /// A v2 event with anything where `seq` and the time belong is
+            /// an event exactly when `seq` is a plain integer in
+            /// `[0, i64::MAX)` and the time is RFC 3339 from the epoch to
+            /// a day past the clock; it then carries both.
+            #[test]
+            fn v2_seq_and_time_are_taken_only_in_range(
+                seq in number(),
+                at in time(),
+                witnessed in any::<bool>(),
+                kind in prop::sample::select(vec!["commit", "identity", "account", "sync", "other"]),
+            ) {
+                let field = if witnessed { "witnessedAt" } else { "time" };
+                let text = format!(
+                    r#"{{"$type":"message","payload":{{"$type":"{V2_PREFIX}{kind}","seq":{seq},"did":"{A}","{field}":{},"account":{{"active":false}}}}}}"#,
+                    serde_json::to_string(&at).unwrap()
+                );
+                let before = now_us();
+                let decoded = decode_v2(text.as_bytes());
+                let after = now_us();
+                let wanted = plain_i64(&seq)
+                    .filter(|n| (0..i64::MAX).contains(n))
+                    .zip(parse_time_us(&at));
+                match (&decoded, wanted) {
+                    (Ok(Frame::Event(ev)), Some((n, us))) => {
+                        prop_assert_eq!((ev.seq, ev.witness_us), (Some(n), us));
+                        prop_assert!(in_range(ev, after));
+                    }
+                    (Ok(other), _) => prop_assert!(false, "{} {} gave {:?}", seq, at, other),
+                    (Err(_), Some((_, us))) => {
+                        prop_assert!(!(0..=before.saturating_add(MAX_WITNESS_AHEAD_US)).contains(&us));
+                    }
+                    (Err(_), None) => {}
+                }
+            }
+
+            /// The range checks agree with their definition for every
+            /// value and clock, and an accepted `seq` has a successor.
+            #[test]
+            fn range_checks_are_total(us in any::<i64>(), now in any::<i64>(), seq in any::<i64>()) {
+                let ok = us >= 0
+                    && i128::from(us) <= i128::from(now) + i128::from(MAX_WITNESS_AHEAD_US);
+                match check_witness(us, now) {
+                    Ok(w) => prop_assert!(ok && w == us),
+                    Err(_) => prop_assert!(!ok),
+                }
+                match check_seq(seq) {
+                    Ok(s) => prop_assert!(s == seq && s >= 0 && s.checked_add(1).is_some()),
+                    Err(_) => prop_assert!(seq < 0 || seq == i64::MAX),
+                }
+            }
+
+            /// Events made from valid parts come back as those parts, on
+            /// both protocols.
+            #[test]
+            fn valid_events_round_trip(
+                plc in "[a-z2-7]{24}",
+                us in 0i64..1_700_000_000_000_000,
+                seq in 0i64..i64::MAX,
+                rev_us in 0u64..(1 << 53),
+                clock in 0u16..1024,
+                rkey in "[A-Za-z0-9_:~-][A-Za-z0-9._:~-]{0,20}",
+                c in 0usize..4,
+                active in any::<bool>(),
+                status in prop::option::of("[a-z]{1,12}"),
+            ) {
+                let did = Did::parse(&format!("did:plc:{plc}")).unwrap();
+                let rev = Tid::from_parts(rev_us, clock).unwrap();
+                let collection = Collection::ALL[c];
+                let at = rfc3339(us).unwrap();
+                let deleted = Body::Commit(CommitOp {
+                    author: did.clone(),
+                    collection,
+                    rkey: RecordKey::parse(&rkey).unwrap(),
+                    rev,
+                    action: farsight_core::CommitAction::Delete,
+                });
+                let account = Body::Account { did: did.clone(), active, status: status.clone() };
+
+                let commit = json!({"rev": rev.encode(), "operation": "delete",
+                    "collection": collection.nsid(), "rkey": rkey});
+                let e = json!({"did": did.as_str(), "time_us": us, "kind": "commit", "commit": commit});
+                prop_assert_eq!(
+                    decode_v1(e.to_string().as_bytes()),
+                    Ok(Frame::Event(InEvent { seq: None, witness_us: us, body: deleted.clone() }))
+                );
+                let e = json!({"did": did.as_str(), "time_us": us, "kind": "account",
+                    "account": {"active": active, "status": status}});
+                prop_assert_eq!(
+                    decode_v1(e.to_string().as_bytes()),
+                    Ok(Frame::Event(InEvent { seq: None, witness_us: us, body: account.clone() }))
+                );
+
+                let e = v2(json!({"$type": format!("{V2_PREFIX}commit"), "seq": seq,
+                    "did": did.as_str(), "time": "2020-01-01T00:00:00Z", "witnessedAt": at,
+                    "rev": rev.encode(), "operation": "delete",
+                    "collection": collection.nsid(), "rkey": rkey}));
+                prop_assert_eq!(
+                    decode_v2(&e),
+                    Ok(Frame::Event(InEvent { seq: Some(seq), witness_us: us, body: deleted }))
+                );
+                let e = v2(json!({"$type": format!("{V2_PREFIX}account"), "seq": seq,
+                    "did": did.as_str(), "time": at,
+                    "account": {"active": active, "status": status}}));
+                prop_assert_eq!(
+                    decode_v2(&e),
+                    Ok(Frame::Event(InEvent { seq: Some(seq), witness_us: us, body: account }))
+                );
+                for (kind, body) in [("identity", Body::Identity(did.clone())), ("sync", Body::Sync(did.clone()))] {
+                    let e = v2(json!({"$type": format!("{V2_PREFIX}{kind}"), "seq": seq,
+                        "did": did.as_str(), "time": at}));
+                    prop_assert_eq!(
+                        decode_v2(&e),
+                        Ok(Frame::Event(InEvent { seq: Some(seq), witness_us: us, body }))
+                    );
+                }
+            }
+        }
     }
 }

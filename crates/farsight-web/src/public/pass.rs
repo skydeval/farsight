@@ -40,7 +40,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use super::handles::{NEGATIVE_TTL, claimed_handle, document_url};
-use crate::pages::{WebState, resolve_handle};
+use crate::pages::{HandleError, WebState, handle_to_did};
 
 /// Ids one query of the walk looks at.
 pub const WINDOW: i64 = 20_000;
@@ -92,7 +92,8 @@ pub enum Checked {
 }
 
 impl Checked {
-    /// Metric label.
+    /// The `outcome` label of the handle pass's counter, and of its log
+    /// line.
     pub fn label(&self) -> &'static str {
         match self {
             Checked::Handle(_) => "handle",
@@ -120,40 +121,65 @@ pub fn register() {
 /// resolved back.
 ///
 /// With an answer that is not a verified handle comes why, for the log.
-async fn check(st: &WebState, cfg: &Config, did: &Did) -> (Checked, Option<String>) {
+async fn check(st: &WebState, cfg: &Config, did: &Did) -> (Checked, Option<Why>) {
     let Some(url) = document_url(cfg, did) else {
         return (Checked::Gone, None);
     };
     let r = match st.safe.get(&url).await {
         Ok(r) => r,
-        Err(e) => return (Checked::Unknown, Some(format!("document: {e}"))),
+        Err(e) => return (Checked::Unknown, Some(Why::Document(e.to_string()))),
     };
     let doc = match r.status {
         200 => serde_json::from_slice::<serde_json::Value>(&r.body).ok(),
         404 | 410 => return (Checked::Gone, None),
-        other => return (Checked::Unknown, Some(format!("document: HTTP {other}"))),
+        other => {
+            return (
+                Checked::Unknown,
+                Some(Why::Document(format!("HTTP {other}"))),
+            );
+        }
     };
     let Some(doc) = doc else {
-        return (Checked::Unknown, Some("document: not JSON".into()));
+        return (Checked::Unknown, Some(Why::Document("not JSON".into())));
     };
     let Some(claim) = claimed_handle(&doc) else {
         return (Checked::Gone, None);
     };
-    match resolve_handle(&st.safe, &claim).await {
+    match handle_to_did(&st.safe, &claim).await {
         Ok(back) if back == *did => (Checked::Handle(claim), None),
         Ok(_) => (Checked::Gone, None),
         // The handle's host answered, and not with this DID: the claim
         // stands unproven. Anything else (no answer, no address, a
         // timeout) proves nothing about the account.
-        Err(e) if answered(&e) => (Checked::Unresolved(claim), Some(e)),
-        Err(e) => (Checked::Unknown, Some(e)),
+        Err(e) if answered(&e) => (Checked::Unresolved(claim), Some(Why::Handle(e))),
+        Err(e) => (Checked::Unknown, Some(Why::Handle(e))),
     }
 }
 
+/// Why a check did not find a verified handle; its text is logged.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+enum Why {
+    /// The DID document could not be read.
+    #[error("document: {0}")]
+    Document(String),
+    /// The claimed handle did not resolve back.
+    #[error(transparent)]
+    Handle(HandleError),
+    /// The check ran out of time.
+    #[error("deadline")]
+    Deadline,
+}
+
 /// The domain a handle that could not be resolved is under (`pds.example`
-/// for `alice.pds.example`), read from the resolution's error text.
-fn failed_under(why: &str) -> Option<String> {
-    let handle = why.strip_prefix("could not resolve ")?.split(':').next()?;
+/// for `alice.pds.example`): of a handle whose host did not answer, or
+/// answered with a status.
+fn failed_under(why: &Why) -> Option<String> {
+    let handle = match why {
+        Why::Handle(HandleError::Unreachable { handle, .. } | HandleError::Http { handle, .. }) => {
+            handle
+        }
+        _ => return None,
+    };
     handle.split_once('.').map(|(_, parent)| parent.to_owned())
 }
 
@@ -174,8 +200,8 @@ fn one_host(failed: &[Option<String>]) -> bool {
 /// Whether a failed handle resolution got an answer from the handle's
 /// host (an HTTP status, or a body that is not a DID), as opposed to no
 /// answer at all.
-fn answered(error: &str) -> bool {
-    error.contains(": HTTP ") || error.ends_with("did not resolve to a DID")
+fn answered(error: &HandleError) -> bool {
+    matches!(error, HandleError::Http { .. } | HandleError::NotADid(_))
 }
 
 /// Checks that established nothing, counted: every [`LOG_EVERY`]th is
@@ -195,12 +221,12 @@ async fn record(
 ) -> farsight_storage::Result<()> {
     let mut conn = st.api.pool.acquire().await?;
     match found {
-        Checked::Handle(h) => store::store(&mut conn, did.as_str(), h).await?,
-        Checked::Gone => store::store_gone(&mut conn, did.as_str()).await?,
+        Checked::Handle(h) => store::store(&mut conn, did, h).await?,
+        Checked::Gone => store::store_gone(&mut conn, did).await?,
         Checked::Unresolved(claim) => {
-            store::store_unresolved(&mut conn, did.as_str(), claim).await?;
+            store::store_unresolved(&mut conn, did, claim).await?;
         }
-        Checked::Unknown => store::store_unknown(&mut conn, did.as_str()).await?,
+        Checked::Unknown => store::store_unknown(&mut conn, did).await?,
     }
     drop(conn);
     let cache = &st.public.handles;
@@ -239,14 +265,14 @@ async fn check_one(st: Arc<WebState>, item: Item) -> Option<(String, Option<Stri
     };
     let (found, why) = tokio::time::timeout(CHECK_DEADLINE, check(&st, cfg, &did))
         .await
-        .unwrap_or((Checked::Unknown, Some("deadline".into())));
-    let under = why.as_deref().and_then(failed_under);
+        .unwrap_or((Checked::Unknown, Some(Why::Deadline)));
+    let under = why.as_ref().and_then(failed_under);
     if let Some(why) = why {
         let n = UNESTABLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n % LOG_EVERY == 0 {
             tracing::warn!(
                 outcome = found.label(),
-                why,
+                why = why.to_string(),
                 seen = n + 1,
                 "handle pass: a check established nothing (one in {LOG_EVERY} is logged)"
             );
@@ -266,9 +292,9 @@ async fn check_one(st: Arc<WebState>, item: Item) -> Option<(String, Option<Stri
     if item.queued {
         let done = match st.api.pool.acquire().await {
             Ok(mut conn) if found == Checked::Unknown => {
-                store::due_later(&mut conn, did.as_str(), DUE_RETRY_SECS).await
+                store::due_later(&mut conn, &did, DUE_RETRY_SECS).await
             }
-            Ok(mut conn) => store::due_done(&mut conn, did.as_str()).await,
+            Ok(mut conn) => store::due_done(&mut conn, &did).await,
             Err(e) => Err(e.into()),
         };
         if let Err(e) = done {
@@ -490,21 +516,36 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
 mod tests {
     use super::*;
 
+    fn unreachable(handle: &str) -> HandleError {
+        HandleError::Unreachable {
+            handle: handle.into(),
+            source: farsight_core::net::OutboundError::Timeout,
+        }
+    }
+
     #[test]
     fn only_an_answer_from_the_host_leaves_a_claim_unresolved() {
-        assert!(answered("could not resolve a.example: HTTP 404"));
-        assert!(answered("a.example did not resolve to a DID"));
-        assert!(!answered(
-            "could not resolve a.example: transport error: error sending request"
-        ));
-        assert!(!answered("could not resolve a.example: request timed out"));
+        let http = HandleError::Http {
+            handle: "a.example".into(),
+            status: 404,
+        };
+        assert_eq!(http.to_string(), "could not resolve a.example: HTTP 404");
+        assert!(answered(&http));
+        assert!(answered(&HandleError::NotADid("a.example".into())));
+        assert!(!answered(&unreachable("a.example")));
+        assert!(!answered(&HandleError::Invalid("a b".into())));
     }
 
     #[test]
     fn failures_under_one_domain_are_one_host() {
-        let under = |h: &str| failed_under(&format!("could not resolve {h}: request timed out"));
+        let under = |h: &str| failed_under(&Why::Handle(unreachable(h)));
         assert_eq!(under("a.pds.example").as_deref(), Some("pds.example"));
-        assert_eq!(failed_under("document: HTTP 429"), None);
+        assert_eq!(failed_under(&Why::Document("HTTP 429".into())), None);
+        assert_eq!(
+            Why::Document("HTTP 429".into()).to_string(),
+            "document: HTTP 429"
+        );
+        assert_eq!(Why::Deadline.to_string(), "deadline");
         let dead: Vec<_> = (0..30)
             .map(|i| under(&format!("u{i}.pds.example")))
             .collect();

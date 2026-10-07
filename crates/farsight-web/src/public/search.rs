@@ -30,58 +30,82 @@ pub enum Target {
     List(Authority, RecordKey),
 }
 
-const NOT_LOOKUP: &str = "Only accounts and lists can be looked up.";
+/// Why a query names nothing to look up. The text is the message of the
+/// 400 page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum QueryError {
+    /// Nothing was typed.
+    #[error("Enter a handle, a DID, an at:// URI or a bsky.app profile or list link.")]
+    Empty,
+    /// Longer than any handle, DID or link.
+    #[error("That is too long to be a handle, a DID or a link.")]
+    TooLong,
+    /// Starts like a DID and is not one.
+    #[error("That is not a valid DID.")]
+    Did,
+    /// The account part is neither a DID nor a handle.
+    #[error("That is not a valid DID or handle.")]
+    Authority,
+    /// The list's record key is not valid.
+    #[error("That is not a valid list key.")]
+    ListKey,
+    /// An at:// URI of something other than an account or a list.
+    #[error("Only accounts and lists can be looked up.")]
+    NotLookup,
+    /// A link other than a bsky.app profile or list link.
+    #[error("Only https://bsky.app/profile/… links to an account or a list are understood.")]
+    Link,
+    /// None of the forms a query may take.
+    #[error("That is not a handle, a DID, an at:// URI or a bsky.app profile or list link.")]
+    Unrecognized,
+}
 
 fn handle(s: &str) -> Option<String> {
     let h = s.trim_start_matches('@').to_ascii_lowercase();
     farsight_core::did::is_valid_hostname(&h).then_some(h)
 }
 
-fn authority(s: &str) -> Result<Authority, String> {
+fn authority(s: &str) -> Result<Authority, QueryError> {
     if s.starts_with("did:") {
         return Did::parse(s)
             .map(Authority::Did)
-            .map_err(|_| "That is not a valid DID.".to_owned());
+            .map_err(|_| QueryError::Did);
     }
     handle(s)
         .map(Authority::Handle)
-        .ok_or_else(|| "That is not a valid DID or handle.".to_owned())
+        .ok_or(QueryError::Authority)
 }
 
-fn rkey(s: &str) -> Result<RecordKey, String> {
-    RecordKey::parse(s).map_err(|_| "That is not a valid list key.".to_owned())
+fn rkey(s: &str) -> Result<RecordKey, QueryError> {
+    RecordKey::parse(s).map_err(|_| QueryError::ListKey)
 }
 
-/// Parses a trimmed query. The error is the message of the 400 page.
-pub fn parse(q: &str) -> Result<Target, String> {
+/// Parses a trimmed query. The error's text is the message of the 400
+/// page.
+pub fn parse(q: &str) -> Result<Target, QueryError> {
     if q.is_empty() {
-        return Err(
-            "Enter a handle, a DID, an at:// URI or a bsky.app profile or list link.".into(),
-        );
+        return Err(QueryError::Empty);
     }
     if q.len() > MAX_QUERY_BYTES {
-        return Err("That is too long to be a handle, a DID or a link.".into());
+        return Err(QueryError::TooLong);
     }
     if q.starts_with("did:") {
         return authority(q).map(Target::Account);
     }
     if let Some(rest) = q.strip_prefix("at://") {
         if rest.contains(['?', '#']) {
-            return Err(NOT_LOOKUP.into());
+            return Err(QueryError::NotLookup);
         }
         let parts: Vec<&str> = rest.split('/').collect();
         return match parts.as_slice() {
             [a] => authority(a).map(Target::Account),
             // The collection is compared exactly: NSIDs are case-sensitive.
             [a, c, r] if *c == LIST_COLLECTION => Ok(Target::List(authority(a)?, rkey(r)?)),
-            _ => Err(NOT_LOOKUP.into()),
+            _ => Err(QueryError::NotLookup),
         };
     }
     if q.starts_with("http://") || q.starts_with("https://") {
-        let bad = || {
-            "Only https://bsky.app/profile/… links to an account or a list are understood."
-                .to_owned()
-        };
+        let bad = || QueryError::Link;
         let u = url::Url::parse(q).map_err(|_| bad())?;
         if u.scheme() != "https"
             || u.host_str() != Some("bsky.app")
@@ -105,9 +129,7 @@ pub fn parse(q: &str) -> Result<Target, String> {
     }
     handle(q)
         .map(|h| Target::Account(Authority::Handle(h)))
-        .ok_or_else(|| {
-            "That is not a handle, a DID, an at:// URI or a bsky.app profile or list link.".into()
-        })
+        .ok_or(QueryError::Unrecognized)
 }
 
 #[cfg(test)]
@@ -159,7 +181,7 @@ mod tests {
         }
         assert_eq!(
             parse(&format!("at://{DID}/app.bsky.feed.post/3k")),
-            Err(NOT_LOOKUP.to_owned())
+            Err(QueryError::NotLookup)
         );
     }
 

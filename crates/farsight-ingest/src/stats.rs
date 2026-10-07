@@ -16,11 +16,13 @@ pub struct IngestStats {
     pub writes_applied: AtomicU64,
     /// Events dropped before apply (invalid, foreign listitem).
     pub dropped: AtomicU64,
-    /// Poisoned events.
+    /// Events skipped after failing `writer::POISON_STRIKES` times when
+    /// applied alone. Not included in `dropped`.
     pub poisoned: AtomicU64,
-    /// Gaps recorded.
+    /// Gaps the reader reported to the writer, whether or not the gap row
+    /// could be written.
     pub gaps: AtomicU64,
-    /// Sessions started.
+    /// Sessions opened: one per successful connect, on either protocol.
     pub sessions: AtomicU64,
     /// Reconnects (any reason).
     pub reconnects: AtomicU64,
@@ -32,7 +34,7 @@ pub struct IngestStats {
     pub seam_repair_events: AtomicU64,
     /// Latest source lag in milliseconds (`-1` = unmeasured).
     pub source_lag_ms: std::sync::atomic::AtomicI64,
-    /// Protocol and URL of the current session.
+    /// URL and protocol of the current session; `None` while disconnected.
     pub current: Mutex<Option<(String, Protocol)>>,
 }
 

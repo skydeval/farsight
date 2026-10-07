@@ -15,6 +15,7 @@ use farsight_api::{IpLayer, client_ip_middleware};
 use farsight_web::setup_token;
 use tokio::sync::watch;
 
+use crate::error::ServerError;
 use crate::{ModeEnd, SETUP_BIND_ENV, VERSION, health};
 
 /// The setup listener address: `FARSIGHT_SETUP_BIND` (an address, or an
@@ -43,21 +44,21 @@ pub fn setup_bind(env: &[(String, String)]) -> String {
     }
 }
 
-/// Runs setup mode.
+/// Runs setup mode until `shutdown` flips ([`ModeEnd::Shutdown`]) or the
+/// wizard has written `config_path` ([`ModeEnd::Switch`], and the caller
+/// loads it and enters normal mode). Prints the setup token at start.
 pub async fn run(
     config_path: PathBuf,
     env: Vec<(String, String)>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<ModeEnd, String> {
+) -> Result<ModeEnd, ServerError> {
     let (state, mut completed) = farsight_web::SetupState::new(config_path, env.clone(), VERSION);
     // Print the token on every setup-mode boot, creating or rotating it
     // as needed.
-    let (token, rotated) = state.check_token().map_err(|e| {
-        format!(
-            "cannot write the setup token next to the config ({}): {e}",
-            state.token_path.display()
-        )
-    })?;
+    let (token, rotated) = state.check_token().map_err(ServerError::io(format!(
+        "cannot write the setup token next to the config ({})",
+        state.token_path.display()
+    )))?;
     if !rotated {
         setup_token::print(&token);
     }
@@ -80,7 +81,9 @@ pub async fn run(
     let bind = setup_bind(&env);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .map_err(|e| format!("binding the setup listener on {bind}: {e}"))?;
+        .map_err(ServerError::io(format!(
+            "binding the setup listener on {bind}"
+        )))?;
     tracing::info!(bind, "setup mode: serving the wizard");
 
     // Token housekeeping: expiry check every minute, re-print every 10.
@@ -126,7 +129,7 @@ pub async fn run(
     });
     let r = server.await;
     ticker.abort();
-    r.map_err(|e| format!("setup listener: {e}"))?;
+    r.map_err(ServerError::io("setup listener"))?;
     if *completed.borrow_and_update() {
         tracing::info!("setup complete; switching to normal mode in-process");
         return Ok(ModeEnd::Switch);

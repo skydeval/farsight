@@ -1,12 +1,15 @@
 //! Token-bucket rate limits (see `docs/design/api.md`), keyed by
 //! resolved client IP (IPv6 by /64) for anonymous callers and by token
 //! for authenticated ones. Buckets live in memory; idle ones are swept.
+//! The bucket arithmetic is [`farsight_core::bucket`]; this module adds
+//! the keys, the classes and what the headers report.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use farsight_core::bucket::{Bucket, Rate};
 use farsight_core::config::Config;
 
 /// Rate-limit classes (also the `class` label of
@@ -114,9 +117,11 @@ impl Class {
 /// A sustained rate and a burst.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Limit {
-    /// Tokens per second.
+    /// Sustained requests per second. At 0 the bucket never refills, and
+    /// a refused caller is told to retry in an hour.
     pub rate: f64,
-    /// Bucket size.
+    /// Bucket capacity: the requests a full bucket allows at once. At
+    /// least 1.
     pub burst: f64,
 }
 
@@ -128,18 +133,25 @@ impl Limit {
             burst: burst.max(1.0),
         }
     }
+
+    fn bucket_rate(self) -> Rate {
+        Rate {
+            per_sec: self.rate,
+            burst: self.burst,
+        }
+    }
 }
 
 /// What the `RateLimit-Policy` / `RateLimit` headers report.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RateHeaders {
-    /// Policy name.
+    /// The policy name both headers quote: [`Class::label`].
     pub class: &'static str,
     /// Quota (burst).
     pub quota: u64,
     /// Window in seconds (time to refill the whole burst).
     pub window: u64,
-    /// Remaining requests.
+    /// Whole tokens left in the bucket after this request.
     pub remaining: u64,
     /// Seconds until the bucket is full again.
     pub reset: u64,
@@ -155,12 +167,6 @@ impl RateHeaders {
     pub fn state(&self) -> String {
         format!("\"{}\";r={};t={}", self.class, self.remaining, self.reset)
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Bucket {
-    tokens: f64,
-    last: Instant,
 }
 
 /// The process-wide limiter.
@@ -207,40 +213,37 @@ impl RateLimiter {
         limit: Limit,
         now: Instant,
     ) -> Result<RateHeaders, (RateHeaders, u64)> {
+        let rate = limit.bucket_rate();
         let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        let b = map.entry((class, key.to_owned())).or_insert(Bucket {
-            tokens: limit.burst,
-            last: now,
-        });
-        let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
-        b.tokens = (b.tokens + elapsed * limit.rate).min(limit.burst);
-        b.last = now;
+        let b = map
+            .entry((class, key.to_owned()))
+            .or_insert_with(|| Bucket::full(rate, now));
+        b.refill(now, rate);
         let window = if limit.rate > 0.0 {
             ceil_secs(limit.burst / limit.rate)
         } else {
             0
         };
-        let headers = |tokens: f64| RateHeaders {
+        let headers = |b: &Bucket| RateHeaders {
             class: class.label(),
             quota: limit.burst as u64,
             window,
-            remaining: tokens.max(0.0).floor() as u64,
+            remaining: b.tokens().max(0.0).floor() as u64,
             reset: if limit.rate > 0.0 {
-                ceil_secs((limit.burst - tokens) / limit.rate)
+                ceil_secs(b.secs_until_full(rate))
             } else {
                 0
             },
         };
-        if b.tokens >= 1.0 {
-            b.tokens -= 1.0;
-            Ok(headers(b.tokens))
+        if b.try_take() {
+            Ok(headers(b))
         } else {
             let retry = if limit.rate > 0.0 {
-                ceil_secs((1.0 - b.tokens) / limit.rate).max(1)
+                ceil_secs(b.secs_until_token(rate)).max(1)
             } else {
                 3600
             };
-            Err((headers(b.tokens), retry))
+            Err((headers(b), retry))
         }
     }
 
@@ -259,20 +262,11 @@ impl RateLimiter {
         reserve: f64,
         now: Instant,
     ) -> bool {
+        let rate = limit.bucket_rate();
         let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        let b = map.entry((class, key.to_owned())).or_insert(Bucket {
-            tokens: limit.burst,
-            last: now,
-        });
-        let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
-        b.tokens = (b.tokens + elapsed * limit.rate).min(limit.burst);
-        b.last = now;
-        if b.tokens >= reserve + 1.0 {
-            b.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+        map.entry((class, key.to_owned()))
+            .or_insert_with(|| Bucket::full(rate, now))
+            .take_above(now, rate, reserve)
     }
 
     /// Drops buckets idle for longer than `idle` (a full bucket carries no
@@ -280,7 +274,7 @@ impl RateLimiter {
     pub fn sweep(&self, idle: Duration) {
         let now = Instant::now();
         let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, b| now.saturating_duration_since(b.last) < idle);
+        map.retain(|_, b| b.idle(now) < idle);
     }
 }
 
@@ -326,6 +320,69 @@ mod tests {
         let t1 = t0 + Duration::from_secs(3);
         assert!(l.take_above_at(Class::PublicHandle, "p", lim, 5.0, t1));
         assert!(!l.take_above_at(Class::PublicHandle, "p", lim, 5.0, t1));
+    }
+
+    #[test]
+    fn headers_follow_the_bucket() {
+        let l = RateLimiter::default();
+        let lim = Limit::new(2.0, 5.0);
+        let t0 = Instant::now();
+        let h = l.check_at(Class::KeyRead, "k", lim, t0).unwrap();
+        // Quota 5 refilled in ceil(5 / 2) s; one spent is back in 1 s.
+        assert_eq!((h.quota, h.window, h.remaining, h.reset), (5, 3, 4, 1));
+        for _ in 0..4 {
+            l.check_at(Class::KeyRead, "k", lim, t0).unwrap();
+        }
+        let (h, retry) = l.check_at(Class::KeyRead, "k", lim, t0).unwrap_err();
+        assert_eq!((h.remaining, h.reset, retry), (0, 3, 1));
+        // 0.25 s later half a token is there: still refused, and the
+        // wait is never reported as zero.
+        let t1 = t0 + Duration::from_millis(250);
+        let (h, retry) = l.check_at(Class::KeyRead, "k", lim, t1).unwrap_err();
+        assert_eq!((h.remaining, h.reset, retry), (0, 3, 1));
+    }
+
+    #[test]
+    fn a_zero_rate_spends_the_burst_and_then_refuses_for_an_hour() {
+        let l = RateLimiter::default();
+        let lim = Limit::new(0.0, 2.0);
+        let t0 = Instant::now();
+        let h = l.check_at(Class::KeyBackfill, "k", lim, t0).unwrap();
+        assert_eq!((h.quota, h.window, h.remaining, h.reset), (2, 0, 1, 0));
+        l.check_at(Class::KeyBackfill, "k", lim, t0).unwrap();
+        let later = t0 + Duration::from_secs(86_400);
+        let (h, retry) = l.check_at(Class::KeyBackfill, "k", lim, later).unwrap_err();
+        assert_eq!((h.remaining, h.reset, retry), (0, 0, 3600));
+    }
+
+    #[test]
+    fn a_changed_limit_applies_to_a_bucket_that_exists() {
+        let l = RateLimiter::default();
+        let t0 = Instant::now();
+        let h = l
+            .check_at(Class::PublicUi, "a", Limit::new(1.0, 20.0), t0)
+            .unwrap();
+        assert_eq!(h.remaining, 19);
+        // A smaller burst cuts the tokens down at the next call.
+        let h = l
+            .check_at(Class::PublicUi, "a", Limit::new(1.0, 3.0), t0)
+            .unwrap();
+        assert_eq!((h.quota, h.remaining), (3, 2));
+        // A larger one is filled only at the rate.
+        let h = l
+            .check_at(Class::PublicUi, "a", Limit::new(1.0, 20.0), t0)
+            .unwrap();
+        assert_eq!((h.quota, h.remaining, h.reset), (20, 1, 19));
+    }
+
+    #[test]
+    fn a_caller_with_an_earlier_clock_gains_nothing() {
+        let l = RateLimiter::default();
+        let lim = Limit::new(1.0, 1.0);
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(l.check_at(Class::UiLogin, "a", lim, t1).is_ok());
+        assert!(l.check_at(Class::UiLogin, "a", lim, t0).is_err());
     }
 
     #[test]

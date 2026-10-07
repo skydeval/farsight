@@ -90,7 +90,8 @@ pub enum AtUriError {
 /// bytewise.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AtUri {
-    /// The repo DID.
+    /// The repo the record is in. Always a DID: a handle authority is
+    /// refused at parse.
     pub authority: Did,
     /// The record's collection.
     pub collection: Nsid,
@@ -206,6 +207,77 @@ mod tests {
             "at://did:plc:short/app.bsky.graph.list/3k2abc".to_owned(),
         ] {
             assert!(AtUri::parse(&bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// Over the record-key alphabet a key is accepted exactly when it
+        /// has 1 to 512 characters and is not `.` or `..`; anything else
+        /// is accepted only if it is in that alphabet. An accepted key is
+        /// the input.
+        #[test]
+        fn record_keys_follow_the_rule(
+            s in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "[A-Za-z0-9._:~-]{0,8}",
+                "[A-Za-z0-9._:~-]{500,520}",
+                "\\.{0,3}",
+            ],
+        ) {
+            let in_alphabet = s
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:~-".contains(&b));
+            let expected =
+                in_alphabet && (1..=MAX_RKEY_LEN).contains(&s.len()) && s != "." && s != "..";
+            let parsed = RecordKey::parse(&s);
+            proptest::prop_assert_eq!(parsed.is_ok(), expected);
+            if let Ok(k) = parsed {
+                proptest::prop_assert_eq!(k.as_str(), s.as_str());
+                proptest::prop_assert_eq!(k.to_string(), s.clone());
+                proptest::prop_assert_eq!(s.parse::<RecordKey>(), Ok(k));
+            }
+        }
+
+        /// Any string at all: parsing returns, and what it accepts prints
+        /// back as the input, within the length bound, with parts that
+        /// are valid alone.
+        #[test]
+        fn parsing_is_total_and_accepted_uris_round_trip(
+            s in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "(at://)?[a-z2-7:./#?%-]{0,60}",
+                "at://did:plc:[a-z2-7]{24}(/[a-zA-Z.]{0,24}){0,4}",
+                "at://(did:web:)?[a-z]{1,8}\\.[a-z]{2,5}/app\\.bsky\\.graph\\.(block|list|x)/[a-z0-9./]{0,14}",
+            ],
+        ) {
+            let Ok(uri) = AtUri::parse(&s) else { return Ok(()) };
+            proptest::prop_assert_eq!(uri.to_string(), s.clone());
+            proptest::prop_assert_eq!(s.parse::<AtUri>(), Ok(uri.clone()));
+            proptest::prop_assert!(s.len() <= MAX_AT_URI_LEN);
+            proptest::prop_assert_eq!(Did::parse(uri.authority.as_str()), Ok(uri.authority.clone()));
+            proptest::prop_assert_eq!(Nsid::parse(uri.collection.as_str()), Ok(uri.collection.clone()));
+            proptest::prop_assert_eq!(
+                uri.indexed_collection(),
+                Collection::from_nsid(uri.collection.as_str())
+            );
+        }
+
+        /// Valid parts make a URI that parses back to the same parts.
+        #[test]
+        fn a_uri_built_from_valid_parts_parses_back(
+            plc in "[a-z2-7]{24}",
+            c in 0usize..4,
+            rkey in "[A-Za-z0-9_:~-][A-Za-z0-9._:~-]{0,40}",
+        ) {
+            let did = Did::parse(&format!("did:plc:{plc}")).unwrap();
+            let rkey = RecordKey::parse(&rkey).unwrap();
+            let uri = AtUri::new(did.clone(), Collection::ALL[c], rkey.clone());
+            let parsed = AtUri::parse(&uri.to_string()).unwrap();
+            proptest::prop_assert_eq!(&parsed, &uri);
+            proptest::prop_assert_eq!(parsed.indexed_collection(), Some(Collection::ALL[c]));
+            proptest::prop_assert_eq!((parsed.authority, parsed.rkey), (did, rkey));
         }
     }
 }

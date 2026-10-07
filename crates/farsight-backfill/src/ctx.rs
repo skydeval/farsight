@@ -17,9 +17,10 @@ pub struct Ctx {
     /// Backfill's own pool (separate from the server's).
     pub pool: PgPool,
     config: RwLock<Arc<Config>>,
-    /// Outbound requests.
+    /// Every outbound request goes through it: the client, the per-host
+    /// limits and the PLC directory's limiter.
     pub net: Arc<Net>,
-    /// DID resolution.
+    /// DID → PDS resolution with its caches.
     pub resolver: Resolver,
     /// Approximate counters of backfill's writes (shard 2).
     pub counters: Arc<CounterSink>,
@@ -27,14 +28,18 @@ pub struct Ctx {
     pub gates: SharedGates,
     /// The last gate state (sweep pause at ≥ 90%).
     pub gate_state: Mutex<GateState>,
-    /// This process's lease owner name.
+    /// `job_leases.lease_owner` of this process's jobs:
+    /// `backfill-<pid>-<12 random hex digits>`, new at every start, so a
+    /// lease left by an earlier process is never mistaken for a held one
+    /// and simply expires.
     pub lease_owner: String,
     /// Binary version (User-Agent).
     pub version: &'static str,
 }
 
 impl Ctx {
-    /// A context.
+    /// A context with open gates and a fresh lease owner name. Its counter
+    /// sink writes shard 2.
     pub fn new(
         pool: PgPool,
         config: Arc<Config>,
@@ -61,7 +66,8 @@ impl Ctx {
         }
     }
 
-    /// The config in force.
+    /// The config in force, as a shared snapshot. A reload swaps in a new
+    /// `Arc`; a job keeps the one it took for as long as it holds it.
     pub fn cfg(&self) -> Arc<Config> {
         self.config
             .read()

@@ -13,6 +13,8 @@
 //! counts only while its block is still stored, so a block made and
 //! removed again does not.
 
+use crate::codes::sql::GONE;
+use crate::ids::ActorId;
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
 
@@ -43,16 +45,16 @@ pub fn day_end(now: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
-/// One of the four lists.
+/// One of the four top lists; each is one `top_lists` row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// Most blocks made, all time.
     BlockersAll,
     /// Most blocked, all time.
     BlockedAll,
-    /// Most blocks made in the day.
+    /// Most blocks made in the day that ended at the last 10:00 UTC.
     BlockersDay,
-    /// Most blocked in the day.
+    /// Most blocked in the day that ended at the last 10:00 UTC.
     BlockedDay,
 }
 
@@ -100,9 +102,9 @@ pub fn is_recent(created: Option<DateTime<Utc>>, seen: DateTime<Utc>) -> bool {
 pub async fn log(
     conn: &mut PgConnection,
     at: DateTime<Utc>,
-    author_id: i64,
+    author_id: ActorId,
     rkey: &str,
-    subject_id: i64,
+    subject_id: ActorId,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO block_recent (at, author_id, rkey, subject_id) VALUES ($1, $2, $3, $4)",
@@ -142,17 +144,19 @@ pub async fn compute(
     limit: i64,
 ) -> Result<Vec<(String, i64)>> {
     let sql = match kind {
-        Kind::BlockersAll => "SELECT did, authored_blocks::bigint FROM actors
-             WHERE authored_blocks > 0 AND status NOT IN (1, 4)
+        Kind::BlockersAll => format!(
+            "SELECT did, authored_blocks::bigint FROM actors
+             WHERE authored_blocks > 0 AND status NOT IN {GONE}
              ORDER BY authored_blocks DESC, id LIMIT $1"
-            .to_owned(),
-        Kind::BlockedAll => "SELECT a.did, t.n FROM (
+        ),
+        Kind::BlockedAll => format!(
+            "SELECT a.did, t.n FROM (
                SELECT subject_id, count(*) AS n FROM blocks
                GROUP BY subject_id ORDER BY n DESC, subject_id LIMIT $1 * 2) t
              JOIN actors a ON a.id = t.subject_id
-             WHERE a.status NOT IN (1, 4)
+             WHERE a.status NOT IN {GONE}
              ORDER BY t.n DESC, a.id LIMIT $1"
-            .to_owned(),
+        ),
         Kind::BlockersDay | Kind::BlockedDay => {
             let by = if kind.blockers() {
                 "author_id"
@@ -167,7 +171,7 @@ pub async fn compute(
                    WHERE r.at >= $2 - {RECENT_SECS} * interval '1 second' AND r.at < $2
                    GROUP BY r.{by} ORDER BY n DESC, id LIMIT $1 * 2) t
                  JOIN actors a ON a.id = t.id
-                 WHERE a.status NOT IN (1, 4)
+                 WHERE a.status NOT IN {GONE}
                  ORDER BY t.n DESC, a.id LIMIT $1"
             )
         }

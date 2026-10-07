@@ -29,7 +29,8 @@ pub fn admin_card_href(did: &str) -> String {
 #[derive(Debug, Clone, Template)]
 #[template(path = "_admin_who.html")]
 pub struct Account {
-    /// The DID.
+    /// The DID: the cell's text when no handle is known, and what its
+    /// links are built from.
     pub did: String,
     /// Its lookup page.
     pub href: String,

@@ -3,15 +3,19 @@
 //! (the backfill process drains it) and `getBackfillStatus` reads job
 //! state without ever enqueueing.
 
+use crate::codes::sql::{
+    CYCLE_FULL, DISCOVERY_QUEUED, DISCOVERY_RUNNING, JOB_REPO, REPO_DONE, REPO_QUEUED, REPO_RUNNING,
+};
+use crate::ids::{ActorId, QueueId};
 use chrono::{DateTime, Utc};
 use farsight_core::Did;
 use sqlx::{PgConnection, PgPool};
 
+use crate::codes::{BackfillState, DiscoveryRun, JobKind, Priority, RequesterKey, Tier};
 use crate::counters::{CounterSink, Deltas};
 use crate::error::Result;
 use crate::keys::Limits;
-use crate::queue::{self, Enqueued, JobKind};
-use crate::repo_events::priority;
+use crate::queue::{self, Enqueued};
 use crate::txn::{Cause, Gates, Refusal, Txn};
 
 /// Waiting entries one requester may hold (beyond it `QueueFull`).
@@ -19,23 +23,6 @@ pub const REQUESTER_QUEUE_CAP: i64 = 10_000;
 /// Waiting `high` entries one requester may hold; beyond it a `high`
 /// request is downgraded.
 pub const REQUESTER_HIGH_CAP: i64 = 100;
-/// Tier of on-demand jobs.
-pub const TIER_ON_DEMAND: i16 = 1;
-
-/// `backfill_state.state` codes.
-pub mod state {
-    /// Never backfilled.
-    pub const NEVER: i16 = 0;
-    /// Waiting in the queue.
-    pub const QUEUED: i16 = 1;
-    /// A repo job holds the lease.
-    pub const RUNNING: i16 = 2;
-    /// Finished (clean, complete-with-debts or inactive).
-    pub const DONE: i16 = 3;
-    /// Failed.
-    pub const FAILED: i16 = 4;
-}
-
 /// Repo job state as reported (open enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoState {
@@ -55,7 +42,7 @@ pub enum RepoState {
 }
 
 impl RepoState {
-    /// Wire name.
+    /// The `repo.state` string of `getBackfillStatus`.
     pub fn api_name(self) -> &'static str {
         match self {
             RepoState::Never => "never",
@@ -71,13 +58,14 @@ impl RepoState {
 /// `getBackfillStatus.repo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoStatus {
-    /// State.
+    /// Where the repo's job stands. A waiting queue entry outranks the
+    /// stored state.
     pub state: RepoState,
     /// Waiting entries of the same tier ahead of this one (queued only).
     pub position: Option<i64>,
     /// Last finish, or the covering cycle's completion.
     pub last_backfilled_at: Option<DateTime<Utc>>,
-    /// Last error.
+    /// `backfill_state.last_error`, as stored.
     pub last_error: Option<String>,
 }
 
@@ -86,7 +74,7 @@ pub struct RepoStatus {
 pub enum DiscoveryState {
     /// No backlink source configured.
     Disabled,
-    /// Never run.
+    /// No discovery was ever requested for the account.
     Never,
     /// Waiting.
     Queued,
@@ -99,7 +87,7 @@ pub enum DiscoveryState {
 }
 
 impl DiscoveryState {
-    /// Wire name.
+    /// The `discovery.state` string of `getBackfillStatus`.
     pub fn api_name(self) -> &'static str {
         match self {
             DiscoveryState::Disabled => "disabled",
@@ -115,11 +103,13 @@ impl DiscoveryState {
 /// `getBackfillStatus.discovery`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryStatus {
-    /// State.
+    /// Where the account's discovery stands. Without a backlink source it
+    /// is `Disabled`, whatever is stored.
     pub state: DiscoveryState,
-    /// Completion time.
+    /// `discovery_state.completed_at`, as stored.
     pub completed_at: Option<DateTime<Utc>>,
-    /// Truncated at `max_refs`.
+    /// The last run stopped at `backfill.backlinks.max_refs` references and
+    /// may have missed some.
     pub truncated: bool,
     /// Backlink source of the last run.
     pub source: Option<String>,
@@ -128,9 +118,9 @@ pub struct DiscoveryStatus {
 /// The `getBackfillStatus` body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillStatus {
-    /// Repo job.
+    /// The listing of the account's own repository.
     pub repo: RepoStatus,
-    /// Subject discovery.
+    /// The search for records in other repositories that name the account.
     pub discovery: DiscoveryStatus,
 }
 
@@ -138,18 +128,18 @@ pub struct BackfillStatus {
 /// whether `backfill.backlinks.url` is set.
 pub async fn status(
     conn: &mut PgConnection,
-    did: &str,
+    did: &Did,
     discovery_enabled: bool,
 ) -> Result<BackfillStatus> {
     let baseline: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT completed_at FROM sweep_cycles WHERE kind = 1 AND completed_at IS NOT NULL
-         ORDER BY completed_at DESC LIMIT 1",
+        &format!("SELECT completed_at FROM sweep_cycles WHERE kind = {CYCLE_FULL} AND completed_at IS NOT NULL
+         ORDER BY completed_at DESC LIMIT 1"),
     )
     .fetch_optional(&mut *conn)
     .await?;
     type Row = (
-        i64,
-        Option<i16>,
+        ActorId,
+        Option<BackfillState>,
         Option<DateTime<Utc>>,
         Option<String>,
         bool,
@@ -157,13 +147,13 @@ pub async fn status(
     );
     let row: Option<Row> =
         sqlx::query_as(
-            "SELECT a.id, s.state, s.backfilled_at, s.last_error,
-                    EXISTS (SELECT 1 FROM backfill_queue q WHERE q.actor_id = a.id AND q.kind = 1),
+            &format!("SELECT a.id, s.state, s.backfilled_at, s.last_error,
+                    EXISTS (SELECT 1 FROM backfill_queue q WHERE q.actor_id = a.id AND q.kind = {JOB_REPO}),
                     EXISTS (SELECT 1 FROM job_leases j WHERE j.did = a.did AND j.lease_until > now())
              FROM actors a LEFT JOIN backfill_state s ON s.actor_id = a.id
-             WHERE a.did = $1",
+             WHERE a.did = $1"),
         )
-        .bind(did)
+        .bind(did.as_str())
         .fetch_optional(&mut *conn)
         .await?;
     let (repo, actor_id) = match row {
@@ -181,18 +171,18 @@ pub async fn status(
             None,
         ),
         Some((id, st, at, err, queued, leased)) => {
-            let running = st == Some(state::RUNNING) && leased;
+            let running = st == Some(BackfillState::Running) && leased;
             let state = if running {
                 RepoState::Running
             } else if queued {
                 RepoState::Queued
             } else {
                 match st {
-                    Some(state::QUEUED) => RepoState::Queued,
-                    Some(state::RUNNING) => RepoState::Running,
-                    Some(state::DONE) => RepoState::Done,
-                    Some(state::FAILED) => RepoState::Failed,
-                    Some(_) => RepoState::Never,
+                    Some(BackfillState::Queued) => RepoState::Queued,
+                    Some(BackfillState::Running) => RepoState::Running,
+                    Some(BackfillState::Done) => RepoState::Done,
+                    Some(BackfillState::Failed) => RepoState::Failed,
+                    Some(BackfillState::Never) => RepoState::Never,
                     None if baseline.is_some() => RepoState::CoveredBySweep,
                     None => RepoState::Never,
                 }
@@ -226,7 +216,7 @@ pub async fn status(
             source: None,
         }
     } else {
-        let d: Option<(i16, Option<DateTime<Utc>>, bool, String)> = match actor_id {
+        let d: Option<(DiscoveryRun, Option<DateTime<Utc>>, bool, String)> = match actor_id {
             None => None,
             Some(id) => {
                 sqlx::query_as(
@@ -247,11 +237,10 @@ pub async fn status(
             },
             Some((st, completed_at, truncated, source)) => DiscoveryStatus {
                 state: match st {
-                    1 => DiscoveryState::Queued,
-                    2 => DiscoveryState::Running,
-                    3 => DiscoveryState::Done,
-                    4 => DiscoveryState::Failed,
-                    _ => DiscoveryState::Never,
+                    DiscoveryRun::Queued => DiscoveryState::Queued,
+                    DiscoveryRun::Running => DiscoveryState::Running,
+                    DiscoveryRun::Done => DiscoveryState::Done,
+                    DiscoveryRun::Failed => DiscoveryState::Failed,
                 },
                 completed_at,
                 truncated,
@@ -268,7 +257,7 @@ pub async fn status(
 pub struct Requester {
     /// `token:<id>` or `admin` (`backfill_queue.requester` and the intern
     /// cause key).
-    pub key: String,
+    pub key: RequesterKey,
     /// May request `high` (`backfill:high` scope or the admin token).
     pub may_high: bool,
 }
@@ -280,9 +269,11 @@ pub struct Request<'a> {
     pub actor: &'a Did,
     /// `priority = high` was asked for.
     pub high: bool,
-    /// `force`.
+    /// The call's `force`: add work even if the repo is running or was done
+    /// within the fresh window.
     pub force: bool,
-    /// The requester.
+    /// Who asks: charged for interning the account, and held to the queue
+    /// caps.
     pub requester: &'a Requester,
     /// `backfill.request_fresh_window`.
     pub fresh_window: std::time::Duration,
@@ -296,9 +287,11 @@ pub enum RequestOutcome {
     /// Done; `enqueued` = new work was added, `downgraded` = `high` was
     /// lowered to `normal`.
     Ok {
-        /// New work was added.
+        /// A repo job was added to the queue. False when one was already
+        /// waiting, or the rules found no new work to do.
         enqueued: bool,
-        /// `high` was downgraded.
+        /// `high` was asked for and not granted: the requester may not ask
+        /// for it, or already holds [`REQUESTER_HIGH_CAP`] `high` entries.
         downgraded: bool,
     },
     /// The requester holds [`REQUESTER_QUEUE_CAP`] waiting entries.
@@ -337,9 +330,9 @@ pub async fn request(
 
 async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome> {
     let did = req.actor.as_str();
-    t.lock_new_dids(&[did]).await?;
+    t.lock_new_dids(&[req.actor]).await?;
     let cause = Cause {
-        key: req.requester.key.clone(),
+        key: req.requester.key.to_string(),
         buckets: Vec::new(),
         large: true,
         mask: 0,
@@ -349,18 +342,18 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
         Err(Refusal::Capped(_) | Refusal::Refused(_)) => return Ok(RequestOutcome::InternRefused),
     };
     let conn: &mut PgConnection = t.conn;
-    let (st, done_at, queued, leased): (Option<i16>, Option<DateTime<Utc>>, bool, bool) =
+    let (st, done_at, queued, leased): (Option<BackfillState>, Option<DateTime<Utc>>, bool, bool) =
         sqlx::query_as(
-            "SELECT (SELECT state FROM backfill_state WHERE actor_id = $1),
-                    (SELECT backfilled_at FROM backfill_state WHERE actor_id = $1 AND state = 3),
-                    EXISTS (SELECT 1 FROM backfill_queue WHERE actor_id = $1 AND kind = 1),
-                    EXISTS (SELECT 1 FROM job_leases WHERE did = $2 AND lease_until > now())",
+            &format!("SELECT (SELECT state FROM backfill_state WHERE actor_id = $1),
+                    (SELECT backfilled_at FROM backfill_state WHERE actor_id = $1 AND state = {REPO_DONE}),
+                    EXISTS (SELECT 1 FROM backfill_queue WHERE actor_id = $1 AND kind = {JOB_REPO}),
+                    EXISTS (SELECT 1 FROM job_leases WHERE did = $2 AND lease_until > now())"),
         )
         .bind(actor_id)
         .bind(did)
         .fetch_one(&mut *conn)
         .await?;
-    let running = st == Some(state::RUNNING) && leased;
+    let running = st == Some(BackfillState::Running) && leased;
     let fresh = match done_at {
         Some(at) => {
             let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
@@ -371,7 +364,7 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
         None => false,
     };
     let mut downgraded = false;
-    let mut prio = priority::NORMAL;
+    let mut prio = Priority::Normal;
     if req.high {
         if !req.requester.may_high {
             downgraded = true;
@@ -380,15 +373,15 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
                 "SELECT count(*) FROM (SELECT 1 FROM backfill_queue
                    WHERE requester = $1 AND priority = $2 LIMIT $3) x",
             )
-            .bind(&req.requester.key)
-            .bind(priority::HIGH)
+            .bind(req.requester.key)
+            .bind(Priority::High)
             .bind(REQUESTER_HIGH_CAP)
             .fetch_one(&mut *conn)
             .await?;
             if highs >= REQUESTER_HIGH_CAP && !queued {
                 downgraded = true;
             } else {
-                prio = priority::HIGH;
+                prio = Priority::High;
             }
         }
     }
@@ -413,9 +406,9 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
         conn,
         actor_id,
         JobKind::Repo,
-        TIER_ON_DEMAND,
+        Tier::OnDemand,
         prio,
-        &req.requester.key,
+        req.requester.key,
         Some(REQUESTER_QUEUE_CAP),
     )
     .await?;
@@ -430,8 +423,8 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
     }
     // Requested DIDs get a backfill_state row.
     sqlx::query(
-        "INSERT INTO backfill_state (actor_id, state) VALUES ($1, 1)
-         ON CONFLICT (actor_id) DO UPDATE SET state = 1 WHERE backfill_state.state <> 2",
+        &format!("INSERT INTO backfill_state (actor_id, state) VALUES ($1, {REPO_QUEUED})
+         ON CONFLICT (actor_id) DO UPDATE SET state = {REPO_QUEUED} WHERE backfill_state.state <> {REPO_RUNNING}"),
     )
     .bind(actor_id)
     .execute(&mut *conn)
@@ -441,17 +434,17 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
             conn,
             actor_id,
             JobKind::Discovery,
-            TIER_ON_DEMAND,
+            Tier::OnDemand,
             prio,
-            &req.requester.key,
+            req.requester.key,
             Some(REQUESTER_QUEUE_CAP),
         )
         .await?;
         if r == Enqueued::Waiting {
             sqlx::query(
-                "INSERT INTO discovery_state (actor_id, state, source) VALUES ($1, 1, $2)
-                 ON CONFLICT (actor_id) DO UPDATE SET state = 1, source = EXCLUDED.source
-                   WHERE discovery_state.state <> 2",
+                &format!("INSERT INTO discovery_state (actor_id, state, source) VALUES ($1, {DISCOVERY_QUEUED}, $2)
+                 ON CONFLICT (actor_id) DO UPDATE SET state = {DISCOVERY_QUEUED}, source = EXCLUDED.source
+                   WHERE discovery_state.state <> {DISCOVERY_RUNNING}"),
             )
             .bind(actor_id)
             .bind(source)
@@ -471,14 +464,15 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
 /// round-robin, estimated with equal per-job cost (each other requester
 /// is served about as many entries as this one's rank). Entries not yet
 /// due (`not_before` in the future) are not ahead.
-async fn queue_position(conn: &mut PgConnection, actor_id: i64) -> Result<Option<i64>> {
-    let me: Option<(i16, String, i16, DateTime<Utc>, i64)> = sqlx::query_as(
-        "SELECT tier, requester, priority, enqueued_at, id FROM backfill_queue
-         WHERE actor_id = $1 AND kind = 1",
-    )
-    .bind(actor_id)
-    .fetch_optional(&mut *conn)
-    .await?;
+async fn queue_position(conn: &mut PgConnection, actor_id: ActorId) -> Result<Option<i64>> {
+    let me: Option<(Tier, RequesterKey, Priority, DateTime<Utc>, QueueId)> =
+        sqlx::query_as(&format!(
+            "SELECT tier, requester, priority, enqueued_at, id FROM backfill_queue
+         WHERE actor_id = $1 AND kind = {JOB_REPO}"
+        ))
+        .bind(actor_id)
+        .fetch_optional(&mut *conn)
+        .await?;
     let Some((tier, requester, prio, at, qid)) = me else {
         return Ok(None);
     };
@@ -490,20 +484,20 @@ async fn queue_position(conn: &mut PgConnection, actor_id: i64) -> Result<Option
            AND (not_before IS NULL OR not_before <= now())",
     )
     .bind(tier)
-    .bind(&requester)
+    .bind(requester)
     .bind(prio)
     .bind(at)
     .bind(qid)
     .fetch_one(&mut *conn)
     .await?;
-    let rank = rank_in_requester(prio == priority::HIGH, same_ahead, other_kind);
+    let rank = rank_in_requester(prio == Priority::High, same_ahead, other_kind);
     let others: Vec<i64> = sqlx::query_scalar(
         "SELECT count(*) FROM backfill_queue
          WHERE tier = $1 AND requester <> $2 AND (not_before IS NULL OR not_before <= now())
          GROUP BY requester",
     )
     .bind(tier)
-    .bind(&requester)
+    .bind(requester)
     .fetch_all(&mut *conn)
     .await?;
     Ok(Some(

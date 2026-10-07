@@ -19,6 +19,7 @@ pub mod firehose;
 pub mod gates;
 pub mod handles;
 pub mod history;
+pub mod ids;
 pub mod janitor;
 pub mod keys;
 pub mod public;
@@ -50,7 +51,8 @@ pub const SCHEMA_VERSION: i32 = 13;
 /// How often `farsight-backfill` polls `schema_version`.
 pub const SCHEMA_POLL: Duration = Duration::from_secs(5);
 
-/// Connects a pool.
+/// Connects a pool of at most `max_connections` connections to
+/// `database_url`.
 pub async fn connect(database_url: &str, max_connections: u32) -> Result<PgPool> {
     Ok(PgPoolOptions::new()
         .max_connections(max_connections)

@@ -16,13 +16,14 @@ use axum::response::Response;
 use farsight_api::handlers;
 use farsight_api::params::Params;
 use farsight_core::Did;
+use farsight_storage::codes::TrackState;
 use farsight_storage::public::{self as store, Counted};
 use farsight_storage::ui_rows::{Filter, Section as Rows};
 
 use super::admin_did::{COUNT_CAP, PAGE_ROWS, Pager};
 use super::{
-    Nav, Stat, WebState, count, coverage_words, gate, nav, parse_list_ref, permit, resolve_handle,
-    stat,
+    HandleError, Nav, Stat, WebState, count, coverage_words, gate, handle_to_did, nav,
+    parse_list_ref, permit, stat,
 };
 use crate::cells;
 use crate::common::render_private;
@@ -30,8 +31,10 @@ use crate::public::paging::{self, Total};
 use crate::public::text::{LISTBLOCK, LISTITEM, Record, Stamp, clean, thousands};
 use crate::public::warming::Asked;
 use crate::rows;
+use farsight_storage::ids::ListId;
 
-/// The page's address.
+/// The page's path. The list is the `q` parameter; the tab and each
+/// table's page are parameters too.
 pub const BASE: &str = "/admin/lookup/list";
 
 /// The tables, in tab order: `(id, label, page parameter)`.
@@ -98,7 +101,8 @@ impl Ask {
 /// One tab.
 #[derive(Debug, Clone)]
 pub struct Tab {
-    /// The table's id.
+    /// The table's id from [`TABLES`]: the value of the address's `tab`
+    /// parameter.
     pub id: &'static str,
     /// Its label.
     pub label: &'static str,
@@ -128,7 +132,8 @@ pub struct Row {
 pub struct Table {
     /// The count for the heading.
     pub count: Option<String>,
-    /// Coverage in words.
+    /// The table's `freshness` as a sentence
+    /// (`dashboard::coverage_words`); empty when it was not read.
     pub coverage: String,
     /// What went wrong, if the rows could not be read.
     pub error: Option<String>,
@@ -144,13 +149,17 @@ pub struct Subject {
     pub uri: String,
     /// Its history page.
     pub history: String,
-    /// Its facts.
+    /// What `getListMembers` and the list's row say of it: owner,
+    /// purpose, name, description, tracking state, listblock count and
+    /// whether its stored members hit a cap.
     pub facts: Vec<Stat>,
-    /// The tabs.
+    /// The tabs in [`TABLES`] order.
     pub tabs: Vec<Tab>,
     /// The id of the table in view.
     pub active: &'static str,
-    /// Members.
+    /// Members: the accounts with a stored listitem on the list. Rows
+    /// are read only for a list the API serves members of (`ready` or
+    /// `retained`, owner shown).
     pub members: Table,
     /// Subscribers: the accounts with a listblock on the list.
     pub subscribers: Table,
@@ -162,9 +171,11 @@ pub struct Subject {
 pub struct ListPage {
     /// Navigation.
     pub nav: Nav,
-    /// The query.
+    /// The `q` parameter, trimmed: the list's at-uri or its bsky.app
+    /// address. Put back into the search box; empty on a first view.
     pub q: String,
-    /// Error.
+    /// Why the query gave no list, or why the page is busy; shown in
+    /// place of the list.
     pub error: Option<String>,
     /// The list, once the query names one.
     pub subject: Option<Subject>,
@@ -193,7 +204,7 @@ async fn table(
     asked: &mut Asked,
     ask: &Ask,
     which: usize,
-    list_id: i64,
+    list_id: ListId,
     viewer: &str,
     owner: &str,
     into: &mut Table,
@@ -207,7 +218,7 @@ async fn table(
         Ok(mut conn) => store::bounded_count_hiding(
             &mut conn,
             counted,
-            list_id,
+            list_id.into(),
             &[],
             NONE_HIDDEN,
             None,
@@ -221,7 +232,7 @@ async fn table(
     match rows::numbered(
         st,
         section,
-        list_id,
+        list_id.into(),
         Filter::default(),
         ask.pages[which],
         PAGE_ROWS,
@@ -287,14 +298,14 @@ pub async fn lookup_list(
         return render_private(&page);
     };
     let owner = if actor.starts_with("did:") {
-        Did::parse(&actor).map_err(|e| e.to_string())
+        Did::parse(&actor).map_err(HandleError::from)
     } else {
-        resolve_handle(&st.safe, &actor).await
+        handle_to_did(&st.safe, &actor).await
     };
     let owner = match owner {
         Ok(d) => d,
         Err(e) => {
-            page.error = Some(e);
+            page.error = Some(e.to_string());
             return render_private(&page);
         }
     };
@@ -302,7 +313,7 @@ pub async fn lookup_list(
     let _permit = match permit(&st).await {
         Ok(p) => p,
         Err(e) => {
-            page.error = Some(e);
+            page.error = Some(e.to_string());
             return render_private(&page);
         }
     };
@@ -311,7 +322,7 @@ pub async fn lookup_list(
     let ask = Ask::read(&uri, &q);
     let mut asked = Asked::new(&cfg.config);
     let info = match st.api.pool.acquire().await {
-        Ok(mut conn) => farsight_storage::queries::list_info(&mut conn, owner.as_str(), &rkey)
+        Ok(mut conn) => farsight_storage::queries::list_info(&mut conn, &owner, &rkey)
             .await
             .ok()
             .flatten(),
@@ -364,10 +375,10 @@ pub async fn lookup_list(
             ));
             // Members are served as the API serves them: for a list that
             // is indexed, whose owner is shown.
-            serves = matches!(b["state"].as_str(), Some("ready" | "retained"))
-                && info.as_ref().is_some_and(|i| {
-                    !farsight_storage::codes::actor_status::is_hidden(i.owner_status)
-                });
+            serves = matches!(
+                b["state"].as_str().and_then(TrackState::from_api_name),
+                Some(TrackState::Ready | TrackState::Retained)
+            ) && info.as_ref().is_some_and(|i| !i.owner_status.is_hidden());
             members.coverage = coverage_words(&b["freshness"]);
         }
         Err(e) => members.error = Some(e.message),

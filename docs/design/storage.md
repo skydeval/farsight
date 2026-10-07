@@ -942,7 +942,7 @@ are fewer than 600,000 rows and less than 100 MB.
 
 ## Account status
 
-`actors.status` holds one of eight codes (`actor_status` in
+`actors.status` holds one of eight codes (`ActorStatus` in
 `crates/farsight-storage/src/codes.rs`):
 
 | Code | Status | Upstream value | Hidden | Effect on the account's rows |

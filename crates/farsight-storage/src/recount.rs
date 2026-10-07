@@ -4,6 +4,8 @@
 //! `docs/design/list-indexing.md` and `docs/design/storage.md`) and the
 //! `capped`-debt re-evaluation of uncounted listblocks.
 
+use crate::codes::sql::RECORD_PRESENT;
+use crate::ids::{ActorId, ListId};
 use std::collections::{BTreeMap, BTreeSet};
 
 use farsight_core::Did;
@@ -18,16 +20,36 @@ use crate::tracking::FireArgs;
 use crate::transition::Event;
 use crate::txn::{Gates, Txn};
 
+/// The row a repaired counter is on: the list counters are columns of
+/// `lists`, the per-author counters columns of `actors`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftRow {
+    /// A `lists` row.
+    List(ListId),
+    /// An `actors` row.
+    Actor(ActorId),
+}
+
+impl std::fmt::Display for DriftRow {
+    /// The row's id, as a number.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriftRow::List(id) => id.fmt(f),
+            DriftRow::Actor(id) => id.fmt(f),
+        }
+    }
+}
+
 /// One repaired counter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Drift {
-    /// `lists.id` or `actors.id`.
-    pub id: i64,
-    /// Column name.
+    /// The row the counter is on.
+    pub id: DriftRow,
+    /// Name of the counter column, e.g. `listblock_count`.
     pub column: &'static str,
     /// Stored value before repair.
     pub stored: i64,
-    /// Recounted value.
+    /// What counting the rows gave; the column holds it after the repair.
     pub actual: i64,
 }
 
@@ -48,10 +70,10 @@ pub async fn recount_lists(
     pool: &PgPool,
     limits: &Limits,
     counters: &CounterSink,
-    after: i64,
+    after: ListId,
     batch: i64,
-) -> Result<(RecountReport, Option<i64>)> {
-    let lists: Vec<(i64, String, String)> = sqlx::query_as(
+) -> Result<(RecountReport, Option<ListId>)> {
+    let lists: Vec<(ListId, String, String)> = sqlx::query_as(
         "SELECT l.id, a.did, l.rkey FROM lists l JOIN actors a ON a.id = l.owner_id
          WHERE l.id > $1 ORDER BY l.id LIMIT $2",
     )
@@ -85,7 +107,7 @@ pub async fn recount_lists(
             report.checked += 1;
             if i64::from(stored_items) != actual_items {
                 report.drift.push(Drift {
-                    id,
+                    id: DriftRow::List(id),
                     column: "item_count",
                     stored: i64::from(stored_items),
                     actual: actual_items,
@@ -98,7 +120,7 @@ pub async fn recount_lists(
             }
             if i64::from(stored_lb) != actual_lb {
                 report.drift.push(Drift {
-                    id,
+                    id: DriftRow::List(id),
                     column: "listblock_count",
                     stored: i64::from(stored_lb),
                     actual: actual_lb,
@@ -134,10 +156,10 @@ pub async fn recount_lists(
 /// their author locks. Returns the report and the last id checked.
 pub async fn recount_actors(
     pool: &PgPool,
-    after: i64,
+    after: ActorId,
     batch: i64,
-) -> Result<(RecountReport, Option<i64>)> {
-    let actors: Vec<(i64, String)> =
+) -> Result<(RecountReport, Option<ActorId>)> {
+    let actors: Vec<(ActorId, String)> =
         sqlx::query_as("SELECT id, did FROM actors WHERE id > $1 ORDER BY id LIMIT $2")
             .bind(after)
             .bind(batch)
@@ -159,16 +181,16 @@ pub async fn recount_actors(
             .execute(&mut *tx)
             .await?;
     }
-    type Row = (i64, i32, i32, i32, i32, i32, i64, i64, i64, i64, i64);
+    type Row = (ActorId, i32, i32, i32, i32, i32, i64, i64, i64, i64, i64);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT a.id, a.authored_blocks, a.authored_listblocks, a.authored_lists,
+        &format!("SELECT a.id, a.authored_blocks, a.authored_listblocks, a.authored_lists,
                 a.owned_items, a.fetch_triggers,
                 (SELECT count(*) FROM blocks x WHERE x.author_id = a.id),
                 (SELECT count(*) FROM list_blocks x WHERE x.author_id = a.id),
-                (SELECT count(*) FROM lists x WHERE x.owner_id = a.id AND x.record_state = 1),
+                (SELECT count(*) FROM lists x WHERE x.owner_id = a.id AND x.record_state = {RECORD_PRESENT}),
                 (SELECT count(*) FROM list_items x WHERE x.owner_id = a.id),
                 (SELECT count(*) FROM list_blocks x WHERE x.author_id = a.id AND x.counted)
-         FROM actors a WHERE a.id BETWEEN $1 AND $2 ORDER BY a.id",
+         FROM actors a WHERE a.id BETWEEN $1 AND $2 ORDER BY a.id"),
     )
     .bind(first)
     .bind(last)
@@ -186,7 +208,7 @@ pub async fn recount_actors(
         for (column, stored, actual) in checks {
             if i64::from(stored) != actual {
                 report.drift.push(Drift {
-                    id: r.0,
+                    id: DriftRow::Actor(r.0),
                     column,
                     stored: i64::from(stored),
                     actual,
@@ -211,13 +233,11 @@ pub async fn recount_actors(
 /// with no per-row record and is left as is; placeholder-list charges in
 /// `stored_listblocks` are not reconstructed.
 pub async fn rebuild_approximate_counters(pool: &PgPool, batch: i64) -> Result<()> {
+    let lists = format!("SELECT count(*) FROM lists WHERE record_state = {RECORD_PRESENT}");
     let exact: [(&str, &str); 5] = [
         (stat::BLOCKS, "SELECT count(*) FROM blocks"),
         (stat::LIST_BLOCKS, "SELECT count(*) FROM list_blocks"),
-        (
-            stat::LISTS,
-            "SELECT count(*) FROM lists WHERE record_state = 1",
-        ),
+        (stat::LISTS, &lists),
         (stat::LIST_ITEMS, "SELECT count(*) FROM list_items"),
         (stat::ACTORS, "SELECT count(*) FROM actors"),
     ];
@@ -251,9 +271,9 @@ pub async fn rebuild_approximate_counters(pool: &PgPool, batch: i64) -> Result<(
     tx.commit().await?;
 
     let mut usage: BTreeMap<String, [i64; 4]> = BTreeMap::new();
-    let mut after = 0i64;
+    let mut after = ActorId::new(0);
     type Row = (
-        i64,
+        ActorId,
         String,
         Option<String>,
         i32,
@@ -367,7 +387,7 @@ pub async fn reevaluate_uncounted(
         t.lock_authors(&[keys::author_lock_key(did.as_str())].into_iter().collect())
             .await?;
         let author = t.author(did).await?;
-        let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
+        let rows: Vec<(String, ListId, String, String)> = sqlx::query_as(
             "SELECT r.rkey, r.list_id, a.did, l.rkey FROM list_blocks r
              JOIN lists l ON l.id = r.list_id JOIN actors a ON a.id = l.owner_id
              WHERE r.author_id = $1 AND NOT r.counted ORDER BY r.rkey",

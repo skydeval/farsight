@@ -15,14 +15,16 @@ use sqlx::{PgExecutor, PgPool};
 
 use crate::codes::{GapCause, Protocol};
 use crate::error::Result;
+use crate::ids::{CycleId, GapId};
 use crate::txn::Txn;
 
 /// What an ingest batch persists alongside its writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirehoseProgress {
-    /// The Jetstream instance URL.
+    /// The Jetstream instance the batch was read from, as configured in
+    /// `firehose.urls`.
     pub source_url: String,
-    /// Protocol of the session.
+    /// Protocol of the session the batch was read on.
     pub protocol: Protocol,
     /// v2 cursor (`seq`, instance-local).
     pub cursor_seq: Option<i64>,
@@ -99,11 +101,12 @@ impl Txn<'_> {
 /// One instance's persisted cursor (`firehose_cursors`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceCursor {
-    /// The instance URL.
+    /// The instance URL; the row's key.
     pub source_url: String,
     /// Protocol of its last committed batch.
     pub protocol: Option<Protocol>,
-    /// v2 cursor.
+    /// v2 cursor: the highest `seq` applied from this instance. A `seq`
+    /// means something on its own instance only.
     pub cursor_seq: Option<i64>,
     /// v1 / timestamp cursor.
     pub cursor_us: Option<i64>,
@@ -159,22 +162,26 @@ pub async fn mark_connected(pool: &PgPool, source_url: &str, protocol: Protocol)
     Ok(())
 }
 
-/// The persisted firehose state.
+/// The single `firehose_state` row. Every `Option` is `None` before the
+/// first batch has committed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FirehoseState {
-    /// Source URL.
+    /// Instance the last committed batch was read from.
     pub source_url: Option<String>,
-    /// Protocol.
+    /// Protocol of the last committed batch.
     pub protocol: Option<Protocol>,
-    /// v2 cursor.
+    /// v2 cursor: the highest `seq` applied from `source_url`. A `seq`
+    /// means something on its own instance only.
     pub cursor_seq: Option<i64>,
-    /// v1 cursor.
+    /// v1 and failover cursor: the highest witness time applied from
+    /// `source_url`, in microseconds since the epoch.
     pub cursor_us: Option<i64>,
     /// Running-maximum witness time.
     pub applied_through: Option<DateTime<Utc>>,
     /// Server time of the first committed batch.
     pub first_applied_at: Option<DateTime<Utc>>,
-    /// Connected flag.
+    /// Whether a session is open, as last recorded by ingest. Coverage
+    /// treats `false` as a synthetic gap.
     pub connected: bool,
 }
 
@@ -280,16 +287,17 @@ pub async fn maintain_clock(pool: &PgPool, now: DateTime<Utc>) -> Result<u64> {
     Ok(thinned + expired)
 }
 
-/// A stored gap.
+/// A `firehose_gaps` row: an interval of the witness clock in which events
+/// may have been lost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gap {
     /// `firehose_gaps.id`.
-    pub id: i64,
+    pub id: GapId,
     /// Start (witness clock).
     pub from_at: DateTime<Utc>,
     /// End; `None` while open (v1 interval).
     pub to_at: Option<DateTime<Utc>>,
-    /// Cause.
+    /// How the gap was detected.
     pub cause: GapCause,
     /// Healed by a repair cycle at this witness time.
     pub healed_witness: Option<DateTime<Utc>>,
@@ -309,8 +317,8 @@ pub async fn record_gap(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     cause: GapCause,
-) -> Result<i64> {
-    let id: i64 = sqlx::query_scalar(
+) -> Result<GapId> {
+    let id: GapId = sqlx::query_scalar(
         "INSERT INTO firehose_gaps (from_at, to_at, cause) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(from)
@@ -324,13 +332,13 @@ pub async fn record_gap(
 
 /// Opens the v1-interval gap when a v1 session starts. Idempotent:
 /// returns the already-open `sync_unavailable` gap if there is one.
-pub async fn open_sync_unavailable(pool: &PgPool, from: DateTime<Utc>) -> Result<i64> {
+pub async fn open_sync_unavailable(pool: &PgPool, from: DateTime<Utc>) -> Result<GapId> {
     let mut tx = pool.begin().await?;
     // Serialize concurrent openers on a fixed advisory key.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('farsight:sync_unavailable_gap'))")
         .execute(&mut *tx)
         .await?;
-    let open: Option<i64> = sqlx::query_scalar(
+    let open: Option<GapId> = sqlx::query_scalar(
         "SELECT id FROM firehose_gaps WHERE cause = $1 AND to_at IS NULL ORDER BY id LIMIT 1",
     )
     .bind(GapCause::SyncUnavailable.code())
@@ -357,8 +365,8 @@ pub async fn open_sync_unavailable(pool: &PgPool, from: DateTime<Utc>) -> Result
 
 /// Closes the open v1-interval gap when a v2 session takes over.
 /// Returns the closed gap's id, if one was open.
-pub async fn close_sync_unavailable(pool: &PgPool, to: DateTime<Utc>) -> Result<Option<i64>> {
-    let id: Option<i64> = sqlx::query_scalar(
+pub async fn close_sync_unavailable(pool: &PgPool, to: DateTime<Utc>) -> Result<Option<GapId>> {
+    let id: Option<GapId> = sqlx::query_scalar(
         "UPDATE firehose_gaps SET to_at = $1 WHERE cause = $2 AND to_at IS NULL RETURNING id",
     )
     .bind(to)
@@ -373,9 +381,9 @@ pub async fn close_sync_unavailable(pool: &PgPool, to: DateTime<Utc>) -> Result<
 /// be healed.
 pub async fn heal_gaps(
     pool: &PgPool,
-    ids: &[i64],
+    ids: &[GapId],
     healed_witness: DateTime<Utc>,
-    repair_cycle_id: i64,
+    repair_cycle_id: CycleId,
 ) -> Result<u64> {
     let n = sqlx::query(
         "UPDATE firehose_gaps SET healed_at = now(), healed_witness = $2, repair_cycle_id = $3
@@ -392,7 +400,7 @@ pub async fn heal_gaps(
 }
 
 type GapRow = (
-    i64,
+    GapId,
     DateTime<Utc>,
     Option<DateTime<Utc>>,
     i16,

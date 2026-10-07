@@ -5,6 +5,8 @@
 //! Every function here must run under list(L) **exclusive**; the
 //! transition function itself is pure (`crate::transition`).
 
+use crate::codes::sql::TRACK_ONLY_UNAVAILABLE;
+use crate::ids::{ActorId, ListId};
 use chrono::{DateTime, Utc};
 
 use crate::codes::{DeferCause, RecordState, TrackState};
@@ -25,16 +27,18 @@ pub struct FireArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListTracking {
     /// `lists.id`.
-    pub id: i64,
-    /// `owner_id`.
-    pub owner_id: i64,
-    /// `track_state`.
+    pub id: ListId,
+    /// `owner_id`: the account whose repository holds the list.
+    pub owner_id: ActorId,
+    /// `track_state`: where the list is in the tracking state machine.
     pub state: TrackState,
-    /// `record_state`.
+    /// `record_state`: whether the list's own record has been seen, and
+    /// whether it was deleted.
     pub record_state: RecordState,
-    /// `listblock_count`.
+    /// `listblock_count`: the counted listblocks that name the list. Exact.
     pub listblock_count: i32,
-    /// `purge_then`.
+    /// `purge_then`: the state the list enters when its purge is done.
+    /// Meaningful only while `purging`.
     pub purge_then: Option<TrackState>,
 }
 
@@ -45,15 +49,20 @@ fn decode_state(code: i16) -> Result<TrackState> {
 
 impl Txn<'_> {
     /// Reads a list's tracking columns, locking the row.
-    pub async fn list_tracking(&mut self, list_id: i64) -> Result<ListTracking> {
-        let (owner_id, state, record_state, count, purge_then): (i64, i16, i16, i32, Option<i16>) =
-            sqlx::query_as(
-                "SELECT owner_id, track_state, record_state, listblock_count, purge_then
+    pub async fn list_tracking(&mut self, list_id: ListId) -> Result<ListTracking> {
+        let (owner_id, state, record_state, count, purge_then): (
+            ActorId,
+            i16,
+            i16,
+            i32,
+            Option<i16>,
+        ) = sqlx::query_as(
+            "SELECT owner_id, track_state, record_state, listblock_count, purge_then
                  FROM lists WHERE id = $1 FOR UPDATE",
-            )
-            .bind(list_id)
-            .fetch_one(&mut *self.conn)
-            .await?;
+        )
+        .bind(list_id)
+        .fetch_one(&mut *self.conn)
+        .await?;
         Ok(ListTracking {
             id: list_id,
             owner_id,
@@ -67,7 +76,7 @@ impl Txn<'_> {
         })
     }
 
-    async fn owner_readmit_available(&mut self, owner_id: i64) -> Result<bool> {
+    async fn owner_readmit_available(&mut self, owner_id: ActorId) -> Result<bool> {
         let (day, count): (Option<chrono::NaiveDate>, i32) =
             sqlx::query_as("SELECT readmit_day, readmit_count FROM actors WHERE id = $1")
                 .bind(owner_id)
@@ -85,7 +94,7 @@ impl Txn<'_> {
 
     /// Fires `event` on list `list_id` and applies the outcome. The caller
     /// holds list(L) exclusive.
-    pub async fn fire(&mut self, list_id: i64, event: Event, args: FireArgs) -> Result<Outcome> {
+    pub async fn fire(&mut self, list_id: ListId, event: Event, args: FireArgs) -> Result<Outcome> {
         let l = self.list_tracking(list_id).await?;
         let facts = ListFacts {
             state: l.state,
@@ -221,11 +230,11 @@ impl Txn<'_> {
             && !admitted
         {
             // Leaving the retry-bearing states clears their bookkeeping.
-            sqlx::query(
+            sqlx::query(&format!(
                 "UPDATE lists SET deferred_by = NULL, next_retry_at = NULL
                  WHERE id = $1 AND (deferred_by IS NOT NULL OR next_retry_at IS NOT NULL)
-                   AND track_state NOT IN (4)",
-            )
+                   AND track_state NOT IN {TRACK_ONLY_UNAVAILABLE}"
+            ))
             .bind(list_id)
             .execute(&mut *self.conn)
             .await?;
@@ -241,7 +250,7 @@ impl Txn<'_> {
         Ok(o)
     }
 
-    async fn admit(&mut self, list_id: i64, owner_id: i64) -> Result<()> {
+    async fn admit(&mut self, list_id: ListId, owner_id: ActorId) -> Result<()> {
         let epoch: i32 = sqlx::query_scalar(
             "UPDATE lists SET admit_epoch = admit_epoch + 1, admitted_at = now(),
                fetch_run_id = NULL, fetch_run_epoch = NULL, fetched_at = NULL,
@@ -268,7 +277,7 @@ impl Txn<'_> {
 
     /// Drops a list's phase-1 queue row and scheduling lanes (it stopped
     /// waiting).
-    pub async fn clear_waiting(&mut self, list_id: i64) -> Result<()> {
+    pub async fn clear_waiting(&mut self, list_id: ListId) -> Result<()> {
         sqlx::query("DELETE FROM list_jobs WHERE list_id = $1")
             .bind(list_id)
             .execute(&mut *self.conn)
@@ -282,7 +291,7 @@ impl Txn<'_> {
 
     /// Recomputes a waiting list's lanes from its current counted
     /// listblocks, by each row's stored `sched_key`.
-    pub async fn rebuild_sched_keys(&mut self, list_id: i64) -> Result<()> {
+    pub async fn rebuild_sched_keys(&mut self, list_id: ListId) -> Result<()> {
         sqlx::query("DELETE FROM list_sched_keys WHERE list_id = $1")
             .bind(list_id)
             .execute(&mut *self.conn)
@@ -301,7 +310,7 @@ impl Txn<'_> {
 
     /// Adjusts one lane by `delta` for a counted listblock change on a
     /// waiting list; a lane is removed at `n = 0`.
-    pub async fn adjust_sched_key(&mut self, list_id: i64, key: &str, delta: i32) -> Result<()> {
+    pub async fn adjust_sched_key(&mut self, list_id: ListId, key: &str, delta: i32) -> Result<()> {
         if delta > 0 {
             sqlx::query(
                 "INSERT INTO list_sched_keys (list_id, key, n) VALUES ($1, $2, $3)
@@ -334,7 +343,7 @@ impl Txn<'_> {
     /// waiting, and fires **+** / **−** on a 0 ↔ ≥ 1 crossing.
     pub async fn change_listblock_count(
         &mut self,
-        list_id: i64,
+        list_id: ListId,
         delta: i32,
         sched_key: Option<&str>,
     ) -> Result<()> {

@@ -36,7 +36,8 @@ pub struct EndpointUsage {
 /// The counters, one set per endpoint.
 #[derive(Debug)]
 pub struct Usage {
-    /// When counting began.
+    /// When this process created the counters (server time): the start of
+    /// the period the dashboard reports.
     pub since: DateTime<Utc>,
     per: Vec<Counters>,
 }

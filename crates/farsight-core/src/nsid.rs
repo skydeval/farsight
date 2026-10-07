@@ -139,7 +139,7 @@ impl Collection {
         }
     }
 
-    /// Storage code.
+    /// The storage code: 1 block, 2 listblock, 3 list, 4 listitem.
     pub fn code(self) -> i16 {
         match self {
             Collection::Block => 1,
@@ -221,5 +221,41 @@ mod tests {
         }
         assert_eq!(Collection::from_code(0), None);
         assert_eq!(Collection::from_nsid("app.bsky.feed.post"), None);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// Any string at all: parsing returns, and what it accepts is the
+        /// input itself, within the length bound, with three segments or
+        /// more and a name that starts with a letter.
+        #[test]
+        fn parsing_is_total_and_accepted_nsids_round_trip(
+            s in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "[a-zA-Z0-9.-]{0,80}",
+                "[a-z0-9-]{1,70}(\\.[a-zA-Z0-9-]{0,70}){0,6}",
+            ],
+        ) {
+            let Ok(nsid) = Nsid::parse(&s) else { return Ok(()) };
+            proptest::prop_assert_eq!(nsid.as_str(), s.as_str());
+            proptest::prop_assert_eq!(nsid.to_string(), s.clone());
+            proptest::prop_assert_eq!(s.parse::<Nsid>(), Ok(nsid.clone()));
+            proptest::prop_assert!(s.len() <= MAX_NSID_LEN);
+            let segments: Vec<&str> = s.split('.').collect();
+            proptest::prop_assert!(segments.len() >= 3);
+            proptest::prop_assert!(segments.iter().all(|x| (1..=63).contains(&x.len())));
+            let name = segments[segments.len() - 1];
+            proptest::prop_assert!(name.as_bytes()[0].is_ascii_alphabetic());
+            proptest::prop_assert_eq!(nsid.collection(), Collection::from_nsid(&s));
+        }
+
+        /// A well-formed NSID is accepted.
+        #[test]
+        fn well_formed_nsids_are_accepted(
+            s in "[a-z][a-z0-9]{0,9}(\\.[a-z0-9]([a-z0-9-]{0,8}[a-z0-9])?){1,3}\\.[a-zA-Z][a-zA-Z0-9]{0,20}",
+        ) {
+            proptest::prop_assert!(Nsid::parse(&s).is_ok(), "{}", s);
+        }
     }
 }

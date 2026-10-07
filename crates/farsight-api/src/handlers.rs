@@ -6,15 +6,16 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use farsight_core::{AtUri, Collection, ListPurpose};
-use farsight_storage::codes::{Protocol, TrackState, actor_status};
+use farsight_storage::codes::{ActorStatus, Protocol, RecordState, TrackState};
 use farsight_storage::coverage::{GlobalSnapshot, Level};
+use farsight_storage::ids::{ActorId, ListId};
 use farsight_storage::queries::{self, ActorCoverage, ActorRef, ListInfo};
 use serde_json::{Map, Value, json};
 use sqlx::PgConnection;
 
 use crate::error::XrpcError;
-use crate::freshness::{BLOCK, Cov, LISTBLOCK, SubjectKind, View, list_state_reason, ts};
-use crate::params::{Params, purpose_code};
+use crate::freshness::{Cov, SubjectKind, View, list_state_reason, ts};
+use crate::params::{Params, purpose_filter};
 use crate::{ApiState, Reply, cursor};
 
 /// The snapshot, or `503 Overloaded` before the first read.
@@ -70,9 +71,14 @@ fn uri(did: &str, collection: Collection, rkey: &str) -> String {
     format!("at://{did}/{}/{rkey}", collection.nsid())
 }
 
-fn purpose_name(code: Option<i16>) -> &'static str {
-    ListPurpose::from_code(code.unwrap_or(0)).api_name()
+/// The API name of a stored purpose; a row without one reads `other`.
+fn purpose_name(purpose: Option<ListPurpose>) -> &'static str {
+    purpose.unwrap_or(ListPurpose::Other).api_name()
 }
+
+/// Stands for an account Farsight has no row for. Ids start at 1, so no
+/// row or reference holds it and every read keyed by it finds nothing.
+pub(crate) const NO_ACTOR: ActorId = ActorId::new(-1);
 
 /// `query.getIncomingBlocks`.
 pub async fn get_incoming_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcError> {
@@ -84,14 +90,14 @@ pub async fn get_incoming_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply
     let v = view(st, &snap);
     let mut tx = st.read_tx().await?;
     harness_sleep(&mut tx, p).await?;
-    let a = queries::actor(&mut tx, actor.as_str()).await?;
+    let a = queries::actor(&mut tx, &actor).await?;
     let (rows, ac) = match a {
         Some(a) => (
             queries::incoming_blocks(
                 &mut tx,
                 a.id,
                 inc,
-                after.as_ref().map(|(i, r)| (*i, r.as_str())),
+                after.as_ref().map(|(i, r)| (ActorId::new(*i), r.as_str())),
                 limit,
             )
             .await?,
@@ -100,7 +106,7 @@ pub async fn get_incoming_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply
         None => (Vec::new(), None),
     };
     tx.rollback().await?;
-    let (cov, _) = v.network_or_subject(BLOCK, ac.as_ref(), SubjectKind::Block);
+    let (cov, _) = v.network_or_subject(Collection::Block, ac.as_ref(), SubjectKind::Block);
     let blocks: Vec<Value> = rows
         .iter()
         .map(|b| {
@@ -118,7 +124,10 @@ pub async fn get_incoming_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply
         let last = rows.last().expect("non-empty");
         body.insert(
             "cursor".into(),
-            json!(cursor::encode(&[json!(last.author_id), json!(last.rkey)])),
+            json!(cursor::encode(&[
+                json!(last.author_id.get()),
+                json!(last.rkey)
+            ])),
         );
     }
     body.insert(
@@ -134,8 +143,11 @@ async fn composite(
     conn: &mut PgConnection,
     x: Option<(ActorRef, &ActorCoverage)>,
 ) -> Result<Cov, XrpcError> {
-    let (mut c, subject) =
-        v.network_or_subject(LISTBLOCK, x.map(|(_, ac)| ac), SubjectKind::ListChain);
+    let (mut c, subject) = v.network_or_subject(
+        Collection::ListBlock,
+        x.map(|(_, ac)| ac),
+        SubjectKind::ListChain,
+    );
     if let Some((a, ac)) = x {
         let nc = queries::naming_coverage(conn, a.id).await?;
         if nc.unfetched {
@@ -178,12 +190,12 @@ pub async fn get_incoming_list_blocks(st: &Arc<ApiState>, p: &Params) -> Result<
     let limit = p.limit()?;
     let after = cursor::id_id_rkey(p.get("cursor"))?;
     let inc = p.bool("includeInactive")?;
-    let purpose = purpose_code(p.get("purpose"))?;
+    let purpose = purpose_filter(p.get("purpose"))?;
     let snap = snapshot(st)?;
     let v = view(st, &snap);
     let mut tx = st.read_tx().await?;
     harness_sleep(&mut tx, p).await?;
-    let a = queries::actor(&mut tx, actor.as_str()).await?;
+    let a = queries::actor(&mut tx, &actor).await?;
     let (rows, cov) = match a {
         Some(a) => {
             let rows = queries::incoming_list_blocks(
@@ -191,7 +203,9 @@ pub async fn get_incoming_list_blocks(st: &Arc<ApiState>, p: &Params) -> Result<
                 a.id,
                 inc,
                 purpose,
-                after.as_ref().map(|(l, b, r)| (*l, *b, r.as_str())),
+                after
+                    .as_ref()
+                    .map(|(l, b, r)| (ListId::new(*l), ActorId::new(*b), r.as_str())),
                 limit,
             )
             .await?;
@@ -229,8 +243,8 @@ pub async fn get_incoming_list_blocks(st: &Arc<ApiState>, p: &Params) -> Result<
         body.insert(
             "cursor".into(),
             json!(cursor::encode(&[
-                json!(last.list.id),
-                json!(last.author_id),
+                json!(last.list.id.get()),
+                json!(last.author_id.get()),
                 json!(last.rkey)
             ])),
         );
@@ -248,15 +262,17 @@ pub async fn get_lists_naming(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
     let limit = p.limit()?;
     let after = cursor::id(p.get("cursor"))?;
     let inc = p.bool("includeInactive")?;
-    let purpose = purpose_code(p.get("purpose"))?;
+    let purpose = purpose_filter(p.get("purpose"))?;
     let snap = snapshot(st)?;
     let v = view(st, &snap);
     let mut tx = st.read_tx().await?;
     harness_sleep(&mut tx, p).await?;
-    let a = queries::actor(&mut tx, actor.as_str()).await?;
+    let a = queries::actor(&mut tx, &actor).await?;
     let (rows, cov) = match a {
         Some(a) => {
-            let rows = queries::lists_naming(&mut tx, a.id, inc, purpose, after, limit).await?;
+            let rows =
+                queries::lists_naming(&mut tx, a.id, inc, purpose, after.map(ListId::new), limit)
+                    .await?;
             let ac = queries::actor_coverage(&mut tx, a.id).await?;
             let cov = composite(&v, &mut tx, Some((a, &ac))).await?;
             (rows, cov)
@@ -290,7 +306,7 @@ pub async fn get_lists_naming(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
         let last = rows.last().expect("non-empty");
         body.insert(
             "cursor".into(),
-            json!(cursor::encode(&[json!(last.list.id)])),
+            json!(cursor::encode(&[json!(last.list.id.get())])),
         );
     }
     body.insert(
@@ -308,7 +324,11 @@ fn on_v2(s: &GlobalSnapshot) -> bool {
         })
 }
 
-/// List scope.
+/// List scope: the coverage of one list's membership, from its tracking
+/// state. `info` is `None` for a list Farsight has no row for. A `ready`
+/// or `retained` list is complete since its fetch, unless the firehose
+/// has not covered the time since or the session lacks sync events; a
+/// list that is not tracked falls back to network scope for `listblock`.
 pub fn list_scope(v: &View<'_>, info: Option<&ListInfo>) -> Cov {
     let a = v.applied_through();
     let base = |level| Cov {
@@ -355,7 +375,7 @@ pub fn list_scope(v: &View<'_>, info: Option<&ListInfo>) -> Cov {
             c
         }
         TrackState::Untracked | TrackState::Purging => {
-            let mut n = v.network(LISTBLOCK);
+            let mut n = v.network(Collection::ListBlock);
             n.note("list_not_tracked");
             n
         }
@@ -379,20 +399,18 @@ pub async fn get_list_members(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
     let v = view(st, &snap);
     let mut tx = st.read_tx().await?;
     harness_sleep(&mut tx, p).await?;
-    let info = queries::list_info(&mut tx, list.authority.as_str(), list.rkey.as_str()).await?;
+    let info = queries::list_info(&mut tx, &list.authority, list.rkey.as_str()).await?;
     let state = info
         .as_ref()
         .map_or(TrackState::Untracked, ListInfo::reported_state);
     let serves = matches!(state, TrackState::Ready | TrackState::Retained)
-        && info
-            .as_ref()
-            .is_some_and(|i| !actor_status::is_hidden(i.owner_status));
+        && info.as_ref().is_some_and(|i| !i.owner_status.is_hidden());
     let members = match (&info, serves) {
         (Some(i), true) => {
             queries::list_members(
                 &mut tx,
                 i.id,
-                after.as_ref().map(|(s, r)| (*s, r.as_str())),
+                after.as_ref().map(|(s, r)| (ActorId::new(*s), r.as_str())),
                 limit,
             )
             .await?
@@ -409,7 +427,7 @@ pub async fn get_list_members(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
         json!(info.as_ref().is_some_and(|i| i.capped)),
     );
     if let Some(i) = &info {
-        if i.record_state == 1 {
+        if i.record_state == RecordState::Present {
             body.insert("purpose".into(), json!(purpose_name(i.purpose)));
         }
         insert_opt(&mut body, "name", i.name.clone());
@@ -442,7 +460,7 @@ pub async fn get_list_members(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
         body.insert(
             "cursor".into(),
             json!(cursor::encode(&[
-                json!(last.subject_id),
+                json!(last.subject_id.get()),
                 json!(last.item_rkey)
             ])),
         );
@@ -457,7 +475,7 @@ pub async fn get_list_members(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
 /// Whether a listblocked list of a party bears on coverage: its record
 /// is not deleted and its owner is shown.
 fn list_relevant(l: &queries::PartyList, inc: bool) -> bool {
-    l.record_state != 2 && (inc || !actor_status::is_hidden(l.owner_status))
+    l.record_state != RecordState::Deleted && (inc || !l.owner_status.is_hidden())
 }
 
 /// The X side of `checkBlocks` at response level: network or subject
@@ -468,15 +486,15 @@ fn list_relevant(l: &queries::PartyList, inc: bool) -> bool {
 pub(crate) fn actor_side_coverage(
     v: &View<'_>,
     ac: Option<&ActorCoverage>,
-    x_id: i64,
+    x_id: ActorId,
     x_debt: bool,
     rows: &queries::CheckRows,
     inc: bool,
 ) -> Cov {
-    let (cb, _) = v.network_or_subject(BLOCK, ac, SubjectKind::Block);
-    let (cl, _) = v.network_or_subject(LISTBLOCK, ac, SubjectKind::ListChain);
-    let net_complete =
-        v.network(BLOCK).level == Level::Complete && v.network(LISTBLOCK).level == Level::Complete;
+    let (cb, _) = v.network_or_subject(Collection::Block, ac, SubjectKind::Block);
+    let (cl, _) = v.network_or_subject(Collection::ListBlock, ac, SubjectKind::ListChain);
+    let net_complete = v.network(Collection::Block).level == Level::Complete
+        && v.network(Collection::ListBlock).level == Level::Complete;
     let mut c = cb.combine(cl);
     if !net_complete && !v.covered(ac.and_then(|a| a.clean_witness)) {
         c.partial("sweep_incomplete");
@@ -534,16 +552,16 @@ pub async fn check_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcE
     let v = view(st, &snap);
     let mut tx = st.read_tx().await?;
     harness_sleep(&mut tx, p).await?;
-    let xa = queries::actor(&mut tx, x.as_str()).await?;
+    let xa = queries::actor(&mut tx, &x).await?;
     let oa = queries::actors(&mut tx, &others).await?;
-    let x_id = xa.map_or(-1, |a| a.id);
-    let other_ids: Vec<i64> = others
+    let x_id = xa.map_or(NO_ACTOR, |a| a.id);
+    let other_ids: Vec<ActorId> = others
         .iter()
         .filter_map(|d| oa.get(d).map(|a| a.id))
         .collect();
     let rows = queries::check_rows(&mut tx, x_id, &other_ids).await?;
     let mut party_ids = other_ids.clone();
-    if x_id >= 0 {
+    if xa.is_some() {
         party_ids.push(x_id);
     }
     let debts = farsight_storage::debts::debts_for(&mut *tx, &party_ids).await?;
@@ -553,14 +571,20 @@ pub async fn check_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcE
     };
     tx.rollback().await?;
 
-    let hidden = |id: i64| actor_status::is_hidden(rows.status.get(&id).copied().unwrap_or(0));
-    let direct = |a: i64, s: i64| {
+    let hidden = |id: ActorId| {
+        rows.status
+            .get(&id)
+            .copied()
+            .unwrap_or(ActorStatus::Active)
+            .is_hidden()
+    };
+    let direct = |a: ActorId, s: ActorId| {
         rows.direct.iter().any(|(au, su, _)| *au == a && *su == s) && (inc || !hidden(a))
     };
-    let names = |l: i64, s: i64| rows.items.iter().any(|(li, si)| *li == l && *si == s);
+    let names = |l: ListId, s: ActorId| rows.items.iter().any(|(li, si)| *li == l && *si == s);
     let empty = Vec::new();
-    let lists_of = |a: i64| rows.listblocks.get(&a).unwrap_or(&empty);
-    let list_uris = |a: i64, s: i64| -> Vec<String> {
+    let lists_of = |a: ActorId| rows.listblocks.get(&a).unwrap_or(&empty);
+    let list_uris = |a: ActorId, s: ActorId| -> Vec<String> {
         if !inc && hidden(a) {
             return Vec::new();
         }
@@ -589,7 +613,7 @@ pub async fn check_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcE
     }
 
     // Response-level coverage: what is common to every pair.
-    let x_debt = x_id >= 0 && debts.get(&x_id).is_some_and(|d| !d.is_empty());
+    let x_debt = xa.is_some() && debts.get(&x_id).is_some_and(|d| !d.is_empty());
     let c = actor_side_coverage(&v, ac.as_ref(), x_id, x_debt, &rows, inc);
     let relevant = |l: &queries::PartyList| list_relevant(l, inc);
     // Per pair.
@@ -632,6 +656,28 @@ pub async fn check_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcE
     Ok(Reply::ok(body))
 }
 
+/// `backfill.sweep.state` in `getStats`: where the latest cycle stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepState {
+    /// The cycle has finished.
+    Completed,
+    /// The cycle is open and `backfill.sweep.enabled` is off.
+    Paused,
+    /// The cycle is open and the sweep is on.
+    Running,
+}
+
+impl SweepState {
+    /// The state as `backfill.sweep.state` spells it.
+    pub const fn api_name(self) -> &'static str {
+        match self {
+            SweepState::Completed => "completed",
+            SweepState::Paused => "paused",
+            SweepState::Running => "running",
+        }
+    }
+}
+
 /// `query.getStats`.
 pub async fn get_stats(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcError> {
     let snap = snapshot(st)?;
@@ -646,13 +692,7 @@ pub async fn get_stats(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcErro
     let mut firehose = Map::new();
     firehose.insert("connected".into(), json!(snap.firehose.connected));
     if let Some(p) = snap.firehose.protocol {
-        firehose.insert(
-            "protocol".into(),
-            json!(match p {
-                Protocol::V1 => "v1",
-                Protocol::V2 => "v2",
-            }),
-        );
+        firehose.insert("protocol".into(), json!(p.api_name()));
     }
     if let Some(a) = snap.firehose.applied_through {
         firehose.insert("lagSeconds".into(), json!(crate::freshness::secs(now - a)));
@@ -672,16 +712,16 @@ pub async fn get_stats(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcErro
     let mut backfill = Map::new();
     if let Some(c) = &bf.cycle {
         let mut s = Map::new();
-        s.insert("cycle".into(), json!(c.id));
-        s.insert("source".into(), json!(c.source));
+        s.insert("cycle".into(), json!(c.id.get()));
+        s.insert("source".into(), json!(c.source.as_str()));
         let state = if c.completed_at.is_some() {
-            "completed"
+            SweepState::Completed
         } else if !cfg.config.backfill.sweep.enabled {
-            "paused"
+            SweepState::Paused
         } else {
-            "running"
+            SweepState::Running
         };
-        s.insert("state".into(), json!(state));
+        s.insert("state".into(), json!(state.api_name()));
         if let Some(total) = c.total_est.filter(|t| *t > 0) {
             s.insert(
                 "progress".into(),
@@ -712,7 +752,7 @@ pub async fn get_stats(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcErro
         "gaps": snap.gaps.iter().filter(|g| g.healed_witness.is_none()).map(|g| json!({
             "from": ts(g.from_at),
             "to": g.to_at.map(ts),
-            "cause": format!("{:?}", g.cause),
+            "cause": g.cause.api_name(),
         })).collect::<Vec<_>>(),
     });
     let body = json!({

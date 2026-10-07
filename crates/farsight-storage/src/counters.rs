@@ -20,7 +20,8 @@ use sqlx::PgPool;
 use crate::error::Result;
 use crate::keys::{CapKind, Limits};
 
-/// Flush period.
+/// How often the deltas accumulated in a [`CounterSink`] are written to
+/// `stats_counters` and `host_usage`. A crash loses at most this much.
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `stats_counters.name` values.
@@ -42,13 +43,13 @@ pub mod stat {
 /// Per-bucket usage delta.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostDelta {
-    /// `stored_blocks`.
+    /// Change to `host_usage.stored_blocks`.
     pub blocks: i64,
-    /// `stored_items`.
+    /// Change to `host_usage.stored_items`.
     pub items: i64,
     /// `stored_listblocks` (placeholder lists included).
     pub listblocks: i64,
-    /// `stored_lists`.
+    /// Change to `host_usage.stored_lists`.
     pub lists: i64,
     /// `stored_interned` (never decremented).
     pub interned: i64,
@@ -87,7 +88,8 @@ pub struct Deltas {
 }
 
 impl Deltas {
-    /// Adds `n` to a stat.
+    /// Adds `n` (which may be negative) to the counter called `name`, one
+    /// of the names in the `stat` module.
     pub fn stat(&mut self, name: &'static str, n: i64) {
         *self.stats.entry(name).or_insert(0) += n;
     }
@@ -119,7 +121,7 @@ impl Deltas {
 /// Buckets whose `capped_mask` changed during a flush.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlushReport {
-    /// Buckets flushed.
+    /// `host_usage` rows the flush wrote.
     pub buckets: usize,
     /// (bucket, bits newly set).
     pub capped: Vec<(String, i16)>,

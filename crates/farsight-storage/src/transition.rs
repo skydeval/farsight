@@ -77,9 +77,10 @@ impl Event {
 /// The list columns the transition function reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListFacts {
-    /// `track_state`.
+    /// `track_state` before the event.
     pub state: TrackState,
-    /// `record_state`.
+    /// `record_state`: whether the list's record is unknown, present or
+    /// deleted.
     pub record_state: RecordState,
     /// `listblock_count` **after** the change that fired the event.
     pub listblock_count: i32,
@@ -126,12 +127,14 @@ pub enum Effect {
     StayRetry,
 }
 
-/// Result of one transition.
+/// What one event does to one list: the new state and what the caller has
+/// to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    /// The new `track_state`.
+    /// The `track_state` to store; equal to the old one in a "stay" cell.
     pub state: TrackState,
-    /// The new `purge_then`.
+    /// The `purge_then` to store: the purge's target when the new state is
+    /// `purging`, otherwise `None`, or unchanged in a "stay" cell.
     pub purge_then: Option<TrackState>,
     /// Side effects, in order.
     pub effects: Vec<Effect>,
@@ -201,7 +204,9 @@ fn admit(charged: bool, ctx: &Ctx) -> Outcome {
     to(TrackState::Pending, effects)
 }
 
-/// The transition function.
+/// The transition function: one cell of the table for the list's state and
+/// the event. Pure; the caller applies [`Outcome::effects`] under the
+/// list's exclusive lock.
 pub fn transition(f: &ListFacts, event: Event, ctx: &Ctx) -> Outcome {
     use Event as E;
     use TrackState as S;

@@ -13,15 +13,17 @@ use chrono::{DateTime, Utc};
 /// Crockford base32 alphabet.
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/// Absolute lifetime.
+/// How long after its creation a token expires, unless a verified setup
+/// session postpones it.
 pub const LIFETIME: Duration = Duration::from_secs(24 * 3600);
-/// Maximum lifetime with postponement.
+/// The latest a token can expire after its creation, however active the
+/// session.
 pub const MAX_LIFETIME: Duration = Duration::from_secs(72 * 3600);
 /// A verified session within this window postpones rotation.
 pub const ACTIVE_WINDOW: Duration = Duration::from_secs(3600);
 /// The wizard warns this long before expiry.
 pub const WARN_BEFORE: Duration = Duration::from_secs(3600);
-/// Re-print period while in setup mode.
+/// How often setup mode prints the token to the log again.
 pub const REPRINT: Duration = Duration::from_secs(600);
 
 /// A setup token and its creation time.
@@ -29,7 +31,8 @@ pub const REPRINT: Duration = Duration::from_secs(600);
 pub struct SetupToken {
     /// Display form, `fst-XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX`.
     pub token: String,
-    /// Creation time.
+    /// When it was generated (UTC): the second line of the token file,
+    /// and what both lifetimes count from.
     pub created: DateTime<Utc>,
 }
 
@@ -47,7 +50,7 @@ fn encode(bytes: &[u8; 16]) -> String {
         .collect()
 }
 
-/// Generates a token now.
+/// A new token from the OS CSPRNG, created now. Not written anywhere.
 pub fn generate() -> SetupToken {
     let digits = encode(&farsight_api::auth::random_bytes::<16>());
     let token = format!(
@@ -88,7 +91,9 @@ pub fn matches(submitted: &str, token: &SetupToken) -> bool {
     crate::common::ct_eq(&normalize(submitted), &normalize(&token.token))
 }
 
-/// Reads the token file.
+/// Reads the token file: the token on its first line, its RFC 3339
+/// creation time on the second. `None` when the file is missing or does
+/// not have that shape.
 pub fn read(path: &Path) -> Option<SetupToken> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();

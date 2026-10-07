@@ -147,7 +147,7 @@ pub async fn s2_refusal_tombstone(env: &mut Env, c: &mut Checks) -> Result<()> {
     c.eq(
         "tombstone rev is E − 1",
         env.tombstone(Collection::Block, &a, "k").await?,
-        Some(e - 1),
+        Some(e.pred()),
     );
     c.eq(
         "author holds a capped debt for the intern rate",
@@ -156,8 +156,10 @@ pub async fn s2_refusal_tombstone(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
 
     // Listings stamped R < E (showing the old version) cannot re-insert.
-    for (label, stamp) in [("R = A", rev_a), ("R = E − 1", e - 1)] {
-        let r = env.listing(vec![block(&a, "k", &s1, 0)], stamp).await?;
+    for (label, stamp) in [("R = A", rev_a), ("R = E − 1", e.pred())] {
+        let r = env
+            .listing(vec![block(&a, "k", &s1, Stamp::ZERO)], stamp)
+            .await?;
         c.eq(
             format!("listing {label} with old version is stale"),
             r.stale,
@@ -170,7 +172,9 @@ pub async fn s2_refusal_tombstone(env: &mut Env, c: &mut Checks) -> Result<()> {
         );
     }
     // R = E while the refusal's cause persists: refused again, not stale.
-    let r = env.listing(vec![block(&a, "k", &s2, 0)], e).await?;
+    let r = env
+        .listing(vec![block(&a, "k", &s2, Stamp::ZERO)], e)
+        .await?;
     c.eq(
         "listing R = E before relaxing: refused (not skipped as stale)",
         (r.stale, r.refused),
@@ -180,7 +184,9 @@ pub async fn s2_refusal_tombstone(env: &mut Env, c: &mut Checks) -> Result<()> {
     // Relax the cause; R ≥ E must apply (with a tombstone at E the
     // equal-rev rule would skip it forever).
     env.limits.cfg.intern_per_did_per_day = 1_000_000;
-    let r = env.listing(vec![block(&a, "k", &s2, 0)], e).await?;
+    let r = env
+        .listing(vec![block(&a, "k", &s2, Stamp::ZERO)], e)
+        .await?;
     c.eq("listing R = E after relaxing applies", r.applied, 1);
     c.eq(
         "row now holds the refused-but-current version",
@@ -196,7 +202,7 @@ pub async fn s2_refusal_tombstone(env: &mut Env, c: &mut Checks) -> Result<()> {
     env.limits.cfg.intern_per_did_per_day = 3;
     env.firehose(vec![listblock(&a2, "k", &o1, "l1", rev_a)])
         .await?;
-    let l1 = env.list_id(&o1, "l1").await?.unwrap_or(-1);
+    let l1 = env.list_id(&o1, "l1").await?.unwrap_or(NO_LIST);
     let v = env.list_view(l1).await?;
     c.eq(
         "listblock at A admitted its list",
@@ -219,7 +225,7 @@ pub async fn s2_refusal_tombstone(env: &mut Env, c: &mut Checks) -> Result<()> {
     c.eq(
         "listblock tombstone at E − 1",
         env.tombstone(Collection::ListBlock, &a2, "k").await?,
-        Some(e - 1),
+        Some(e.pred()),
     );
     let v = env.list_view(l1).await?;
     c.eq(
@@ -228,12 +234,12 @@ pub async fn s2_refusal_tombstone(env: &mut Env, c: &mut Checks) -> Result<()> {
         (0, TrackState::Purging, Some(TrackState::Untracked)),
     );
     let r = env
-        .listing(vec![listblock(&a2, "k", &o1, "l1", 0)], e - 1)
+        .listing(vec![listblock(&a2, "k", &o1, "l1", Stamp::ZERO)], e.pred())
         .await?;
     c.eq("listblock listing R = E − 1 is stale", r.stale, 1);
     env.limits.cfg.intern_per_did_per_day = 1_000_000;
     let r = env
-        .listing(vec![listblock(&a2, "k", &o2, "l2", 0)], e)
+        .listing(vec![listblock(&a2, "k", &o2, "l2", Stamp::ZERO)], e)
         .await?;
     c.eq(
         "listblock listing R = E after relaxing applies",
@@ -248,7 +254,7 @@ pub async fn s2_refusal_tombstone(env: &mut Env, c: &mut Checks) -> Result<()> {
     Ok(())
 }
 
-async fn promote(env: &Env, list_id: i64) -> Result<()> {
+async fn promote(env: &Env, list_id: ListId) -> Result<()> {
     janitor::fire_event(
         &env.pool,
         &env.limits,
@@ -264,7 +270,12 @@ async fn promote(env: &Env, list_id: i64) -> Result<()> {
     Ok(())
 }
 
-async fn item_count_consistent(env: &Env, c: &mut Checks, what: &str, list_id: i64) -> Result<()> {
+async fn item_count_consistent(
+    env: &Env,
+    c: &mut Checks,
+    what: &str,
+    list_id: ListId,
+) -> Result<()> {
     let actual: i64 = sqlx::query_scalar("SELECT count(*) FROM list_items WHERE list_id = $1")
         .bind(list_id)
         .fetch_one(&env.pool)
@@ -308,7 +319,7 @@ pub async fn s3_refused_item(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
     env.firehose(vec![listblock(&b, "lb1", &o, "L", rev(60))])
         .await?;
-    let l = env.list_id(&o, "L").await?.unwrap_or(-1);
+    let l = env.list_id(&o, "L").await?.unwrap_or(NO_LIST);
     let v = env.list_view(l).await?;
     c.eq(
         "order 1: flip admitted L with a phase-1 job",
@@ -317,7 +328,7 @@ pub async fn s3_refused_item(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
     // The list job's run reads its stamp after the flip: R ≥ I's rev.
     let r = env
-        .listing(vec![item(&o, "i1", "L", &x, 0)], rev(70))
+        .listing(vec![item(&o, "i1", "L", &x, Stamp::ZERO)], rev(70))
         .await?;
     c.eq("order 1: the run's listing applies I", r.applied, 1);
     promote(env, l).await?;
@@ -342,7 +353,7 @@ pub async fn s3_refused_item(env: &mut Env, c: &mut Checks) -> Result<()> {
         r.applied,
         1,
     );
-    let m = env.list_id(&o, "M").await?.unwrap_or(-1);
+    let m = env.list_id(&o, "M").await?.unwrap_or(NO_LIST);
     item_count_consistent(env, c, "order 2", m).await?;
 
     // Order 3: I moved into untracked N by an update at E is refused
@@ -367,16 +378,18 @@ pub async fn s3_refused_item(env: &mut Env, c: &mut Checks) -> Result<()> {
     c.eq(
         "order 3: tombstone at E − 1",
         env.tombstone(Collection::ListItem, &o, "i3").await?,
-        Some(e - 1),
+        Some(e.pred()),
     );
-    let n0 = env.list_id(&o, "N0").await?.unwrap_or(-1);
+    let n0 = env.list_id(&o, "N0").await?.unwrap_or(NO_LIST);
     item_count_consistent(env, c, "order 3 (N0)", n0).await?;
     env.firehose(vec![listblock(&b, "lb4", &o, "N", rev(110))])
         .await?;
-    let r = env.listing(vec![item(&o, "i3", "N", &x, 0)], e - 1).await?;
+    let r = env
+        .listing(vec![item(&o, "i3", "N", &x, Stamp::ZERO)], e.pred())
+        .await?;
     c.eq("order 3: a listing stamped E − 1 cannot apply", r.stale, 1);
     let r = env
-        .listing(vec![item(&o, "i3", "N", &x, 0)], rev(120))
+        .listing(vec![item(&o, "i3", "N", &x, Stamp::ZERO)], rev(120))
         .await?;
     c.eq(
         "order 3: the run's listing (R ≥ E) applies I into N",
@@ -406,7 +419,7 @@ pub async fn s3_refused_item(env: &mut Env, c: &mut Checks) -> Result<()> {
         .await?;
     env.firehose(vec![delete(&b, Collection::ListBlock, "lb5", rev(141))])
         .await?;
-    let p = env.list_id(&o, "P").await?.unwrap_or(-1);
+    let p = env.list_id(&o, "P").await?.unwrap_or(NO_LIST);
     c.eq(
         "reverse: pending P → purging",
         env.list_view(p).await?.state,

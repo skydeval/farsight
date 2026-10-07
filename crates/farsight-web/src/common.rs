@@ -10,7 +10,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-/// The stylesheet.
+/// The stylesheet of the admin pages and the wizard, served at
+/// `/static/farsight.css`.
 pub const CSS: &str = include_str!("../static/farsight.css");
 /// Vendored htmx (see `static/NOTICE.md`).
 pub const HTMX: &str = include_str!("../static/htmx.min.js");
@@ -215,12 +216,10 @@ pub fn random_id() -> String {
     URL_SAFE_NO_PAD.encode(farsight_api::auth::random_bytes::<32>())
 }
 
-/// SHA-256 of a string.
-pub fn sha256(s: &str) -> [u8; 32] {
-    Sha256::digest(s.as_bytes()).into()
-}
+pub use farsight_api::auth::sha256;
 
-/// Constant-time string equality.
+/// String equality in time that depends on the lengths alone, for
+/// comparing a submitted secret with the stored one.
 pub fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
@@ -245,7 +244,8 @@ pub fn cookie(
     HeaderValue::from_str(&c).expect("cookie is ASCII")
 }
 
-/// The value of cookie `name`.
+/// The value of cookie `name` in the request's `Cookie` headers; `None`
+/// when it is not sent.
 pub fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
@@ -293,7 +293,8 @@ pub fn forbidden(msg: &str) -> Response {
     r
 }
 
-/// Formats a byte count.
+/// Formats a byte count in decimal units (1 KB = 1000 B) with one
+/// decimal, up to TB: `512 B`, `1.5 GB`.
 pub fn human_bytes(b: u64) -> String {
     const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = b as f64;

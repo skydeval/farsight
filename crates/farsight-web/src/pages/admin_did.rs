@@ -24,7 +24,7 @@ use farsight_storage::backfill_api;
 use farsight_storage::public::{self as store, Counted};
 use farsight_storage::ui_rows::{self, Filter, Find, Section as Rows};
 
-use super::{Nav, WebState, coverage_words, gate, nav, permit, resolve_handle};
+use super::{HandleError, Nav, WebState, coverage_words, gate, handle_to_did, nav, permit};
 use crate::cells;
 use crate::common::render_private;
 use crate::public::card;
@@ -39,7 +39,8 @@ pub const PAGE_ROWS: i64 = 50;
 pub const COUNT_CAP: i64 = 5_000_000;
 /// Longest filter text read.
 pub const MAX_FIND: usize = 100;
-/// The page's address.
+/// The page's path. The account is the `q` parameter; the tab, the
+/// filter and each table's page are parameters too.
 pub const BASE: &str = "/admin/lookup/did";
 
 /// The tables, in tab order: `(id, label, page parameter)`. The first is
@@ -127,7 +128,8 @@ impl Ask {
 /// One tab.
 #[derive(Debug, Clone)]
 pub struct Tab {
-    /// The table's id.
+    /// The table's id from [`TABLES`] (or [`HISTORY`]): the value of the
+    /// address's `tab` parameter.
     pub id: &'static str,
     /// Its label.
     pub label: &'static str,
@@ -294,7 +296,8 @@ pub struct BlockingRow {
 pub struct Table<R> {
     /// The count for the heading; `None` when it could not be read.
     pub count: Option<String>,
-    /// Coverage in words.
+    /// The table's `freshness` as a sentence
+    /// (`dashboard::coverage_words`); empty when it was not read.
     pub coverage: String,
     /// What went wrong, if the rows could not be read.
     pub error: Option<String>,
@@ -324,7 +327,8 @@ impl<R> Default for Table<R> {
 pub struct HeldRow {
     /// The handle or host.
     pub value: String,
-    /// Since when.
+    /// When the PLC operation that set it was made. The value held from
+    /// then until the next row's time.
     pub since: Stamp,
     /// It is the one the account has now.
     pub current: bool,
@@ -359,7 +363,8 @@ pub struct HistoryTab {
 
 /// The account in view.
 pub struct Subject {
-    /// The DID.
+    /// The account's DID: what the query named, or what the handle typed
+    /// in its place resolved to.
     pub did: String,
     /// Its verified handle, if cached.
     pub handle: Option<String>,
@@ -370,9 +375,10 @@ pub struct Subject {
     pub history: Option<HistoryTab>,
     /// Backfill state: label and value.
     pub backfill: Vec<(&'static str, String)>,
-    /// The filter text.
+    /// The filter text as read from the address (trimmed, at most
+    /// [`MAX_FIND`] characters), put back into the filter box.
     pub find: String,
-    /// The tabs.
+    /// The tabs in [`TABLES`] order, then History.
     pub tabs: Vec<Tab>,
     /// The id of the table in view.
     pub active: &'static str,
@@ -393,9 +399,11 @@ pub struct Subject {
 pub struct DidPage {
     /// Navigation.
     pub nav: Nav,
-    /// The query.
+    /// The `q` parameter, trimmed: a DID or a handle. Put back into the
+    /// search box; empty on a first view.
     pub q: String,
-    /// Error.
+    /// Why the query gave no account (not a DID, a handle that does not
+    /// resolve) or why the page is busy; shown in place of the account.
     pub error: Option<String>,
     /// The account, once the query names one.
     pub subject: Option<Subject>,
@@ -417,8 +425,8 @@ fn total_of(n: i64) -> Total {
     }
 }
 
-fn purpose_words(code: Option<i16>) -> &'static str {
-    match code.map(|c| farsight_core::ListPurpose::from_code(c).api_name()) {
+fn purpose_words(purpose: Option<farsight_core::ListPurpose>) -> &'static str {
+    match purpose.map(farsight_core::ListPurpose::api_name) {
         Some("modlist") => "Moderation",
         Some("curatelist") => "Curation",
         Some("referencelist") => "Reference",
@@ -448,7 +456,7 @@ async fn finder(st: &WebState, text: &str) -> Option<Find> {
     }
     if let Ok(did) = Did::parse(text) {
         let id = match st.api.pool.acquire().await {
-            Ok(mut conn) => farsight_storage::queries::actor(&mut conn, did.as_str())
+            Ok(mut conn) => farsight_storage::queries::actor(&mut conn, &did)
                 .await
                 .ok()
                 .flatten()
@@ -498,21 +506,21 @@ pub async fn lookup_did(
         return render_private(&page);
     }
     let did = if query.starts_with("did:") {
-        Did::parse(&query).map_err(|e| e.to_string())
+        Did::parse(&query).map_err(HandleError::from)
     } else {
-        resolve_handle(&st.safe, &query).await
+        handle_to_did(&st.safe, &query).await
     };
     let did = match did {
         Ok(d) => d,
         Err(e) => {
-            page.error = Some(e);
+            page.error = Some(e.to_string());
             return render_private(&page);
         }
     };
     let _permit = match permit(&st).await {
         Ok(p) => p,
         Err(e) => {
-            page.error = Some(e);
+            page.error = Some(e.to_string());
             return render_private(&page);
         }
     };
@@ -526,7 +534,7 @@ pub async fn lookup_did(
         ("limit".to_owned(), "1".to_owned()),
     ]);
     let subject_row = match st.api.pool.acquire().await {
-        Ok(mut conn) => farsight_storage::queries::actor(&mut conn, did.as_str())
+        Ok(mut conn) => farsight_storage::queries::actor(&mut conn, &did)
             .await
             .ok()
             .flatten(),
@@ -567,7 +575,7 @@ pub async fn lookup_did(
             Ok(mut conn) => store::bounded_count_hiding(
                 &mut conn,
                 Counted::IncomingBlocks,
-                a.id,
+                a.id.into(),
                 &[],
                 hidden,
                 find.as_ref(),
@@ -582,7 +590,7 @@ pub async fn lookup_did(
         match rows::numbered(
             &st,
             Rows::IncomingBlocks,
-            a.id,
+            a.id.into(),
             filter,
             ask.pages[0],
             PAGE_ROWS,
@@ -792,7 +800,7 @@ pub async fn lookup_did(
     let mut backfill = Vec::new();
     if let Ok(mut conn) = st.api.pool.acquire().await {
         let discovery = !cfg.config.backfill.backlinks.url.is_empty();
-        if let Ok(b) = backfill_api::status(&mut conn, did.as_str(), discovery).await {
+        if let Ok(b) = backfill_api::status(&mut conn, &did, discovery).await {
             backfill.push(("Repo", b.repo.state.api_name().to_owned()));
             if let Some(t) = b.repo.last_backfilled_at {
                 backfill.push((

@@ -68,9 +68,10 @@ pub struct FaultHook {
 /// Ingest settings derived from the config.
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
-    /// Reader settings.
+    /// Reader settings: instances, resume tuning, stall timeout, seam
+    /// repair.
     pub reader: reader::ReaderConfig,
-    /// Limits for `apply`.
+    /// Caps the writer hands to `apply` with every batch.
     pub limits: Limits,
     /// Write gates, shared with the budget monitor.
     pub gates: Arc<SharedGates>,
@@ -80,7 +81,9 @@ pub struct IngestConfig {
 }
 
 impl IngestConfig {
-    /// From a loaded config.
+    /// Derives the settings from a loaded config: `firehose.urls`,
+    /// `[firehose.tuning]` and the limits. zstd frames are always
+    /// requested, and the gates are a fresh set for the caller to share.
     pub fn from_config(c: &Config) -> IngestConfig {
         let t = &c.firehose.tuning;
         IngestConfig {
@@ -108,11 +111,12 @@ impl IngestConfig {
     }
 }
 
-/// A running ingest.
+/// A running ingest: the handles to command it, observe it and shut it
+/// down.
 pub struct IngestHandle {
     /// Commands to the reader.
     pub control: mpsc::Sender<Control>,
-    /// Live statistics.
+    /// Live statistics, updated by the reader and the writer.
     pub stats: Arc<IngestStats>,
     /// The counter sink (approximate counters).
     pub counters: Arc<CounterSink>,
@@ -219,7 +223,7 @@ impl IngestHandle {
     }
 }
 
-/// Entry point.
+/// Entry point: [`Ingest::start`].
 pub struct Ingest;
 
 impl Ingest {

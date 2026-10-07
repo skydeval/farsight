@@ -6,44 +6,50 @@ use chrono::{DateTime, Utc};
 use farsight_core::record::parse_record;
 use farsight_core::{Collection, Did, RecordKey};
 use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Write, WriteAction};
-use farsight_storage::codes::{DeferCause, TrackState};
+use farsight_storage::codes::sql::TRACK_PENDING;
+use farsight_storage::codes::{
+    DeferCause, JobKind, Priority, RecordState, RequesterKey, Tier, TrackState,
+};
+use farsight_storage::ids::{ActorId, ListId, Stamp};
 use farsight_storage::keys::CapKind;
 use farsight_storage::transition::Event;
 
 use crate::ctx::Ctx;
-use crate::jobs::{self, JobResult, Outcome};
+use crate::jobs::{self, JobError, JobResult, Outcome};
 use crate::resolve::ResolveError;
 use crate::xrpc;
 
 /// Weekly retry after the short schedules are exhausted.
 pub const WEEKLY: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
-/// Requester of list jobs.
-pub const SYSTEM_LISTS: &str = "system:lists";
 
 /// A waiting list as phase 1 sees it.
 #[derive(Debug, Clone)]
 pub struct ListRow {
     /// `lists.id`.
-    pub id: i64,
+    pub id: ListId,
     /// Owner `actors.id`.
-    pub owner_id: i64,
-    /// Owner DID.
+    pub owner_id: ActorId,
+    /// The owner's DID (`actors.did` of `owner_id`): whose PDS the record
+    /// is read from.
     pub owner: Did,
-    /// List rkey.
+    /// `lists.rkey`: the list record's key in the owner's repo.
     pub rkey: String,
-    /// `record_state` code.
-    pub record_state: i16,
-    /// Tracking state.
+    /// Whether the list's record has been seen.
+    pub record_state: RecordState,
+    /// `lists.track_state` when the row was loaded.
     pub state: TrackState,
-    /// `admit_epoch`.
+    /// `lists.admit_epoch` when the row was loaded. Phase 1's result is
+    /// applied only if it is still the list's epoch.
     pub admit_epoch: i32,
-    /// `phase1_attempts`.
+    /// `lists.phase1_attempts`: the list's place on its retry schedule.
+    /// For a waiting list, record checks that ended in an error; for a
+    /// `missing` one, re-checks that found no record.
     pub attempts: i32,
 }
 
 /// Loads a list row.
-pub async fn load(ctx: &Ctx, list_id: i64) -> Result<Option<ListRow>, sqlx::Error> {
-    let r: Option<(i64, String, String, i16, i16, i32, i32)> = sqlx::query_as(
+pub async fn load(ctx: &Ctx, list_id: ListId) -> Result<Option<ListRow>, sqlx::Error> {
+    let r: Option<(ActorId, String, String, RecordState, i16, i32, i32)> = sqlx::query_as(
         "SELECT l.owner_id, o.did, l.rkey, l.record_state, l.track_state, l.admit_epoch,
                 l.phase1_attempts
          FROM lists l JOIN actors o ON o.id = l.owner_id WHERE l.id = $1",
@@ -67,7 +73,11 @@ pub async fn load(ctx: &Ctx, list_id: i64) -> Result<Option<ListRow>, sqlx::Erro
     )
 }
 
-async fn fire(ctx: &Ctx, list_id: i64, event: Event) -> Result<(), farsight_storage::StorageError> {
+async fn fire(
+    ctx: &Ctx,
+    list_id: ListId,
+    event: Event,
+) -> Result<(), farsight_storage::StorageError> {
     farsight_storage::janitor::fire_event(
         &ctx.pool,
         &ctx.limits(),
@@ -82,7 +92,7 @@ async fn fire(ctx: &Ctx, list_id: i64, event: Event) -> Result<(), farsight_stor
 
 async fn set_job_not_before(
     ctx: &Ctx,
-    list_id: i64,
+    list_id: ListId,
     delay: std::time::Duration,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -97,7 +107,7 @@ async fn set_job_not_before(
 
 async fn set_retry_at(
     ctx: &Ctx,
-    list_id: i64,
+    list_id: ListId,
     delay: std::time::Duration,
 ) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE lists SET next_retry_at = now() + make_interval(secs => $2) WHERE id = $1")
@@ -118,36 +128,33 @@ enum Check {
 }
 
 /// Runs phase 1 for one list (the scheduler picked it from its lanes).
-pub async fn run(ctx: &Ctx, list_id: i64) -> JobResult {
+pub async fn run(ctx: &Ctx, list_id: ListId) -> JobResult {
     let mut cost = 0u64;
     let outcome = match run_inner(ctx, list_id, &mut cost).await {
         Ok(o) => o,
         Err(e) => Outcome::Failed {
-            error: e,
+            error: e.to_string(),
             terminal: false,
         },
     };
     JobResult { outcome, cost }
 }
 
-async fn run_inner(ctx: &Ctx, list_id: i64, cost: &mut u64) -> Result<Outcome, String> {
-    let err = |e: &dyn std::fmt::Display| e.to_string();
-    let Some(l) = load(ctx, list_id).await.map_err(|e| err(&e))? else {
+async fn run_inner(ctx: &Ctx, list_id: ListId, cost: &mut u64) -> Result<Outcome, JobError> {
+    let Some(l) = load(ctx, list_id).await? else {
         return Ok(Outcome::Clean);
     };
     if !l.state.is_waiting() {
         sqlx::query("DELETE FROM list_jobs WHERE list_id = $1")
             .bind(list_id)
             .execute(&ctx.pool)
-            .await
-            .map_err(|e| err(&e))?;
+            .await?;
         return Ok(Outcome::Clean);
     }
     let epoch: i32 = sqlx::query_scalar("SELECT admit_epoch FROM list_jobs WHERE list_id = $1")
         .bind(list_id)
         .fetch_optional(&ctx.pool)
-        .await
-        .map_err(|e| err(&e))?
+        .await?
         .unwrap_or(l.admit_epoch);
     if epoch != l.admit_epoch {
         // A newer admission replaced this job (results apply only if
@@ -156,14 +163,10 @@ async fn run_inner(ctx: &Ctx, list_id: i64, cost: &mut u64) -> Result<Outcome, S
             .bind(list_id)
             .bind(l.admit_epoch)
             .execute(&ctx.pool)
-            .await
-            .map_err(|e| err(&e))?;
+            .await?;
     }
     // The owner's lease, only for the getRecord call.
-    if !jobs::acquire_lease(&ctx.pool, l.owner.as_str(), &ctx.lease_owner)
-        .await
-        .map_err(|e| err(&e))?
-    {
+    if !jobs::acquire_lease(&ctx.pool, l.owner.as_str(), &ctx.lease_owner).await? {
         return Ok(Outcome::Busy);
     }
     let check = record_check(ctx, &l, cost).await;
@@ -173,7 +176,7 @@ async fn run_inner(ctx: &Ctx, list_id: i64, cost: &mut u64) -> Result<Outcome, S
         Check::Present => {
             // Re-read: the apply may have fired RP (e.g. missing → admit, a
             // new epoch with its own phase-1 job).
-            let Some(now) = load(ctx, list_id).await.map_err(|e| err(&e))? else {
+            let Some(now) = load(ctx, list_id).await? else {
                 return Ok(Outcome::Clean);
             };
             if now.admit_epoch != l.admit_epoch
@@ -192,41 +195,31 @@ async fn run_inner(ctx: &Ctx, list_id: i64, cost: &mut u64) -> Result<Outcome, S
             )
             .bind(l.owner_id)
             .fetch_one(&ctx.pool)
-            .await
-            .map_err(|e| err(&e))?;
+            .await?;
             if owner_mask & CapKind::Items.bit() != 0 {
-                fire(ctx, list_id, Event::GateFail(DeferCause::HostCap))
-                    .await
-                    .map_err(|e| err(&e))?;
+                fire(ctx, list_id, Event::GateFail(DeferCause::HostCap)).await?;
                 return Ok(Outcome::CompleteWithDebts);
             }
-            pass(ctx, &now).await.map_err(|e| err(&e))?;
+            pass(ctx, &now).await?;
             Ok(Outcome::Clean)
         }
         Check::Refused => {
-            fire(ctx, list_id, Event::GateFail(DeferCause::ListsCap))
-                .await
-                .map_err(|e| err(&e))?;
+            fire(ctx, list_id, Event::GateFail(DeferCause::ListsCap)).await?;
             Ok(Outcome::CompleteWithDebts)
         }
         Check::OwnerInactive => {
-            fire(ctx, list_id, Event::OwnerInactive)
-                .await
-                .map_err(|e| err(&e))?;
+            fire(ctx, list_id, Event::OwnerInactive).await?;
             if l.state != TrackState::Missing {
                 // Only OA (a new epoch) revives a list that went
                 // unavailable via OI at phase 1.
                 sqlx::query("DELETE FROM list_jobs WHERE list_id = $1")
                     .bind(list_id)
                     .execute(&ctx.pool)
-                    .await
-                    .map_err(|e| err(&e))?;
+                    .await?;
             } else {
                 // A missing list's retry continues; OI does not count.
                 let i = (l.attempts.max(0) as usize).min(cfg.backfill.missing_retry.len() - 1);
-                set_retry_at(ctx, list_id, cfg.backfill.missing_retry[i].get())
-                    .await
-                    .map_err(|e| err(&e))?;
+                set_retry_at(ctx, list_id, cfg.backfill.missing_retry[i].get()).await?;
             }
             Ok(Outcome::Inactive)
         }
@@ -235,33 +228,23 @@ async fn run_inner(ctx: &Ctx, list_id: i64, cost: &mut u64) -> Result<Outcome, S
             if l.state == TrackState::Missing {
                 let n = l.attempts + 1;
                 if n as usize >= retries.len() {
-                    fire(ctx, list_id, Event::NotFoundExhausted)
-                        .await
-                        .map_err(|e| err(&e))?;
+                    fire(ctx, list_id, Event::NotFoundExhausted).await?;
                 } else {
                     sqlx::query("UPDATE lists SET phase1_attempts = $2 WHERE id = $1")
                         .bind(list_id)
                         .bind(n)
                         .execute(&ctx.pool)
-                        .await
-                        .map_err(|e| err(&e))?;
-                    set_retry_at(ctx, list_id, retries[n as usize].get())
-                        .await
-                        .map_err(|e| err(&e))?;
+                        .await?;
+                    set_retry_at(ctx, list_id, retries[n as usize].get()).await?;
                 }
             } else {
-                fire(ctx, list_id, Event::NotFound)
-                    .await
-                    .map_err(|e| err(&e))?;
+                fire(ctx, list_id, Event::NotFound).await?;
                 // Entering missing: the retry ladder starts.
                 sqlx::query("UPDATE lists SET phase1_attempts = 0 WHERE id = $1")
                     .bind(list_id)
                     .execute(&ctx.pool)
-                    .await
-                    .map_err(|e| err(&e))?;
-                set_retry_at(ctx, list_id, retries[0].get())
-                    .await
-                    .map_err(|e| err(&e))?;
+                    .await?;
+                set_retry_at(ctx, list_id, retries[0].get()).await?;
             }
             Ok(Outcome::CompleteWithDebts)
         }
@@ -276,29 +259,22 @@ async fn run_inner(ctx: &Ctx, list_id: i64, cost: &mut u64) -> Result<Outcome, S
                     .get(i)
                     .map(|d| d.get())
                     .unwrap_or(WEEKLY);
-                set_retry_at(ctx, list_id, d).await.map_err(|x| err(&x))?;
+                set_retry_at(ctx, list_id, d).await?;
             } else {
                 let n = l.attempts + 1;
                 sqlx::query("UPDATE lists SET phase1_attempts = $2 WHERE id = $1")
                     .bind(list_id)
                     .bind(n)
                     .execute(&ctx.pool)
-                    .await
-                    .map_err(|x| err(&x))?;
+                    .await?;
                 let sched = &cfg.backfill.phase1_retry;
                 if (n as usize) <= sched.len() {
-                    set_job_not_before(ctx, list_id, sched[n as usize - 1].get())
-                        .await
-                        .map_err(|x| err(&x))?;
+                    set_job_not_before(ctx, list_id, sched[n as usize - 1].get()).await?;
                 } else {
                     if l.state == TrackState::Pending {
-                        fire(ctx, list_id, Event::FailTerminal)
-                            .await
-                            .map_err(|x| err(&x))?;
+                        fire(ctx, list_id, Event::FailTerminal).await?;
                     }
-                    set_job_not_before(ctx, list_id, WEEKLY)
-                        .await
-                        .map_err(|x| err(&x))?;
+                    set_job_not_before(ctx, list_id, WEEKLY).await?;
                 }
             }
             Ok(Outcome::Failed {
@@ -344,10 +320,10 @@ pub async fn pass(ctx: &Ctx, l: &ListRow) -> Result<(), farsight_storage::Storag
         farsight_storage::queue::enqueue(
             &mut conn,
             l.owner_id,
-            farsight_storage::queue::JobKind::ListFetch,
-            1,
-            farsight_storage::repo_events::priority::NORMAL,
-            SYSTEM_LISTS,
+            JobKind::ListFetch,
+            Tier::OnDemand,
+            Priority::Normal,
+            RequesterKey::Lists,
             Some(cap),
         )
         .await?;
@@ -356,7 +332,7 @@ pub async fn pass(ctx: &Ctx, l: &ListRow) -> Result<(), farsight_storage::Storag
 }
 
 async fn record_check(ctx: &Ctx, l: &ListRow, cost: &mut u64) -> Check {
-    if l.record_state == 1 {
+    if l.record_state == RecordState::Present {
         return Check::Present;
     }
     let mut bypass = false;
@@ -371,7 +347,7 @@ async fn record_check(ctx: &Ctx, l: &ListRow, cost: &mut u64) -> Check {
         match xrpc::get_record(
             &ctx.net,
             &pds.endpoint,
-            l.owner.as_str(),
+            &l.owner,
             Collection::List.nsid(),
             &l.rkey,
         )
@@ -381,7 +357,7 @@ async fn record_check(ctx: &Ctx, l: &ListRow, cost: &mut u64) -> Check {
                 return match apply_record(ctx, l, &value).await {
                     Ok(true) => Check::Present,
                     Ok(false) => Check::Refused,
-                    Err(e) => Check::Error(e),
+                    Err(e) => Check::Error(e.to_string()),
                 };
             }
             Ok(None) | Err(_) if !bypass => {
@@ -392,11 +368,11 @@ async fn record_check(ctx: &Ctx, l: &ListRow, cost: &mut u64) -> Check {
             }
             Ok(None) => return Check::NotFound,
             Err(e) if xrpc::is_repo_level(&e) => {
-                if e.xrpc_name() == Some("RepoNotFound") {
+                if e.xrpc_name() == Some(crate::net::REPO_NOT_FOUND) {
                     // The repo may have moved or gone: the relay decides.
                     let relay = ctx.cfg().backfill.relay_url.clone();
                     *cost += 1;
-                    return match xrpc::repo_status(&ctx.net, &relay, l.owner.as_str()).await {
+                    return match xrpc::repo_status(&ctx.net, &relay, &l.owner).await {
                         Ok(s) if !s.active => {
                             let _ = crate::jobs::repo::apply_status(ctx, &l.owner, false, s.status)
                                 .await;
@@ -408,7 +384,7 @@ async fn record_check(ctx: &Ctx, l: &ListRow, cost: &mut u64) -> Check {
                 }
                 let relay = ctx.cfg().backfill.relay_url.clone();
                 *cost += 1;
-                return match xrpc::repo_status(&ctx.net, &relay, l.owner.as_str()).await {
+                return match xrpc::repo_status(&ctx.net, &relay, &l.owner).await {
                     Ok(s) if !s.active => {
                         let _ =
                             crate::jobs::repo::apply_status(ctx, &l.owner, false, s.status).await;
@@ -424,8 +400,8 @@ async fn record_check(ctx: &Ctx, l: &ListRow, cost: &mut u64) -> Check {
 
 /// Applies a fetched list record with `W = 0` under author(O) + list(L)
 /// exclusive (the apply path); `false` if a cap refused it.
-async fn apply_record(ctx: &Ctx, l: &ListRow, value: &serde_json::Value) -> Result<bool, String> {
-    let rec = parse_record(&l.owner, Collection::List, value).map_err(|e| e.to_string())?;
+async fn apply_record(ctx: &Ctx, l: &ListRow, value: &serde_json::Value) -> Result<bool, JobError> {
+    let rec = parse_record(&l.owner, Collection::List, value)?;
     let limits = ctx.limits();
     let actx = ApplyCtx {
         limits: &limits,
@@ -433,19 +409,17 @@ async fn apply_record(ctx: &Ctx, l: &ListRow, value: &serde_json::Value) -> Resu
         counters: &ctx.counters,
     };
     let mut b = Batch::new(Origin::Discovery {
-        requester: SYSTEM_LISTS.into(),
+        requester: RequesterKey::Lists,
     });
     b.writes.push(Write {
         author: l.owner.clone(),
         collection: Collection::List,
-        rkey: RecordKey::parse(&l.rkey).map_err(|e| e.to_string())?,
-        stamp: 0,
+        rkey: RecordKey::parse(&l.rkey)?,
+        stamp: Stamp::ZERO,
         witness: None,
         action: WriteAction::Upsert(rec),
     });
-    let report = apply::apply(&ctx.pool, &actx, &b)
-        .await
-        .map_err(|e| e.to_string())?;
+    let report = apply::apply(&ctx.pool, &actx, &b).await?;
     crate::metrics::count_refusals(&report);
     Ok(report.refused == 0)
 }
@@ -459,10 +433,10 @@ pub async fn pending_timeouts(
     now: DateTime<Utc>,
 ) -> Result<usize, farsight_storage::StorageError> {
     let max_age = ctx.cfg().limits.pending_max_age.get();
-    let lists: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM lists WHERE track_state = 1
-           AND admitted_at < $1 - make_interval(secs => $2) ORDER BY admitted_at, id",
-    )
+    let lists: Vec<ListId> = sqlx::query_scalar(&format!(
+        "SELECT id FROM lists WHERE track_state = {TRACK_PENDING}
+           AND admitted_at < $1 - make_interval(secs => $2) ORDER BY admitted_at, id"
+    ))
     .bind(now)
     .bind(max_age.as_secs_f64())
     .fetch_all(&ctx.pool)

@@ -15,6 +15,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::PgPool;
 
 use crate::error::{Result, StorageError};
+use crate::ids::{ActorId, HistoryId, Stamp};
 use crate::txn::{AuthorInfo, Txn};
 
 /// `farsight_block_history_written_total{table,cause}`.
@@ -36,7 +37,8 @@ pub enum Cause {
     SubjectChange,
     /// The same, with the new version refused and the row deleted.
     RefusedUpdate,
-    /// Range or whole reconcile.
+    /// A listing no longer had the record: a range or whole-collection
+    /// reconcile removed the row.
     Reconcile,
     /// Purge drain while the list's record is deleted (listitems only).
     ListDeleted,
@@ -52,7 +54,7 @@ impl Cause {
         Cause::ListDeleted,
     ];
 
-    /// Storage code.
+    /// The stored `cause` code: 1 to 5, in the order of [`Cause::ALL`].
     pub fn code(self) -> i16 {
         match self {
             Cause::Delete => 1,
@@ -68,7 +70,15 @@ impl Cause {
         Cause::ALL.into_iter().find(|x| x.code() == c)
     }
 
-    /// Metric label.
+    fn sql_value(&self) -> i16 {
+        self.code()
+    }
+
+    fn from_sql_value(code: &i16) -> Option<Cause> {
+        Cause::from_code(*code)
+    }
+
+    /// The `cause` label of `farsight_block_history_written_total`.
     pub fn label(self) -> &'static str {
         match self {
             Cause::Delete => "delete",
@@ -80,7 +90,10 @@ impl Cause {
     }
 }
 
-/// A history table.
+crate::codes::sqlx_code!(Cause, i16);
+
+/// One of the three history tables; each takes the rows removed from one
+/// live table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Table {
     /// `blocks_history`.
@@ -120,7 +133,7 @@ pub struct Removal {
     /// Why the row goes.
     pub cause: Cause,
     /// Commit rev of the removing firehose event; `None` for a listing.
-    pub rev: Option<i64>,
+    pub rev: Option<Stamp>,
     /// Witness of the removing firehose event; `None` for a listing, which
     /// uses the transaction's clock.
     pub witness: Option<DateTime<Utc>>,
@@ -140,31 +153,35 @@ impl Removal {
 /// The columns a removed live row hands to its history row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gone<'a> {
-    /// Record key.
+    /// Record key of the removed row.
     pub rkey: &'a str,
     /// Author-claimed `createdAt`.
     pub created_at: Option<DateTime<Utc>>,
-    /// Witness bound.
+    /// The live row's `first_seen`: the witness time at which Farsight
+    /// first stored it.
     pub first_seen: Option<DateTime<Utc>>,
-    /// Witness bound.
+    /// The live row's `last_seen`: the witness time of the last write
+    /// applied to it.
     pub last_seen: Option<DateTime<Utc>>,
 }
 
 /// A removed live row on its way to its history table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GoneRow {
-    /// Record key.
+    /// Record key of the removed row.
     pub rkey: String,
     /// `blocks`, `list_items`: the subject. `list_blocks`: the list's
     /// owner.
-    pub actor_id: i64,
+    pub actor_id: ActorId,
     /// `list_blocks`, `list_items`: the list's rkey.
     pub list_rkey: Option<String>,
     /// Author-claimed `createdAt`.
     pub created_at: Option<DateTime<Utc>>,
-    /// Witness bound.
+    /// The live row's `first_seen`: the witness time at which Farsight
+    /// first stored it.
     pub first_seen: Option<DateTime<Utc>>,
-    /// Witness bound.
+    /// The live row's `last_seen`: the witness time of the last write
+    /// applied to it.
     pub last_seen: Option<DateTime<Utc>>,
 }
 
@@ -173,7 +190,7 @@ pub(crate) struct GoneRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Written {
     table: Table,
-    id: i64,
+    id: HistoryId,
     cause: Cause,
 }
 
@@ -365,7 +382,7 @@ impl Txn<'_> {
                  SELECT $1, u.rkey, u.list_rkey, u.actor_id,"
             }
         };
-        let ids: Vec<i64> = sqlx::query_scalar(&format!(
+        let ids: Vec<HistoryId> = sqlx::query_scalar(&format!(
             "INSERT INTO {columns} u.created_at, u.first_seen, u.last_seen,
                     GREATEST($8, u.last_seen), $9, $10
              FROM UNNEST($2::text[], $3::bigint[], $4::text[], $5::timestamptz[],
@@ -407,7 +424,7 @@ impl Txn<'_> {
         &mut self,
         author: &AuthorInfo,
         gone: &Gone<'_>,
-        subject_id: i64,
+        subject_id: ActorId,
         r: &Removal,
     ) -> Result<()> {
         let row = GoneRow {
@@ -506,9 +523,9 @@ pub async fn prune(
             .map_err(|e| StorageError::Invariant(e.to_string()))?;
     for (i, t) in Table::ALL.into_iter().enumerate() {
         let name = t.name();
-        let mut after: i64 = 0;
+        let mut after = HistoryId::new(0);
         loop {
-            let (last, seen, deleted): (Option<i64>, i64, i64) = sqlx::query_as(&format!(
+            let (last, seen, deleted): (Option<HistoryId>, i64, i64) = sqlx::query_as(&format!(
                 "WITH batch AS (
                    SELECT id, removed_at FROM {name} WHERE id > $1 ORDER BY id LIMIT $2),
                  del AS (
@@ -544,7 +561,7 @@ pub async fn prune(
 /// table (account purge). Returns the rows deleted.
 pub(crate) async fn delete_authored(
     conn: &mut sqlx::PgConnection,
-    author_id: i64,
+    author_id: ActorId,
     batch: i64,
 ) -> Result<u64> {
     let mut n = 0;

@@ -180,5 +180,45 @@ mod tests {
             let (ta, tb) = (Tid::from_i64(a).unwrap(), Tid::from_i64(b).unwrap());
             proptest::prop_assert_eq!(ta.encode().cmp(&tb.encode()), a.cmp(&b));
         }
+
+        /// Any string at all: parsing returns, and what it accepts is 13
+        /// characters that encode back to the input and decode to a value
+        /// that is not negative.
+        #[test]
+        fn parsing_is_total_and_accepted_tids_round_trip(
+            s in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "[2-7a-z]{12,14}",
+                "[0-9a-zA-Z]{13}",
+            ],
+        ) {
+            let parsed = Tid::parse(&s);
+            let well_formed = s.len() == TID_LEN
+                && s.bytes().all(|b| ALPHABET.contains(&b))
+                && b"234567ab".contains(&s.as_bytes()[0]);
+            proptest::prop_assert_eq!(parsed.is_ok(), well_formed);
+            if let Ok(t) = parsed {
+                proptest::prop_assert!(t.as_i64() >= 0);
+                proptest::prop_assert_eq!(t.encode(), s.clone());
+                proptest::prop_assert_eq!(t.to_string(), s.clone());
+                proptest::prop_assert_eq!(s.parse::<Tid>(), Ok(t));
+            }
+        }
+
+        /// A time and a clock id make a TID exactly when both are in
+        /// range, and the time reads back.
+        #[test]
+        fn parts_in_range_read_back(
+            micros in proptest::prop_oneof![0u64..(1 << 53), proptest::prelude::any::<u64>()],
+            clock in proptest::prop_oneof![0u16..1024, proptest::prelude::any::<u16>()],
+        ) {
+            let t = Tid::from_parts(micros, clock);
+            proptest::prop_assert_eq!(t.is_some(), micros < (1 << 53) && clock < 1024);
+            if let Some(t) = t {
+                proptest::prop_assert_eq!(t.micros(), micros);
+                proptest::prop_assert_eq!(t.as_i64() & 1023, i64::from(clock));
+                proptest::prop_assert_eq!(Tid::parse(&t.encode()), Ok(t));
+            }
+        }
     }
 }

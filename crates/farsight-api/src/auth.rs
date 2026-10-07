@@ -9,6 +9,7 @@ use axum::http::{HeaderMap, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use farsight_core::Config;
+use farsight_storage::codes::RequesterKey;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
@@ -48,7 +49,8 @@ pub fn sha256(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
 
-/// Lowercase hex.
+/// Lowercase hex of `bytes`: the form `auth.admin_token_sha256` holds a
+/// token hash in.
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -83,16 +85,19 @@ pub fn is_admin_token(token: &str, cfg: &Config) -> bool {
     stored.len() == 32 && bool::from(h.ct_eq(stored.as_slice()))
 }
 
-/// A live API key.
+/// A live API key: a row of `api_tokens` whose `revoked_at` is null, as
+/// [`KeyTable`] holds it in memory.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyInfo {
     /// `api_tokens.id`.
     pub id: i32,
-    /// Display name.
+    /// `api_tokens.name`: the label given when the key was created.
     pub name: String,
-    /// Scopes.
+    /// `api_tokens.scopes`: which of [`SCOPES`] the key carries.
     pub scopes: Vec<String>,
-    /// Per-key read rate override.
+    /// `api_tokens.read_rps`: read requests per second for this key in
+    /// place of `rate_limit.key_rps`, with the burst scaled by the same
+    /// ratio. `None` (or a value not above zero) uses the configured rate.
     pub read_rps: Option<f32>,
 }
 
@@ -108,19 +113,19 @@ impl KeyInfo {
 pub enum Caller {
     /// No `Authorization` header.
     Anonymous,
-    /// A valid API key.
+    /// A well-formed `fsk_` token whose hash is in the [`KeyTable`].
     Key(KeyInfo),
-    /// The admin token.
+    /// The `fsa_` token whose hash is `auth.admin_token_sha256`.
     Admin,
 }
 
 impl Caller {
     /// The requester key (`backfill_queue.requester`, intern cause).
-    pub fn requester(&self) -> Option<String> {
+    pub fn requester(&self) -> Option<RequesterKey> {
         match self {
             Caller::Anonymous => None,
-            Caller::Key(k) => Some(format!("token:{}", k.id)),
-            Caller::Admin => Some("admin".to_owned()),
+            Caller::Key(k) => Some(RequesterKey::Token(k.id)),
+            Caller::Admin => Some(RequesterKey::Admin),
         }
     }
 }
@@ -134,7 +139,8 @@ pub struct KeyTable {
 }
 
 impl KeyTable {
-    /// Reloads the live keys.
+    /// Replaces the table with the rows of `api_tokens` that are not
+    /// revoked. A row whose stored hash is not 32 bytes is skipped.
     pub async fn refresh(&self, pool: &PgPool) -> Result<(), farsight_storage::StorageError> {
         let rows = farsight_storage::auth::active_tokens(pool).await?;
         let mut map = HashMap::new();

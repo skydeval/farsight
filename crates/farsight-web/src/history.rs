@@ -34,7 +34,7 @@ use chrono::{DateTime, Utc};
 use farsight_api::cursor;
 use farsight_api::params::Params;
 use farsight_core::{Did, RecordKey};
-use farsight_storage::codes::{TrackState, actor_status};
+use farsight_storage::codes::TrackState;
 use farsight_storage::history::Cause;
 use farsight_storage::public::{self as store, HistoryArgs, HistoryCursor, Removed};
 use farsight_storage::queries::{self, ActorRef};
@@ -50,6 +50,7 @@ use crate::public::text::{
 };
 use crate::public::warming::Asked;
 use crate::public::{MAX_DID_SEGMENT, PAGE_ROWS};
+use farsight_storage::ids::HistoryId;
 
 /// The cursor parameters of the two pages. Cursors are opaque and
 /// unstable.
@@ -95,11 +96,14 @@ pub struct RemovedRow {
     pub record: String,
     /// Created, as stated by the author.
     pub created: Option<String>,
-    /// First seen.
+    /// `first_seen` of the live row: the witness time of the write that
+    /// inserted it.
     pub first_seen: Option<String>,
-    /// Last seen.
+    /// `last_seen` of the live row: a lower bound on when the record was
+    /// last known to exist.
     pub last_seen: Option<String>,
-    /// Removed.
+    /// `removed_at`: the witness time of the removing write, never before
+    /// `last_seen`. Like the three above, `YYYY-MM-DD HH:MM:SS UTC`.
     pub removed: String,
     /// The same four as instants, for a page whose script writes times
     /// in the viewer's zone.
@@ -110,7 +114,8 @@ pub struct RemovedRow {
     pub last_seen_at: Option<Stamp>,
     /// Removed, as an instant.
     pub removed_at: Stamp,
-    /// How it ended.
+    /// The history row's cause in words ([`cause_words`]): what removed
+    /// the record.
     pub cause: &'static str,
     /// "blocks this account again" / "on this list now".
     pub mark: Option<&'static str>,
@@ -119,9 +124,10 @@ pub struct RemovedRow {
 /// A history section.
 #[derive(Debug, Clone)]
 pub struct HistorySection {
-    /// Rows shown.
+    /// The rows of this page, latest removal first, without those whose
+    /// author or list owner is hidden.
     pub rows: Vec<RemovedRow>,
-    /// Next link.
+    /// The link to the next page, when the query had more rows.
     pub pager: Pager,
     /// "No removals recorded.": only on a first page with nothing after it.
     pub empty: bool,
@@ -169,32 +175,28 @@ pub enum Kind {
 }
 
 /// How a removal is worded.
-pub fn cause_words(kind: Kind, cause: i16) -> &'static str {
+pub fn cause_words(kind: Kind, cause: Cause) -> &'static str {
     use Cause::*;
-    match (kind, Cause::from_code(cause)) {
-        (Kind::Block, Some(Delete)) => "Block deleted.",
-        (Kind::Block, Some(SubjectChange)) => "Record changed to block a different account.",
-        (Kind::ListBlock, Some(Delete)) => "Listblock deleted.",
-        (Kind::ListBlock, Some(SubjectChange)) => "Record changed to block a different list.",
-        (Kind::Block | Kind::ListBlock, Some(RefusedUpdate)) => {
+    match (kind, cause) {
+        (Kind::Block, Delete) => "Block deleted.",
+        (Kind::Block, SubjectChange) => "Record changed to block a different account.",
+        (Kind::ListBlock, Delete) => "Listblock deleted.",
+        (Kind::ListBlock, SubjectChange) => "Record changed to block a different list.",
+        (Kind::Block | Kind::ListBlock, RefusedUpdate) => {
             "Record changed; the new version was not stored."
         }
-        (Kind::Block | Kind::ListBlock, Some(Reconcile)) => {
+        (Kind::Block | Kind::ListBlock, Reconcile) => {
             "Found missing when the author's records were re-read. Removed some time between \
              'last seen' and this time."
         }
-        (Kind::Membership, Some(Delete)) => "Removed from the list.",
-        (Kind::Membership, Some(SubjectChange)) => {
-            "List entry changed to name another account or list."
-        }
-        (Kind::Membership, Some(RefusedUpdate)) => {
-            "List entry changed; the new version was not stored."
-        }
-        (Kind::Membership, Some(Reconcile)) => {
+        (Kind::Membership, Delete) => "Removed from the list.",
+        (Kind::Membership, SubjectChange) => "List entry changed to name another account or list.",
+        (Kind::Membership, RefusedUpdate) => "List entry changed; the new version was not stored.",
+        (Kind::Membership, Reconcile) => {
             "Found missing when the owner's records were re-read. Removed some time between \
              'last seen' and this time."
         }
-        (Kind::Membership, Some(ListDeleted)) => "The list was deleted.",
+        (Kind::Membership, ListDeleted) => "The list was deleted.",
         _ => "Removed.",
     }
 }
@@ -213,8 +215,8 @@ fn list_state_words(s: TrackState) -> String {
     state_words(s.api_name()).0
 }
 
-fn purpose_of_code(c: Option<i16>) -> Option<&'static str> {
-    c.map(|c| purpose_words(farsight_core::ListPurpose::from_code(c).api_name()))
+fn purpose_text(p: Option<farsight_core::ListPurpose>) -> Option<&'static str> {
+    p.map(|p| purpose_words(p.api_name()))
 }
 
 /// The at-uri of a removed record. A block or a listblock is in its
@@ -252,7 +254,7 @@ fn removed_row(
             uri: list_uri(&l.owner_did, &l.rkey),
             href: lookup_list_href(&l.owner_did, &l.rkey),
             name: l.name.as_deref().map(clean).filter(|n| !n.is_empty()),
-            purpose: purpose_of_code(l.purpose),
+            purpose: purpose_text(l.purpose),
             state: l.state.map(list_state_words),
         }),
         created: h.created_at.map(when),
@@ -281,17 +283,21 @@ fn history_cursor(q: &Params, key: &str) -> Result<Option<HistoryCursor>, BadCur
         return Err(BadCursor);
     }
     let removed_at = DateTime::<Utc>::from_timestamp_micros(micros).ok_or(BadCursor)?;
-    Ok(Some(HistoryCursor { removed_at, id }))
+    Ok(Some(HistoryCursor {
+        removed_at,
+        id: HistoryId::new(id),
+    }))
 }
 
 fn encode_history_cursor(c: HistoryCursor) -> String {
-    cursor::encode(&[json!(c.removed_at.timestamp_micros()), json!(c.id)])
+    cursor::encode(&[json!(c.removed_at.timestamp_micros()), json!(c.id.get())])
 }
 
 /// One recording window, clipped to the retention horizon.
 #[derive(Debug, Clone)]
 pub struct Window {
-    /// Start.
+    /// When recording began, or the retention horizon if the window
+    /// began before it; `YYYY-MM-DD HH:MM:SS UTC`.
     pub from: String,
     /// End; `None` for the open window.
     pub to: Option<String>,
@@ -365,10 +371,7 @@ impl HistoryData {
     /// Whether a row naming `did`, as author, list owner or member, may be
     /// shown.
     fn ok(&self, did: &str) -> bool {
-        !self
-            .status
-            .get(did)
-            .is_some_and(|a| actor_status::is_hidden(a.status))
+        !self.status.get(did).is_some_and(|a| a.status.is_hidden())
     }
 }
 
@@ -463,7 +466,7 @@ async fn load(
     };
     // Works from the `actors` id (and the list's key), so a deleted list
     // keeps its history without a `lists` row.
-    let actor = queries::actor(&mut tx, did.as_str()).await?;
+    let actor = queries::actor(&mut tx, did).await?;
     let (first, second) = match (actor, rkey) {
         (None, _) => (Vec::new(), Vec::new()),
         (Some(x), None) => (
@@ -472,10 +475,10 @@ async fn load(
         ),
         // A list's rows are all authored by, or point at a list of, its
         // owner: a hidden owner shows nothing.
-        (Some(x), Some(_)) if actor_status::is_hidden(x.status) => (Vec::new(), Vec::new()),
+        (Some(x), Some(_)) if x.status.is_hidden() => (Vec::new(), Vec::new()),
         (Some(x), Some(k)) => (
-            store::list_blocks_history_by_list(&mut tx, x.id, k.as_str(), args(a)).await?,
-            store::list_items_history_by_list(&mut tx, x.id, k.as_str(), args(b)).await?,
+            store::list_blocks_history_by_list(&mut tx, x.id, k, args(a)).await?,
+            store::list_items_history_by_list(&mut tx, x.id, k, args(b)).await?,
         ),
     };
     let windows = store::history_windows(&mut tx).await?;
@@ -652,7 +655,12 @@ async fn serve(
     let _permit = match permit(st).await {
         Ok(p) => p,
         Err(e) => {
-            return message(&admin, StatusCode::SERVICE_UNAVAILABLE, "Busy", &e);
+            return message(
+                &admin,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Busy",
+                &e.to_string(),
+            );
         }
     };
     let cfg = st.api.config.current();
@@ -799,20 +807,33 @@ mod tests {
 
     #[test]
     fn causes_are_worded_per_kind() {
-        assert_eq!(cause_words(Kind::Block, 1), "Block deleted.");
-        assert_eq!(cause_words(Kind::ListBlock, 1), "Listblock deleted.");
-        assert_eq!(cause_words(Kind::Membership, 1), "Removed from the list.");
-        assert_eq!(cause_words(Kind::Membership, 5), "The list was deleted.");
-        assert!(cause_words(Kind::Block, 4).contains("author's records were re-read"));
-        assert!(cause_words(Kind::Membership, 4).contains("owner's records were re-read"));
+        assert_eq!(cause_words(Kind::Block, Cause::Delete), "Block deleted.");
         assert_eq!(
-            cause_words(Kind::ListBlock, 2),
+            cause_words(Kind::ListBlock, Cause::Delete),
+            "Listblock deleted."
+        );
+        assert_eq!(
+            cause_words(Kind::Membership, Cause::Delete),
+            "Removed from the list."
+        );
+        assert_eq!(
+            cause_words(Kind::Membership, Cause::ListDeleted),
+            "The list was deleted."
+        );
+        assert!(
+            cause_words(Kind::Block, Cause::Reconcile).contains("author's records were re-read")
+        );
+        assert!(
+            cause_words(Kind::Membership, Cause::Reconcile)
+                .contains("owner's records were re-read")
+        );
+        assert_eq!(
+            cause_words(Kind::ListBlock, Cause::SubjectChange),
             "Record changed to block a different list."
         );
-        // `list_deleted` is a membership cause only; anything unknown is
-        // still a removal.
-        assert_eq!(cause_words(Kind::Block, 5), "Removed.");
-        assert_eq!(cause_words(Kind::Block, 99), "Removed.");
+        // `list_deleted` is a membership cause only; on anything else it
+        // is still a removal.
+        assert_eq!(cause_words(Kind::Block, Cause::ListDeleted), "Removed.");
     }
 
     #[test]
@@ -830,7 +851,7 @@ mod tests {
     #[test]
     fn removed_records_are_named_by_their_repo() {
         let h = |party: &str, list: Option<&str>| Removed {
-            id: 1,
+            id: HistoryId::new(1),
             removed_at: DateTime::<Utc>::UNIX_EPOCH,
             party: party.to_owned(),
             list: list.map(|o| store::RemovedList {
@@ -844,7 +865,7 @@ mod tests {
             created_at: None,
             first_seen: None,
             last_seen: None,
-            cause: 1,
+            cause: Cause::Delete,
             live: false,
         };
         assert_eq!(

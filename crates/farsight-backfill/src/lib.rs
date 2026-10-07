@@ -81,7 +81,8 @@ pub const TASKS: [&str; 9] = [
     "backfill_metrics_listener",
 ];
 
-/// The config file path.
+/// The config file path: `FARSIGHT_CONFIG` if set, else the default the
+/// server uses.
 pub fn config_path() -> PathBuf {
     std::env::var_os(CONFIG_PATH_ENV)
         .map(PathBuf::from)
@@ -178,7 +179,7 @@ async fn serve_metrics(handle: PrometheusHandle, cfg: &Config, mut stop: watch::
 /// Why a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum End {
-    /// Signal.
+    /// The shutdown signal arrived: the process exits.
     Shutdown,
     /// Config gone (reset): idle until one exists again.
     Idle,
@@ -190,24 +191,42 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// Why the backfill process cannot run.
+#[derive(Debug, thiserror::Error)]
+pub enum BackfillError {
+    /// The configuration does not load. `origin` names where it was read
+    /// from: the file's path, or the environment.
+    #[error("invalid configuration in {origin}: {error}")]
+    Config {
+        /// Where the configuration came from.
+        origin: String,
+        /// Why it does not load.
+        #[source]
+        error: config::ConfigError,
+    },
+    /// The database could not be reached, or its schema not read.
+    #[error(transparent)]
+    Storage(#[from] farsight_storage::StorageError),
+}
+
 /// Runs until `shutdown` flips. Errors are fatal (invalid config).
 pub async fn run(
     path: PathBuf,
     shutdown: watch::Receiver<bool>,
     metrics: Option<PrometheusHandle>,
-) -> Result<(), String> {
+) -> Result<(), BackfillError> {
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
         let env: Vec<(String, String)> = std::env::vars().collect();
-        let mode = config::load(&path, &env).map_err(|e| {
-            let source = if path.exists() {
+        let mode = config::load(&path, &env).map_err(|error| {
+            let origin = if path.exists() {
                 path.display().to_string()
             } else {
                 "the environment (FARSIGHT_SKIP_WIZARD)".to_owned()
             };
-            format!("invalid configuration in {source}: {e}")
+            BackfillError::Config { origin, error }
         })?;
         let end = match mode {
             StartMode::Setup => idle(&path, shutdown.clone()).await,
@@ -275,17 +294,15 @@ async fn run_normal(
     path: &Path,
     mut shutdown: watch::Receiver<bool>,
     metrics_handle: Option<PrometheusHandle>,
-) -> Result<End, String> {
+) -> Result<End, BackfillError> {
     let max_conn = cfg.backfill.concurrency.saturating_add(8);
-    let pool = farsight_storage::connect(&cfg.storage.database_url, max_conn)
-        .await
-        .map_err(|e| e.to_string())?;
+    let pool = farsight_storage::connect(&cfg.storage.database_url, max_conn).await?;
     tracing::info!(
         schema = farsight_storage::SCHEMA_VERSION,
         "waiting for the schema"
     );
     tokio::select! {
-        r = farsight_storage::wait_for_schema(&pool) => r.map_err(|e| e.to_string())?,
+        r = farsight_storage::wait_for_schema(&pool) => r?,
         _ = shutdown.changed() => return Ok(End::Shutdown),
     }
     let net = Arc::new(Net::new(

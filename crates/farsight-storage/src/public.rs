@@ -28,19 +28,22 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
 
-use crate::codes::TrackState;
+use crate::codes::sql::HIDDEN;
+use crate::codes::{RecordState, TrackState};
 use crate::error::Result;
-
-/// SQL fragment: status codes hidden by default.
-const HIDDEN: &str = "(1, 2, 3, 4)";
+use crate::history::Cause;
+use crate::ids::{ActorId, HistoryId};
+use crate::ui_rows::SectionKey;
+use farsight_core::{ListPurpose, RecordKey};
 
 /// Position in a history section: the last row returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryCursor {
-    /// Its `removed_at`.
+    /// Its `removed_at`: the first cursor key, newest first.
     pub removed_at: DateTime<Utc>,
-    /// Its `id`.
-    pub id: i64,
+    /// Its `id`: the second cursor key, which orders rows removed at the
+    /// same instant.
+    pub id: HistoryId,
 }
 
 /// What every history query takes besides its key.
@@ -51,7 +54,7 @@ pub struct HistoryArgs {
     pub horizon: Option<DateTime<Utc>>,
     /// Keyset position; `None` = first page.
     pub after: Option<HistoryCursor>,
-    /// Page size.
+    /// Most rows the query returns.
     pub limit: i64,
 }
 
@@ -65,8 +68,8 @@ pub struct RemovedList {
     pub rkey: String,
     /// Name, when the row has one.
     pub name: Option<String>,
-    /// `purpose` code, when the record is present.
-    pub purpose: Option<i16>,
+    /// The list's purpose, when the record is present.
+    pub purpose: Option<ListPurpose>,
     /// The list's state as `getListMembers` reports it; `None` when no
     /// `lists` row exists.
     pub state: Option<TrackState>,
@@ -76,7 +79,7 @@ pub struct RemovedList {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Removed {
     /// History row id (second cursor key).
-    pub id: i64,
+    pub id: HistoryId,
     /// When Farsight applied the removal (first cursor key).
     pub removed_at: DateTime<Utc>,
     /// The other account of the row: the blocker, or the member on a
@@ -92,8 +95,8 @@ pub struct Removed {
     pub first_seen: Option<DateTime<Utc>>,
     /// When Farsight last saw the record.
     pub last_seen: Option<DateTime<Utc>>,
-    /// `cause` code (`history::Cause`).
-    pub cause: i16,
+    /// Why the record was removed.
+    pub cause: Cause,
     /// The same (author, target) or (list, subject) has a live row now.
     pub live: bool,
 }
@@ -136,14 +139,14 @@ fn tail(a: &HistoryArgs) -> String {
 }
 
 type PartyRow = (
-    i64,
+    HistoryId,
     DateTime<Utc>,
     String,
     String,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
-    i16,
+    Cause,
     bool,
 );
 
@@ -170,7 +173,7 @@ fn party_rows(rows: Vec<PartyRow>) -> Vec<Removed> {
 /// block on the subject now.
 pub async fn blocks_history_by_subject(
     conn: &mut PgConnection,
-    subject_id: i64,
+    subject_id: ActorId,
     a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let sql = format!(
@@ -188,7 +191,7 @@ pub async fn blocks_history_by_subject(
 async fn fetch_party(
     conn: &mut PgConnection,
     sql: &str,
-    key: i64,
+    key: ActorId,
     a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let rows: Vec<PartyRow> = sqlx::query_as(sql)
@@ -209,8 +212,8 @@ async fn fetch_party(
 /// listblocker has a listblock on the list now. Needs no `lists` row.
 pub async fn list_blocks_history_by_list(
     conn: &mut PgConnection,
-    owner_id: i64,
-    list_rkey: &str,
+    owner_id: ActorId,
+    list_rkey: &RecordKey,
     a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let sql = format!(
@@ -230,14 +233,14 @@ pub async fn list_blocks_history_by_list(
         .bind(a.after.map(|c| c.removed_at))
         .bind(a.after.map(|c| c.id))
         .bind(a.limit)
-        .bind(list_rkey)
+        .bind(list_rkey.as_str())
         .fetch_all(conn)
         .await?;
     Ok(party_rows(rows))
 }
 
 type ListRow = (
-    i64,
+    HistoryId,
     DateTime<Utc>,
     String,
     String,
@@ -245,13 +248,13 @@ type ListRow = (
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
-    i16,
+    Cause,
     bool,
     Option<String>,
     Option<i16>,
+    Option<RecordState>,
     Option<i16>,
-    Option<i16>,
-    Option<i16>,
+    Option<TrackState>,
     Option<i32>,
 );
 
@@ -267,7 +270,7 @@ fn list_rows(rows: Vec<ListRow>) -> Vec<Removed> {
             // else `untracked`, as `getListMembers` reports it.
             let state = r.13.and_then(TrackState::from_code).map(|s| match s {
                 TrackState::Purging => {
-                    if r.14 == Some(TrackState::Untracked.code()) && r.15.unwrap_or(0) > 0 {
+                    if r.14 == Some(TrackState::Untracked) && r.15.unwrap_or(0) > 0 {
                         TrackState::Pending
                     } else {
                         TrackState::Untracked
@@ -284,7 +287,11 @@ fn list_rows(rows: Vec<ListRow>) -> Vec<Removed> {
                     rkey: r.3,
                     name: r.10,
                     // A deleted list has no purpose.
-                    purpose: if r.12 == Some(1) { r.11 } else { None },
+                    purpose: if r.12 == Some(RecordState::Present) {
+                        r.11.map(ListPurpose::from_code)
+                    } else {
+                        None
+                    },
                     state,
                 }),
                 rkey: r.4,
@@ -304,7 +311,7 @@ fn list_rows(rows: Vec<ListRow>) -> Vec<Removed> {
 /// `live`: the list has a live listitem naming the subject now.
 pub async fn list_items_history_by_subject(
     conn: &mut PgConnection,
-    subject_id: i64,
+    subject_id: ActorId,
     a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let sql = format!(
@@ -325,7 +332,7 @@ pub async fn list_items_history_by_subject(
 async fn fetch_list(
     conn: &mut PgConnection,
     sql: &str,
-    key: i64,
+    key: ActorId,
     a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let rows: Vec<ListRow> = sqlx::query_as(sql)
@@ -345,8 +352,8 @@ async fn fetch_list(
 /// member has a live listitem on the list now. Needs no `lists` row.
 pub async fn list_items_history_by_list(
     conn: &mut PgConnection,
-    owner_id: i64,
-    list_rkey: &str,
+    owner_id: ActorId,
+    list_rkey: &RecordKey,
     a: HistoryArgs,
 ) -> Result<Vec<Removed>> {
     let sql = format!(
@@ -366,7 +373,7 @@ pub async fn list_items_history_by_list(
         .bind(a.after.map(|c| c.removed_at))
         .bind(a.after.map(|c| c.id))
         .bind(a.limit)
-        .bind(list_rkey)
+        .bind(list_rkey.as_str())
         .fetch_all(conn)
         .await?;
     Ok(party_rows(rows))
@@ -395,8 +402,8 @@ pub enum Counted {
 pub async fn bounded_count(
     conn: &mut PgConnection,
     what: Counted,
-    key: i64,
-    excluded: &[i64],
+    key: SectionKey,
+    excluded: &[ActorId],
     taken_down: bool,
     find: Option<&crate::ui_rows::Find>,
     cap: i64,
@@ -411,8 +418,8 @@ pub async fn bounded_count(
 pub async fn bounded_count_hiding(
     conn: &mut PgConnection,
     what: Counted,
-    key: i64,
-    excluded: &[i64],
+    key: SectionKey,
+    excluded: &[ActorId],
     hidden: &'static str,
     find: Option<&crate::ui_rows::Find>,
     cap: i64,
@@ -432,7 +439,7 @@ pub async fn bounded_count_hiding(
                              WHERE h.did = a.did AND h.handle LIKE $5::text))
            LIMIT $3) x"
     ))
-    .bind(key)
+    .bind(key.get())
     .bind(excluded)
     .bind(cap + 1)
     .bind(find.map(|f| &f.ids[..]))
@@ -455,7 +462,7 @@ pub async fn history_windows(
 
 /// `actors.id` of those of `dids` that are interned (the operator's
 /// exclusion list as ids).
-pub async fn actor_ids(conn: &mut PgConnection, dids: &[String]) -> Result<Vec<i64>> {
+pub async fn actor_ids(conn: &mut PgConnection, dids: &[String]) -> Result<Vec<ActorId>> {
     if dids.is_empty() {
         return Ok(Vec::new());
     }
@@ -477,7 +484,7 @@ mod tests {
             horizon: horizon.then_some(t),
             after: after.then_some(HistoryCursor {
                 removed_at: t,
-                id: 1,
+                id: HistoryId::new(1),
             }),
             limit: 50,
         }
@@ -496,7 +503,7 @@ mod tests {
     #[test]
     fn cursor_only_after_a_full_page() {
         let row = |id| Removed {
-            id,
+            id: HistoryId::new(id),
             removed_at: DateTime::<Utc>::UNIX_EPOCH,
             party: String::new(),
             list: None,
@@ -504,10 +511,13 @@ mod tests {
             created_at: None,
             first_seen: None,
             last_seen: None,
-            cause: 1,
+            cause: Cause::Delete,
             live: false,
         };
         assert_eq!(next_cursor(&[row(3), row(2)], 3), None);
-        assert_eq!(next_cursor(&[row(3), row(2)], 2).map(|c| c.id), Some(2));
+        assert_eq!(
+            next_cursor(&[row(3), row(2)], 2).map(|c| c.id.get()),
+            Some(2)
+        );
     }
 }

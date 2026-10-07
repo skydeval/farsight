@@ -8,11 +8,13 @@ use sqlx::{PgExecutor, PgPool};
 
 use crate::codes::{CapType, DebtReason};
 use crate::error::Result;
+use crate::ids::ActorId;
 
-/// One debt row.
+/// One `relist_debt` row: one reason an actor's stored records may be
+/// incomplete until its repository is listed again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Debt {
-    /// Reason.
+    /// Why the debt exists. An actor has at most one row per reason.
     pub reason: DebtReason,
     /// Cap or rate, for `capped` / `refused`.
     pub cap_type: Option<CapType>,
@@ -24,7 +26,7 @@ pub struct Debt {
 /// transaction; e.g. `#sync`, poisoned events, account events).
 pub async fn add_debt(
     pool: &PgPool,
-    actor_id: i64,
+    actor_id: ActorId,
     reason: DebtReason,
     cap_type: Option<CapType>,
     since_witness: DateTime<Utc>,
@@ -54,7 +56,7 @@ pub async fn add_debt(
 /// actor whose `since_witness ≤ point`. Returns rows deleted.
 pub async fn clear_for_clean_run(
     pool: &PgPool,
-    actor_id: i64,
+    actor_id: ActorId,
     point: DateTime<Utc>,
 ) -> Result<u64> {
     let mut tx = pool.begin().await?;
@@ -77,7 +79,7 @@ pub async fn clear_for_clean_run(
 /// actor never counts twice for one cause).
 pub async fn replace_resync_with_unreachable(
     pool: &PgPool,
-    actor_id: i64,
+    actor_id: ActorId,
     since_witness: DateTime<Utc>,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
@@ -108,16 +110,16 @@ pub async fn replace_resync_with_unreachable(
 /// from the map.
 pub async fn debts_for<'e>(
     ex: impl PgExecutor<'e>,
-    actor_ids: &[i64],
-) -> Result<HashMap<i64, Vec<Debt>>> {
-    let rows: Vec<(i64, i16, Option<i16>, DateTime<Utc>)> = sqlx::query_as(
+    actor_ids: &[ActorId],
+) -> Result<HashMap<ActorId, Vec<Debt>>> {
+    let rows: Vec<(ActorId, i16, Option<i16>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT actor_id, reason, cap_type, since_witness FROM relist_debt
          WHERE actor_id = ANY($1) ORDER BY actor_id, reason",
     )
     .bind(actor_ids)
     .fetch_all(ex)
     .await?;
-    let mut out: HashMap<i64, Vec<Debt>> = HashMap::new();
+    let mut out: HashMap<ActorId, Vec<Debt>> = HashMap::new();
     for (actor, reason, cap, since) in rows {
         let Some(reason) = DebtReason::from_code(reason) else {
             continue;
@@ -154,7 +156,7 @@ pub async fn expire_resyncs(
     let cutoff = now
         - chrono::Duration::from_std(after)
             .map_err(|e| crate::error::StorageError::Invariant(e.to_string()))?;
-    let stale: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
+    let stale: Vec<(ActorId, DateTime<Utc>)> = sqlx::query_as(
         "SELECT actor_id, since_witness FROM relist_debt WHERE reason = $1 AND created_at < $2",
     )
     .bind(DebtReason::Resync.code())

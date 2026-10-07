@@ -8,10 +8,16 @@
 //! `firehoseAppliedThrough`. The API refreshes it on `NOTIFY
 //! farsight_coverage`, every 10 s and on every LISTEN reconnect.
 
+use crate::codes::sql::{
+    CYCLE_FULL, DEBT_UNLISTED, TRACK_DEFERRED, TRACK_MISSING, TRACK_PENDING, TRACK_PURGING,
+    TRACK_UNAVAILABLE, TRACK_UNTRACKED, TRACKED,
+};
+use crate::ids::{CycleId, ListId};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use farsight_core::Collection;
 use sqlx::PgPool;
 
 use crate::codes::{DebtReason, GapCause, Protocol};
@@ -23,14 +29,15 @@ use crate::keys::Limits;
 /// Channel name for coverage notifications.
 pub const COVERAGE_CHANNEL: &str = "farsight_coverage";
 
-/// Snapshot refresh period.
+/// How often the API reads the global snapshot again when no notification
+/// asks for it sooner.
 pub const SNAPSHOT_REFRESH: Duration = Duration::from_secs(10);
 
 /// The latest completed full sweep cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
     /// `sweep_cycles.id`.
-    pub cycle_id: i64,
+    pub cycle_id: CycleId,
     /// Collections the cycle covered (storage codes).
     pub collections: Vec<i16>,
     /// `S_C` on the witness clock.
@@ -61,12 +68,14 @@ pub struct PendingEffects {
     /// re-admitted).
     pub considered: i64,
     /// Their ids, sorted (the live rule compares against it).
-    pub considered_ids: Vec<i64>,
+    pub considered_ids: Vec<ListId>,
     /// `excludedPendingLists`: no relevant listblocks, or beyond the
     /// per-owner-key bound.
     pub excluded: i64,
-    /// Lists taking effect.
-    pub effective: Vec<i64>,
+    /// Ids of the pending lists that take effect: those with relevant
+    /// listblocks, up to `limits.pending_effects_per_owner_key` per owner
+    /// key, oldest admission first.
+    pub effective: Vec<ListId>,
     /// `indexedAt` cap: min over effective live lists of
     /// `min(witnessed_at) − 1 µs`.
     pub indexed_at_cap: Option<DateTime<Utc>>,
@@ -97,7 +106,12 @@ pub struct GlobalSnapshot {
 }
 
 /// `sweep_cycles` columns of the latest completed baseline.
-type BaselineRow = (i64, Vec<i16>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+type BaselineRow = (
+    CycleId,
+    Vec<i16>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+);
 
 /// Reads the global snapshot in one `REPEATABLE READ, READ ONLY`
 /// transaction.
@@ -110,11 +124,11 @@ pub async fn read_snapshot(pool: &PgPool, limits: &Limits) -> Result<GlobalSnaps
         .fetch_one(&mut *tx)
         .await?;
     let fh = firehose::read_state(&mut *tx).await?;
-    let baseline: Option<BaselineRow> = sqlx::query_as(
+    let baseline: Option<BaselineRow> = sqlx::query_as(&format!(
         "SELECT id, collections, effective_start_witness, completed_witness
-             FROM sweep_cycles WHERE kind = 1 AND completed_at IS NOT NULL
-             ORDER BY completed_at DESC LIMIT 1",
-    )
+             FROM sweep_cycles WHERE kind = {CYCLE_FULL} AND completed_at IS NOT NULL
+             ORDER BY completed_at DESC LIMIT 1"
+    ))
     .fetch_optional(&mut *tx)
     .await?;
     let gaps = firehose::all_gaps(&mut *tx).await?;
@@ -125,14 +139,14 @@ pub async fn read_snapshot(pool: &PgPool, limits: &Limits) -> Result<GlobalSnaps
     .await?;
     let debt_counts = debts::counts_by_reason(&mut *tx).await?;
     let (pending, unavailable, missing, deferred, capped): (i64, i64, i64, i64, i64) =
-        sqlx::query_as(
-            "SELECT count(*) FILTER (WHERE track_state = 1),
-                    count(*) FILTER (WHERE track_state = 4),
-                    count(*) FILTER (WHERE track_state = 6),
-                    count(*) FILTER (WHERE track_state = 8),
-                    count(*) FILTER (WHERE track_state IN (1, 2, 3, 4) AND capped)
-             FROM lists WHERE track_state <> 0",
-        )
+        sqlx::query_as(&format!(
+            "SELECT count(*) FILTER (WHERE track_state = {TRACK_PENDING}),
+                    count(*) FILTER (WHERE track_state = {TRACK_UNAVAILABLE}),
+                    count(*) FILTER (WHERE track_state = {TRACK_MISSING}),
+                    count(*) FILTER (WHERE track_state = {TRACK_DEFERRED}),
+                    count(*) FILTER (WHERE track_state IN {TRACKED} AND capped)
+             FROM lists WHERE track_state <> {TRACK_UNTRACKED}"
+        ))
         .fetch_one(&mut *tx)
         .await?;
     let pending_effects = read_pending_effects(&mut tx, limits).await?;
@@ -164,10 +178,12 @@ pub async fn read_snapshot(pool: &PgPool, limits: &Limits) -> Result<GlobalSnaps
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingList {
     /// `lists.id`.
-    pub id: i64,
+    pub id: ListId,
     /// Admission time (slot order: oldest first).
     pub admitted_at: Option<DateTime<Utc>>,
-    /// The owner key.
+    /// The key the per-owner bound counts by: the cap bucket of the owner's
+    /// host if the owner is resolved and the host is not a large one, else
+    /// the owner's DID.
     pub owner_key: String,
     /// Counted listblocks by covered authors.
     pub relevant: i64,
@@ -178,7 +194,7 @@ pub struct PendingList {
 }
 
 type PendingRow = (
-    i64,
+    ListId,
     Option<DateTime<Utc>>,
     String,
     Option<String>,
@@ -194,7 +210,7 @@ type PendingRow = (
 /// (a covered author has no `resync` or `unreachable` debt).
 pub async fn read_pending_lists(conn: &mut sqlx::PgConnection) -> Result<Vec<PendingList>> {
     let rows: Vec<PendingRow> = sqlx::query_as(
-        "SELECT l.id, l.admitted_at, a.did, h.cap_key, COALESCE(h.large, false),
+        &format!("SELECT l.id, l.admitted_at, a.did, h.cap_key, COALESCE(h.large, false),
                 a.pds_host_id IS NOT NULL,
                 count(b.author_id), count(b.author_id) FILTER (WHERE b.witnessed_at IS NULL),
                 min(b.witnessed_at)
@@ -203,10 +219,10 @@ pub async fn read_pending_lists(conn: &mut sqlx::PgConnection) -> Result<Vec<Pen
          LEFT JOIN pds_hosts h ON h.id = a.pds_host_id
          LEFT JOIN list_blocks b ON b.list_id = l.id AND b.counted
               AND NOT EXISTS (SELECT 1 FROM relist_debt d
-                              WHERE d.actor_id = b.author_id AND d.reason IN (1, 2))
-         WHERE l.track_state = 1
-            OR (l.track_state = 5 AND l.purge_then = 0 AND l.listblock_count > 0)
-         GROUP BY l.id, l.admitted_at, a.did, h.cap_key, h.large, a.pds_host_id",
+                              WHERE d.actor_id = b.author_id AND d.reason IN {DEBT_UNLISTED})
+         WHERE l.track_state = {TRACK_PENDING}
+            OR (l.track_state = {TRACK_PURGING} AND l.purge_then = {TRACK_UNTRACKED} AND l.listblock_count > 0)
+         GROUP BY l.id, l.admitted_at, a.did, h.cap_key, h.large, a.pds_host_id"),
     )
     .fetch_all(&mut *conn)
     .await?;
@@ -320,31 +336,49 @@ pub fn gap_overlaps(g: &Gap, t: DateTime<Utc>, a: DateTime<Utc>) -> bool {
 /// Coverage level (open enum on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
-    /// Worst.
+    /// `partial`: no completeness claim. Rows may be missing, and the
+    /// reasons say why. The lowest level.
     Partial,
-    /// Via discovery.
+    /// `assisted`: the claim of `complete` for one subject, established by
+    /// a discovery run for it while the network-wide claim cannot be made.
     Assisted,
-    /// Best.
+    /// `complete`: every record Farsight is not excluding is reflected. The
+    /// highest level.
     Complete,
+}
+
+impl Level {
+    /// Wire name (`coverage.level`).
+    pub const fn api_name(self) -> &'static str {
+        match self {
+            Level::Complete => "complete",
+            Level::Assisted => "assisted",
+            Level::Partial => "partial",
+        }
+    }
 }
 
 /// A scope's coverage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
-    /// Level.
+    /// The completeness claim made for the scope.
     pub level: Level,
     /// `completeSince` (witness clock), when the level holds since a point.
     pub complete_since: Option<DateTime<Utc>>,
-    /// Reason codes.
+    /// Why the network-wide claim of `complete` cannot be made, as the
+    /// API's reason strings (`sweep_incomplete`, `firehose_gap`, …).
     pub reasons: Vec<&'static str>,
 }
 
-/// Network scope for collection `k` (storage code): `complete` iff a
+/// Network scope for collection `k`: `complete` iff a
 /// completed baseline covers `k`, `covered(S_C)`, protocol v2, and no
 /// global storage refusal is active.
-pub fn network_scope(s: &GlobalSnapshot, k: i16, synthetic_gap_lag: Duration) -> Scope {
+pub fn network_scope(s: &GlobalSnapshot, k: Collection, synthetic_gap_lag: Duration) -> Scope {
     let mut reasons = Vec::new();
-    let baseline = s.baseline.as_ref().filter(|b| b.collections.contains(&k));
+    let baseline = s
+        .baseline
+        .as_ref()
+        .filter(|b| b.collections.contains(&k.code()));
     if baseline.is_none() {
         reasons.push("sweep_incomplete");
     }
@@ -426,7 +460,7 @@ mod tests {
         min_w: Option<i64>,
     ) -> PendingList {
         PendingList {
-            id,
+            id: ListId::new(id),
             admitted_at: Some(t(admitted)),
             owner_key: key.to_owned(),
             relevant,
@@ -448,7 +482,7 @@ mod tests {
             5,
         );
         assert_eq!(e.excluded, 1);
-        assert_eq!(e.effective, [2, 3]);
+        assert_eq!(e.effective, [ListId::new(2), ListId::new(3)]);
         assert!(!e.historical);
         assert_eq!(
             e.indexed_at_cap,
@@ -470,8 +504,8 @@ mod tests {
         // key is unaffected.
         assert_eq!(e.excluded, 2);
         assert_eq!(e.effective.len(), 6);
-        assert!(e.effective.contains(&99));
-        assert!(e.effective.contains(&16) && !e.effective.contains(&10));
+        assert!(e.effective.contains(&ListId::new(99)));
+        assert!(e.effective.contains(&ListId::new(16)) && !e.effective.contains(&ListId::new(10)));
     }
 
     fn snap(applied: Option<i64>, connected: bool, gaps: Vec<Gap>) -> GlobalSnapshot {
@@ -484,7 +518,7 @@ mod tests {
                 ..FirehoseState::default()
             },
             baseline: Some(Baseline {
-                cycle_id: 1,
+                cycle_id: CycleId::new(1),
                 collections: vec![1, 2, 3, 4],
                 s_c: Some(t(100)),
                 completed_witness: Some(t(500)),
@@ -499,7 +533,7 @@ mod tests {
 
     fn gap(from: i64, to: Option<i64>, healed: Option<i64>) -> Gap {
         Gap {
-            id: 1,
+            id: crate::ids::GapId::new(1),
             from_at: t(from),
             to_at: to.map(t),
             cause: GapCause::CursorTooOld,
@@ -533,25 +567,34 @@ mod tests {
     #[test]
     fn network_scope_levels() {
         let s = snap(Some(999), true, vec![]);
-        let n = network_scope(&s, 1, LAG);
+        let n = network_scope(&s, Collection::Block, LAG);
         assert_eq!(n.level, Level::Complete);
         assert_eq!(n.complete_since, Some(t(500)));
         let s = snap(Some(999), true, vec![gap(700, Some(800), Some(900))]);
-        assert_eq!(network_scope(&s, 1, LAG).complete_since, Some(t(900)));
+        assert_eq!(
+            network_scope(&s, Collection::Block, LAG).complete_since,
+            Some(t(900))
+        );
         let s = snap(Some(999), true, vec![gap(700, Some(800), None)]);
-        let n = network_scope(&s, 1, LAG);
+        let n = network_scope(&s, Collection::Block, LAG);
         assert_eq!((n.level, n.reasons), (Level::Partial, vec!["firehose_gap"]));
         let mut s = snap(Some(999), true, vec![]);
         s.baseline = None;
-        assert_eq!(network_scope(&s, 1, LAG).reasons, ["sweep_incomplete"]);
+        assert_eq!(
+            network_scope(&s, Collection::Block, LAG).reasons,
+            ["sweep_incomplete"]
+        );
         let mut s = snap(Some(999), true, vec![]);
         s.firehose.protocol = Some(Protocol::V1);
         assert_eq!(
-            network_scope(&s, 1, LAG).reasons,
+            network_scope(&s, Collection::Block, LAG).reasons,
             ["sync_events_unavailable"]
         );
         let mut s = snap(Some(999), true, vec![]);
         s.storage_refusal_active = true;
-        assert_eq!(network_scope(&s, 1, LAG).reasons, ["storage_refusal"]);
+        assert_eq!(
+            network_scope(&s, Collection::Block, LAG).reasons,
+            ["storage_refusal"]
+        );
     }
 }

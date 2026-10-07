@@ -10,6 +10,12 @@ use farsight_core::record::{
     BlockRecord, ListBlockRecord, ListItemRecord, ListPurpose, ListRecord,
 };
 use farsight_core::{Collection, Did, Record, RecordKey, Tid};
+pub use farsight_storage::ids::{ActorId, CycleId, ListId, Stamp};
+
+/// Stands for a list the harness expected and did not find; no row has it.
+pub const NO_LIST: ListId = ListId::new(-1);
+/// The same for an actor.
+pub const NO_ACTOR: ActorId = ActorId::new(-1);
 use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Write, WriteAction};
 use farsight_storage::codes::TrackState;
 use farsight_storage::counters::CounterSink;
@@ -255,10 +261,8 @@ pub fn plc(tag: &str, n: u64) -> Did {
 pub const REV_BASE_US: u64 = 1_767_225_600_000_000;
 
 /// A TID-valued rev: `REV_BASE_US + n` microseconds, clock id 0.
-pub fn rev(n: u64) -> i64 {
-    Tid::from_parts(REV_BASE_US + n, 0)
-        .expect("in range")
-        .as_i64()
+pub fn rev(n: u64) -> Stamp {
+    Stamp::from_tid(Tid::from_parts(REV_BASE_US + n, 0).expect("in range"))
 }
 
 /// `Utc::now()` truncated to microseconds (Postgres precision).
@@ -276,7 +280,7 @@ pub fn list_uri(owner: &Did, rkey: &str) -> AtUri {
 
 // ---------------------------------------------------------------- builders
 
-pub fn block(author: &Did, rkey: &str, subject: &Did, stamp: i64) -> Write {
+pub fn block(author: &Did, rkey: &str, subject: &Did, stamp: Stamp) -> Write {
     Write {
         author: author.clone(),
         collection: Collection::Block,
@@ -290,7 +294,7 @@ pub fn block(author: &Did, rkey: &str, subject: &Did, stamp: i64) -> Write {
     }
 }
 
-pub fn listblock(author: &Did, rkey: &str, owner: &Did, list_rkey: &str, stamp: i64) -> Write {
+pub fn listblock(author: &Did, rkey: &str, owner: &Did, list_rkey: &str, stamp: Stamp) -> Write {
     Write {
         author: author.clone(),
         collection: Collection::ListBlock,
@@ -307,7 +311,7 @@ pub fn listblock(author: &Did, rkey: &str, owner: &Did, list_rkey: &str, stamp: 
 /// The avatar CID every fixture list names.
 pub const LIST_AVATAR: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
 
-pub fn list(owner: &Did, rkey: &str, stamp: i64) -> Write {
+pub fn list(owner: &Did, rkey: &str, stamp: Stamp) -> Write {
     Write {
         author: owner.clone(),
         collection: Collection::List,
@@ -324,7 +328,7 @@ pub fn list(owner: &Did, rkey: &str, stamp: i64) -> Write {
     }
 }
 
-pub fn item(owner: &Did, rkey: &str, list_rkey: &str, subject: &Did, stamp: i64) -> Write {
+pub fn item(owner: &Did, rkey: &str, list_rkey: &str, subject: &Did, stamp: Stamp) -> Write {
     Write {
         author: owner.clone(),
         collection: Collection::ListItem,
@@ -339,7 +343,7 @@ pub fn item(owner: &Did, rkey: &str, list_rkey: &str, subject: &Did, stamp: i64)
     }
 }
 
-pub fn delete(author: &Did, collection: Collection, rkey: &str, stamp: i64) -> Write {
+pub fn delete(author: &Did, collection: Collection, rkey: &str, stamp: Stamp) -> Write {
     Write {
         author: author.clone(),
         collection,
@@ -393,14 +397,14 @@ impl Env {
     }
 
     /// Applies a listing page: every write stamped `stamp`, read now.
-    pub async fn listing(&self, writes: Vec<Write>, stamp: i64) -> Result<ApplyReport> {
+    pub async fn listing(&self, writes: Vec<Write>, stamp: Stamp) -> Result<ApplyReport> {
         self.listing_at(writes, stamp, Utc::now()).await
     }
 
     pub async fn listing_at(
         &self,
         writes: Vec<Write>,
-        stamp: i64,
+        stamp: Stamp,
         read_at: DateTime<Utc>,
     ) -> Result<ApplyReport> {
         let mut b = Batch::new(Origin::Listing {
@@ -420,7 +424,7 @@ impl Env {
 
     // ---- readers ----
 
-    pub async fn actor_id(&self, did: &Did) -> Result<Option<i64>> {
+    pub async fn actor_id(&self, did: &Did) -> Result<Option<ActorId>> {
         Ok(sqlx::query_scalar("SELECT id FROM actors WHERE did = $1")
             .bind(did.as_str())
             .fetch_optional(&self.pool)
@@ -428,7 +432,7 @@ impl Env {
     }
 
     /// (subject DID, rev) of a stored block.
-    pub async fn block_row(&self, author: &Did, rkey: &str) -> Result<Option<(String, i64)>> {
+    pub async fn block_row(&self, author: &Did, rkey: &str) -> Result<Option<(String, Stamp)>> {
         Ok(sqlx::query_as(
             "SELECT s.did, b.rev FROM blocks b JOIN actors a ON a.id = b.author_id
              JOIN actors s ON s.id = b.subject_id WHERE a.did = $1 AND b.rkey = $2",
@@ -444,7 +448,7 @@ impl Env {
         &self,
         author: &Did,
         rkey: &str,
-    ) -> Result<Option<(String, String, bool, i64)>> {
+    ) -> Result<Option<(String, String, bool, Stamp)>> {
         Ok(sqlx::query_as(
             "SELECT o.did, l.rkey, b.counted, b.rev FROM list_blocks b
              JOIN actors a ON a.id = b.author_id JOIN lists l ON l.id = b.list_id
@@ -457,7 +461,11 @@ impl Env {
     }
 
     /// (list rkey, subject DID, rev) of a stored listitem.
-    pub async fn item_row(&self, owner: &Did, rkey: &str) -> Result<Option<(String, String, i64)>> {
+    pub async fn item_row(
+        &self,
+        owner: &Did,
+        rkey: &str,
+    ) -> Result<Option<(String, String, Stamp)>> {
         Ok(sqlx::query_as(
             "SELECT l.rkey, s.did, i.rev FROM list_items i JOIN actors a ON a.id = i.owner_id
              JOIN lists l ON l.id = i.list_id JOIN actors s ON s.id = i.subject_id
@@ -469,7 +477,12 @@ impl Env {
         .await?)
     }
 
-    pub async fn tombstone(&self, c: Collection, author: &Did, rkey: &str) -> Result<Option<i64>> {
+    pub async fn tombstone(
+        &self,
+        c: Collection,
+        author: &Did,
+        rkey: &str,
+    ) -> Result<Option<Stamp>> {
         Ok(sqlx::query_scalar(
             "SELECT t.rev FROM tombstones t JOIN actors a ON a.id = t.author_id
              WHERE t.collection = $1 AND a.did = $2 AND t.rkey = $3",
@@ -481,7 +494,7 @@ impl Env {
         .await?)
     }
 
-    pub async fn list_id(&self, owner: &Did, rkey: &str) -> Result<Option<i64>> {
+    pub async fn list_id(&self, owner: &Did, rkey: &str) -> Result<Option<ListId>> {
         Ok(sqlx::query_scalar(
             "SELECT l.id FROM lists l JOIN actors a ON a.id = l.owner_id
              WHERE a.did = $1 AND l.rkey = $2",
@@ -492,7 +505,7 @@ impl Env {
         .await?)
     }
 
-    pub async fn list_view(&self, list_id: i64) -> Result<ListView> {
+    pub async fn list_view(&self, list_id: ListId) -> Result<ListView> {
         let r: ListRow = sqlx::query_as(
             "SELECT track_state, purge_then, listblock_count, item_count, admit_epoch,
                     admitted_at IS NOT NULL, retain_until IS NOT NULL, deferred_by,

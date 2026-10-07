@@ -911,10 +911,11 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
             match floor {
                 Some(floor_us) => {
                     let target = floor_us - 3_600_000_000;
-                    let gaps_before: HashSet<i64> = farsight_storage::firehose::all_gaps(&run.pool)
-                        .await
-                        .map(|g| g.iter().map(|x| x.id).collect())
-                        .unwrap_or_default();
+                    let gaps_before: HashSet<farsight_storage::ids::GapId> =
+                        farsight_storage::firehose::all_gaps(&run.pool)
+                            .await
+                            .map(|g| g.iter().map(|x| x.id).collect())
+                            .unwrap_or_default();
                     println!(
                         "[{:>5}s] rewind to {target} (instance floor {floor_us})",
                         el.as_secs()

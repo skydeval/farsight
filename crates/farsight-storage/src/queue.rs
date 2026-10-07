@@ -6,36 +6,14 @@
 //! poisoned events and newly active unknown DIDs (see
 //! `docs/design/firehose.md`).
 
+use crate::codes::sql::TIER_ACTIVE;
+use crate::ids::ActorId;
 use sqlx::PgConnection;
 
+use crate::codes::{Priority, RequesterKey, Tier};
 use crate::error::Result;
 
-/// `backfill_queue.kind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobKind {
-    /// Full repo job.
-    Repo,
-    /// List fetch run for an owner.
-    ListFetch,
-    /// Subject discovery.
-    Discovery,
-}
-
-impl JobKind {
-    /// Stored code.
-    pub fn code(self) -> i16 {
-        match self {
-            JobKind::Repo => 1,
-            JobKind::ListFetch => 2,
-            JobKind::Discovery => 3,
-        }
-    }
-}
-
-/// Requester of `system:resync` re-lists.
-pub const SYSTEM_RESYNC: &str = "system:resync";
-/// Requester of tier-2 active-author jobs enqueued by ingest.
-pub const SYSTEM_FIREHOSE: &str = "system:firehose";
+pub use crate::codes::JobKind;
 
 /// Tier-2 cap (overflow dropped; the sweep covers it).
 pub const TIER2_CAP: i64 = 1_000_000;
@@ -58,18 +36,18 @@ pub enum Enqueued {
 /// entry would be inserted.
 pub async fn enqueue(
     conn: &mut PgConnection,
-    actor_id: i64,
+    actor_id: ActorId,
     kind: JobKind,
-    tier: i16,
-    priority: i16,
-    requester: &str,
+    tier: Tier,
+    priority: Priority,
+    requester: RequesterKey,
     cap: Option<i64>,
 ) -> Result<Enqueued> {
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM backfill_queue WHERE actor_id = $1 AND kind = $2)",
     )
     .bind(actor_id)
-    .bind(kind.code())
+    .bind(kind)
     .fetch_one(&mut *conn)
     .await?;
     if !exists {
@@ -86,9 +64,9 @@ pub async fn enqueue(
                 return Ok(Enqueued::CapReached);
             }
         }
-        if tier == 2 {
+        if tier == Tier::Active {
             let n: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM (SELECT 1 FROM backfill_queue WHERE tier = 2 LIMIT $1) x",
+                &format!("SELECT count(*) FROM (SELECT 1 FROM backfill_queue WHERE tier = {TIER_ACTIVE} LIMIT $1) x"),
             )
             .bind(TIER2_CAP)
             .fetch_one(&mut *conn)
@@ -114,7 +92,7 @@ pub async fn enqueue(
              ELSE LEAST(backfill_queue.not_before, EXCLUDED.not_before) END",
     )
     .bind(actor_id)
-    .bind(kind.code())
+    .bind(kind)
     .bind(tier)
     .bind(priority)
     .bind(requester)

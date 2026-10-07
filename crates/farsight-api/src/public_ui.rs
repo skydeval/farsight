@@ -14,14 +14,13 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use farsight_core::Did;
+use farsight_core::{Collection, Did};
 use farsight_storage::queries;
 use serde_json::Value;
 
 use crate::ApiState;
 use crate::error::XrpcError;
-use crate::freshness::LISTBLOCK;
-use crate::handlers::{actor_side_coverage, snapshot, view};
+use crate::handlers::{NO_ACTOR, actor_side_coverage, snapshot, view};
 
 /// `freshness` for the blocks authored by `actor`, as `checkBlocks`
 /// reports the actor side with default filtering. It weighs the actor's
@@ -31,8 +30,8 @@ pub async fn outgoing_freshness(st: &Arc<ApiState>, actor: &Did) -> Result<Value
     let snap = snapshot(st)?;
     let v = view(st, &snap);
     let mut tx = st.read_tx().await?;
-    let a = queries::actor(&mut tx, actor.as_str()).await?;
-    let x_id = a.map_or(-1, |a| a.id);
+    let a = queries::actor(&mut tx, actor).await?;
+    let x_id = a.map_or(NO_ACTOR, |a| a.id);
     let rows = queries::check_rows(&mut tx, x_id, &[]).await?;
     let debt = match a {
         Some(a) => farsight_storage::debts::debts_for(&mut *tx, &[a.id])
@@ -55,6 +54,6 @@ pub async fn outgoing_freshness(st: &Arc<ApiState>, actor: &Did) -> Result<Value
 pub fn listblock_freshness(st: &Arc<ApiState>) -> Result<Value, XrpcError> {
     let snap = snapshot(st)?;
     let v = view(st, &snap);
-    let c = v.network(LISTBLOCK);
+    let c = v.network(Collection::ListBlock);
     Ok(v.render(&c, Utc::now(), st.source_lag()))
 }

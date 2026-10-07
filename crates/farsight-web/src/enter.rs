@@ -54,7 +54,8 @@ pub struct EnterPage {
     pub hostname: String,
     /// Where hosted sign-in is, when the hostname allows it.
     pub hosted_url: Option<String>,
-    /// Error.
+    /// Why the last attempt did not complete, shown in a banner above
+    /// the card; `None` on a plain view.
     pub error: Option<String>,
 }
 
@@ -270,7 +271,7 @@ pub async fn submit(
     };
     let server = match st.oauth.server(&st.safe, &cfg.config, &parsed).await {
         Ok(s) => s,
-        Err(e) => return unreachable(&e),
+        Err(e) => return unreachable(&e.to_string()),
     };
     let state = oauth::new_secret();
     let cookie_value = oauth::new_secret();
@@ -285,7 +286,7 @@ pub async fn submit(
     .await
     {
         Ok(x) => x,
-        Err(e) => return unreachable(&e),
+        Err(e) => return unreachable(&e.to_string()),
     };
     st.oauth.flows.insert(state, flow);
     let Ok(location) = HeaderValue::from_str(to.as_str()) else {

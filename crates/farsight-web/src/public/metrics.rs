@@ -19,7 +19,8 @@ pub const WITHHELD: &str = "farsight_public_ui_withheld_total";
 /// `farsight_public_ui_cards_total{outcome}`.
 pub const CARDS: &str = "farsight_public_ui_cards_total";
 
-/// The matched route.
+/// The route a public request matched: the `page` label of the request
+/// counter and of the duration histogram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     /// `/`, when it serves the public home.
@@ -47,7 +48,7 @@ impl Page {
         Page::Robots,
     ];
 
-    /// Metric label.
+    /// The `page` label.
     pub fn label(self) -> &'static str {
         match self {
             Page::Home => "home",
@@ -70,7 +71,8 @@ pub fn status_class(s: StatusCode) -> &'static str {
     }
 }
 
-/// Counts one response.
+/// Counts one response under its page and status class, and records how
+/// long it took, in seconds.
 pub fn observe(page: Page, status: StatusCode, took: Duration) {
     ::metrics::counter!(REQUESTS, "page" => page.label(), "status" => status_class(status))
         .increment(1);

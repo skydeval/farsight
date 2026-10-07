@@ -34,9 +34,12 @@ pub struct OriginalForwarding(pub Vec<(String, String)>);
 pub struct ClientIp {
     /// The resolved client address (rate-limit key, logs).
     pub ip: IpAddr,
-    /// The TCP peer.
+    /// Address of the socket peer, with IPv4-mapped IPv6 normalized to
+    /// IPv4. Equal to `ip` unless the peer is a trusted proxy that named
+    /// another client.
     pub peer: IpAddr,
-    /// The peer is a trusted proxy.
+    /// Whether `peer` is in the trusted set in force. Only then are the
+    /// forwarding headers believed, and left on the request.
     pub trusted_peer: bool,
     /// The request reached the proxy (or us) over HTTPS: decides the
     /// cookie `Secure` flag.
@@ -204,7 +207,9 @@ impl Default for CfTracker {
 const CF_MIN_REQUESTS: u64 = 20;
 
 impl CfTracker {
-    /// Records one request.
+    /// Counts one request in the current window, first rolling the window
+    /// over when it is older than [`CF_WINDOW`]. A window that ended more
+    /// than one window ago is not kept as the last complete one.
     pub fn record(&self, c: &ClientIp) {
         let from_cf = !c.trusted_peer && in_any(c.peer, &self.cf);
         let mut w = self.w.lock().unwrap_or_else(|e| e.into_inner());

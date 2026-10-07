@@ -56,12 +56,13 @@ use farsight_api::params::Params;
 use farsight_api::ratelimit::Class;
 use farsight_core::config::{AdminAuth, Config, LoadedConfig};
 use farsight_core::{Did, RecordKey};
-use farsight_storage::codes::actor_status;
+use farsight_storage::codes::ActorStatus;
 use farsight_storage::handles::HandleCache;
 use tokio::sync::Notify;
 
 use self::metrics::Page;
 use crate::pages::WebState;
+use farsight_storage::ids::ActorId;
 
 /// Rows per page of every public table. There is no `limit` parameter.
 pub const PAGE_ROWS: i64 = 50;
@@ -99,7 +100,7 @@ pub fn csp(cfg: &Config) -> &'static str {
     }
 }
 
-/// The public stylesheet.
+/// The stylesheet of the public pages, served at `/static/public.css`.
 pub const PUBLIC_CSS: &str = include_str!("../../static/public.css");
 /// The script: theme toggle, local times, profile cards.
 pub const PUBLIC_JS: &str = include_str!("../../static/public.js");
@@ -122,7 +123,8 @@ pub struct RenderGate {
     freed: Notify,
 }
 
-/// A held render slot.
+/// A held render slot. Dropping it frees the slot and wakes a waiting
+/// render.
 #[derive(Debug)]
 pub struct RenderSlot<'a> {
     gate: &'a RenderGate,
@@ -182,7 +184,7 @@ pub enum WithheldReason {
 }
 
 impl WithheldReason {
-    /// Metric label.
+    /// The `reason` label of `farsight_public_ui_withheld_total`.
     pub fn label(self) -> &'static str {
         match self {
             WithheldReason::HiddenStatus => "hidden_status",
@@ -198,7 +200,7 @@ pub struct Withheld {
     pub dids: Arc<HashSet<String>>,
     /// `actors.id` of the excluded DIDs that are interned (SQL filters and
     /// counts; refreshed every [`EXCLUDED_REFRESH`]).
-    pub ids: Arc<Vec<i64>>,
+    pub ids: Arc<Vec<ActorId>>,
 }
 
 impl Withheld {
@@ -209,10 +211,10 @@ impl Withheld {
 
     /// Why `did` with stored `status` (`None`: no `actors` row) is
     /// withheld, if it is.
-    pub fn reason(&self, did: &str, status: Option<i16>) -> Option<WithheldReason> {
+    pub fn reason(&self, did: &str, status: Option<ActorStatus>) -> Option<WithheldReason> {
         if self.excluded(did) {
             Some(WithheldReason::OperatorExcluded)
-        } else if status.is_some_and(actor_status::is_hidden) {
+        } else if status.is_some_and(ActorStatus::is_hidden) {
             Some(WithheldReason::HiddenStatus)
         } else {
             None
@@ -240,14 +242,16 @@ pub struct PendingEnable {
     pub change: crate::public_settings::Change,
 }
 
-/// State of the public UI.
+/// State of the public UI, in memory. Kept whether or not the public UI
+/// is on, since the admin pages use the handle cache too.
 #[derive(Debug, Default)]
 pub struct PublicState {
     /// Verified handles: the memory layer in front of `handle_cache`.
     pub handles: HandleCache,
     /// Accounts whose handles the warming worker is asked to verify.
     pub warm: warming::WarmQueue,
-    /// Render concurrency bound.
+    /// How many public pages are being rendered now, bounded per request
+    /// by `public_ui.query_concurrency`.
     pub render: RenderGate,
     excluded: Mutex<Option<ExcludedCache>>,
     /// Enable requests awaiting confirmation, by confirmation token.
@@ -332,7 +336,7 @@ pub const OG_INSTANCE: &str = "An independent index of public block records on t
 pub struct Chrome {
     /// `public_ui.dark_mode_default`: `light`, `dark` or `system`.
     pub theme: &'static str,
-    /// Preview tags.
+    /// The page's OpenGraph and Twitter tags, printed in its `<head>`.
     pub og: OpenGraph,
     /// The home page: its bar has no search form and no guide button,
     /// because the page itself has both.
@@ -388,11 +392,11 @@ pub enum Fail {
     },
     /// Nothing is known under this address.
     NotFound {
-        /// Heading.
+        /// The 404 page's heading.
         title: String,
-        /// Message.
+        /// What the page says under it.
         message: String,
-        /// A way forward.
+        /// A way forward: (href, text). `None` links back to search.
         link: Option<(String, String)>,
     },
     /// Render queue full or a query timed out.
@@ -589,7 +593,7 @@ pub fn redirect(cfg: &Config, to: &str) -> Response {
 
 /// A request that passed the gates.
 pub struct Req<'a> {
-    /// Web state.
+    /// The web state: the pool, the limiter and the public UI's caches.
     pub st: &'a WebState,
     /// The config in force for this request.
     pub cfg: Arc<LoadedConfig>,
@@ -620,7 +624,8 @@ fn gate<'a>(
 }
 
 impl Req<'_> {
-    /// The config.
+    /// The config in force for this request: one snapshot, so a page
+    /// never mixes two configs.
     pub fn config(&self) -> &Config {
         &self.cfg.config
     }
@@ -652,7 +657,8 @@ impl Req<'_> {
         Ok((slot, permit))
     }
 
-    /// The exclusion list.
+    /// The exclusion list for this request's config
+    /// (`PublicState::withheld`).
     pub async fn withheld(&self) -> Result<Withheld, Fail> {
         Ok(self
             .st
@@ -891,17 +897,17 @@ mod tests {
     fn one_rule_for_hidden_and_excluded() {
         let w = Withheld {
             dids: Arc::new(["did:plc:excluded".to_owned()].into_iter().collect()),
-            ids: Arc::new(vec![7]),
+            ids: Arc::new(vec![ActorId::new(7)]),
         };
         assert_eq!(
-            w.reason("did:plc:excluded", Some(actor_status::ACTIVE)),
+            w.reason("did:plc:excluded", Some(ActorStatus::Active)),
             Some(WithheldReason::OperatorExcluded)
         );
         for s in [
-            actor_status::DEACTIVATED,
-            actor_status::TAKENDOWN,
-            actor_status::SUSPENDED,
-            actor_status::DELETED,
+            ActorStatus::Deactivated,
+            ActorStatus::Takendown,
+            ActorStatus::Suspended,
+            ActorStatus::Deleted,
         ] {
             assert_eq!(
                 w.reason("did:plc:other", Some(s)),
@@ -909,10 +915,10 @@ mod tests {
             );
         }
         for s in [
-            actor_status::ACTIVE,
-            actor_status::THROTTLED,
-            actor_status::DESYNCHRONIZED,
-            actor_status::UNKNOWN,
+            ActorStatus::Active,
+            ActorStatus::Throttled,
+            ActorStatus::Desynchronized,
+            ActorStatus::Unknown,
         ] {
             assert_eq!(w.reason("did:plc:other", Some(s)), None);
         }

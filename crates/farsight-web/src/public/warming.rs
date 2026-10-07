@@ -101,7 +101,7 @@ impl Outcome {
         Outcome::Dropped,
     ];
 
-    /// Metric label.
+    /// The `outcome` label of `farsight_handle_warming_total`.
     pub fn label(self) -> &'static str {
         match self {
             Outcome::Resolved => "resolved",
@@ -135,7 +135,9 @@ struct Inner {
     taken: HashSet<String>,
 }
 
-/// The warming queue.
+/// The warming queue: the DIDs whose handles pages have asked for, most
+/// recently asked first, at most [`QUEUE_CAP`]. A DID is in it once; one
+/// the worker has taken is not queued again until it is finished.
 #[derive(Debug, Default)]
 pub struct WarmQueue {
     inner: Mutex<Inner>,
@@ -214,7 +216,8 @@ impl WarmQueue {
         ::metrics::gauge!(QUEUE).set(len as f64);
     }
 
-    /// Empties the queue.
+    /// Drops every waiting DID. Those the worker has already taken are
+    /// not affected.
     pub fn clear(&self) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.order.clear();
@@ -223,7 +226,7 @@ impl WarmQueue {
         ::metrics::gauge!(QUEUE).set(0.0);
     }
 
-    /// DIDs waiting.
+    /// DIDs waiting, not counting those the worker has taken.
     pub fn len(&self) -> usize {
         self.inner
             .lock()

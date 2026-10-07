@@ -24,6 +24,8 @@
 //! statement removes the rows and adjusts the counters they were counted
 //! in, and their history is written by one more.
 
+use crate::codes::sql::{RECORD_DELETED, RECORD_PRESENT, RECORD_UNKNOWN};
+use crate::ids::{ActorId, ListId, Stamp};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -33,12 +35,12 @@ use farsight_core::{
 };
 use sqlx::PgPool;
 
-use crate::codes::{CapType, DebtReason, RecordState, TrackState};
+use crate::codes::{CapType, DebtReason, RecordState, RequesterKey, TrackState};
 use crate::counters::{CounterSink, stat};
 use crate::error::{Result, StorageError};
 use crate::firehose::FirehoseProgress;
 use crate::history::{Cause as Removed, Gone, GoneRow, Removal, Table};
-use crate::keys::{self, CapKind, Limits};
+use crate::keys::{self, CapKind, Limits, clamp};
 use crate::repo_events::{RepoEvent, unavailable_list_keys};
 use crate::tracking::FireArgs;
 use crate::transition::Event;
@@ -68,12 +70,12 @@ pub enum Origin {
     },
     /// Discovery writes (`W = 0`), charged to the requester.
     Discovery {
-        /// Requester cause key: `token:<id>` or `admin`.
-        requester: String,
+        /// Who the interning is charged to.
+        requester: RequesterKey,
     },
 }
 
-/// What a write does.
+/// What a write does to its record key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteAction {
     /// Create or update with this version.
@@ -87,12 +89,13 @@ pub enum WriteAction {
 pub struct Write {
     /// Record author (repo DID).
     pub author: Did,
-    /// Collection.
+    /// Which of the four indexed collections the record is in.
     pub collection: Collection,
-    /// Record key.
+    /// Record key; with `author` and `collection` it names the row the
+    /// write is for, and the tombstone a delete leaves.
     pub rkey: RecordKey,
     /// Stamp `W`: commit rev, listing stamp `R`, or 0 for discovery.
-    pub stamp: i64,
+    pub stamp: Stamp,
     /// Firehose witness time of the event, if firehose.
     pub witness: Option<DateTime<Utc>>,
     /// Upsert or delete.
@@ -105,24 +108,25 @@ pub struct Write {
 /// tombstone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reconcile {
-    /// The repo.
+    /// The repo that was listed; only its rows are candidates.
     pub author: Did,
-    /// Collection.
+    /// The collection that was listed.
     pub collection: Collection,
     /// The listing stamp `R`.
-    pub stamp: i64,
+    pub stamp: Stamp,
     /// Exclusive lower bound (`prev_last`); `None` = from the start.
     pub after: Option<RecordKey>,
     /// Inclusive upper bound; `None` = to +∞ (last page / whole range).
     pub through: Option<RecordKey>,
-    /// Keys present on the page.
+    /// Record keys the page listed. A row at one of them is kept whatever
+    /// its rev.
     pub keep: Vec<RecordKey>,
 }
 
 /// A batch: one transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch {
-    /// Where it comes from.
+    /// Where the batch comes from; one origin for everything in it.
     pub origin: Origin,
     /// Writes, applied in order.
     pub writes: Vec<Write>,
@@ -135,7 +139,7 @@ pub struct Batch {
 }
 
 impl Batch {
-    /// An empty batch.
+    /// A batch of `origin` with nothing in it and no firehose progress.
     pub fn new(origin: Origin) -> Batch {
         Batch {
             origin,
@@ -150,7 +154,7 @@ impl Batch {
 /// Process-level inputs to `apply`.
 #[derive(Debug, Clone, Copy)]
 pub struct ApplyCtx<'a> {
-    /// Limits in force.
+    /// The caps and rates the batch is checked against.
     pub limits: &'a Limits,
     /// Budget / ceiling gates in force.
     pub gates: Gates,
@@ -265,7 +269,7 @@ async fn apply_once(
         // Discovery reads only: an author without an `actors` row has no
         // stored rows, and its row is created later, under its intern lock.
         for ((author, collection), rkeys) in &stored_keys {
-            let Some(author_id) = t.actor_id(author.as_str()).await? else {
+            let Some(author_id) = t.actor_id(author).await? else {
                 continue;
             };
             for (owner, lrkey) in stored_list_targets(&mut t, author_id, *collection, rkeys).await?
@@ -275,7 +279,7 @@ async fn apply_once(
         }
         let mut candidates: Vec<Vec<String>> = Vec::with_capacity(batch.reconciles.len());
         for r in &batch.reconciles {
-            let Some(author_id) = t.actor_id(r.author.as_str()).await? else {
+            let Some(author_id) = t.actor_id(&r.author).await? else {
                 candidates.push(Vec::new());
                 continue;
             };
@@ -326,17 +330,17 @@ async fn apply_once(
         // inserts into the unique index and deadlock repeatedly (observed:
         // retries exhausted). Taken last, so the global order is authors,
         // lists, interns.
-        let mut dids: BTreeSet<&str> = authors.iter().map(|d| d.as_str()).collect();
+        let mut dids: BTreeSet<&Did> = authors.clone();
         for w in &batch.writes {
             match &w.action {
                 WriteAction::Upsert(Record::Block(r)) => {
-                    dids.insert(r.subject.as_str());
+                    dids.insert(&r.subject);
                 }
                 WriteAction::Upsert(Record::ListBlock(r)) => {
-                    dids.insert(r.subject.authority.as_str());
+                    dids.insert(&r.subject.authority);
                 }
                 WriteAction::Upsert(Record::ListItem(r)) => {
-                    dids.insert(r.subject.as_str());
+                    dids.insert(&r.subject);
                 }
                 _ => {}
             }
@@ -367,15 +371,15 @@ async fn apply_once(
         // interns it (above) and takes the active-DID branch here: a tier-2
         // repo job, so its pre-existing records get listed.
         if batch.origin == Origin::Firehose && !batch.writes.is_empty() {
-            let new: Vec<i64> = std::mem::take(&mut t.report.new_authors);
+            let new: Vec<ActorId> = std::mem::take(&mut t.report.new_authors);
             for id in &new {
                 crate::queue::enqueue(
                     &mut *t.conn,
                     *id,
                     crate::queue::JobKind::Repo,
-                    2,
-                    crate::repo_events::priority::NORMAL,
-                    crate::queue::SYSTEM_FIREHOSE,
+                    crate::codes::Tier::Active,
+                    crate::codes::Priority::Normal,
+                    crate::codes::RequesterKey::Firehose,
                     None,
                 )
                 .await?;
@@ -418,7 +422,7 @@ async fn check_stamp_fresh(t: &mut Txn<'_>, stamp_read_at: DateTime<Utc>) -> Res
 /// `rkeys` point to.
 async fn stored_list_targets(
     t: &mut Txn<'_>,
-    author_id: i64,
+    author_id: ActorId,
     collection: Collection,
     rkeys: &[String],
 ) -> Result<Vec<(String, String)>> {
@@ -469,7 +473,7 @@ fn seen_for(t: &Txn<'_>, origin: &Origin, w: &Write) -> DateTime<Utc> {
 fn cause_for(author: &AuthorInfo, origin: &Origin) -> Cause {
     match origin {
         Origin::Discovery { requester } => Cause {
-            key: requester.clone(),
+            key: requester.to_string(),
             buckets: Vec::new(),
             large: true,
             mask: 0,
@@ -519,7 +523,7 @@ async fn apply_write(t: &mut Txn<'_>, origin: &Origin, w: &Write) -> Result<()> 
 async fn deletes_only_skip(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<()> {
     let rkey = w.rkey.as_str();
     let row_rev = stored_rev(t, w.collection, author.id, rkey).await?;
-    let tomb = t.tombstone_rev(w.collection, author.id, rkey).await?;
+    let tomb = t.tombstone_rev(w.collection, author.id, &w.rkey).await?;
     if !lww_upsert_wins(w.stamp, row_rev, tomb) {
         t.report.stale += 1;
         return Ok(());
@@ -527,7 +531,7 @@ async fn deletes_only_skip(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> R
     t.refuse(
         author,
         w.collection,
-        rkey,
+        &w.rkey,
         Refusal::Refused(CapType::DeletesOnly),
         w.witness,
     )
@@ -537,18 +541,18 @@ async fn deletes_only_skip(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> R
 async fn stored_rev(
     t: &mut Txn<'_>,
     c: Collection,
-    author_id: i64,
+    author_id: ActorId,
     rkey: &str,
-) -> Result<Option<i64>> {
+) -> Result<Option<Stamp>> {
     let sql = match c {
         Collection::Block => "SELECT rev FROM blocks WHERE author_id = $1 AND rkey = $2",
         Collection::ListBlock => "SELECT rev FROM list_blocks WHERE author_id = $1 AND rkey = $2",
         Collection::ListItem => "SELECT rev FROM list_items WHERE owner_id = $1 AND rkey = $2",
-        Collection::List => {
-            "SELECT rev FROM lists WHERE owner_id = $1 AND rkey = $2 AND record_state <> 0"
-        }
+        Collection::List => &format!(
+            "SELECT rev FROM lists WHERE owner_id = $1 AND rkey = $2 AND record_state <> {RECORD_UNKNOWN}"
+        ),
     };
-    let r: Option<Option<i64>> = sqlx::query_scalar(sql)
+    let r: Option<Option<Stamp>> = sqlx::query_scalar(sql)
         .bind(author_id)
         .bind(rkey)
         .fetch_optional(&mut *t.conn)
@@ -575,23 +579,25 @@ async fn block_upsert(
     .bind(rkey)
     .fetch_optional(&mut *t.conn)
     .await?;
-    let tomb = t.tombstone_rev(Collection::Block, author.id, rkey).await?;
+    let tomb = t
+        .tombstone_rev(Collection::Block, author.id, &w.rkey)
+        .await?;
     if !lww_upsert_wins(w.stamp, row.map(|x| x.1), tomb) {
         t.report.stale += 1;
         return Ok(());
     }
     let seen = seen_for(t, origin, w);
     if let Some((old_subject, _, old_created, old_first, old_last)) = row {
-        let same = t.actor_id(r.subject.as_str()).await? == Some(old_subject);
+        let same = t.actor_id(&r.subject).await? == Some(old_subject);
         let refused = removal_for(origin, w, Removed::RefusedUpdate);
         if let Some(refusal) = t.gate(cause, CapKind::Blocks) {
             if !same {
                 block_delete_row(t, author, rkey, Some(&refused)).await?;
-                t.put_refusal_tombstone(Collection::Block, author.id, rkey, w.stamp)
+                t.put_refusal_tombstone(Collection::Block, author.id, &w.rkey, w.stamp)
                     .await?;
             }
             return t
-                .refuse(author, Collection::Block, rkey, refusal, w.witness)
+                .refuse(author, Collection::Block, &w.rkey, refusal, w.witness)
                 .await;
         }
         let subject_id = if same {
@@ -601,10 +607,10 @@ async fn block_upsert(
                 Ok(id) => id,
                 Err(refusal) => {
                     block_delete_row(t, author, rkey, Some(&refused)).await?;
-                    t.put_refusal_tombstone(Collection::Block, author.id, rkey, w.stamp)
+                    t.put_refusal_tombstone(Collection::Block, author.id, &w.rkey, w.stamp)
                         .await?;
                     return t
-                        .refuse(author, Collection::Block, rkey, refusal, w.witness)
+                        .refuse(author, Collection::Block, &w.rkey, refusal, w.witness)
                         .await;
                 }
             }
@@ -647,7 +653,7 @@ async fn block_upsert(
             Ok(())
         }
         Err(refusal) => {
-            t.refuse(author, Collection::Block, rkey, refusal, w.witness)
+            t.refuse(author, Collection::Block, &w.rkey, refusal, w.witness)
                 .await
         }
     }
@@ -655,8 +661,8 @@ async fn block_upsert(
 
 /// `subject_id, rev, created_at, first_seen, last_seen` of a stored block.
 type BlockRow = (
-    i64,
-    i64,
+    ActorId,
+    Stamp,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
@@ -714,7 +720,7 @@ async fn block_insert(
 /// block.
 type BlockGone = (
     String,
-    i64,
+    ActorId,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
@@ -724,13 +730,13 @@ type BlockGone = (
 /// of a deleted listblock, and its list's `owner_id, rkey`.
 type ListBlockGone = (
     String,
-    i64,
+    ListId,
     bool,
     Option<String>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
-    Option<i64>,
+    Option<ActorId>,
     Option<String>,
 );
 
@@ -738,12 +744,12 @@ type ListBlockGone = (
 /// listitem, and its list's `track_state, record_state, rkey`.
 type ItemGone = (
     String,
-    i64,
+    ActorId,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<i16>,
-    Option<i16>,
+    Option<RecordState>,
     Option<String>,
 );
 
@@ -760,7 +766,7 @@ pub(crate) async fn block_delete_rows(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
     rkeys: &[String],
-    below: Option<i64>,
+    below: Option<Stamp>,
     removal: Option<&Removal>,
 ) -> Result<u64> {
     if rkeys.is_empty() {
@@ -824,7 +830,7 @@ async fn block_delete(
     w: &Write,
 ) -> Result<()> {
     let rkey = w.rkey.as_str();
-    let rev: Option<i64> =
+    let rev: Option<Stamp> =
         sqlx::query_scalar("SELECT rev FROM blocks WHERE author_id = $1 AND rkey = $2")
             .bind(author.id)
             .bind(rkey)
@@ -834,7 +840,7 @@ async fn block_delete(
         let removal = removal_for(origin, w, Removed::Delete);
         block_delete_row(t, author, rkey, Some(&removal)).await?;
     }
-    t.put_tombstone(Collection::Block, author.id, rkey, w.stamp)
+    t.put_tombstone(Collection::Block, author.id, &w.rkey, w.stamp)
         .await?;
     t.report.applied += 1;
     Ok(())
@@ -844,16 +850,16 @@ async fn block_delete(
 
 /// The stored listblock row.
 struct ListBlockRow {
-    list_id: i64,
-    rev: i64,
+    list_id: ListId,
+    rev: Stamp,
 }
 
 async fn listblock_row(
     t: &mut Txn<'_>,
-    author_id: i64,
+    author_id: ActorId,
     rkey: &str,
 ) -> Result<Option<ListBlockRow>> {
-    let r: Option<(i64, i64)> =
+    let r: Option<(ListId, Stamp)> =
         sqlx::query_as("SELECT list_id, rev FROM list_blocks WHERE author_id = $1 AND rkey = $2")
             .bind(author_id)
             .bind(rkey)
@@ -862,13 +868,13 @@ async fn listblock_row(
     Ok(r.map(|(list_id, rev)| ListBlockRow { list_id, rev }))
 }
 
-async fn find_list(t: &mut Txn<'_>, owner: &str, rkey: &str) -> Result<Option<i64>> {
+async fn find_list(t: &mut Txn<'_>, owner: &Did, rkey: &RecordKey) -> Result<Option<ListId>> {
     Ok(sqlx::query_scalar(
         "SELECT l.id FROM lists l JOIN actors a ON a.id = l.owner_id
          WHERE a.did = $1 AND l.rkey = $2",
     )
-    .bind(owner)
-    .bind(rkey)
+    .bind(owner.as_str())
+    .bind(rkey.as_str())
     .fetch_optional(&mut *t.conn)
     .await?)
 }
@@ -884,20 +890,20 @@ async fn listblock_upsert(
     let rkey = w.rkey.as_str();
     let row = listblock_row(t, author.id, rkey).await?;
     let tomb = t
-        .tombstone_rev(Collection::ListBlock, author.id, rkey)
+        .tombstone_rev(Collection::ListBlock, author.id, &w.rkey)
         .await?;
     if !lww_upsert_wins(w.stamp, row.as_ref().map(|x| x.rev), tomb) {
         t.report.stale += 1;
         return Ok(());
     }
-    let target = find_list(t, r.subject.authority.as_str(), r.subject.rkey.as_str()).await?;
+    let target = find_list(t, &r.subject.authority, &r.subject.rkey).await?;
     let seen = seen_for(t, origin, w);
     if let Some(old) = row {
         if Some(old.list_id) == target {
             // Same subject: counted, witnessed_at and sched_key are sticky.
             if let Some(refusal) = t.gate(cause, CapKind::Listblocks) {
                 return t
-                    .refuse(author, Collection::ListBlock, rkey, refusal, w.witness)
+                    .refuse(author, Collection::ListBlock, &w.rkey, refusal, w.witness)
                     .await;
             }
             sqlx::query(
@@ -929,9 +935,9 @@ async fn listblock_upsert(
             }
             Err(refusal) => {
                 t.relabel_last_history(Removed::RefusedUpdate).await?;
-                t.put_refusal_tombstone(Collection::ListBlock, author.id, rkey, w.stamp)
+                t.put_refusal_tombstone(Collection::ListBlock, author.id, &w.rkey, w.stamp)
                     .await?;
-                t.refuse(author, Collection::ListBlock, rkey, refusal, w.witness)
+                t.refuse(author, Collection::ListBlock, &w.rkey, refusal, w.witness)
                     .await
             }
         };
@@ -942,7 +948,7 @@ async fn listblock_upsert(
             Ok(())
         }
         Err(refusal) => {
-            t.refuse(author, Collection::ListBlock, rkey, refusal, w.witness)
+            t.refuse(author, Collection::ListBlock, &w.rkey, refusal, w.witness)
                 .await
         }
     }
@@ -971,7 +977,7 @@ fn would_admit(
 pub(crate) async fn decide_counted(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
-    list_id: i64,
+    list_id: ListId,
 ) -> Result<Result<(), CapType>> {
     let l = t.list_tracking(list_id).await?;
     let ok: Option<i32> = sqlx::query_scalar(
@@ -1009,7 +1015,7 @@ async fn listblock_insert(
         return Ok(Err(refusal));
     }
     let list_id = match t
-        .intern_list(&r.subject.authority, r.subject.rkey.as_str(), cause)
+        .intern_list(&r.subject.authority, &r.subject.rkey, cause)
         .await?
     {
         Ok(id) => id,
@@ -1074,7 +1080,7 @@ pub(crate) async fn listblock_delete_rows(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
     rkeys: &[String],
-    below: Option<i64>,
+    below: Option<Stamp>,
     removal: Option<&Removal>,
 ) -> Result<u64> {
     if rkeys.is_empty() {
@@ -1106,7 +1112,7 @@ pub(crate) async fn listblock_delete_rows(
     t.deltas.stat(stat::LIST_BLOCKS, -n);
     t.deltas.host(&author.buckets, CapKind::Listblocks, -n);
     // Counted rows per list and lane, in the order the rows went.
-    let mut lanes: Vec<((i64, Option<String>), i32)> = Vec::new();
+    let mut lanes: Vec<((ListId, Option<String>), i32)> = Vec::new();
     let mut rows: Vec<GoneRow> = Vec::new();
     for (rkey, list_id, counted, sched_key, created_at, first_seen, last_seen, owner, list_rkey) in
         gone
@@ -1163,7 +1169,7 @@ async fn listblock_delete(
             listblock_delete_row(t, author, rkey, Some(&removal)).await?;
         }
     }
-    t.put_tombstone(Collection::ListBlock, author.id, rkey, w.stamp)
+    t.put_tombstone(Collection::ListBlock, author.id, &w.rkey, w.stamp)
         .await?;
     t.report.applied += 1;
     Ok(())
@@ -1172,13 +1178,13 @@ async fn listblock_delete(
 // -------------------------------------------------------------- listitems
 
 struct ItemRow {
-    list_id: i64,
-    subject_id: i64,
-    rev: i64,
+    list_id: ListId,
+    subject_id: ActorId,
+    rev: Stamp,
 }
 
-async fn item_row(t: &mut Txn<'_>, owner_id: i64, rkey: &str) -> Result<Option<ItemRow>> {
-    let r: Option<(i64, i64, i64)> = sqlx::query_as(
+async fn item_row(t: &mut Txn<'_>, owner_id: ActorId, rkey: &str) -> Result<Option<ItemRow>> {
+    let r: Option<(ListId, ActorId, Stamp)> = sqlx::query_as(
         "SELECT list_id, subject_id, rev FROM list_items WHERE owner_id = $1 AND rkey = $2",
     )
     .bind(owner_id)
@@ -1194,7 +1200,7 @@ async fn item_row(t: &mut Txn<'_>, owner_id: i64, rkey: &str) -> Result<Option<I
 
 /// Marks a list `capped` because one of its items was refused;
 /// `refresh` also requests a refresh run (intern-rate refusals).
-async fn mark_list_capped(t: &mut Txn<'_>, list_id: i64, refresh: bool) -> Result<()> {
+async fn mark_list_capped(t: &mut Txn<'_>, list_id: ListId, refresh: bool) -> Result<()> {
     sqlx::query(
         "UPDATE lists SET capped = true, refresh_requested = refresh_requested OR $2
          WHERE id = $1",
@@ -1218,14 +1224,14 @@ async fn listitem_upsert(
     let rkey = w.rkey.as_str();
     let row = item_row(t, author.id, rkey).await?;
     let tomb = t
-        .tombstone_rev(Collection::ListItem, author.id, rkey)
+        .tombstone_rev(Collection::ListItem, author.id, &w.rkey)
         .await?;
     if !lww_upsert_wins(w.stamp, row.as_ref().map(|x| x.rev), tomb) {
         t.report.stale += 1;
         return Ok(());
     }
     // Authority rule held at parse time: r.list.authority == author.
-    let target: Option<(i64, i16)> =
+    let target: Option<(ListId, i16)> =
         sqlx::query_as("SELECT id, track_state FROM lists WHERE owner_id = $1 AND rkey = $2")
             .bind(author.id)
             .bind(r.list.rkey.as_str())
@@ -1234,16 +1240,18 @@ async fn listitem_upsert(
     let tracked = target
         .and_then(|(_, s)| TrackState::from_code(s))
         .is_some_and(TrackState::is_tracked);
+    // `tracked` comes from the same row: where an insert is tried the id is
+    // there, and the fallback below (an id no list has) is never stored.
     let target_id = target.map(|(id, _)| id);
     let seen = seen_for(t, origin, w);
 
     if let Some(old) = &row {
         let same_list = Some(old.list_id) == target_id;
-        let same_subject = t.actor_id(r.subject.as_str()).await? == Some(old.subject_id);
+        let same_subject = t.actor_id(&r.subject).await? == Some(old.subject_id);
         if same_list && same_subject && tracked {
             if let Some(refusal) = t.gate(cause, CapKind::Items) {
                 return t
-                    .refuse(author, Collection::ListItem, rkey, refusal, w.witness)
+                    .refuse(author, Collection::ListItem, &w.rkey, refusal, w.witness)
                     .await;
             }
             sqlx::query(
@@ -1270,7 +1278,16 @@ async fn listitem_upsert(
         t.clear_last_history();
         item_delete_row(t, author, rkey, Some(&removal)).await?;
         let result = if tracked {
-            item_insert(t, author, cause, w, r, target_id.unwrap_or_default(), seen).await?
+            item_insert(
+                t,
+                author,
+                cause,
+                w,
+                r,
+                target_id.unwrap_or(ListId::new(0)),
+                seen,
+            )
+            .await?
         } else {
             Err(ItemRefusal::Untracked)
         };
@@ -1284,9 +1301,9 @@ async fn listitem_upsert(
                 t.relabel_last_history(Removed::RefusedUpdate).await?;
                 // Refused new version with a stored row ⇒ delete +
                 // refusal tombstone at E − 1.
-                t.put_refusal_tombstone(Collection::ListItem, author.id, rkey, w.stamp)
+                t.put_refusal_tombstone(Collection::ListItem, author.id, &w.rkey, w.stamp)
                     .await?;
-                item_refused(t, author, rkey, w, refusal).await
+                item_refused(t, author, w, refusal).await
             }
         };
     }
@@ -1294,12 +1311,22 @@ async fn listitem_upsert(
         t.report.untracked_items += 1;
         return Ok(());
     }
-    match item_insert(t, author, cause, w, r, target_id.unwrap_or_default(), seen).await? {
+    match item_insert(
+        t,
+        author,
+        cause,
+        w,
+        r,
+        target_id.unwrap_or(ListId::new(0)),
+        seen,
+    )
+    .await?
+    {
         Ok(()) => {
             t.report.applied += 1;
             Ok(())
         }
-        Err(refusal) => item_refused(t, author, rkey, w, refusal).await,
+        Err(refusal) => item_refused(t, author, w, refusal).await,
     }
 }
 
@@ -1316,7 +1343,6 @@ enum ItemRefusal {
 async fn item_refused(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
-    rkey: &str,
     w: &Write,
     refusal: ItemRefusal,
 ) -> Result<()> {
@@ -1330,7 +1356,7 @@ async fn item_refused(
             Ok(())
         }
         ItemRefusal::Debt(r) => {
-            t.refuse(author, Collection::ListItem, rkey, r, w.witness)
+            t.refuse(author, Collection::ListItem, &w.rkey, r, w.witness)
                 .await
         }
     }
@@ -1342,7 +1368,7 @@ async fn item_insert(
     cause: &Cause,
     w: &Write,
     r: &ListItemRecord,
-    list_id: i64,
+    list_id: ListId,
     seen: DateTime<Utc>,
 ) -> Result<Result<(), ItemRefusal>> {
     if let Some(refusal) = t.gate(cause, CapKind::Items) {
@@ -1418,7 +1444,7 @@ pub(crate) async fn item_delete_rows(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
     rkeys: &[String],
-    below: Option<i64>,
+    below: Option<Stamp>,
     removal: Option<&Removal>,
 ) -> Result<u64> {
     if rkeys.is_empty() {
@@ -1453,7 +1479,7 @@ pub(crate) async fn item_delete_rows(
     t.deltas.stat(stat::LIST_ITEMS, -n);
     t.deltas.host(&author.buckets, CapKind::Items, -n);
     if let Some(r) = removal {
-        if author.status != crate::codes::actor_status::DELETED {
+        if author.status != crate::codes::ActorStatus::Deleted {
             let rows: Vec<GoneRow> = gone
                 .into_iter()
                 .filter_map(
@@ -1461,7 +1487,7 @@ pub(crate) async fn item_delete_rows(
                         let tracked = ts
                             .and_then(TrackState::from_code)
                             .is_some_and(TrackState::is_tracked);
-                        let record_deleted = rs == Some(RecordState::Deleted.code());
+                        let record_deleted = rs == Some(RecordState::Deleted);
                         let list_rkey = lr?;
                         (tracked || record_deleted).then_some(GoneRow {
                             rkey,
@@ -1504,7 +1530,7 @@ async fn listitem_delete(
             item_delete_row(t, author, rkey, Some(&removal)).await?;
         }
     }
-    t.put_tombstone(Collection::ListItem, author.id, rkey, w.stamp)
+    t.put_tombstone(Collection::ListItem, author.id, &w.rkey, w.stamp)
         .await?;
     t.report.applied += 1;
     Ok(())
@@ -1520,21 +1546,23 @@ async fn list_upsert(
     r: &ListRecord,
 ) -> Result<()> {
     let rkey = w.rkey.as_str();
-    let row: Option<(i64, Option<i64>, i16)> =
+    let row: Option<(ListId, Option<Stamp>, RecordState)> =
         sqlx::query_as("SELECT id, rev, record_state FROM lists WHERE owner_id = $1 AND rkey = $2")
             .bind(author.id)
             .bind(rkey)
             .fetch_optional(&mut *t.conn)
             .await?;
-    let tomb = t.tombstone_rev(Collection::List, author.id, rkey).await?;
+    let tomb = t
+        .tombstone_rev(Collection::List, author.id, &w.rkey)
+        .await?;
     if !lww_upsert_wins(w.stamp, row.and_then(|x| x.1), tomb) {
         t.report.stale += 1;
         return Ok(());
     }
-    let was_present = row.is_some_and(|x| x.2 == RecordState::Present.code());
+    let was_present = row.is_some_and(|x| x.2 == RecordState::Present);
     if let Some(refusal) = t.gate(cause, CapKind::Lists) {
         return t
-            .refuse(author, Collection::List, rkey, refusal, w.witness)
+            .refuse(author, Collection::List, &w.rkey, refusal, w.witness)
             .await;
     }
     if !was_present {
@@ -1551,7 +1579,7 @@ async fn list_upsert(
                 .refuse(
                     author,
                     Collection::List,
-                    rkey,
+                    &w.rkey,
                     Refusal::Capped(CapType::ListsPerAuthor),
                     w.witness,
                 )
@@ -1560,17 +1588,17 @@ async fn list_upsert(
         t.deltas.stat(stat::LISTS, 1);
         t.deltas.host(&author.buckets, CapKind::Lists, 1);
     }
-    let list_id: i64 = sqlx::query_scalar(
+    let list_id: ListId = sqlx::query_scalar(&format!(
         "INSERT INTO lists (owner_id, rkey, record_state, purpose, name, created_at, rev,
                             description, avatar_cid, about_read)
-         VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, true)
-         ON CONFLICT (owner_id, rkey) DO UPDATE SET record_state = 1,
+         VALUES ($1, $2, {RECORD_PRESENT}, $3, $4, $5, $6, $7, $8, true)
+         ON CONFLICT (owner_id, rkey) DO UPDATE SET record_state = {RECORD_PRESENT},
            purpose = EXCLUDED.purpose, name = EXCLUDED.name,
            created_at = EXCLUDED.created_at, rev = EXCLUDED.rev,
            description = EXCLUDED.description, avatar_cid = EXCLUDED.avatar_cid,
            about_read = true
-         RETURNING id",
-    )
+         RETURNING id"
+    ))
     .bind(author.id)
     .bind(rkey)
     .bind(r.purpose.code())
@@ -1594,15 +1622,15 @@ async fn list_upsert(
 pub(crate) async fn list_mark_deleted(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
-    list_id: i64,
+    list_id: ListId,
     was_present: bool,
-    w: i64,
+    w: Stamp,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE lists SET record_state = 2, purpose = NULL, name = NULL, created_at = NULL,
+        &format!("UPDATE lists SET record_state = {RECORD_DELETED}, purpose = NULL, name = NULL, created_at = NULL,
            description = NULL, avatar_cid = NULL,
            rev = GREATEST(COALESCE(rev, $2), $2)
-         WHERE id = $1",
+         WHERE id = $1"),
     )
     .bind(list_id)
     .bind(w)
@@ -1623,7 +1651,7 @@ pub(crate) async fn list_mark_deleted(
 
 async fn list_delete(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<()> {
     let rkey = w.rkey.as_str();
-    let row: Option<(i64, Option<i64>, i16)> =
+    let row: Option<(ListId, Option<Stamp>, RecordState)> =
         sqlx::query_as("SELECT id, rev, record_state FROM lists WHERE owner_id = $1 AND rkey = $2")
             .bind(author.id)
             .bind(rkey)
@@ -1631,11 +1659,11 @@ async fn list_delete(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<
             .await?;
     if let Some((id, rev, state)) = row {
         if rev.is_none_or(|r| r < w.stamp) {
-            let was_present = state == RecordState::Present.code();
+            let was_present = state == RecordState::Present;
             list_mark_deleted(t, author, id, was_present, w.stamp).await?;
         }
     }
-    t.put_tombstone(Collection::List, author.id, rkey, w.stamp)
+    t.put_tombstone(Collection::List, author.id, &w.rkey, w.stamp)
         .await?;
     t.report.applied += 1;
     Ok(())
@@ -1645,7 +1673,7 @@ async fn list_delete(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<
 
 async fn reconcile_candidates(
     t: &mut Txn<'_>,
-    author_id: i64,
+    author_id: ActorId,
     r: &Reconcile,
 ) -> Result<Vec<String>> {
     let sql = match r.collection {
@@ -1664,12 +1692,12 @@ async fn reconcile_candidates(
                AND ($3::text IS NULL OR rkey > $3) AND ($4::text IS NULL OR rkey <= $4)
                AND NOT (rkey = ANY($5)) ORDER BY rkey"
         }
-        Collection::List => {
-            "SELECT rkey FROM lists WHERE owner_id = $1 AND record_state = 1
+        Collection::List => &format!(
+            "SELECT rkey FROM lists WHERE owner_id = $1 AND record_state = {RECORD_PRESENT}
                AND (rev IS NULL OR rev < $2)
                AND ($3::text IS NULL OR rkey > $3) AND ($4::text IS NULL OR rkey <= $4)
                AND NOT (rkey = ANY($5)) ORDER BY rkey"
-        }
+        ),
     };
     let keep: Vec<String> = r.keep.iter().map(|k| k.as_str().to_owned()).collect();
     Ok(sqlx::query_scalar(sql)
@@ -1701,7 +1729,7 @@ async fn apply_reconcile(t: &mut Txn<'_>, r: &Reconcile, candidates: &[String]) 
         Collection::List => {
             let mut gone = 0;
             for rkey in candidates {
-                let row: Option<(i64, i16, Option<i64>)> = sqlx::query_as(
+                let row: Option<(ListId, RecordState, Option<Stamp>)> = sqlx::query_as(
                     "SELECT id, record_state, rev FROM lists WHERE owner_id = $1 AND rkey = $2",
                 )
                 .bind(author.id)
@@ -1710,8 +1738,7 @@ async fn apply_reconcile(t: &mut Txn<'_>, r: &Reconcile, candidates: &[String]) 
                 .await?;
                 match row {
                     Some((id, state, rev))
-                        if state == RecordState::Present.code()
-                            && rev.is_none_or(|rev| rev < r.stamp) =>
+                        if state == RecordState::Present && rev.is_none_or(|rev| rev < r.stamp) =>
                     {
                         list_mark_deleted(t, &author, id, true, r.stamp).await?;
                         gone += 1;
@@ -1724,10 +1751,6 @@ async fn apply_reconcile(t: &mut Txn<'_>, r: &Reconcile, candidates: &[String]) 
     };
     t.report.reconciled += gone;
     Ok(())
-}
-
-fn clamp(v: u64) -> i64 {
-    i64::try_from(v).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

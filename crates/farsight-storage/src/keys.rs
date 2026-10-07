@@ -50,7 +50,9 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// From a loaded config.
+    /// Takes `[limits]` whole and four keys of other sections:
+    /// `firehose.tuning.synthetic_gap_lag`, `storage.tombstone_ttl`,
+    /// `backfill.system_queue_cap` and `storage.block_history_enabled`.
     pub fn from_config(config: &Config) -> Limits {
         Limits {
             cfg: config.limits.clone(),
@@ -126,7 +128,8 @@ impl Limits {
     }
 }
 
-fn clamp(v: u64) -> i64 {
+/// A configured count as a bind value: `i64::MAX` for one beyond it.
+pub(crate) fn clamp(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
@@ -156,7 +159,8 @@ impl CapKind {
         CapKind::Interned,
     ];
 
-    /// `capped_mask` bit.
+    /// The kind's bit in `host_usage.capped_mask`: set while the bucket is
+    /// over the cap of this kind.
     pub fn bit(self) -> i16 {
         match self {
             CapKind::Blocks => 1,

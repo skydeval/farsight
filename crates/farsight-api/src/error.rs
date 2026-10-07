@@ -16,11 +16,12 @@ pub const QUERY_CANCELED: &str = "57014";
 pub struct XrpcError {
     /// HTTP status.
     pub status: StatusCode,
-    /// Stable error name.
+    /// The body's `error`: one of the fixed names, which clients match
+    /// on.
     pub name: &'static str,
-    /// Human-readable message.
+    /// The body's `message`: the detail, in words.
     pub message: String,
-    /// `Retry-After` seconds.
+    /// `Retry-After` in seconds; `None` sends no such header.
     pub retry_after: Option<u64>,
     /// Rate-limit headers to attach.
     pub rate: Option<RateHeaders>,

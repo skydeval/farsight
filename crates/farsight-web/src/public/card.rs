@@ -61,7 +61,7 @@ use super::handles::{self, claimed_handle};
 use super::metrics::{self as m, Page};
 use super::text::{Stamp, clean};
 use super::{Cache, client_key, finish, parse_did};
-use crate::pages::{WebState, resolve_handle};
+use crate::pages::{WebState, handle_to_did};
 
 /// The deadline of all of a card's fetches together.
 pub const CARD_DEADLINE: Duration = Duration::from_secs(3);
@@ -86,7 +86,8 @@ pub enum Outcome {
     PdsFailed,
     /// Complete, without an image because `show_avatars` is off.
     AvatarsDisabled,
-    /// Complete.
+    /// Complete: every part was read, the image included when the
+    /// account has one.
     Served,
 }
 
@@ -100,7 +101,7 @@ impl Outcome {
         Outcome::AvatarsDisabled,
     ];
 
-    /// Metric label.
+    /// The `outcome` label of `farsight_public_ui_cards_total`.
     pub fn label(self) -> &'static str {
         match self {
             Outcome::Served => "served",
@@ -112,7 +113,8 @@ impl Outcome {
     }
 }
 
-/// The fragment.
+/// The profile-card fragment: the HTML the page's script fetches and
+/// shows when an account's link is hovered or focused.
 #[derive(Debug, Template)]
 #[template(path = "public_card.html")]
 struct CardView {
@@ -451,7 +453,7 @@ async fn avatar(
     deadline: tokio::time::Instant,
 ) -> Result<Option<String>, ()> {
     let stored = match st.api.pool.acquire().await {
-        Ok(mut conn) => farsight_storage::handles::avatar_stored(&mut conn, did.as_str())
+        Ok(mut conn) => farsight_storage::handles::avatar_stored(&mut conn, did)
             .await
             .ok()
             .flatten(),
@@ -472,12 +474,8 @@ async fn avatar(
                 Avatar::Unusable => return Ok(None),
             };
             if let Ok(mut conn) = st.api.pool.acquire().await {
-                let written = farsight_storage::handles::avatar_store(
-                    &mut conn,
-                    did.as_str(),
-                    found.as_deref(),
-                )
-                .await;
+                let written =
+                    farsight_storage::handles::avatar_store(&mut conn, did, found.as_deref()).await;
                 if let Err(e) = written {
                     tracing::warn!(error = %e, "an avatar reference could not be stored");
                 }
@@ -509,7 +507,7 @@ async fn handle(
         m::handle_resolution(handles::Outcome::Failed);
         return Ok(handles::settle(st, cfg, did, None).await);
     };
-    match tokio::time::timeout_at(deadline, resolve_handle(&st.safe, claim)).await {
+    match tokio::time::timeout_at(deadline, handle_to_did(&st.safe, claim)).await {
         Ok(Ok(back)) if back == *did => {
             m::handle_resolution(handles::Outcome::Resolved);
             Ok(handles::settle(st, cfg, did, Some(claim.to_owned())).await)
@@ -653,7 +651,7 @@ async fn card(
         let Ok(mut conn) = st.api.pool.acquire().await else {
             return busy();
         };
-        match queries::actor(&mut conn, did.as_str()).await {
+        match queries::actor(&mut conn, &did).await {
             Ok(Some(a)) => withheld
                 .as_ref()
                 .is_none_or(|w| w.reason(did.as_str(), Some(a.status)).is_none()),

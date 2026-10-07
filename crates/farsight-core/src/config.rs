@@ -41,7 +41,7 @@ pub enum ConfigError {
     /// The file could not be read.
     #[error("reading {path}: {source}")]
     Io {
-        /// The path.
+        /// Path of the config file that could not be read.
         path: String,
         /// The I/O error.
         source: std::io::Error,
@@ -58,11 +58,12 @@ pub enum ConfigError {
     /// A `FARSIGHT__*` value could not be converted to the key's type.
     #[error("environment variable {var}: cannot parse {value:?} as {expected}")]
     EnvValue {
-        /// The variable.
+        /// Full name of the variable, prefix included (`FARSIGHT__…`).
         var: String,
-        /// Its value.
+        /// Its raw value, as found in the environment.
         value: String,
-        /// The expected type.
+        /// TOML type of the key's default value, which the raw value must
+        /// convert to: `integer`, `float`, `boolean`, …
         expected: &'static str,
     },
     /// Required keys are missing (listed as dotted paths).
@@ -73,7 +74,7 @@ pub enum ConfigError {
     Invalid {
         /// Dotted key path.
         key: String,
-        /// Why.
+        /// The rule the value breaks, worded for the operator.
         reason: String,
     },
 }
@@ -85,7 +86,8 @@ fn invalid(key: &str, reason: impl Into<String>) -> ConfigError {
     }
 }
 
-/// The complete configuration.
+/// The complete configuration: one field per table of `config.toml`. A key
+/// the schema does not know is refused at every level.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -119,7 +121,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Listen address.
+    /// Listen address of the API and the web UI, as `host:port`.
     pub bind: String,
     /// Public hostname (absolute links, User-Agent). Required.
     pub hostname: String,
@@ -148,7 +150,8 @@ pub struct StorageConfig {
     /// Hard ceiling in bytes; 0 means 115% of `budget_bytes`. Must exceed
     /// the budget after defaulting.
     pub hard_ceiling_bytes: u64,
-    /// Tombstone TTL.
+    /// How long a deletion's tombstone is kept before the janitor deletes
+    /// it.
     pub tombstone_ttl: ConfigDuration,
     /// Record removed blocks, listblocks and list memberships.
     pub block_history_enabled: bool,
@@ -207,15 +210,20 @@ impl Default for FirehoseConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FirehoseTuning {
-    /// v1 heuristic gap threshold.
+    /// On a resume, a first event later than the requested cursor by more
+    /// than this counts as a clamp (the instance no longer had the
+    /// position) and opens a gap.
     pub gap_threshold: ConfigDuration,
-    /// Minimum failover rewind.
+    /// Smallest rewind on failover: the new instance is asked for the
+    /// applied position minus the larger of this and its lag plus 5
+    /// minutes.
     pub failover_rewind_min: ConfigDuration,
-    /// Maximum instance lag for a gapless failover.
+    /// Largest lag of the new instance for which such a rewind is trusted
+    /// to leave no gap.
     pub failover_max_lag: ConfigDuration,
     /// Lag beyond which the synthetic gap exists.
     pub synthetic_gap_lag: ConfigDuration,
-    /// No-message stall timeout.
+    /// Silence on the connection that ends a session.
     pub stall_timeout: ConfigDuration,
     /// Seam repair window start, before the session's connect.
     pub seam_repair_before: ConfigDuration,
@@ -248,17 +256,19 @@ impl Default for FirehoseTuning {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackfillConfig {
-    /// Worker pool size.
+    /// Worker pool size; positive. The backfill process's database pool is
+    /// this plus 8 connections.
     pub concurrency: u32,
-    /// Per-host request rate.
+    /// Requests per second towards any one PDS host.
     pub per_host_rps: u32,
-    /// PLC directory URL.
+    /// Base URL of the PLC directory: `did:plc` resolution, and the export
+    /// the `plc` sweep source reads.
     pub plc_url: String,
-    /// PLC request rate.
+    /// Requests per second towards the PLC directory, in total.
     pub plc_rps: u32,
     /// Seed PDS resolution from the PLC export.
     pub plc_seed_from_export: bool,
-    /// Relay URL.
+    /// Base URL of the relay whose listings enumerate repositories.
     pub relay_url: String,
     /// `requestBackfill` freshness window.
     pub request_fresh_window: ConfigDuration,
@@ -276,7 +286,8 @@ pub struct BackfillConfig {
     pub phase1_retry: Vec<ConfigDuration>,
     /// Wall-clock cap on one list fetch run.
     pub list_fetch_max_duration: ConfigDuration,
-    /// Repair candidate slack.
+    /// Margin before a gap's start when a repair chooses the accounts to
+    /// re-read: those whose rev is at or after `from − repair_slack − lag`.
     pub repair_slack: ConfigDuration,
     /// In-memory seen-set cap for out-of-order listings.
     pub seen_set_cap: u64,
@@ -336,7 +347,7 @@ impl Default for BackfillConfig {
     }
 }
 
-/// Sweep enumeration source.
+/// `backfill.sweep.source`: where the sweep enumerates repositories from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SweepSource {
@@ -377,7 +388,7 @@ impl Default for RepairConfig {
 pub struct SweepConfig {
     /// Whether the systematic sweep runs.
     pub enabled: bool,
-    /// Enumeration source.
+    /// Where the sweep enumerates repositories from.
     pub source: SweepSource,
     /// Pacing cap; 0 = host-bounded.
     pub max_repos_per_hour: u64,
@@ -437,7 +448,7 @@ pub enum ReadsMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccessConfig {
-    /// Read access mode.
+    /// Who may call the read queries.
     pub reads: ReadsMode,
     /// Send `Access-Control-Allow-Origin: *` on reads.
     pub cors: bool,
@@ -477,7 +488,7 @@ pub enum ThemeDefault {
 }
 
 impl ThemeDefault {
-    /// The config value.
+    /// The spelling in `config.toml`: `light`, `dark` or `system`.
     pub fn as_str(self) -> &'static str {
         match self {
             ThemeDefault::Light => "light",
@@ -520,7 +531,7 @@ pub struct PublicUiConfig {
     pub crawlable: bool,
     /// Public page views per second per client address.
     pub rate_limit_rps: u32,
-    /// Burst of the same class.
+    /// Burst of the public page view limit; positive.
     pub rate_limit_burst: u32,
     /// Concurrent public page renders; at most
     /// `rate_limit.query_concurrency`.
@@ -711,7 +722,8 @@ pub enum ProxyMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyConfig {
-    /// Proxy mode.
+    /// Which header, if any, names the client address when the TCP peer is
+    /// in `trusted`.
     pub mode: ProxyMode,
     /// Trusted proxy CIDRs (validated by [`validate_trusted_proxy`]).
     pub trusted: Vec<IpNet>,
@@ -751,9 +763,9 @@ pub struct LimitsConfig {
     pub did_admissions_per_day: u64,
     /// Extra shared CDN/anycast ranges excluded as address buckets.
     pub cdn_ranges_extra: Vec<IpNet>,
-    /// Items per list.
+    /// Stored items per list.
     pub list_items_per_list: u64,
-    /// Items per owner.
+    /// Stored items per list owner, over all of the owner's lists.
     pub list_items_per_owner: u64,
     /// Stored blocks per author.
     pub blocks_per_author: u64,
@@ -853,13 +865,14 @@ pub struct NetConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateLimitConfig {
-    /// Anonymous read rate.
+    /// Anonymous read queries per second per client address.
     pub anon_rps: u32,
-    /// Anonymous read burst.
+    /// Burst of the anonymous read limit.
     pub anon_burst: u32,
-    /// API-key read rate.
+    /// Read queries per second per API key, unless the key has its own
+    /// rate.
     pub key_rps: u32,
-    /// API-key read burst.
+    /// Burst of the API-key read limit.
     pub key_burst: u32,
     /// Admin `requestBackfill` rate.
     pub admin_backfill_rps: u32,
@@ -867,7 +880,8 @@ pub struct RateLimitConfig {
     pub key_backfill_rps: u32,
     /// UI lookup rate (anonymous).
     pub ui_lookup_rps: u32,
-    /// Concurrent read queries.
+    /// Concurrent API requests; also sizes the API connection pool. Read at
+    /// start only.
     pub query_concurrency: u32,
     /// Read query `statement_timeout`.
     pub query_timeout: ConfigDuration,
@@ -893,9 +907,9 @@ impl Default for RateLimitConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsConfig {
-    /// Server metrics listener.
+    /// The server's metrics listener, as `host:port`.
     pub bind: String,
-    /// Backfill metrics listener.
+    /// The backfill process's metrics listener, as `host:port`.
     pub backfill_bind: String,
     /// Optional bearer token hash; empty = no auth.
     pub bearer_token_sha256: String,
@@ -923,7 +937,7 @@ pub enum StartMode {
 /// A validated config plus provenance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedConfig {
-    /// The config.
+    /// The merged config: defaults, then the file, then the environment.
     pub config: Config,
     /// Dotted keys set from the environment (locked in the settings UI).
     pub env_keys: Vec<String>,

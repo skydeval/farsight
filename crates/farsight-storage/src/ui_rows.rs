@@ -29,6 +29,11 @@
 //! the pieces it needs are here ([`index_state`], [`estimate_bytes`],
 //! [`create_index`], [`drop_index`]).
 
+use crate::codes::sql::{
+    GONE, HIDDEN, HIDDEN_BUT_SUSPENDED, HIDDEN_BUT_TAKENDOWN, RECORD_PRESENT, TRACK_SERVED,
+};
+use crate::ids::{ActorId, ListId};
+use farsight_core::ListPurpose;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
@@ -43,18 +48,15 @@ pub const SHOWN_TIME: &str = "COALESCE(LEAST(created_at, first_seen), '-infinity
 /// The same on the row alias the queries use.
 const SHOWN_B: &str = "COALESCE(LEAST(b.created_at, b.first_seen), '-infinity'::timestamptz)";
 
-/// SQL fragment: status codes hidden by default.
-const HIDDEN: &str = "(1, 2, 3, 4)";
-
-/// The statuses a table leaves out, as an SQL list: deactivated (1) and
-/// deleted (4) always; taken down (2) unless `takendown`; suspended (3)
-/// unless `suspended`. With neither, the API's hidden set.
+/// The statuses a table leaves out, as an SQL list: deactivated and
+/// deleted always; taken down unless `taken_down`; suspended unless
+/// `suspended`. With neither, the API's hidden set.
 pub fn hidden_statuses(suspended: bool, taken_down: bool) -> &'static str {
     match (suspended, taken_down) {
         (false, false) => HIDDEN,
-        (true, false) => "(1, 2, 4)",
-        (false, true) => "(1, 3, 4)",
-        (true, true) => "(1, 4)",
+        (true, false) => HIDDEN_BUT_SUSPENDED,
+        (false, true) => HIDDEN_BUT_TAKENDOWN,
+        (true, true) => GONE,
     }
 }
 
@@ -208,6 +210,40 @@ pub enum Order {
     Shown,
 }
 
+/// What a section's rows are read by: the account whose blocks the two
+/// block sections show, the list whose listblocks or items the two list
+/// sections show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionKey {
+    /// [`Section::IncomingBlocks`] (the subject) and
+    /// [`Section::OutgoingBlocks`] (the author).
+    Actor(ActorId),
+    /// [`Section::ListBlockers`] and [`Section::ListMembers`].
+    List(ListId),
+}
+
+impl SectionKey {
+    /// The id as the key column stores it.
+    pub const fn get(self) -> i64 {
+        match self {
+            SectionKey::Actor(id) => id.get(),
+            SectionKey::List(id) => id.get(),
+        }
+    }
+}
+
+impl From<ActorId> for SectionKey {
+    fn from(id: ActorId) -> SectionKey {
+        SectionKey::Actor(id)
+    }
+}
+
+impl From<ListId> for SectionKey {
+    fn from(id: ListId) -> SectionKey {
+        SectionKey::List(id)
+    }
+}
+
 /// One row of a section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -226,7 +262,7 @@ pub struct Row {
 pub struct Find {
     /// `actors.id` of the accounts named outright (a DID, or a handle
     /// that was resolved).
-    pub ids: Vec<i64>,
+    pub ids: Vec<ActorId>,
     /// A `LIKE` pattern, lower-case, its wildcards already escaped: it is
     /// matched against DIDs and against the handles in `handle_cache`, so
     /// an account whose handle was never verified is found by its DID
@@ -264,7 +300,7 @@ pub struct Filter<'a> {
     pub show_taken_down: bool,
     /// Rows whose listed account is one of these `actors.id` values
     /// (`public_ui.excluded_dids`).
-    pub excluded: &'a [i64],
+    pub excluded: &'a [ActorId],
     /// Only the rows the filter box asks for.
     pub find: Option<&'a Find>,
 }
@@ -281,7 +317,7 @@ fn keyed_by_party(section: Section, order: Order) -> bool {
 fn build<'a>(
     prefix: &str,
     section: Section,
-    key: i64,
+    key: SectionKey,
     order: Order,
     filter: Filter<'a>,
     offset: i64,
@@ -294,7 +330,7 @@ fn build<'a>(
         section.table(),
         section.key()
     ));
-    q.push_bind(key);
+    q.push_bind(key.get());
     if filter.hide_inactive {
         q.push(format!(
             " AND a.status NOT IN {}",
@@ -344,7 +380,7 @@ type Raw = (String, String, Option<DateTime<Utc>>);
 pub async fn rows_at(
     conn: &mut PgConnection,
     section: Section,
-    key: i64,
+    key: SectionKey,
     order: Order,
     filter: Filter<'_>,
     offset: i64,
@@ -376,8 +412,8 @@ pub struct NamingRow {
     pub name: Option<String>,
     /// Counted listblocks on it.
     pub listblock_count: i32,
-    /// Its `purpose` code, if the record states one Farsight knows.
-    pub purpose: Option<i16>,
+    /// The list's purpose; `None` if the stored row has none.
+    pub purpose: Option<ListPurpose>,
     /// Owner-claimed `createdAt` of the listitem naming the account (the
     /// one with the lowest record key if it is named twice).
     pub added_at: Option<DateTime<Utc>>,
@@ -392,7 +428,7 @@ fn naming_from(ids: u8, pattern: u8) -> String {
     format!(
         "JOIN lists l ON l.id = x.list_id
          JOIN actors o ON o.id = l.owner_id
-         WHERE l.track_state IN (2, 3) AND l.record_state = 1
+         WHERE l.track_state IN {TRACK_SERVED} AND l.record_state = {RECORD_PRESENT}
            AND o.status NOT IN {} AND NOT (o.id = ANY($2))
            AND (${ids}::bigint[] IS NULL OR o.id = ANY(${ids})
                 OR lower(l.name) LIKE ${pattern}::text OR o.did LIKE ${pattern}::text
@@ -423,8 +459,8 @@ fn naming_sql() -> String {
 /// part of the stable API and is not touched.
 pub async fn lists_naming(
     conn: &mut PgConnection,
-    subject_id: i64,
-    excluded: &[i64],
+    subject_id: ActorId,
+    excluded: &[ActorId],
     find: Option<&Find>,
     offset: i64,
     limit: i64,
@@ -454,7 +490,7 @@ pub async fn lists_naming(
                 rkey,
                 name,
                 listblock_count,
-                purpose,
+                purpose: purpose.map(ListPurpose::from_code),
                 added_at,
             },
         )
@@ -465,8 +501,8 @@ pub async fn lists_naming(
 /// counted up to `cap + 1`: a result above `cap` means "more than `cap`".
 pub async fn lists_naming_count(
     conn: &mut PgConnection,
-    subject_id: i64,
-    excluded: &[i64],
+    subject_id: ActorId,
+    excluded: &[ActorId],
     find: Option<&Find>,
     cap: i64,
 ) -> Result<i64> {
@@ -497,8 +533,8 @@ pub struct BlockedList {
     pub rkey: String,
     /// Its name, if Farsight holds its record and the record has one.
     pub name: Option<String>,
-    /// Its `purpose` code, likewise.
-    pub purpose: Option<i16>,
+    /// Its purpose, likewise.
+    pub purpose: Option<ListPurpose>,
     /// The record key of the account's listblock.
     pub block_rkey: String,
     /// The listblock's stated `createdAt`.
@@ -511,7 +547,7 @@ pub struct BlockedList {
 fn blocked_where(all: u8, ids: u8, pattern: u8) -> String {
     format!(
         "WHERE b.author_id = $1 AND NOT (o.id = ANY($2))
-           AND (${all} OR (l.track_state IN (2, 3) AND l.record_state = 1
+           AND (${all} OR (l.track_state IN {TRACK_SERVED} AND l.record_state = {RECORD_PRESENT}
                           AND o.status NOT IN {}))
            AND (${ids}::bigint[] IS NULL OR o.id = ANY(${ids})
                 OR lower(l.name) LIKE ${pattern}::text OR o.did LIKE ${pattern}::text
@@ -529,8 +565,8 @@ fn blocked_where(all: u8, ids: u8, pattern: u8) -> String {
 /// listblock the account has, whatever Farsight knows of the list.
 pub async fn lists_blocked(
     conn: &mut PgConnection,
-    author_id: i64,
-    excluded: &[i64],
+    author_id: ActorId,
+    excluded: &[ActorId],
     find: Option<&Find>,
     all: bool,
     offset: i64,
@@ -569,7 +605,7 @@ pub async fn lists_blocked(
                 owner_did,
                 rkey,
                 name,
-                purpose,
+                purpose: purpose.map(ListPurpose::from_code),
                 block_rkey,
                 created_at,
             },
@@ -580,8 +616,8 @@ pub async fn lists_blocked(
 /// How many rows [`lists_blocked`] pages over, counted up to `cap + 1`.
 pub async fn lists_blocked_count(
     conn: &mut PgConnection,
-    author_id: i64,
-    excluded: &[i64],
+    author_id: ActorId,
+    excluded: &[ActorId],
     find: Option<&Find>,
     all: bool,
     cap: i64,
@@ -611,8 +647,8 @@ pub async fn lists_blocked_count(
 /// counts twice.
 pub async fn lists_naming_listblocks(
     conn: &mut PgConnection,
-    subject_id: i64,
-    excluded: &[i64],
+    subject_id: ActorId,
+    excluded: &[ActorId],
 ) -> Result<i64> {
     Ok(sqlx::query_scalar(&format!(
         "SELECT COALESCE(sum(l.listblock_count), 0)::bigint
@@ -623,7 +659,7 @@ pub async fn lists_naming_listblocks(
     ))
     .bind(subject_id)
     .bind(excluded)
-    .bind(None::<&[i64]>)
+    .bind(None::<&[ActorId]>)
     .bind(None::<&str>)
     .fetch_one(conn)
     .await?)
@@ -636,7 +672,7 @@ pub async fn lists_naming_listblocks(
 pub async fn explain(
     conn: &mut PgConnection,
     section: Section,
-    key: i64,
+    key: SectionKey,
     order: Order,
     filter: Filter<'_>,
     offset: i64,
@@ -753,7 +789,9 @@ mod tests {
     use super::*;
 
     fn sql(section: Section, order: Order, filter: Filter<'_>) -> String {
-        build("", section, 1, order, filter, 0, 50).sql().to_owned()
+        build("", section, ActorId::new(1).into(), order, filter, 0, 50)
+            .sql()
+            .to_owned()
     }
 
     #[test]
@@ -824,7 +862,7 @@ mod tests {
 
     #[test]
     fn filters_run_in_the_query() {
-        let ids = [7i64];
+        let ids = [ActorId::new(7)];
         let f = Filter {
             hide_inactive: true,
             show_suspended: false,

@@ -35,13 +35,16 @@ use tokio::sync::{Semaphore, watch};
 
 use farsight_core::task::supervise;
 
+use crate::error::{CloudflareError, ServerError};
 use crate::tasks::{self, TaskCtx};
 use crate::{ModeEnd, VERSION, health, metrics_http, sort_indexes};
 
 /// Extra API-pool connections beyond the query semaphore (writes,
 /// lookups, health).
 pub const API_POOL_EXTRA: u32 = 8;
-/// Tasks pool size.
+/// Connections of the pool shared by the periodic tasks, the counter
+/// flusher and the sort-index builder's short checks: apart from the API
+/// pool and from ingest's, so neither can starve them.
 pub const TASKS_POOL: u32 = 4;
 /// Counter sink shard of the server's own writes (ingest uses 0).
 pub const TASKS_SHARD: i16 = 1;
@@ -65,11 +68,11 @@ async fn connect_retry(
     url: &str,
     max: u32,
     shutdown: &mut watch::Receiver<bool>,
-) -> Result<Option<PgPool>, String> {
+) -> Option<PgPool> {
     let mut wait = Duration::from_millis(500);
     loop {
         match farsight_storage::connect(url, max).await {
-            Ok(p) => return Ok(Some(p)),
+            Ok(p) => return Some(p),
             Err(e) => {
                 tracing::warn!(error = %e, "database not reachable yet; retrying");
             }
@@ -77,7 +80,7 @@ async fn connect_retry(
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             _ = shutdown.changed() => {
-                if *shutdown.borrow() { return Ok(None); }
+                if *shutdown.borrow() { return None; }
             }
         }
         wait = (wait * 2).min(Duration::from_secs(10));
@@ -92,27 +95,31 @@ async fn stopped(mut rx: watch::Receiver<bool>) {
     }
 }
 
-/// Runs normal mode.
+/// Runs normal mode until `shutdown` flips ([`ModeEnd::Shutdown`]) or the
+/// configuration is reset from the admin UI ([`ModeEnd::Switch`], and the
+/// caller enters setup mode). `env` is the environment captured at
+/// start-up, which config edits are validated against. An error is a
+/// failed start-up step, a listener failure or a panicked ingest task.
 pub async fn run(
     loaded: LoadedConfig,
     config_path: PathBuf,
     env: Vec<(String, String)>,
     mut shutdown: watch::Receiver<bool>,
     metrics_handle: Option<PrometheusHandle>,
-) -> Result<ModeEnd, String> {
+) -> Result<ModeEnd, ServerError> {
     for w in &loaded.warnings {
         tracing::warn!(warning = %w, "configuration");
     }
     let cfg = loaded.config.clone();
     let api_pool_size = cfg.rate_limit.query_concurrency + API_POOL_EXTRA;
     let Some(api_pool) =
-        connect_retry(&cfg.storage.database_url, api_pool_size, &mut shutdown).await?
+        connect_retry(&cfg.storage.database_url, api_pool_size, &mut shutdown).await
     else {
         return Ok(ModeEnd::Shutdown);
     };
     farsight_storage::migrate(&api_pool)
         .await
-        .map_err(|e| format!("migrations: {e}"))?;
+        .map_err(ServerError::step("migrations"))?;
     tracing::info!(
         schema = farsight_storage::SCHEMA_VERSION,
         "migrations applied"
@@ -122,15 +129,11 @@ pub async fn run(
     let recording =
         farsight_storage::history::sync_window(&api_pool, cfg.storage.block_history_enabled)
             .await
-            .map_err(|e| format!("history window: {e}"))?;
+            .map_err(ServerError::step("history window"))?;
     tracing::info!(recording, "block and list-membership history");
     let ingest_pool =
-        farsight_storage::connect(&cfg.storage.database_url, farsight_ingest::POOL_SIZE)
-            .await
-            .map_err(|e| e.to_string())?;
-    let tasks_pool = farsight_storage::connect(&cfg.storage.database_url, TASKS_POOL)
-        .await
-        .map_err(|e| e.to_string())?;
+        farsight_storage::connect(&cfg.storage.database_url, farsight_ingest::POOL_SIZE).await?;
+    let tasks_pool = farsight_storage::connect(&cfg.storage.database_url, TASKS_POOL).await?;
 
     let config = Arc::new(ConfigStore::new(config_path.clone(), env, loaded));
     let gates = Arc::new(SharedGates::default());
@@ -141,7 +144,7 @@ pub async fn run(
     icfg.gates = gates.clone();
     let ingest = Ingest::start(icfg, ingest_pool)
         .await
-        .map_err(|e| format!("starting ingest: {e}"))?;
+        .map_err(ServerError::Ingest)?;
 
     // The server's own counter sink (janitors, requestBackfill interning).
     let counters = Arc::new(CounterSink::new(TASKS_SHARD));
@@ -198,7 +201,7 @@ pub async fn run(
     let keys = Arc::new(farsight_api::auth::KeyTable::default());
     keys.refresh(&api_pool)
         .await
-        .map_err(|e| format!("loading API keys: {e}"))?;
+        .map_err(ServerError::step("loading API keys"))?;
     let limiter = Arc::new(farsight_api::ratelimit::RateLimiter::default());
     let trust = Arc::new(ProxyTrust::default());
     let cf = Arc::new(CfTracker::default());
@@ -214,7 +217,7 @@ pub async fn run(
     let sort = Arc::new(farsight_storage::ui_rows::SortIndexes::default());
     sort_indexes::load(&api_pool, &sort)
         .await
-        .map_err(|e| format!("reading the sort indexes: {e}"))?;
+        .map_err(ServerError::step("reading the sort indexes"))?;
 
     let api = Arc::new(ApiState {
         pool: api_pool.clone(),
@@ -352,7 +355,7 @@ pub async fn run(
     let bind = cfg.server.bind.clone();
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .map_err(|e| format!("binding {bind}: {e}"))?;
+        .map_err(ServerError::io(format!("binding {bind}")))?;
     tracing::info!(bind, hostname = %cfg.server.hostname, "normal mode: serving");
 
     // Not periodic jobs: the warming worker waits on its queue, and the
@@ -444,11 +447,9 @@ pub async fn run(
     let _ = keys.flush_usage(&api_pool).await;
     api_pool.close().await;
     tasks_pool.close().await;
-    served.map_err(|e| format!("listener: {e}"))?;
+    served.map_err(ServerError::io("listener"))?;
     if let Some(task) = *ingest_failed.lock().unwrap_or_else(|e| e.into_inner()) {
-        return Err(format!(
-            "the ingest task {task} panicked; exiting so that ingest resumes from its stored position"
-        ));
+        return Err(ServerError::IngestPanicked(task));
     }
     if *reset_rx.borrow_and_update() {
         tracing::info!("configuration reset; entering setup mode in-process");
@@ -460,38 +461,38 @@ pub async fn run(
 /// Largest Cloudflare range list accepted.
 const CLOUDFLARE_LIST_MAX_BYTES: usize = 256 * 1024;
 
-async fn refresh_cloudflare() -> Result<Vec<ipnet::IpNet>, String> {
+async fn refresh_cloudflare() -> Result<Vec<ipnet::IpNet>, CloudflareError> {
+    let unusable = |url: &'static str, problem: String| CloudflareError::List { url, problem };
     // Direct, like every other outbound request: a proxy named in the
     // environment is not used.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .no_proxy()
-        .build()
-        .map_err(|e| e.to_string())?;
+        .build()?;
     let mut all = Vec::new();
     for url in farsight_core::cloudflare::REFRESH_URLS {
         let mut resp = client
             .get(url)
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| e.to_string())?;
+            .and_then(reqwest::Response::error_for_status)?;
         // The lists are a few hundred bytes; the cap is what a response
         // may cost at most.
         let mut body = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        while let Some(chunk) = resp.chunk().await? {
             if body.len() + chunk.len() > CLOUDFLARE_LIST_MAX_BYTES {
-                return Err(format!(
-                    "{url}: larger than {CLOUDFLARE_LIST_MAX_BYTES} bytes"
+                return Err(unusable(
+                    url,
+                    format!("larger than {CLOUDFLARE_LIST_MAX_BYTES} bytes"),
                 ));
             }
             body.extend_from_slice(&chunk);
         }
-        let text = String::from_utf8(body).map_err(|e| format!("{url}: {e}"))?;
+        let text = String::from_utf8(body).map_err(|e| unusable(url, e.to_string()))?;
         let nets = farsight_core::cloudflare::parse_list(&text)
-            .ok_or_else(|| format!("{url}: unexpected content"))?;
+            .ok_or_else(|| unusable(url, "unexpected content".into()))?;
         if nets.is_empty() {
-            return Err(format!("{url}: empty list"));
+            return Err(unusable(url, "empty list".into()));
         }
         all.extend(nets);
     }

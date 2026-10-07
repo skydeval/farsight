@@ -313,4 +313,64 @@ mod tests {
         assert_eq!(serde_json::from_str::<Did>(&j).unwrap(), d);
         assert!(serde_json::from_str::<Did>("\"did:key:x\"").is_err());
     }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// Any string at all: parsing returns, and what it accepts is the
+        /// input itself, within the length bound, in ASCII, of a method
+        /// the accessors agree on.
+        #[test]
+        fn parsing_is_total_and_accepted_dids_round_trip(
+            s in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "did:(plc|web|key|PLC|)?:?[a-zA-Z2-7.%:_-]{0,40}",
+                "did:web:[a-z0-9.-]{0,30}(%3[Aa][0-9]{0,6})?",
+                "did:plc:[a-z2-7]{23,25}",
+            ],
+        ) {
+            let Ok(did) = Did::parse(&s) else { return Ok(()) };
+            proptest::prop_assert_eq!(did.as_str(), s.as_str());
+            proptest::prop_assert_eq!(did.to_string(), s.clone());
+            proptest::prop_assert_eq!(s.parse::<Did>(), Ok(did.clone()));
+            proptest::prop_assert!(s.len() <= MAX_DID_LEN && s.is_ascii());
+            match did.method() {
+                DidMethod::Plc => {
+                    proptest::prop_assert_eq!(s.len(), "did:plc:".len() + 24);
+                    proptest::prop_assert_eq!(did.web_host(), None);
+                }
+                DidMethod::Web => {
+                    proptest::prop_assert!(s.starts_with("did:web:"));
+                    let host = did.web_host().unwrap_or_default();
+                    proptest::prop_assert!(!host.is_empty() && !host.contains(['%', ':']));
+                    proptest::prop_assert!(host == "localhost" || is_valid_hostname(&host));
+                }
+            }
+            let json = serde_json::to_string(&did).unwrap();
+            proptest::prop_assert_eq!(serde_json::from_str::<Did>(&json).unwrap(), did);
+        }
+
+        /// Every `did:plc` of 24 base32 characters is accepted, and none of
+        /// another length.
+        #[test]
+        fn plc_identifiers_are_24_base32_characters(id in "[a-z2-7]{0,40}") {
+            let ok = Did::parse(&format!("did:plc:{id}")).is_ok();
+            proptest::prop_assert_eq!(ok, id.len() == 24);
+        }
+
+        /// Hostname syntax over arbitrary strings: total, and what it
+        /// accepts has two labels or more within the bounds.
+        #[test]
+        fn hostnames_are_bounded(
+            h in proptest::prop_oneof![
+                proptest::prelude::any::<String>(),
+                "[a-zA-Z0-9.-]{0,300}",
+            ],
+        ) {
+            if is_valid_hostname(&h) {
+                proptest::prop_assert!(h.len() <= 253 && h.split('.').count() >= 2);
+                proptest::prop_assert!(h.split('.').all(|l| (1..=63).contains(&l.len())));
+            }
+        }
+    }
 }

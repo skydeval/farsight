@@ -87,7 +87,7 @@ async fn consistency(env: &Env, c: &mut Checks, label: &str) -> Result<()> {
 
 async fn recount_all(env: &Env) -> Result<recount::RecountReport> {
     let mut total = recount::RecountReport::default();
-    let mut after = 0;
+    let mut after = ListId::new(0);
     loop {
         let (r, last) =
             recount::recount_lists(&env.pool, &env.limits, &env.counters, after, 500).await?;
@@ -98,7 +98,7 @@ async fn recount_all(env: &Env) -> Result<recount::RecountReport> {
             None => break,
         }
     }
-    let mut after = 0;
+    let mut after = ActorId::new(0);
     loop {
         let (r, last) = recount::recount_actors(&env.pool, after, 500).await?;
         total.checked += r.checked;
@@ -343,7 +343,7 @@ pub async fn s6_counted_stickiness(env: &mut Env, c: &mut Checks) -> Result<()> 
             env.firehose(std::mem::take(&mut batch)).await?;
         }
     }
-    let a_id = env.actor_id(&a).await?.unwrap_or(-1);
+    let a_id = env.actor_id(&a).await?.unwrap_or(NO_ACTOR);
     let counts = |sql: &'static str| {
         let pool = env.pool.clone();
         async move {
@@ -382,7 +382,7 @@ pub async fn s6_counted_stickiness(env: &mut Env, c: &mut Checks) -> Result<()> 
         env.debt(&a, DebtReason::Capped.code()).await?,
         Some(Some(CapType::TriggerCap.code())),
     );
-    let x1 = env.list_id(&owners[0], "x1").await?.unwrap_or(-1);
+    let x1 = env.list_id(&owners[0], "x1").await?.unwrap_or(NO_LIST);
     c.eq(
         "uncounted listblock cannot admit its list",
         (
@@ -397,8 +397,8 @@ pub async fn s6_counted_stickiness(env: &mut Env, c: &mut Checks) -> Result<()> 
     let r = env
         .listing(
             vec![
-                listblock(&a, "c0000", &owners[0], "l0", 0),
-                listblock(&a, "u1", &owners[0], "x1", 0),
+                listblock(&a, "c0000", &owners[0], "l0", Stamp::ZERO),
+                listblock(&a, "u1", &owners[0], "x1", Stamp::ZERO),
             ],
             rev(n_rev),
         )
@@ -472,7 +472,7 @@ pub async fn s6_counted_stickiness(env: &mut Env, c: &mut Checks) -> Result<()> 
         let id = env
             .list_id(&owners[0], &format!("x{k}"))
             .await?
-            .unwrap_or(-1);
+            .unwrap_or(NO_LIST);
         let v = env.list_view(id).await?;
         c.eq(
             format!("x{k} admitted by the flip"),
@@ -530,7 +530,9 @@ pub async fn s7_tombstone_ttl(env: &mut Env, c: &mut Checks) -> Result<()> {
         env.tombstone(Collection::Block, &a, "k").await?,
         Some(e),
     );
-    let r = env.listing(vec![block(&a, "k", &s, 0)], rev(150)).await?;
+    let r = env
+        .listing(vec![block(&a, "k", &s, Stamp::ZERO)], rev(150))
+        .await?;
     c.eq(
         "stale listing (R < E) cannot re-insert while the tombstone lives",
         r.stale,
@@ -554,7 +556,11 @@ pub async fn s7_tombstone_ttl(env: &mut Env, c: &mut Checks) -> Result<()> {
     let now = db_now(env).await?;
     let stale_read_at = now - chrono::Duration::hours(7 * 24 + 1);
     let err = env
-        .listing_at(vec![block(&a, "k", &s, 0)], rev(150), stale_read_at)
+        .listing_at(
+            vec![block(&a, "k", &s, Stamp::ZERO)],
+            rev(150),
+            stale_read_at,
+        )
         .await;
     c.check(
         "listing with a stamp read > 72 h ago is refused (StaleStamp)",
@@ -569,7 +575,7 @@ pub async fn s7_tombstone_ttl(env: &mut Env, c: &mut Checks) -> Result<()> {
     // Boundary of the 72 h window.
     let ok = env
         .listing_at(
-            vec![block(&a, "k71", &s, 0)],
+            vec![block(&a, "k71", &s, Stamp::ZERO)],
             rev(300),
             now - chrono::Duration::hours(71),
         )
@@ -581,7 +587,7 @@ pub async fn s7_tombstone_ttl(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
     let late = env
         .listing_at(
-            vec![block(&a, "k73", &s, 0)],
+            vec![block(&a, "k73", &s, Stamp::ZERO)],
             rev(300),
             now - chrono::Duration::hours(73),
         )
@@ -867,7 +873,7 @@ pub async fn s9_coverage_plumbing(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
     drain(&mut listener).await;
     let snap = coverage::read_snapshot(&env.pool, &env.limits).await?;
-    let l = env.list_id(&owner, "L").await?.unwrap_or(-1);
+    let l = env.list_id(&owner, "L").await?.unwrap_or(NO_LIST);
     c.eq("snapshot: one pending list", snap.lists.pending, 1);
     c.eq(
         "snapshot: pending list takes effect",
@@ -886,7 +892,13 @@ pub async fn s9_coverage_plumbing(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
     // A listing-stored listblock (witnessed_at NULL) makes it historical.
     env.listing(
-        vec![listblock(&plc("covblocker", 2), "k", &owner, "L", 0)],
+        vec![listblock(
+            &plc("covblocker", 2),
+            "k",
+            &owner,
+            "L",
+            Stamp::ZERO,
+        )],
         rev(20),
     )
     .await?;
@@ -897,7 +909,10 @@ pub async fn s9_coverage_plumbing(env: &mut Env, c: &mut Checks) -> Result<()> {
         "",
     );
     // A resync debt makes the author uncovered: its listblock stops counting.
-    let b2 = env.actor_id(&plc("covblocker", 2)).await?.unwrap_or(-1);
+    let b2 = env
+        .actor_id(&plc("covblocker", 2))
+        .await?
+        .unwrap_or(NO_ACTOR);
     farsight_storage::debts::add_debt(&env.pool, b2, DebtReason::Resync, None, w3).await?;
     c.check(
         "NOTIFY on debt insert",
@@ -929,10 +944,13 @@ pub async fn s9_coverage_plumbing(env: &mut Env, c: &mut Checks) -> Result<()> {
         "open v1 gap ⇒ nothing after it covered, sync_events_unavailable",
         !snap.covered(Some(w2), lag)
             && !snap.covered(Some(w1), lag)
-            && coverage::network_scope(&snap, 1, lag)
+            && coverage::network_scope(&snap, farsight_core::Collection::Block, lag)
                 .reasons
                 .contains(&"sync_events_unavailable"),
-        format!("{:?}", coverage::network_scope(&snap, 1, lag)),
+        format!(
+            "{:?}",
+            coverage::network_scope(&snap, farsight_core::Collection::Block, lag)
+        ),
     );
     let closed =
         firehose::close_sync_unavailable(&env.pool, w3 + chrono::Duration::seconds(5)).await?;
@@ -943,8 +961,13 @@ pub async fn s9_coverage_plumbing(env: &mut Env, c: &mut Checks) -> Result<()> {
         gaps.len() == 1 && gaps[0].cause == GapCause::SyncUnavailable && gaps[0].to_at.is_some(),
         format!("{gaps:?}"),
     );
-    let healed =
-        firehose::heal_gaps(&env.pool, &[g1], w3 + chrono::Duration::seconds(9), 1).await?;
+    let healed = firehose::heal_gaps(
+        &env.pool,
+        &[g1],
+        w3 + chrono::Duration::seconds(9),
+        CycleId::new(1),
+    )
+    .await?;
     c.eq("repair heals the closed gap", healed, 1);
 
     // firehose_clock maintenance: 1-minute granularity after 24 h, 30 d
@@ -1021,7 +1044,7 @@ async fn queue_of(env: &Env, did: &farsight_core::Did) -> Result<Option<(i16, i1
 /// Stream 10: non-commit firehose events through `apply`, the queue
 /// collapse rule, and poisoned-event recording.
 pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
-    use farsight_storage::codes::actor_status as st;
+    use farsight_storage::codes::ActorStatus as st;
     use farsight_storage::repo_events::RepoEvent as E;
     let w = now_micros();
     let o = plc("evowner", 1);
@@ -1033,7 +1056,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         listblock(&b, "lb", &o, "L", rev(2)),
     ])
     .await?;
-    let l = env.list_id(&o, "L").await?.unwrap_or(-1);
+    let l = env.list_id(&o, "L").await?.unwrap_or(NO_LIST);
     janitor::fire_event(
         &env.pool,
         &env.limits,
@@ -1063,7 +1086,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
     c.eq(
         "account deactivated ⇒ status deactivated",
         status_of(env, &o).await?,
-        Some(st::DEACTIVATED),
+        Some(st::Deactivated.code()),
     );
     c.eq(
         "deactivation raises no debt",
@@ -1085,7 +1108,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
     c.eq(
         "reactivation ⇒ status active",
         status_of(env, &o).await?,
-        Some(st::ACTIVE),
+        Some(st::Active.code()),
     );
     c.check(
         "reactivation ⇒ resync debt",
@@ -1114,7 +1137,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
     c.eq(
         "replayed older account event skipped (status stays active)",
         (status_of(env, &o).await?, r.stale_repo_events),
-        (Some(st::ACTIVE), 1),
+        (Some(st::Active.code()), 1),
     );
 
     // desynchronized ⇒ resync debt (shown status).
@@ -1133,7 +1156,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
     c.eq(
         "desynchronized ⇒ status",
         status_of(env, &d).await?,
-        Some(st::DESYNCHRONIZED),
+        Some(st::Desynchronized.code()),
     );
     c.check(
         "desynchronized ⇒ resync debt",
@@ -1187,7 +1210,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
     // Not for listings (only the firehose's first sight of an author).
     let listed = plc("evlisted", 1);
-    env.listing(vec![block(&listed, "k", &b, 0)], rev(7))
+    env.listing(vec![block(&listed, "k", &b, Stamp::ZERO)], rev(7))
         .await?;
     c.eq(
         "a listing's new author gets no tier-2 job",
@@ -1220,14 +1243,14 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
     c.eq("collapse: one waiting entry per (actor, kind)", n, 1);
     // A later, less urgent request does not downgrade it.
     let mut conn = env.pool.acquire().await?;
-    let uid = env.actor_id(&u).await?.unwrap_or(-1);
+    let uid = env.actor_id(&u).await?.unwrap_or(NO_ACTOR);
     farsight_storage::queue::enqueue(
         &mut conn,
         uid,
         farsight_storage::queue::JobKind::Repo,
-        3,
-        0,
-        "system:sweep",
+        farsight_storage::codes::Tier::Sweep,
+        farsight_storage::codes::Priority::Normal,
+        farsight_storage::codes::RequesterKey::Sweep,
         None,
     )
     .await?;
@@ -1466,7 +1489,7 @@ pub async fn s12_reactivation_lock(env: &mut Env, c: &mut Checks) -> Result<()> 
         listblock(&b, "lb", &o, "L", rev(2)),
     ])
     .await?;
-    let l = env.list_id(&o, "L").await?.unwrap_or(-1);
+    let l = env.list_id(&o, "L").await?.unwrap_or(NO_LIST);
     events_batch(
         env,
         vec![E::Account {

@@ -39,7 +39,7 @@ use farsight_core::{Did, DidMethod};
 use farsight_storage::handles::Cached;
 
 use super::metrics as m;
-use crate::pages::{WebState, resolve_handle};
+use crate::pages::{WebState, handle_to_did};
 
 /// How long a page waits for its handle before rendering the DID alone.
 pub const RESOLVE_WAIT: Duration = Duration::from_secs(2);
@@ -79,7 +79,8 @@ impl Outcome {
         Outcome::Skipped,
     ];
 
-    /// Metric label.
+    /// The `outcome` label of
+    /// `farsight_public_ui_handle_resolutions_total`.
     pub fn label(self) -> &'static str {
         match self {
             Outcome::Cached => "cached",
@@ -143,7 +144,7 @@ pub(crate) async fn verify(
     let Some(handle) = doc.as_ref().and_then(claimed_handle) else {
         return (Outcome::Failed, None);
     };
-    match resolve_handle(safe, &handle).await {
+    match handle_to_did(safe, &handle).await {
         Ok(back) if back == *did => (Outcome::Resolved, Some(handle)),
         _ => (Outcome::Unverified, None),
     }
@@ -238,9 +239,7 @@ pub(crate) async fn settle(
         cache.insert(did.as_str(), kept.clone(), NEGATIVE_TTL);
         if kept.is_none() {
             let written = match st.api.pool.acquire().await {
-                Ok(mut conn) => {
-                    farsight_storage::handles::store_none(&mut conn, did.as_str()).await
-                }
+                Ok(mut conn) => farsight_storage::handles::store_none(&mut conn, did).await,
                 Err(e) => Err(e.into()),
             };
             if let Err(e) = written {
@@ -255,7 +254,7 @@ pub(crate) async fn settle(
         cfg.public_ui.handle_cache_ttl.get(),
     );
     let written = match st.api.pool.acquire().await {
-        Ok(mut conn) => farsight_storage::handles::store(&mut conn, did.as_str(), &handle).await,
+        Ok(mut conn) => farsight_storage::handles::store(&mut conn, did, &handle).await,
         Err(e) => Err(e.into()),
     };
     if let Err(e) = written {

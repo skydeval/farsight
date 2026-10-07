@@ -1,0 +1,66 @@
+# cargo-deny configuration: `cargo deny check` (run by the `deny` job in
+# .github/workflows/ci.yml).
+
+[graph]
+# Farsight is built for and run on Linux; dependencies that only other
+# platforms pull in are left out.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+# The feature-gated harness binaries have dependencies of their own.
+all-features = true
+
+[advisories]
+version = 2
+# A yanked version in Cargo.lock fails the check, like a vulnerability.
+yanked = "deny"
+ignore = [
+    # hickory-proto 0.25: an unbounded loop in DNSSEC validation. The code
+    # is compiled only with the `dnssec-ring` or `dnssec-aws-lc-rs`
+    # feature; Farsight builds hickory-resolver with `tokio` and
+    # `system-config` alone and validates no DNSSEC.
+    { id = "RUSTSEC-2026-0118", reason = "DNSSEC validation is not compiled in (no dnssec feature)" },
+    # hickory-proto 0.25: quadratic name compression when a message with
+    # many records is encoded. Farsight uses the stub resolver only, which
+    # encodes its own one-question queries and never a message a peer
+    # supplied. Fixed in hickory 0.26.1; remove this entry with that upgrade.
+    { id = "RUSTSEC-2026-0119", reason = "only one-question queries are encoded; remove when hickory-resolver is 0.26.1 or later" },
+]
+
+[licenses]
+version = 2
+# The licences the dependency tree needs, all permissive and compatible
+# with distributing Farsight under MIT OR Apache-2.0. A crate offered under
+# several licences passes when one of them is listed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# The workspace's own crates are `publish = false`.
+ignore = true
+
+[bans]
+# Two versions of one crate are reported, not refused: the duplicates in
+# this tree come from dependencies of dependencies.
+multiple-versions = "warn"
+wildcards = "deny"
+# A dependency on a workspace crate by path has no version requirement.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

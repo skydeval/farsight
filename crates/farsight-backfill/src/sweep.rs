@@ -15,6 +15,9 @@
 //! - No cycle starts before the firehose committed its first batch;
 //!   `S_C = clock(max(started_at, first_applied_at))`.
 
+use farsight_storage::codes::sql::{
+    ACTOR_ACTIVE, CYCLE_FULL, CYCLE_REPAIR, MEMBER_OUTSTANDING, RUN_LISTED, TRACKED,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -22,7 +25,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use farsight_core::config::SweepSource;
 use farsight_core::{Collection, Tid};
-use farsight_storage::codes::{DebtReason, TrackState};
+use farsight_storage::codes::{CycleKind, CycleSource, DebtReason, TrackState};
+use farsight_storage::ids::{CycleId, GapId, ListId};
 use farsight_storage::tracking::FireArgs;
 use farsight_storage::transition::Event;
 use tokio::sync::watch;
@@ -30,13 +34,6 @@ use tokio::sync::watch;
 use crate::ctx::Ctx;
 use crate::metrics as m;
 use crate::xrpc;
-
-/// `sweep_cycles.kind`.
-pub const FULL: i16 = 1;
-/// `sweep_cycles.kind`.
-pub const REPAIR: i16 = 2;
-/// Source label of a repair re-listing known DIDs (relay unavailable).
-pub const KNOWN_DIDS: &str = "known_dids";
 
 const TICK: Duration = Duration::from_secs(5);
 /// Largest enumeration page asked for (`listReposByCollection` limit).
@@ -48,18 +45,27 @@ const SWEPT: [Collection; 3] = [Collection::Block, Collection::ListBlock, Collec
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Cycle {
     /// `sweep_cycles.id`.
-    pub id: i64,
-    /// 1 full, 2 repair.
-    pub kind: i16,
-    /// Source label.
-    pub source: String,
-    /// Server start.
+    pub id: CycleId,
+    /// Full sweep or repair.
+    pub kind: CycleKind,
+    /// What the cycle enumerates. A repair's is `relay_repos` or
+    /// `known_dids`, whatever the configured sweep source.
+    pub source: CycleSource,
+    /// `sweep_cycles.started_at`: server time at which the cycle's row
+    /// was inserted. A job that started after it settles the DID's
+    /// membership in the cycle.
     pub started_at: DateTime<Utc>,
-    /// `S_C` on the witness clock.
+    /// `S_C` on the witness clock. `None` only on a row another process
+    /// inserted (`admin.startRepair`) that this one has not adopted yet.
     pub effective_start_witness: Option<DateTime<Utc>>,
-    /// Enumeration finished.
+    /// `sweep_cycles.enumerated_at`: server time at which the last page
+    /// of the source was stored. `None` while enumeration goes on.
     pub enumerated_at: Option<DateTime<Utc>>,
-    /// Enumeration checkpoint.
+    /// `sweep_cycles.checkpoint`: where the next page starts, in the
+    /// source's own terms: `<collection index>|<cursor>` for
+    /// `relay_collections`, the relay's cursor for `relay_repos`, the
+    /// last operation's `createdAt` for the PLC export, the last DID for
+    /// known DIDs. `None` before the first page.
     pub checkpoint: Option<String>,
     /// Repair lower bound (`min(from_at)` of covered gaps).
     pub repair_from: Option<DateTime<Utc>>,
@@ -68,18 +74,12 @@ pub struct Cycle {
 /// One enumerated member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
-    /// DID.
+    /// The member's DID as the source gave it: the key of its
+    /// `cycle_outstanding` row, which needs no `actors` row.
     pub did: String,
     /// Relay says active while Farsight holds it inactive (repair only).
     pub reactivated: bool,
 }
-
-/// `sweep_cycles.source` of a cycle enumerating `listReposByCollection`.
-pub const RELAY_COLLECTIONS: &str = "relay_collections";
-/// `sweep_cycles.source` of a cycle enumerating `listRepos`.
-pub const RELAY_REPOS: &str = "relay_repos";
-/// `sweep_cycles.source` of a cycle enumerating the PLC export.
-pub const PLC: &str = "plc";
 
 /// Sweep state kept between ticks.
 #[derive(Default)]
@@ -96,10 +96,9 @@ impl Sweep {
     /// gained it since the last cycle is used with it again. Any other
     /// failure (the relay is down, or busy) says nothing about the method
     /// and leaves the configured source; the cycle's pages retry.
-    async fn full_source(&self, ctx: &Ctx) -> &'static str {
+    async fn full_source(&self, ctx: &Ctx) -> CycleSource {
         match ctx.cfg().backfill.sweep.source {
-            SweepSource::RelayRepos => RELAY_REPOS,
-            SweepSource::Plc => PLC,
+            source @ (SweepSource::RelayRepos | SweepSource::Plc) => source.into(),
             SweepSource::RelayCollections => {
                 let relay = ctx.cfg().backfill.relay_url.clone();
                 let probe = xrpc::list_repos_by_collection(
@@ -118,9 +117,9 @@ impl Sweep {
                 }
                 self.fell_back.store(missing, Ordering::Relaxed);
                 if missing {
-                    RELAY_REPOS
+                    CycleSource::RelayRepos
                 } else {
-                    RELAY_COLLECTIONS
+                    CycleSource::RelayCollections
                 }
             }
         }
@@ -143,11 +142,22 @@ pub async fn run(ctx: Arc<Ctx>, sweep: Arc<Sweep>, mut stop: watch::Receiver<boo
     }
 }
 
-type Res<T> = Result<T, String>;
-
-fn e(x: impl std::fmt::Display) -> String {
-    x.to_string()
+/// Why a step of the sweep failed. The step is tried again at the next
+/// tick.
+#[derive(Debug, thiserror::Error)]
+pub enum SweepError {
+    /// A statement failed.
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+    /// The storage layer refused or failed.
+    #[error(transparent)]
+    Storage(#[from] farsight_storage::StorageError),
+    /// The relay or the directory could not be read.
+    #[error(transparent)]
+    Net(#[from] crate::net::NetError),
 }
+
+type Res<T> = Result<T, SweepError>;
 
 /// One step: start cycles that are due, enumerate a page per open cycle
 /// while under the outstanding bound, complete finished cycles.
@@ -156,8 +166,7 @@ pub async fn tick(ctx: &Ctx, sweep: &Sweep) -> Res<()> {
     let first: Option<DateTime<Utc>> =
         sqlx::query_scalar("SELECT first_applied_at FROM firehose_state WHERE id = 1")
             .fetch_optional(pool)
-            .await
-            .map_err(e)?
+            .await?
             .flatten();
     let Some(first_applied) = first else {
         return Ok(()); // no cycle before the first committed batch
@@ -169,8 +178,7 @@ pub async fn tick(ctx: &Ctx, sweep: &Sweep) -> Res<()> {
          FROM sweep_cycles WHERE completed_at IS NULL ORDER BY id",
     )
     .fetch_all(pool)
-    .await
-    .map_err(e)?;
+    .await?;
     let max_out = i64::try_from(ctx.cfg().backfill.sweep.max_outstanding).unwrap_or(i64::MAX);
     for c in &open {
         if c.effective_start_witness.is_none() {
@@ -181,19 +189,18 @@ pub async fn tick(ctx: &Ctx, sweep: &Sweep) -> Res<()> {
         // A full cycle pauses with the sweep (operator toggle) or at 90% of
         // the budget; its members also stop being dispatched (tier 3).
         // A repair pauses with its own switch.
-        let paused = if c.kind == FULL {
+        let paused = if c.kind == CycleKind::Full {
             !ctx.cfg().backfill.sweep.enabled || ctx.sweep_paused_by_storage()
         } else {
             ctx.cfg().backfill.repair.paused
         };
         if c.enumerated_at.is_none() && !paused {
             let outstanding: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM cycle_outstanding WHERE cycle_id = $1 AND state = 1",
+                &format!("SELECT count(*) FROM cycle_outstanding WHERE cycle_id = $1 AND state = {MEMBER_OUTSTANDING}"),
             )
             .bind(c.id)
             .fetch_one(pool)
-            .await
-            .map_err(e)?;
+            .await?;
             // Each page asks for at most the room left, so outstanding
             // rows never exceed the bound.
             if outstanding < max_out {
@@ -211,13 +218,12 @@ async fn maybe_start(ctx: &Ctx, sweep: &Sweep, first_applied: DateTime<Utc>) -> 
     let pool = &ctx.pool;
     let cfg = ctx.cfg();
     let (open_full, open_repair, last_full): (bool, bool, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM sweep_cycles WHERE kind = 1 AND completed_at IS NULL),
-                EXISTS (SELECT 1 FROM sweep_cycles WHERE kind = 2 AND completed_at IS NULL),
-                (SELECT max(started_at) FROM sweep_cycles WHERE kind = 1)",
+        &format!("SELECT EXISTS (SELECT 1 FROM sweep_cycles WHERE kind = {CYCLE_FULL} AND completed_at IS NULL),
+                EXISTS (SELECT 1 FROM sweep_cycles WHERE kind = {CYCLE_REPAIR} AND completed_at IS NULL),
+                (SELECT max(started_at) FROM sweep_cycles WHERE kind = {CYCLE_FULL})"),
     )
     .fetch_one(pool)
-    .await
-    .map_err(e)?;
+    .await?;
     if cfg.backfill.sweep.enabled && !open_full {
         let due = match last_full {
             None => true,
@@ -228,7 +234,7 @@ async fn maybe_start(ctx: &Ctx, sweep: &Sweep, first_applied: DateTime<Utc>) -> 
         };
         if due && !ctx.sweep_paused_by_storage() {
             let source = sweep.full_source(ctx).await;
-            start_cycle(ctx, FULL, source, first_applied, None).await?;
+            start_cycle(ctx, CycleKind::Full, source, first_applied, None).await?;
         }
     }
     if !open_repair && cfg.backfill.repair.auto_start {
@@ -239,18 +245,17 @@ async fn maybe_start(ctx: &Ctx, sweep: &Sweep, first_applied: DateTime<Utc>) -> 
              WHERE to_at IS NOT NULL AND healed_at IS NULL AND repair_cycle_id IS NULL",
         )
         .fetch_one(pool)
-        .await
-        .map_err(e)?;
+        .await?;
         if let Some(from) = from {
             let relay = cfg.backfill.relay_url.clone();
             let source = match xrpc::list_repos(&ctx.net, &relay, None, 1).await {
-                Ok(_) => RELAY_REPOS,
+                Ok(_) => CycleSource::RelayRepos,
                 Err(err) => {
                     tracing::warn!(error = %err, "relay unavailable; repair re-lists known DIDs");
-                    KNOWN_DIDS
+                    CycleSource::KnownDids
                 }
             };
-            start_cycle(ctx, REPAIR, source, first_applied, Some(from)).await?;
+            start_cycle(ctx, CycleKind::Repair, source, first_applied, Some(from)).await?;
         }
     }
     Ok(())
@@ -258,14 +263,14 @@ async fn maybe_start(ctx: &Ctx, sweep: &Sweep, first_applied: DateTime<Utc>) -> 
 
 async fn start_cycle(
     ctx: &Ctx,
-    kind: i16,
-    source: &str,
+    kind: CycleKind,
+    source: CycleSource,
     first_applied: DateTime<Utc>,
     repair_from: Option<DateTime<Utc>>,
-) -> Res<i64> {
-    let mut tx = ctx.pool.begin().await.map_err(e)?;
+) -> Res<CycleId> {
+    let mut tx = ctx.pool.begin().await?;
     let collections: Vec<i16> = Collection::ALL.iter().map(|c| c.code()).collect();
-    let id: i64 = sqlx::query_scalar(
+    let id: CycleId = sqlx::query_scalar(
         "INSERT INTO sweep_cycles (kind, source, collections, started_at, effective_start, repair_from)
          VALUES ($1, $2, $3, clock_timestamp(), GREATEST(clock_timestamp(), $4), $5) RETURNING id",
     )
@@ -275,8 +280,7 @@ async fn start_cycle(
     .bind(first_applied)
     .bind(repair_from)
     .fetch_one(&mut *tx)
-    .await
-    .map_err(e)?;
+    .await?;
     sqlx::query(
         "UPDATE sweep_cycles SET effective_start_witness =
            (SELECT witness_at FROM firehose_clock WHERE server_at <= sweep_cycles.effective_start
@@ -285,24 +289,26 @@ async fn start_cycle(
     )
     .bind(id)
     .execute(&mut *tx)
-    .await
-    .map_err(e)?;
-    if kind == REPAIR && source != KNOWN_DIDS {
+    .await?;
+    if kind == CycleKind::Repair && source != CycleSource::KnownDids {
         sqlx::query(
             "UPDATE firehose_gaps SET repair_cycle_id = $1
              WHERE to_at IS NOT NULL AND healed_at IS NULL AND repair_cycle_id IS NULL",
         )
         .bind(id)
         .execute(&mut *tx)
-        .await
-        .map_err(e)?;
+        .await?;
     }
     sqlx::query("SELECT pg_notify('farsight_coverage', '')")
         .execute(&mut *tx)
-        .await
-        .map_err(e)?;
-    tx.commit().await.map_err(e)?;
-    tracing::info!(cycle = id, kind, source, "cycle started");
+        .await?;
+    tx.commit().await?;
+    tracing::info!(
+        cycle = id.get(),
+        kind = kind.code(),
+        source = source.as_str(),
+        "cycle started"
+    );
     Ok(id)
 }
 
@@ -310,19 +316,19 @@ async fn start_cycle(
 /// source (listRepos, or known DIDs while the relay is down) and the gaps
 /// it covers.
 async fn adopt(ctx: &Ctx, c: &Cycle, first_applied: DateTime<Utc>) -> Res<()> {
-    let source = if c.kind == REPAIR {
+    let source = if c.kind == CycleKind::Repair {
         let relay = ctx.cfg().backfill.relay_url.clone();
         match xrpc::list_repos(&ctx.net, &relay, None, 1).await {
-            Ok(_) => RELAY_REPOS.to_owned(),
+            Ok(_) => CycleSource::RelayRepos,
             Err(err) => {
                 tracing::warn!(error = %err, "relay unavailable; repair re-lists known DIDs");
-                KNOWN_DIDS.to_owned()
+                CycleSource::KnownDids
             }
         }
     } else {
-        c.source.clone()
+        c.source
     };
-    let mut tx = ctx.pool.begin().await.map_err(e)?;
+    let mut tx = ctx.pool.begin().await?;
     sqlx::query(
         "UPDATE sweep_cycles SET source = $2,
            effective_start = GREATEST(started_at, $3),
@@ -331,20 +337,18 @@ async fn adopt(ctx: &Ctx, c: &Cycle, first_applied: DateTime<Utc>) -> Res<()> {
          WHERE id = $1",
     )
     .bind(c.id)
-    .bind(&source)
+.bind(source)
     .bind(first_applied)
     .execute(&mut *tx)
-    .await
-    .map_err(e)?;
-    if c.kind == REPAIR && source != KNOWN_DIDS {
+    .await?;
+    if c.kind == CycleKind::Repair && source != CycleSource::KnownDids {
         sqlx::query(
             "UPDATE firehose_gaps SET repair_cycle_id = $1
              WHERE to_at IS NOT NULL AND healed_at IS NULL AND repair_cycle_id IS NULL",
         )
         .bind(c.id)
         .execute(&mut *tx)
-        .await
-        .map_err(e)?;
+        .await?;
         sqlx::query(
             "UPDATE sweep_cycles SET repair_from = COALESCE(repair_from,
                (SELECT min(from_at) FROM firehose_gaps WHERE repair_cycle_id = $1))
@@ -352,11 +356,15 @@ async fn adopt(ctx: &Ctx, c: &Cycle, first_applied: DateTime<Utc>) -> Res<()> {
         )
         .bind(c.id)
         .execute(&mut *tx)
-        .await
-        .map_err(e)?;
+        .await?;
     }
-    tx.commit().await.map_err(e)?;
-    tracing::info!(cycle = c.id, kind = c.kind, source, "cycle adopted");
+    tx.commit().await?;
+    tracing::info!(
+        cycle = c.id.get(),
+        kind = c.kind.code(),
+        source = source.as_str(),
+        "cycle adopted"
+    );
     Ok(())
 }
 
@@ -366,12 +374,12 @@ enum PageError {
     /// The relay does not have `listReposByCollection`.
     NoCollectionListing,
     /// Anything else; the page is retried.
-    Other(String),
+    Other(SweepError),
 }
 
-impl From<String> for PageError {
-    fn from(s: String) -> PageError {
-        PageError::Other(s)
+impl From<SweepError> for PageError {
+    fn from(e: SweepError) -> PageError {
+        PageError::Other(e)
     }
 }
 
@@ -385,13 +393,13 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
     let relay = cfg.backfill.relay_url.clone();
     let cp = c.checkpoint.clone();
     // Repairs enumerate listRepos whatever the sweep source.
-    let source = if c.kind == REPAIR && c.source != KNOWN_DIDS {
-        RELAY_REPOS
+    let source = if c.kind == CycleKind::Repair && c.source != CycleSource::KnownDids {
+        CycleSource::RelayRepos
     } else {
-        c.source.as_str()
+        c.source
     };
     match source {
-        RELAY_COLLECTIONS => {
+        CycleSource::RelayCollections => {
             // Checkpoint `<collection index>|<cursor>`.
             let (mut idx, cursor) = match cp.as_deref().and_then(|s| s.split_once('|')) {
                 Some((i, cur)) => (
@@ -410,7 +418,7 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
                         if err.method_missing() {
                             PageError::NoCollectionListing
                         } else {
-                            PageError::Other(err.to_string())
+                            PageError::Other(err.into())
                         }
                     })?;
             let members = dids
@@ -430,11 +438,11 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
             let done = idx >= SWEPT.len();
             Ok((members, Some(next_cp), done))
         }
-        RELAY_REPOS => {
+        CycleSource::RelayRepos => {
             let (repos, next) = xrpc::list_repos(&ctx.net, &relay, cp.as_deref(), room)
                 .await
-                .map_err(e)?;
-            let members = if c.kind == REPAIR {
+                .map_err(SweepError::from)?;
+            let members = if c.kind == CycleKind::Repair {
                 repair_candidates(ctx, c, repos).await?
             } else {
                 repos
@@ -449,10 +457,10 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
             let done = next.is_none();
             Ok((members, next.or(cp), done))
         }
-        PLC => {
+        CycleSource::Plc => {
             let ops = xrpc::plc_export(&ctx.net, &cfg.backfill.plc_url, cp.as_deref(), room)
                 .await
-                .map_err(e)?;
+                .map_err(SweepError::from)?;
             let done = ops.len() < room.min(1000) as usize;
             let next = ops.last().map(|o| o.created_at.clone()).or(cp);
             // The directory decides how many operations a page holds, so
@@ -474,23 +482,23 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
             }
             Ok((members, next, done))
         }
-        _ => {
+        CycleSource::KnownDids => {
             // KNOWN_DIDS: every DID in backfill_state plus owners of
             // tracked lists, in DID order; checkpoint = last DID.
             let after = cp.clone().unwrap_or_default();
-            let dids: Vec<String> = sqlx::query_scalar(
+            let dids: Vec<String> = sqlx::query_scalar(&format!(
                 "SELECT did FROM (
                    SELECT a.did FROM backfill_state b JOIN actors a ON a.id = b.actor_id
                    UNION
                    SELECT a.did FROM lists l JOIN actors a ON a.id = l.owner_id
-                   WHERE l.track_state IN (1, 2, 3, 4)) x
-                 WHERE did > $1 ORDER BY did LIMIT $2",
-            )
+                   WHERE l.track_state IN {TRACKED}) x
+                 WHERE did > $1 ORDER BY did LIMIT $2"
+            ))
             .bind(&after)
             .bind(i64::from(room))
             .fetch_all(&ctx.pool)
             .await
-            .map_err(e)?;
+            .map_err(SweepError::from)?;
             let done = dids.len() < room as usize;
             let next = dids.last().cloned().or(cp);
             Ok((
@@ -516,8 +524,7 @@ async fn repair_candidates(ctx: &Ctx, c: &Cycle, repos: Vec<xrpc::ListedRepo>) -
          FROM firehose_state WHERE id = 1",
     )
     .fetch_optional(&ctx.pool)
-    .await
-    .map_err(e)?
+    .await?
     .unwrap_or(0);
     let slack = chrono::Duration::from_std(cfg.backfill.repair_slack.get()).unwrap_or_default()
         + chrono::Duration::seconds(lag);
@@ -529,13 +536,12 @@ async fn repair_candidates(ctx: &Ctx, c: &Cycle, repos: Vec<xrpc::ListedRepo>) -
         .map(|r| r.did.clone())
         .collect();
     let held_inactive: Vec<String> = sqlx::query_scalar(
-        "SELECT a.did FROM actors a LEFT JOIN backfill_state b ON b.actor_id = a.id
-         WHERE a.did = ANY($1) AND (a.status <> 0 OR COALESCE(b.inactive_at_listing, false))",
+        &format!("SELECT a.did FROM actors a LEFT JOIN backfill_state b ON b.actor_id = a.id
+         WHERE a.did = ANY($1) AND (a.status <> {ACTOR_ACTIVE} OR COALESCE(b.inactive_at_listing, false))"),
     )
     .bind(&active)
     .fetch_all(&ctx.pool)
-    .await
-    .map_err(e)?;
+    .await?;
     let mut out = Vec::new();
     for r in repos {
         let reactivated = r.active && held_inactive.contains(&r.did);
@@ -568,20 +574,19 @@ async fn enumerate_page(ctx: &Ctx, sweep: &Sweep, c: &Cycle, room: u32) -> Res<(
                  WHERE id = $1 AND source = $3 AND enumerated_at IS NULL",
             )
             .bind(c.id)
-            .bind(RELAY_REPOS)
-            .bind(RELAY_COLLECTIONS)
+            .bind(CycleSource::RelayRepos)
+            .bind(CycleSource::RelayCollections)
             .execute(&ctx.pool)
-            .await
-            .map_err(e)?;
+            .await?;
             sweep.fell_back.store(true, Ordering::Relaxed);
             tracing::warn!(
-                cycle = c.id,
+                cycle = c.id.get(),
                 "relay lacks listReposByCollection; the cycle continues with relay_repos"
             );
             return Ok(());
         }
         Err(PageError::Other(err)) => {
-            tracing::warn!(cycle = c.id, error = %err, "sweep enumeration page failed; retrying");
+            tracing::warn!(cycle = c.id.get(), error = %err, "sweep enumeration page failed; retrying");
             return Ok(());
         }
     };
@@ -589,24 +594,23 @@ async fn enumerate_page(ctx: &Ctx, sweep: &Sweep, c: &Cycle, room: u32) -> Res<(
         reactivation(ctx, &m.did).await?;
     }
     let dids: Vec<String> = members.into_iter().map(|m| m.did).collect();
-    let mut tx = ctx.pool.begin().await.map_err(e)?;
+    let mut tx = ctx.pool.begin().await?;
     // A DID whose job started after S_C already satisfied this cycle (its
     // point is ≥ S_C), e.g. seen in an earlier collection's listing.
-    let n = sqlx::query(
+    let n = sqlx::query(&format!(
         "INSERT INTO cycle_outstanding (cycle_id, did, state)
-         SELECT $1, d, 1 FROM unnest($2::text[]) d
+         SELECT $1, d, {MEMBER_OUTSTANDING} FROM unnest($2::text[]) d
          WHERE NOT EXISTS (
            SELECT 1 FROM actors a JOIN backfill_state b ON b.actor_id = a.id
-           WHERE a.did = d AND b.last_outcome IN (1, 2, 3)
+           WHERE a.did = d AND b.last_outcome IN {RUN_LISTED}
              AND b.backfilled_witness >= $3)
-         ON CONFLICT DO NOTHING",
-    )
+         ON CONFLICT DO NOTHING"
+    ))
     .bind(c.id)
     .bind(&dids)
     .bind(c.effective_start_witness)
     .execute(&mut *tx)
-    .await
-    .map_err(e)?
+    .await?
     .rows_affected();
     sqlx::query(
         "UPDATE sweep_cycles SET checkpoint = $2,
@@ -619,32 +623,27 @@ async fn enumerate_page(ctx: &Ctx, sweep: &Sweep, c: &Cycle, room: u32) -> Res<(
     .bind(n as i64)
     .bind(done)
     .execute(&mut *tx)
-    .await
-    .map_err(e)?;
-    tx.commit().await.map_err(e)?;
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
 /// A repo the relay reports active that Farsight holds inactive: a
 /// `resync` debt, and OA on its `unavailable` lists.
 async fn reactivation(ctx: &Ctx, did: &str) -> Res<()> {
-    let Some(id) = crate::jobs::actor_id(&ctx.pool, did).await.map_err(e)? else {
+    let Some(id) = crate::jobs::actor_id(&ctx.pool, did).await? else {
         return Ok(());
     };
     let witness = farsight_storage::firehose::clock_now(&ctx.pool)
-        .await
-        .map_err(e)?
+        .await?
         .unwrap_or_else(Utc::now);
-    farsight_storage::debts::add_debt(&ctx.pool, id, DebtReason::Resync, None, witness)
-        .await
-        .map_err(e)?;
-    let lists: Vec<i64> =
+    farsight_storage::debts::add_debt(&ctx.pool, id, DebtReason::Resync, None, witness).await?;
+    let lists: Vec<ListId> =
         sqlx::query_scalar("SELECT id FROM lists WHERE owner_id = $1 AND track_state = $2")
             .bind(id)
             .bind(TrackState::Unavailable.code())
             .fetch_all(&ctx.pool)
-            .await
-            .map_err(e)?;
+            .await?;
     let limits = ctx.limits();
     for l in lists {
         farsight_storage::janitor::fire_event(
@@ -655,8 +654,7 @@ async fn reactivation(ctx: &Ctx, did: &str) -> Res<()> {
             Event::OwnerActive,
             FireArgs::default(),
         )
-        .await
-        .map_err(e)?;
+        .await?;
     }
     Ok(())
 }
@@ -670,84 +668,74 @@ async fn maybe_complete(ctx: &Ctx, c: &Cycle) -> Res<()> {
         sqlx::query_scalar("SELECT enumerated_at FROM sweep_cycles WHERE id = $1")
             .bind(c.id)
             .fetch_one(pool)
-            .await
-            .map_err(e)?;
+            .await?;
     if enumerated.is_none() {
         return Ok(());
     }
     let outstanding: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM cycle_outstanding WHERE cycle_id = $1 AND state = 1)",
+        &format!("SELECT EXISTS (SELECT 1 FROM cycle_outstanding WHERE cycle_id = $1 AND state = {MEMBER_OUTSTANDING})"),
     )
     .bind(c.id)
     .fetch_one(pool)
-    .await
-    .map_err(e)?;
+    .await?;
     if outstanding {
         return Ok(());
     }
-    let now: DateTime<Utc> = crate::jobs::db_now(pool).await.map_err(e)?;
+    let now: DateTime<Utc> = crate::jobs::db_now(pool).await?;
     let witness = farsight_storage::firehose::clock(pool, now)
-        .await
-        .map_err(e)?
+        .await?
         .unwrap_or(now);
-    let gaps: Vec<i64> = if c.kind == REPAIR && c.source != KNOWN_DIDS {
+    let gaps: Vec<GapId> = if c.kind == CycleKind::Repair && c.source != CycleSource::KnownDids {
         sqlx::query_scalar(
             "SELECT id FROM firehose_gaps WHERE repair_cycle_id = $1 AND healed_at IS NULL",
         )
         .bind(c.id)
         .fetch_all(pool)
-        .await
-        .map_err(e)?
-    } else if c.kind == FULL {
+        .await?
+    } else if c.kind == CycleKind::Full {
         sqlx::query_scalar(
             "SELECT id FROM firehose_gaps WHERE healed_at IS NULL AND to_at IS NOT NULL
                AND to_at <= $1",
         )
         .bind(c.effective_start_witness)
         .fetch_all(pool)
-        .await
-        .map_err(e)?
+        .await?
     } else {
         Vec::new()
     };
-    let mut tx = pool.begin().await.map_err(e)?;
+    let mut tx = pool.begin().await?;
+    // Terminal rows are kept counted as `unreachable` debts; the cycle's
+    // own rows go. They go before the cycle's row is written, the order a
+    // job settling a member takes the two locks in.
+    sqlx::query("DELETE FROM cycle_outstanding WHERE cycle_id = $1")
+        .bind(c.id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("UPDATE sweep_cycles SET completed_at = $2, completed_witness = $3 WHERE id = $1")
         .bind(c.id)
         .bind(now)
         .bind(witness)
         .execute(&mut *tx)
-        .await
-        .map_err(e)?;
-    // Terminal rows are kept counted as `unreachable` debts; the cycle's
-    // own rows go.
-    sqlx::query("DELETE FROM cycle_outstanding WHERE cycle_id = $1")
-        .bind(c.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(e)?;
-    if c.kind == REPAIR {
+        .await?;
+    if c.kind == CycleKind::Repair {
         // Gaps it could not heal (relay down) go back to the next repair
         // or full cycle.
         sqlx::query("UPDATE firehose_gaps SET repair_cycle_id = NULL WHERE repair_cycle_id = $1 AND healed_at IS NULL AND NOT (id = ANY($2))")
             .bind(c.id)
             .bind(&gaps)
             .execute(&mut *tx)
-            .await
-            .map_err(e)?;
+            .await?;
     }
     sqlx::query("SELECT pg_notify('farsight_coverage', '')")
         .execute(&mut *tx)
-        .await
-        .map_err(e)?;
-    tx.commit().await.map_err(e)?;
+        .await?;
+    tx.commit().await?;
     if !gaps.is_empty() {
-        farsight_storage::firehose::heal_gaps(pool, &gaps, witness, c.id)
-            .await
-            .map_err(e)?;
+        farsight_storage::firehose::heal_gaps(pool, &gaps, witness, c.id).await?;
     }
     tracing::info!(
-        cycle = c.id,
-        kind = c.kind,
+        cycle = c.id.get(),
+        kind = c.kind.code(),
         healed = gaps.len(),
         "cycle completed"
     );
@@ -757,12 +745,12 @@ async fn maybe_complete(ctx: &Ctx, c: &Cycle) -> Res<()> {
 /// Progress gauges per cycle kind, and the ETA of the open full cycle
 /// (remaining ÷ trailing-1h rate).
 async fn publish_progress(ctx: &Ctx) {
-    for (kind, label) in [(FULL, "full"), (REPAIR, "repair")] {
+    for (kind, label) in [(CycleKind::Full, "full"), (CycleKind::Repair, "repair")] {
         let row: Option<(i64, i64, i64, bool)> = sqlx::query_as(
-            "SELECT c.done, c.failed_terminal,
-                    (SELECT count(*) FROM cycle_outstanding o WHERE o.cycle_id = c.id AND o.state = 1),
+            &format!("SELECT c.done, c.failed_terminal,
+                    (SELECT count(*) FROM cycle_outstanding o WHERE o.cycle_id = c.id AND o.state = {MEMBER_OUTSTANDING}),
                     c.enumerated_at IS NOT NULL
-             FROM sweep_cycles c WHERE c.completed_at IS NULL AND c.kind = $1 ORDER BY c.id LIMIT 1",
+             FROM sweep_cycles c WHERE c.completed_at IS NULL AND c.kind = $1 ORDER BY c.id LIMIT 1"),
         )
         .bind(kind)
         .fetch_optional(&ctx.pool)
@@ -778,7 +766,7 @@ async fn publish_progress(ctx: &Ctx) {
         let total = (done + failed + outstanding).max(1) as f64;
         metrics::gauge!(m::SWEEP_PROGRESS, "cycle_kind" => label)
             .set((done + failed) as f64 / total);
-        if kind == FULL {
+        if kind == CycleKind::Full {
             let rate: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM backfill_state WHERE backfilled_at > now() - interval '1 hour'",
             )

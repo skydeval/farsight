@@ -29,6 +29,8 @@ use farsight_web::ServerStatus;
 use sqlx::{Connection, PgConnection, PgPool};
 use tokio::sync::watch;
 
+use crate::error::ServerError;
+
 /// `farsight_ui_sort_indexes_ready`: how many of the four are valid.
 pub const READY: &str = "farsight_ui_sort_indexes_ready";
 
@@ -61,7 +63,7 @@ pub struct Builder {
     pub config: Arc<ConfigStore>,
     /// The flags the pages read.
     pub sort: Arc<SortIndexes>,
-    /// Dashboard status.
+    /// Where a hold is published for the dashboard (`sort_held_bytes`).
     pub status: Arc<ServerStatus>,
 }
 
@@ -83,11 +85,9 @@ fn publish(sort: &SortIndexes) {
 /// Sets the flags from the database. Called once before the server starts
 /// serving, so that a section whose index exists sorts by it from the
 /// first request.
-pub async fn load(pool: &PgPool, sort: &SortIndexes) -> Result<(), String> {
-    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-    ui_rows::load_states(&mut conn, sort)
-        .await
-        .map_err(|e| e.to_string())?;
+pub async fn load(pool: &PgPool, sort: &SortIndexes) -> Result<(), ServerError> {
+    let mut conn = pool.acquire().await?;
+    ui_rows::load_states(&mut conn, sort).await?;
     publish(sort);
     Ok(())
 }

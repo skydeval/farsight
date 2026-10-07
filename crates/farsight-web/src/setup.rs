@@ -27,11 +27,13 @@ use tokio::sync::{Semaphore, watch};
 use crate::common::{self, cookie, ct_eq, random_id, read_cookie, render_private};
 use crate::setup_token::{self, SetupToken};
 
-/// Setup session cookie.
+/// Name of the setup session cookie, set once the token is verified.
+/// Sessions are kept by the SHA-256 of its value.
 pub const SESSION_COOKIE: &str = "farsight_setup";
 /// Failures per minute from one client before responses are delayed.
 pub const FAILURES_PER_MIN: usize = 5;
-/// Delay of a throttled failure.
+/// How long the answer to a wrong token is held back once the client is
+/// over [`FAILURES_PER_MIN`].
 pub const FAILURE_DELAY: Duration = Duration::from_secs(2);
 /// Delayed responses held at once (beyond: immediate 429).
 pub const MAX_DELAYED: usize = 64;
@@ -97,7 +99,10 @@ pub struct Wizard {
     pub admin_did: String,
     /// The DID the access step last looked up, and what came back: the
     /// identity, or why it did not resolve.
-    pub admin_seen: Option<(String, Result<crate::oauth::Identity, String>)>,
+    pub admin_seen: Option<(
+        String,
+        Result<crate::oauth::Identity, crate::oauth::OAuthError>,
+    )>,
     /// The admin DID the operator confirmed (after seeing what it
     /// resolves to, or by "use anyway").
     pub admin_confirmed: Option<String>,
@@ -210,23 +215,27 @@ impl Wizard {
     }
 }
 
-/// One setup session.
+/// One setup session: a browser that has presented the setup token. In
+/// memory only; a token rotation ends every one.
 #[derive(Debug)]
 pub struct SetupSession {
-    /// Last request.
+    /// When the session's cookie last came with a request. A session
+    /// seen within the last hour postpones the token's expiry.
     pub last_seen: Instant,
     /// CSRF token for its forms.
     pub csrf: String,
-    /// The wizard.
+    /// The answers given so far, kept here until the final write.
     pub wizard: Wizard,
 }
 
-/// Setup-mode state.
+/// Setup-mode state: where the wizard writes, its sessions and the
+/// throttle on wrong tokens.
 #[derive(Debug)]
 pub struct SetupState {
-    /// `config.toml` path.
+    /// Where the wizard writes `config.toml` when it finishes.
     pub config_path: PathBuf,
-    /// `.setup-token` path.
+    /// The setup token's file, next to `config_path`; deleted when setup
+    /// completes.
     pub token_path: PathBuf,
     /// Environment captured at start-up.
     pub env: Vec<(String, String)>,
@@ -238,12 +247,13 @@ pub struct SetupState {
     pub delayed: Arc<Semaphore>,
     /// Set to true once `config.toml` is written.
     pub completed: watch::Sender<bool>,
-    /// Binary version.
+    /// Version of the running binary, shown in the wizard's header.
     pub version: &'static str,
 }
 
 impl SetupState {
-    /// A new state.
+    /// A state with no sessions, and the receiver that reads `true` once
+    /// the wizard has written `config_path`.
     pub fn new(
         config_path: PathBuf,
         env: Vec<(String, String)>,
@@ -337,7 +347,7 @@ pub fn router(state: Arc<SetupState>) -> Router {
 /// A row of the step navigation.
 #[derive(Debug, Clone)]
 pub struct StepNav {
-    /// Title.
+    /// The step's title from [`STEPS`].
     pub title: &'static str,
     /// `cur`, `done` or empty.
     pub class: &'static str,
@@ -356,25 +366,31 @@ pub const PROJECTION: [(&str, &str, &str); 4] = [
 #[derive(Template)]
 #[template(path = "setup.html")]
 pub struct SetupPage {
-    /// Current step slug.
+    /// Slug of the step shown, from [`STEPS`]: selects the part of the
+    /// template that renders.
     pub step: &'static str,
-    /// Step title.
+    /// That step's title; empty for a slug that is not a step.
     pub title: &'static str,
-    /// Navigation.
+    /// One row per step, the current and the validated ones marked.
     pub nav: Vec<StepNav>,
-    /// CSRF token.
+    /// The session's form token; empty before the token step has given
+    /// the browser a session.
     pub csrf: String,
-    /// Error to show.
+    /// Why the last submit of this step was refused; `None` on a plain
+    /// view.
     pub error: Option<String>,
-    /// Token expiry warning.
+    /// Set when the setup token expires within the hour: how long is
+    /// left. Only shown to a browser with a session.
     pub expiry_warning: Option<String>,
     /// The wizard (empty before the token step).
     pub w: Wizard,
     /// Show the admin token (until saved).
     pub show_token: bool,
-    /// Disk warning.
+    /// Set when the sweep is on and the disk entered is under 150 GB:
+    /// what the resulting budget allows.
     pub disk_warning: Option<String>,
-    /// Budget, formatted.
+    /// The storage budget the wizard would write (70% of the disk
+    /// entered), in decimal units.
     pub budget_text: String,
     /// Proxy preview lines.
     pub preview: Vec<String>,
@@ -387,7 +403,7 @@ pub struct SetupPage {
     /// Show, in place of the access step's form, the page that lists
     /// what the public UI makes public and asks for confirmation.
     pub confirm_public: bool,
-    /// Version.
+    /// Version of the running binary, shown in the header.
     pub version: &'static str,
     /// The bundled Cloudflare set's date.
     pub cf_as_of: &'static str,
@@ -425,9 +441,9 @@ impl SetupPage {
     }
 
     /// Why the entered admin DID did not resolve, when it did not.
-    pub fn admin_not_found(&self) -> Option<&str> {
+    pub fn admin_not_found(&self) -> Option<String> {
         match self.w.admin_seen.as_ref()? {
-            (did, Err(e)) if *did == self.w.admin_did => Some(e.as_str()),
+            (did, Err(e)) if *did == self.w.admin_did => Some(e.to_string()),
             _ => None,
         }
     }
@@ -795,14 +811,42 @@ fn preview_lines(
     lines
 }
 
-fn parse_u64(form: &HashMap<String, String>, k: &str, min: u64) -> Result<u64, String> {
+/// Why a wizard step was not accepted. The text is shown on the step's
+/// page.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StepError {
+    /// A submitted value is not acceptable. The text names it and what
+    /// is expected.
+    #[error("{0}")]
+    Field(String),
+    /// The step is not one of the wizard's.
+    #[error("unknown step")]
+    UnknownStep,
+    /// The wizard's session ended while the step was being applied.
+    #[error("session ended")]
+    SessionEnded,
+}
+
+impl From<String> for StepError {
+    fn from(message: String) -> StepError {
+        StepError::Field(message)
+    }
+}
+
+impl From<&str> for StepError {
+    fn from(message: &str) -> StepError {
+        StepError::Field(message.to_owned())
+    }
+}
+
+fn parse_u64(form: &HashMap<String, String>, k: &str, min: u64) -> Result<u64, StepError> {
     let v = form.get(k).map(|s| s.trim()).unwrap_or("");
     let n: u64 = v
         .replace('_', "")
         .parse()
         .map_err(|_| format!("{k}: expected a whole number"))?;
     if n < min {
-        return Err(format!("{k}: must be at least {min}"));
+        return Err(StepError::Field(format!("{k}: must be at least {min}")));
     }
     Ok(n)
 }
@@ -824,7 +868,7 @@ pub fn valid_server_host(s: &str) -> bool {
             && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
-fn parse_cidrs(text: &str) -> Result<Vec<IpNet>, String> {
+fn parse_cidrs(text: &str) -> Result<Vec<IpNet>, StepError> {
     let mut out = Vec::new();
     for line in text
         .split(['\n', ',', ' '])
@@ -860,7 +904,7 @@ fn public_outside_cf(nets: &[IpNet]) -> Vec<IpNet> {
         .collect()
 }
 
-fn apply_step(w: &mut Wizard, step: &str, f: &HashMap<String, String>) -> Result<(), String> {
+fn apply_step(w: &mut Wizard, step: &str, f: &HashMap<String, String>) -> Result<(), StepError> {
     let get = |k: &str| f.get(k).map(|s| s.trim().to_owned()).unwrap_or_default();
     let on = |k: &str| {
         f.get(k)
@@ -897,7 +941,9 @@ fn apply_step(w: &mut Wizard, step: &str, f: &HashMap<String, String>) -> Result
                 .iter()
                 .find(|u| !(u.starts_with("wss://") || u.starts_with("ws://")))
             {
-                return Err(format!("{bad} is not a ws:// or wss:// URL."));
+                return Err(StepError::Field(format!(
+                    "{bad} is not a ws:// or wss:// URL."
+                )));
             }
             if urls != w.urls {
                 w.firehose_test.clear();
@@ -1015,7 +1061,7 @@ fn apply_step(w: &mut Wizard, step: &str, f: &HashMap<String, String>) -> Result
             };
             let public = public_outside_cf(&trusted);
             if !public.is_empty() && !on("proxy_ack") {
-                return Err(format!(
+                return Err(StepError::Field(format!(
                     "{} is public address space outside the bundled Cloudflare ranges. Trusting \
                      it lets anyone there choose their client IP. Tick the acknowledgement if it \
                      really is your proxy.",
@@ -1024,7 +1070,7 @@ fn apply_step(w: &mut Wizard, step: &str, f: &HashMap<String, String>) -> Result
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(", ")
-                ));
+                )));
             }
             w.proxy_choice = choice;
             w.proxy_mode = mode;
@@ -1043,7 +1089,7 @@ fn apply_step(w: &mut Wizard, step: &str, f: &HashMap<String, String>) -> Result
             }
         }
         "review" => {}
-        _ => return Err("unknown step".into()),
+        _ => return Err(StepError::UnknownStep),
     }
     Ok(())
 }
@@ -1098,9 +1144,9 @@ async fn save_step(
             }
             r
         })
-        .unwrap_or_else(|| Err("session ended".into()));
+        .unwrap_or(Err(StepError::SessionEnded));
     if let Err(e) = result {
-        return render_step(&st, &id, slug, Some(e));
+        return render_step(&st, &id, slug, Some(e.to_string()));
     }
     // The admin DID is shown resolved before the step advances: the
     // first submit of a DID looks it up, the second confirms it. A DID
@@ -1143,9 +1189,12 @@ async fn save_step(
 /// Looks the wizard's admin DID up through a safe client built from the
 /// wizard's own answers (the PLC directory is step 5's). Setup mode has
 /// no other outbound client; the caller holds a verified setup session.
-async fn resolve_admin_did(st: &SetupState, w: &Wizard) -> Result<crate::oauth::Identity, String> {
+async fn resolve_admin_did(
+    st: &SetupState,
+    w: &Wizard,
+) -> Result<crate::oauth::Identity, crate::oauth::OAuthError> {
     use farsight_core::net::{SafeClient, SafeClientConfig};
-    let did = farsight_core::Did::parse(&w.admin_did).map_err(|e| e.to_string())?;
+    let did = farsight_core::Did::parse(&w.admin_did)?;
     let cfg = w.build_config();
     let safe = SafeClient::new(SafeClientConfig::from_config(&cfg, st.version));
     match tokio::time::timeout(
@@ -1155,7 +1204,7 @@ async fn resolve_admin_did(st: &SetupState, w: &Wizard) -> Result<crate::oauth::
     .await
     {
         Ok(r) => r,
-        Err(_) => Err("the lookup timed out".into()),
+        Err(_) => Err(crate::oauth::OAuthError::TimedOut),
     }
 }
 
@@ -1399,7 +1448,7 @@ async fn proxy_preview(
         .unwrap_or_else(|| Wizard::new(&st.env));
     let mut f = form.clone();
     f.insert("proxy_ack".into(), "on".into());
-    let err = apply_step(&mut w, "proxy", &f).err();
+    let err = apply_step(&mut w, "proxy", &f).err().map(|e| e.to_string());
     let mut p = page(&st, "proxy", snapshot(&st, &id), err);
     p.w.proxy_choice = w.proxy_choice.clone();
     p.w.proxy_mode = w.proxy_mode;
@@ -1418,7 +1467,8 @@ async fn proxy_preview(
     setup_response(&p)
 }
 
-/// The final page.
+/// The final page: what was written and where to go next, or why the
+/// config could not be written.
 #[derive(Template)]
 #[template(path = "setup_done.html")]
 pub struct DonePage {

@@ -98,7 +98,8 @@ impl ListPurpose {
         }
     }
 
-    /// Storage code.
+    /// The `lists.purpose` storage code: 0 other, 1 mod, 2 curate, 3
+    /// reference.
     pub fn code(self) -> i16 {
         match self {
             ListPurpose::Other => 0,
@@ -351,10 +352,10 @@ pub enum CommitAction {
     Upsert {
         /// `Create` or `Update`.
         op: Operation,
-        /// The new version.
+        /// The record's new version, parsed and validated.
         record: Record,
     },
-    /// Delete.
+    /// Delete of the record key. A Jetstream delete carries no record.
     Delete,
 }
 
@@ -363,11 +364,11 @@ pub enum CommitAction {
 pub struct CommitOp {
     /// The repo (record author).
     pub author: Did,
-    /// The collection.
+    /// Which of the four indexed collections the record is in.
     pub collection: Collection,
     /// The record key.
     pub rkey: RecordKey,
-    /// The commit rev.
+    /// Rev of the commit that carried the operation.
     pub rev: Tid,
     /// Upsert or delete.
     pub action: CommitAction,

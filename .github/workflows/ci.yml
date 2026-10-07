@@ -5,12 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  HARNESS_FEATURES: farsight-storage/harness,farsight-ingest/harness,farsight-api/harness,farsight-server/harness,farsight-backfill/harness
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -18,7 +23,52 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      # The Phase B harnesses are feature-gated; compile and lint them too (not run).
-      - run: cargo clippy --workspace --all-targets --features farsight-storage/harness,farsight-ingest/harness,farsight-api/harness,farsight-server/harness,farsight-backfill/harness -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # The integration harnesses are binaries behind the `harness`
+      # features. They are linted and built here and not run: the nightly
+      # workflow (harness.yml) runs them.
+      - run: cargo clippy --locked --workspace --all-targets --features "$HARNESS_FEATURES" -- -D warnings
+      - run: cargo build --locked --workspace --bins --features "$HARNESS_FEATURES"
+      - run: cargo test --locked --workspace
+
+  # Advisories, licences, banned and duplicated crates, and where crates
+  # come from, as deny.toml sets them.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # Line coverage of the unit tests, printed in the job's log and its
+  # summary. Nothing is sent anywhere.
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+      - name: Run the tests with coverage
+        run: |
+          set -euo pipefail
+          cargo llvm-cov --locked --workspace --no-report
+          cargo llvm-cov report --summary-only | tee coverage.txt
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Unit test coverage"
+            echo '```'
+            if [ -s coverage.txt ]; then cat coverage.txt; else echo "no coverage report was produced"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

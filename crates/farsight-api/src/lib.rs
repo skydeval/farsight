@@ -69,27 +69,33 @@ pub struct IngestLink {
 pub struct ApiState {
     /// API pool (separate from ingest's).
     pub pool: PgPool,
-    /// Live configuration.
+    /// Live configuration, read once per request so hot keys apply at
+    /// once.
     pub config: Arc<ConfigStore>,
-    /// Coverage snapshot.
+    /// The global coverage snapshot every `freshness` object is composed
+    /// on. Empty until the first read succeeds; reads answer `503
+    /// Overloaded` until then.
     pub snapshot: Arc<SnapshotHolder>,
-    /// API keys.
+    /// The live API keys by token hash, mirrored from `api_tokens`.
     pub keys: Arc<KeyTable>,
-    /// Rate limits.
+    /// The token buckets of every rate-limit class, the web UI's
+    /// included.
     pub limiter: Arc<RateLimiter>,
     /// The global read-query semaphore.
     pub query_permits: Arc<Semaphore>,
-    /// Proxy trust.
+    /// The refreshed Cloudflare ranges that extend `proxy.trusted`.
     pub trust: Arc<ProxyTrust>,
     /// Cloudflare-share detector.
     pub cf: Arc<CfTracker>,
-    /// The running ingest.
+    /// The running ingest. `None` when this process runs none: source lag
+    /// is then left out of responses and `restartFirehose` has nothing to
+    /// restart.
     pub ingest: Option<IngestLink>,
     /// Approximate counters (interning by `requestBackfill`).
     pub counters: Arc<CounterSink>,
     /// Write gates (budget monitor).
     pub gates: Arc<SharedGates>,
-    /// Binary version.
+    /// Version of the running binary, as `getStats` reports it.
     pub version: &'static str,
     /// Requests answered per endpoint since start, for the dashboard.
     pub usage: Arc<usage::Usage>,
@@ -120,7 +126,8 @@ macro_rules! endpoints {
             pub const ALL: &'static [Endpoint] = &[$(Endpoint::$var),+];
             /// The NSID suffix after `app.nearhorizon.farsight.`.
             pub fn name(self) -> &'static str { match self { $(Endpoint::$var => $name),+ } }
-            /// Access class.
+            /// The class that decides who may call it, which rate limit
+            /// it draws on and how its responses are cached.
             pub fn kind(self) -> Kind { match self { $(Endpoint::$var => Kind::$kind),+ } }
             /// Expected HTTP method (queries GET, procedures POST).
             pub fn method(self) -> Method { match self { $(Endpoint::$var => Method::$method),+ } }
@@ -148,7 +155,8 @@ endpoints! {
 }
 
 impl Endpoint {
-    /// Looks up a full NSID.
+    /// The endpoint with this full NSID; `None` for an unknown method or
+    /// another namespace.
     pub fn from_nsid(nsid: &str) -> Option<Endpoint> {
         let rest = nsid.strip_prefix(NSID_PREFIX)?;
         Endpoint::ALL.iter().copied().find(|e| e.name() == rest)
@@ -185,7 +193,7 @@ pub enum CacheClass {
 pub struct Reply {
     /// Status (200, or 202 for `requestBackfill`).
     pub status: StatusCode,
-    /// JSON body.
+    /// The response body, serialized as `application/json`.
     pub body: serde_json::Value,
 }
 
@@ -219,7 +227,7 @@ pub fn setup_router() -> Router {
 pub struct IpLayer {
     /// Live config (`None` in setup mode: no proxy is trusted yet).
     pub config: Option<Arc<ConfigStore>>,
-    /// Proxy trust.
+    /// The refreshed Cloudflare ranges that extend `proxy.trusted`.
     pub trust: Arc<ProxyTrust>,
     /// Cloudflare-share detector.
     pub cf: Arc<CfTracker>,

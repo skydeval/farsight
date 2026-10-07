@@ -42,6 +42,7 @@ use tokio::sync::watch;
 
 use crate::fake::{Repo, Shared, w};
 use crate::support::{Checks, Pg, Proc, free_port};
+use farsight_storage::ids::{ActorId, ListId, Stamp};
 
 type Res<T> = Result<T, String>;
 
@@ -168,7 +169,7 @@ impl H {
             author: a,
             collection: k,
             rkey: RecordKey::parse(rkey).map_err(e)?,
-            stamp: Tid::parse(&tid_now()).map_err(e)?.as_i64(),
+            stamp: Stamp::from_tid(Tid::parse(&tid_now()).map_err(e)?),
             witness: Some(Utc::now()),
             action: WriteAction::Upsert(rec),
         });
@@ -211,8 +212,9 @@ impl H {
             &self.ctx,
             &JobReq {
                 did,
-                tier,
-                requester: requester.into(),
+                tier: farsight_storage::codes::Tier::from_code(tier).expect("a tier"),
+                requester: farsight_storage::codes::RequesterKey::parse(requester)
+                    .expect("a requester key"),
             },
         )
         .await;
@@ -239,7 +241,7 @@ impl H {
             self.pool(),
             &self.ctx.limits(),
             &self.ctx.counters,
-            list,
+            ListId::new(list),
             ev,
             FireArgs::default(),
         )
@@ -705,13 +707,13 @@ async fn check_divergence(h: &H, c: &mut Checks) -> Res<()> {
     );
     // Phase 1 and a fetch run make the list ready (the transition where DV
     // matters most: it must never be served empty as ready).
-    jobs::list_phase1::run(&h.ctx, lid).await;
+    jobs::list_phase1::run(&h.ctx, ListId::new(lid)).await;
     let oid = h.id(&o).await?;
     h.exec(&format!(
         "DELETE FROM backfill_queue WHERE actor_id = {oid} AND kind = 2"
     ))
     .await?;
-    jobs::list_fetch::run(&h.ctx, oid, &Did::parse(&o).map_err(e)?).await;
+    jobs::list_fetch::run(&h.ctx, ActorId::new(oid), &Did::parse(&o).map_err(e)?).await;
     let state_before = h.track(lid).await?;
     let epoch_before = h
         .i64(&format!(
@@ -834,7 +836,7 @@ async fn check_phase1(h: &H, c: &mut Checks) -> Res<()> {
         admitted == 1 && job,
         format!("track_state {admitted}, list_jobs {job}"),
     );
-    jobs::list_phase1::run(&h.ctx, lid).await;
+    jobs::list_phase1::run(&h.ctx, ListId::new(lid)).await;
     let nf = h.track(lid).await?;
     h.purges().await?;
     let first = h.track(lid).await?;
@@ -851,7 +853,7 @@ async fn check_phase1(h: &H, c: &mut Checks) -> Res<()> {
             "UPDATE lists SET next_retry_at = now() - interval '1 second' WHERE id = {lid}"
         ))
         .await?;
-        jobs::list_phase1::run(&h.ctx, lid).await;
+        jobs::list_phase1::run(&h.ctx, ListId::new(lid)).await;
         h.purges().await?;
         states.push(h.track(lid).await?);
     }
@@ -873,7 +875,7 @@ async fn check_phase1(h: &H, c: &mut Checks) -> Res<()> {
     )
     .await?;
     let lid2 = h.list_id(&f2, &rk2).await?;
-    jobs::list_phase1::run(&h.ctx, lid2).await;
+    jobs::list_phase1::run(&h.ctx, ListId::new(lid2)).await;
     let (passed, rec): (bool, i16) =
         sqlx::query_as("SELECT phase1_epoch = admit_epoch, record_state FROM lists WHERE id = $1")
             .bind(lid2)
@@ -925,7 +927,7 @@ async fn check_fetch(h: &H, c: &mut Checks) -> Res<()> {
         )
         .await?;
         let id = h.list_id(&o, rk).await?;
-        jobs::list_phase1::run(&h.ctx, id).await;
+        jobs::list_phase1::run(&h.ctx, ListId::new(id)).await;
         ids.push(id);
     }
     let oid = h.id(&o).await?;
@@ -947,7 +949,7 @@ async fn check_fetch(h: &H, c: &mut Checks) -> Res<()> {
     h.set_cfg(|c| c.limits.list_items_per_list = 2);
     let before = h.hits("listRecords", &o, Collection::ListItem.nsid());
     let od = Did::parse(&o).map_err(e)?;
-    let r = jobs::list_fetch::run(&h.ctx, oid, &od).await;
+    let r = jobs::list_fetch::run(&h.ctx, ActorId::new(oid), &od).await;
     let pages = h.hits("listRecords", &o, Collection::ListItem.nsid()) - before;
     let rows: Vec<(i16, Option<DateTime<Utc>>, bool, i64)> = sqlx::query_as(
         "SELECT l.track_state, l.fetched_witness, l.capped, (SELECT count(*) FROM list_items i WHERE i.list_id = l.id)
@@ -984,7 +986,7 @@ async fn check_fetch(h: &H, c: &mut Checks) -> Res<()> {
         "UPDATE list_fetch_runs SET started_at = started_at - interval '1 day', finished_at = finished_at - interval '1 day' WHERE owner_id = {oid}"
     ))
     .await?;
-    let r = jobs::list_fetch::run(&h.ctx, oid, &od).await;
+    let r = jobs::list_fetch::run(&h.ctx, ActorId::new(oid), &od).await;
     let (capped, refresh, items): (bool, bool, i64) = sqlx::query_as(
         "SELECT capped, refresh_requested, (SELECT count(*) FROM list_items i WHERE i.list_id = l.id) FROM lists l WHERE id = $1",
     )
@@ -1076,16 +1078,16 @@ async fn check_pending_timeout(h: &H, c: &mut Checks) -> Res<()> {
 // ------------------------------------------------------------- check 6
 
 async fn check_fairness(h: &H, c: &mut Checks) -> Res<()> {
-    // token:a 500 (100 high), token:b 300 (50 high), token:c 200 (none).
+    // token:101 500 (100 high), token:102 300 (50 high), token:103 200 (none).
     let mut dids = Vec::new();
     let mut reqs = Vec::new();
     let mut pris: Vec<i16> = Vec::new();
     let mut meta: HashMap<String, (String, bool)> = HashMap::new();
     for i in 0..1000u64 {
         let (r, high) = match i {
-            0..500 => ("token:a", i < 100),
-            500..800 => ("token:b", i < 550),
-            _ => ("token:c", false),
+            0..500 => ("token:101", i < 100),
+            500..800 => ("token:102", i < 550),
+            _ => ("token:103", false),
         };
         let d = did("fra", i);
         meta.insert(d.clone(), (r.to_owned(), high));
@@ -1161,15 +1163,15 @@ async fn check_fairness(h: &H, c: &mut Checks) -> Res<()> {
             .map(|d| meta[d].1)
             .collect()
     };
-    let a = seq("token:a", 50);
+    let a = seq("token:101", 50);
     let pattern: Vec<bool> = (0..50).map(|i| i % 5 != 4).collect();
-    let b = seq("token:b", 62);
+    let b = seq("token:102", 62);
     let b_high = b.iter().filter(|x| **x).count();
     c.check(
-        "high before normal 4:1 within a requester (token:a: HHHHN×10; token:b: 50 high in its first 62)",
+        "high before normal 4:1 within a requester (token:101: HHHHN×10; token:102: 50 high in its first 62)",
         a == pattern && b_high == 50,
         format!(
-            "token:a first 50: {}; token:b high in first 62: {b_high}",
+            "token:101 first 50: {}; token:102 high in first 62: {b_high}",
             a.iter().map(|x| if *x { 'H' } else { 'N' }).collect::<String>()
         ),
     );
@@ -1318,7 +1320,7 @@ async fn check_sweep(h: &H, c: &mut Checks) -> Res<()> {
     let sw = Arc::new(sweep::Sweep::default());
     // The first tick starts the cycle and enumerates one page before any
     // member runs: the page asks for exactly the room left.
-    sweep::tick(&h.ctx, &sw).await?;
+    sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
     let first_fill = h
         .i64("SELECT count(*) FROM cycle_outstanding o JOIN sweep_cycles c ON c.id = o.cycle_id WHERE c.kind = 1 AND c.completed_at IS NULL AND o.state = 1")
         .await?;
@@ -1331,7 +1333,7 @@ async fn check_sweep(h: &H, c: &mut Checks) -> Res<()> {
     let mut cycle: Option<i64> = None;
     let mut pages_seen = HashSet::new();
     while start.elapsed() < Duration::from_secs(300) {
-        sweep::tick(&h.ctx, &sw).await?;
+        sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
         if cycle.is_none() {
             cycle = h
                 .opt_i64("SELECT max(id) FROM sweep_cycles WHERE kind = 1")
@@ -1508,7 +1510,7 @@ async fn check_repair(h: &H, c: &mut Checks) -> Res<()> {
     let mut cycle = None;
     let mut resync_seen = false;
     while start.elapsed() < Duration::from_secs(120) {
-        sweep::tick(&h.ctx, &sw).await?;
+        sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
         cycle = h
             .opt_i64("SELECT max(id) FROM sweep_cycles WHERE kind = 2")
             .await?;
@@ -1600,7 +1602,7 @@ async fn check_repair(h: &H, c: &mut Checks) -> Res<()> {
     let task = tokio::spawn(sched.clone().run(stop));
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(120) {
-        sweep::tick(&h.ctx, &sw).await?;
+        sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
         if h.bool(&format!(
             "SELECT completed_at IS NOT NULL FROM sweep_cycles WHERE id = {manual}"
         ))
@@ -1880,7 +1882,12 @@ async fn check_discovery(h: &H, c: &mut Checks) -> Res<()> {
     }
     let base = h.pds.clone();
     h.set_cfg(|c| c.backfill.backlinks.url = base);
-    let r = jobs::discovery::run(&h.ctx, &Did::parse(&x).map_err(e)?, "token:7").await;
+    let r = jobs::discovery::run(
+        &h.ctx,
+        &Did::parse(&x).map_err(e)?,
+        farsight_storage::codes::RequesterKey::Token(7),
+    )
+    .await;
     h.set_cfg(|c| c.backfill.backlinks.url = String::new());
     let xid = h.id(&x).await?;
     let row: Option<(i16, bool, i32)> = sqlx::query_as(
@@ -2017,9 +2024,9 @@ async fn check_hostile(h: &H, c: &mut Checks) -> Res<()> {
     sched.panic_for(&boom, true);
     let (stop_tx, stop) = watch::channel(false);
     let task = tokio::spawn(sched.clone().run(stop));
-    queue_repo(h, &bad, "token:h").await?;
-    queue_repo(h, &boom, "token:h").await?;
-    queue_repo(h, &good, "token:h").await?;
+    queue_repo(h, &bad, "token:108").await?;
+    queue_repo(h, &boom, "token:108").await?;
+    queue_repo(h, &good, "token:108").await?;
 
     // The hostile host's answer has been taken in once it is cooling.
     let cooled = eventually(30, || async {
@@ -2062,7 +2069,7 @@ async fn check_hostile(h: &H, c: &mut Checks) -> Res<()> {
     sched.panic_for(&boom, false);
     h.exec(&format!("DELETE FROM job_leases WHERE did = '{boom}'"))
         .await?;
-    queue_repo(h, &boom, "token:h").await?;
+    queue_repo(h, &boom, "token:108").await?;
     let again = eventually(30, || backfilled(h, &boom)).await?;
     c.check(
         "the DID whose job panicked is dispatched again and completes",
@@ -2120,7 +2127,7 @@ async fn check_fallback(h: &H, c: &mut Checks) -> Res<()> {
     });
     let sw = sweep::Sweep::default();
     // The relay answers the probe with 501 MethodNotImplemented.
-    sweep::tick(&h.ctx, &sw).await?;
+    sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
     let first = open_full_cycle(h).await?;
     let members = h
         .i64("SELECT count(*) FROM cycle_outstanding WHERE did LIKE 'did:plc:fbk%'")
@@ -2135,7 +2142,7 @@ async fn check_fallback(h: &H, c: &mut Checks) -> Res<()> {
     // the same process state, and uses it.
     retire_cycles(h).await?;
     w(&h.world).collections_supported = true;
-    sweep::tick(&h.ctx, &sw).await?;
+    sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
     let second = open_full_cycle(h).await?;
     c.check(
         "the relay is probed before every full cycle: once it has the method, the next cycle is relay_collections again",
@@ -2149,9 +2156,9 @@ async fn check_fallback(h: &H, c: &mut Checks) -> Res<()> {
     w(&h.world).collections_supported = false;
     h.exec("DELETE FROM cycle_outstanding WHERE did LIKE 'did:plc:fbk%'")
         .await?;
-    sweep::tick(&h.ctx, &sw).await?;
+    sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
     let switched = open_full_cycle(h).await?;
-    sweep::tick(&h.ctx, &sw).await?;
+    sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
     let after = open_full_cycle(h).await?;
     let members = h
         .i64("SELECT count(*) FROM cycle_outstanding WHERE did LIKE 'did:plc:fbk%'")

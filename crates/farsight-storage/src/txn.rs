@@ -5,12 +5,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, NaiveDate, Utc};
-use farsight_core::{Collection, Did};
+use farsight_core::{Collection, Did, RecordKey};
 use sqlx::PgConnection;
 
-use crate::codes::{CapType, DebtReason, TrackState};
+use crate::codes::{ActorStatus, CapType, DebtReason, TrackState};
 use crate::counters::{Deltas, stat};
 use crate::error::Result;
+use crate::ids::{ActorId, ListId, Stamp};
 use crate::keys::{self, CapKind, HostFacts, Limits};
 
 /// Global write gates, supplied by the budget monitor.
@@ -33,7 +34,8 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    /// The debt reason.
+    /// The `relist_debt.reason` the refusal is recorded under: `capped` or
+    /// `refused`.
     pub fn reason(self) -> DebtReason {
         match self {
             Refusal::Capped(_) => DebtReason::Capped,
@@ -41,7 +43,8 @@ impl Refusal {
         }
     }
 
-    /// The cap type.
+    /// Which cap, rate or gate refused the write; stored as the debt's
+    /// `cap_type`.
     pub fn cap_type(self) -> CapType {
         match self {
             Refusal::Capped(c) | Refusal::Refused(c) => c,
@@ -66,19 +69,21 @@ pub struct Cause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorInfo {
     /// `actors.id`.
-    pub id: i64,
-    /// The DID.
+    pub id: ActorId,
+    /// The author's DID; the transaction caches the value under it.
     pub did: Did,
-    /// Current admission key.
+    /// The admission key the author's daily rates are charged to: the one
+    /// stored on `actors`, or the one derived by [`keys::admission_key`].
     pub key: String,
-    /// Cap buckets.
+    /// The `host_usage` buckets the author's stored rows count in; empty on
+    /// a large host.
     pub buckets: Vec<String>,
     /// Resolved on a large host.
     pub large: bool,
     /// OR of the buckets' `capped_mask`.
     pub mask: i16,
-    /// `actors.status` code, as read with the row.
-    pub status: i16,
+    /// `actors.status`, as read with the row.
+    pub status: ActorStatus,
 }
 
 impl AuthorInfo {
@@ -97,8 +102,8 @@ impl AuthorInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionRecord {
     /// `lists.id`.
-    pub list_id: i64,
-    /// The event.
+    pub list_id: ListId,
+    /// The event that fired.
     pub event: crate::transition::Event,
     /// State before.
     pub from: TrackState,
@@ -122,7 +127,7 @@ pub enum WriteOutcome {
 }
 
 impl WriteOutcome {
-    /// Metric label.
+    /// The `outcome` label of `farsight_firehose_events_total`.
     pub fn label(self) -> &'static str {
         match self {
             WriteOutcome::Applied => "applied",
@@ -136,13 +141,14 @@ impl WriteOutcome {
 /// One refused or uncounted write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusalRecord {
-    /// The author.
+    /// The repo the write was for.
     pub author: Did,
-    /// The collection.
+    /// The collection of the record that was refused or left uncounted.
     pub collection: Collection,
-    /// The record key.
+    /// Its record key.
     pub rkey: String,
-    /// Why.
+    /// Which cap, rate or gate it met, and whether the debt is `capped` or
+    /// `refused`.
     pub refusal: Refusal,
 }
 
@@ -182,7 +188,7 @@ pub struct ApplyReport {
     /// Unknown DIDs that became active: counted only.
     pub unknown_activations: u64,
     /// Authors whose `actors` row this transaction created.
-    pub new_authors: Vec<i64>,
+    pub new_authors: Vec<ActorId>,
     /// `resync` debts raised by `#sync` / account events.
     pub resyncs: u64,
     /// Accounts that became `deleted`: the caller purges them after commit
@@ -198,7 +204,8 @@ pub struct Txn<'c> {
     pub conn: &'c mut PgConnection,
     /// Limits in force.
     pub limits: &'c Limits,
-    /// Gates in force.
+    /// The budget and ceiling gates as the caller read them before the
+    /// transaction began.
     pub gates: Gates,
     /// Current UTC day (database clock).
     pub today: NaiveDate,
@@ -217,7 +224,7 @@ pub struct Txn<'c> {
     pub deltas: Deltas,
     /// Send `NOTIFY farsight_coverage` before commit.
     pub notify: bool,
-    /// The report.
+    /// What the transaction has done so far; [`Txn::finish`] returns it.
     pub report: ApplyReport,
 }
 
@@ -295,11 +302,11 @@ impl<'c> Txn<'c> {
     /// under its DID's intern lock, so concurrent batches never wait on each
     /// other's uncommitted inserts in the unique index. Call after the list
     /// locks.
-    pub async fn lock_new_dids(&mut self, dids: &[&str]) -> Result<()> {
+    pub async fn lock_new_dids(&mut self, dids: &[&Did]) -> Result<()> {
         if dids.is_empty() {
             return Ok(());
         }
-        let wanted: Vec<String> = dids.iter().map(|d| (*d).to_owned()).collect();
+        let wanted: Vec<String> = dids.iter().map(|d| d.as_str().to_owned()).collect();
         let existing: Vec<String> =
             sqlx::query_scalar("SELECT did FROM actors WHERE did = ANY($1)")
                 .bind(&wanted)
@@ -321,9 +328,9 @@ impl<'c> Txn<'c> {
     }
 
     /// `actors.id` for a DID, without creating it.
-    pub async fn actor_id(&mut self, did: &str) -> Result<Option<i64>> {
+    pub async fn actor_id(&mut self, did: &Did) -> Result<Option<ActorId>> {
         Ok(sqlx::query_scalar("SELECT id FROM actors WHERE did = $1")
-            .bind(did)
+            .bind(did.as_str())
             .fetch_optional(&mut *self.conn)
             .await?)
     }
@@ -372,10 +379,10 @@ impl<'c> Txn<'c> {
                 let buckets = keys::buckets(did, &facts);
                 // Charged, never refused.
                 self.charge_intern(&key, None).await?;
-                let id = self.insert_actor(did.as_str()).await?;
+                let id = self.insert_actor(did).await?;
                 self.deltas.host(&buckets, CapKind::Interned, 1);
                 self.report.new_authors.push(id);
-                (id, facts, crate::codes::actor_status::ACTIVE)
+                (id, facts, crate::codes::ActorStatus::Active)
             }
         };
         let key = keys::admission_key(did, &facts);
@@ -395,11 +402,11 @@ impl<'c> Txn<'c> {
         Ok(info)
     }
 
-    async fn insert_actor(&mut self, did: &str) -> Result<i64> {
-        let inserted: Option<i64> = sqlx::query_scalar(
+    async fn insert_actor(&mut self, did: &Did) -> Result<ActorId> {
+        let inserted: Option<ActorId> = sqlx::query_scalar(
             "INSERT INTO actors (did) VALUES ($1) ON CONFLICT (did) DO NOTHING RETURNING id",
         )
-        .bind(did)
+        .bind(did.as_str())
         .fetch_optional(&mut *self.conn)
         .await?;
         match inserted {
@@ -408,7 +415,7 @@ impl<'c> Txn<'c> {
                 Ok(id)
             }
             None => Ok(sqlx::query_scalar("SELECT id FROM actors WHERE did = $1")
-                .bind(did)
+                .bind(did.as_str())
                 .fetch_one(&mut *self.conn)
                 .await?),
         }
@@ -486,11 +493,15 @@ impl<'c> Txn<'c> {
 
     /// Interns a subject / member / owner DID, charged to `cause`: the
     /// lifetime bound of a non-large cause bucket, then the daily rate.
-    pub async fn intern_actor(&mut self, did: &Did, cause: &Cause) -> Result<Result<i64, Refusal>> {
+    pub async fn intern_actor(
+        &mut self,
+        did: &Did,
+        cause: &Cause,
+    ) -> Result<Result<ActorId, Refusal>> {
         if let Some(a) = self.authors.get(did) {
             return Ok(Ok(a.id));
         }
-        if let Some(id) = self.actor_id(did.as_str()).await? {
+        if let Some(id) = self.actor_id(did).await? {
             return Ok(Ok(id));
         }
         if !cause.large && cause.mask & CapKind::Interned.bit() != 0 {
@@ -500,7 +511,7 @@ impl<'c> Txn<'c> {
         if !self.charge_intern(&cause.key, Some(limit)).await? {
             return Ok(Err(Refusal::Capped(CapType::InternRate)));
         }
-        let id = self.insert_actor(did.as_str()).await?;
+        let id = self.insert_actor(did).await?;
         self.deltas.host(&cause.buckets, CapKind::Interned, 1);
         Ok(Ok(id))
     }
@@ -512,17 +523,17 @@ impl<'c> Txn<'c> {
     pub async fn intern_list(
         &mut self,
         owner: &Did,
-        rkey: &str,
+        rkey: &RecordKey,
         cause: &Cause,
-    ) -> Result<Result<i64, Refusal>> {
+    ) -> Result<Result<ListId, Refusal>> {
         let owner_id = match self.intern_actor(owner, cause).await? {
             Ok(id) => id,
             Err(r) => return Ok(Err(r)),
         };
-        let existing: Option<i64> =
+        let existing: Option<ListId> =
             sqlx::query_scalar("SELECT id FROM lists WHERE owner_id = $1 AND rkey = $2")
                 .bind(owner_id)
-                .bind(rkey)
+                .bind(rkey.as_str())
                 .fetch_optional(&mut *self.conn)
                 .await?;
         if let Some(id) = existing {
@@ -535,13 +546,13 @@ impl<'c> Txn<'c> {
         if !self.charge_intern(&cause.key, Some(limit)).await? {
             return Ok(Err(Refusal::Capped(CapType::InternRate)));
         }
-        let id: i64 = sqlx::query_scalar(
+        let id: ListId = sqlx::query_scalar(
             "INSERT INTO lists (owner_id, rkey) VALUES ($1, $2)
              ON CONFLICT (owner_id, rkey) DO UPDATE SET rkey = EXCLUDED.rkey
              RETURNING id",
         )
         .bind(owner_id)
-        .bind(rkey)
+        .bind(rkey.as_str())
         .fetch_one(&mut *self.conn)
         .await?;
         // Placeholder rows are charged to the writer's bucket
@@ -578,7 +589,7 @@ impl<'c> Txn<'c> {
     /// Inserts a debt or raises its `since_witness`.
     pub async fn add_debt(
         &mut self,
-        actor_id: i64,
+        actor_id: ActorId,
         reason: DebtReason,
         cap_type: Option<CapType>,
         witness: Option<DateTime<Utc>>,
@@ -609,7 +620,7 @@ impl<'c> Txn<'c> {
         &mut self,
         author: &AuthorInfo,
         collection: Collection,
-        rkey: &str,
+        rkey: &RecordKey,
         refusal: Refusal,
         witness: Option<DateTime<Utc>>,
     ) -> Result<()> {
@@ -624,7 +635,7 @@ impl<'c> Txn<'c> {
         self.report.refusals.push(RefusalRecord {
             author: author.did.clone(),
             collection,
-            rkey: rkey.to_owned(),
+            rkey: rkey.as_str().to_owned(),
             refusal,
         });
         Ok(())
@@ -634,15 +645,15 @@ impl<'c> Txn<'c> {
     pub async fn tombstone_rev(
         &mut self,
         collection: Collection,
-        author_id: i64,
-        rkey: &str,
-    ) -> Result<Option<i64>> {
+        author_id: ActorId,
+        rkey: &RecordKey,
+    ) -> Result<Option<Stamp>> {
         Ok(sqlx::query_scalar(
             "SELECT rev FROM tombstones WHERE collection = $1 AND author_id = $2 AND rkey = $3",
         )
         .bind(collection.code())
         .bind(author_id)
-        .bind(rkey)
+        .bind(rkey.as_str())
         .fetch_optional(&mut *self.conn)
         .await?)
     }
@@ -652,9 +663,9 @@ impl<'c> Txn<'c> {
     pub async fn put_tombstone(
         &mut self,
         collection: Collection,
-        author_id: i64,
-        rkey: &str,
-        rev: i64,
+        author_id: ActorId,
+        rkey: &RecordKey,
+        rev: Stamp,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO tombstones (collection, author_id, rkey, rev) VALUES ($1, $2, $3, $4)
@@ -665,7 +676,7 @@ impl<'c> Txn<'c> {
         )
         .bind(collection.code())
         .bind(author_id)
-        .bind(rkey)
+        .bind(rkey.as_str())
         .bind(rev)
         .execute(&mut *self.conn)
         .await?;
@@ -677,11 +688,11 @@ impl<'c> Txn<'c> {
     pub async fn put_refusal_tombstone(
         &mut self,
         collection: Collection,
-        author_id: i64,
-        rkey: &str,
-        e: i64,
+        author_id: ActorId,
+        rkey: &RecordKey,
+        e: Stamp,
     ) -> Result<()> {
-        self.put_tombstone(collection, author_id, rkey, e - 1)
+        self.put_tombstone(collection, author_id, rkey, e.pred())
             .await?;
         self.report.refusal_tombstones += 1;
         Ok(())
@@ -699,19 +710,19 @@ impl<'c> Txn<'c> {
 
 /// `actors` + `pds_hosts` columns read by [`Txn::author`].
 type AuthorRow = (
-    i64,
+    ActorId,
     Option<String>,
     i32,
     bool,
     Option<String>,
     Option<String>,
     bool,
-    i16,
+    ActorStatus,
 );
 
 /// The LWW upsert rule: apply iff `w` beats the stored row's rev and
 /// the tombstone's rev (absent ones pass). Equal ⇒ skip.
-pub fn lww_upsert_wins(w: i64, row_rev: Option<i64>, tombstone_rev: Option<i64>) -> bool {
+pub fn lww_upsert_wins(w: Stamp, row_rev: Option<Stamp>, tombstone_rev: Option<Stamp>) -> bool {
     row_rev.is_none_or(|r| w > r) && tombstone_rev.is_none_or(|t| w > t)
 }
 
@@ -721,15 +732,16 @@ mod tests {
 
     #[test]
     fn lww_rule() {
-        assert!(lww_upsert_wins(5, None, None));
-        assert!(lww_upsert_wins(5, Some(4), Some(4)));
-        assert!(!lww_upsert_wins(5, Some(5), None));
-        assert!(!lww_upsert_wins(5, None, Some(5)));
-        assert!(!lww_upsert_wins(5, Some(6), None));
+        let s = Stamp::new;
+        assert!(lww_upsert_wins(s(5), None, None));
+        assert!(lww_upsert_wins(s(5), Some(s(4)), Some(s(4))));
+        assert!(!lww_upsert_wins(s(5), Some(s(5)), None));
+        assert!(!lww_upsert_wins(s(5), None, Some(s(5))));
+        assert!(!lww_upsert_wins(s(5), Some(s(6)), None));
         // Refusal tombstone at E − 1: R = E applies, R = E − 1 does not.
-        let e = 100;
-        assert!(lww_upsert_wins(e, None, Some(e - 1)));
-        assert!(!lww_upsert_wins(e - 1, None, Some(e - 1)));
+        let e = s(100);
+        assert!(lww_upsert_wins(e, None, Some(e.pred())));
+        assert!(!lww_upsert_wins(e.pred(), None, Some(e.pred())));
     }
 
     #[test]

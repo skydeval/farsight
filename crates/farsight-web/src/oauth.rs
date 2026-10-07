@@ -49,6 +49,44 @@ pub const HANDLE_TTL: Duration = Duration::from_secs(3600);
 /// Longest wait for the handle when a page shows it.
 pub const HANDLE_WAIT: Duration = Duration::from_secs(2);
 
+/// Why a step of the sign-in's client failed. The texts are for the log
+/// and for the operator; none carries a code, a token or a response body.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OAuthError {
+    /// The safe client refused the request, or it failed in transport.
+    #[error(transparent)]
+    Outbound(#[from] farsight_core::net::OutboundError),
+    /// A well-known URL could not be formed.
+    #[error(transparent)]
+    Url(#[from] url::ParseError),
+    /// The text is not a DID.
+    #[error(transparent)]
+    Did(#[from] farsight_core::did::DidError),
+    /// Generating the flow's key, or signing with it, failed.
+    #[error("{0}")]
+    Key(&'static str),
+    /// The directory says the DID does not exist.
+    #[error("the DID was not found")]
+    DidNotFound,
+    /// The DID's document could not be read, or does not say what is
+    /// needed.
+    #[error("{0}")]
+    Document(String),
+    /// The PDS's or the authorization server's metadata could not be
+    /// read, or does not meet what the flow needs.
+    #[error("{0}")]
+    Metadata(String),
+    /// The authorization server refused a request.
+    #[error("{0}")]
+    Refused(String),
+    /// The authorization server's answer is not usable.
+    #[error("{0}")]
+    Response(&'static str),
+    /// The lookup did not finish in its time.
+    #[error("the lookup timed out")]
+    TimedOut,
+}
+
 /// The identity Farsight presents to an authorization server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Client {
@@ -172,17 +210,18 @@ impl std::fmt::Debug for DpopKey {
 }
 
 impl DpopKey {
-    /// Generates a key pair.
-    pub fn generate() -> Result<DpopKey, String> {
+    /// Generates an ES256 (P-256) key pair for one flow's DPoP proofs.
+    /// It lives in memory with the flow and is never stored.
+    pub fn generate() -> Result<DpopKey, OAuthError> {
         let rng = SystemRandom::new();
         let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
-            .map_err(|_| "key generation failed".to_owned())?;
+            .map_err(|_| OAuthError::Key("key generation failed"))?;
         let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, doc.as_ref(), &rng)
-            .map_err(|_| "key generation failed".to_owned())?;
+            .map_err(|_| OAuthError::Key("key generation failed"))?;
         // Uncompressed point: 0x04 || X (32) || Y (32).
         let point = pair.public_key().as_ref();
         if point.len() != 65 || point[0] != 4 {
-            return Err("unexpected public key encoding".into());
+            return Err(OAuthError::Key("unexpected public key encoding"));
         }
         let jwk = json!({
             "kty": "EC",
@@ -196,7 +235,12 @@ impl DpopKey {
     /// A DPoP proof (RFC 9449) for one request: ES256, a fresh `jti`, the
     /// method, the URL without query or fragment, the time, and the
     /// server's nonce when it has given one.
-    pub fn proof(&self, method: &str, url: &Url, nonce: Option<&str>) -> Result<String, String> {
+    pub fn proof(
+        &self,
+        method: &str,
+        url: &Url,
+        nonce: Option<&str>,
+    ) -> Result<String, OAuthError> {
         let mut htu = url.clone();
         htu.set_query(None);
         htu.set_fragment(None);
@@ -218,7 +262,7 @@ impl DpopKey {
         let sig = self
             .pair
             .sign(&SystemRandom::new(), signing_input.as_bytes())
-            .map_err(|_| "signing failed".to_owned())?;
+            .map_err(|_| OAuthError::Key("signing failed"))?;
         Ok(format!(
             "{signing_input}.{}",
             URL_SAFE_NO_PAD.encode(sig.as_ref())
@@ -239,17 +283,25 @@ pub struct Server {
     pub token: Url,
 }
 
-async fn get_json(safe: &SafeClient, url: &Url) -> Result<Value, String> {
-    let r = safe.get(url).await.map_err(|e| e.to_string())?;
+async fn get_json(safe: &SafeClient, url: &Url) -> Result<Value, OAuthError> {
+    let r = safe.get(url).await?;
     // A discovery document is read where it was asked for: a redirect is
     // not followed to another document.
     if r.final_url != *url {
-        return Err(format!("{} redirects elsewhere", origin_of(url)));
+        return Err(OAuthError::Metadata(format!(
+            "{} redirects elsewhere",
+            origin_of(url)
+        )));
     }
     if r.status != 200 {
-        return Err(format!("{}: HTTP {}", origin_of(url), r.status));
+        return Err(OAuthError::Metadata(format!(
+            "{}: HTTP {}",
+            origin_of(url),
+            r.status
+        )));
     }
-    serde_json::from_slice(&r.body).map_err(|_| format!("{}: not JSON", origin_of(url)))
+    serde_json::from_slice(&r.body)
+        .map_err(|_| OAuthError::Metadata(format!("{}: not JSON", origin_of(url))))
 }
 
 fn origin_of(u: &Url) -> String {
@@ -283,7 +335,7 @@ pub fn check_server_metadata(
     issuer: &Url,
     meta: &Value,
     safe: &SafeClientConfig,
-) -> Result<Server, String> {
+) -> Result<Server, OAuthError> {
     let has = |key: &str, want: &str| {
         meta[key]
             .as_array()
@@ -292,22 +344,29 @@ pub fn check_server_metadata(
     let declared = meta["issuer"]
         .as_str()
         .and_then(bare_origin)
-        .ok_or("the authorization server names no issuer")?;
+        .ok_or_else(|| OAuthError::Metadata("the authorization server names no issuer".into()))?;
     if declared.origin() != issuer.origin() {
-        return Err("the authorization server's issuer is not the one it was fetched from".into());
+        return Err(OAuthError::Metadata(
+            "the authorization server's issuer is not the one it was fetched from".into(),
+        ));
     }
     if meta["require_pushed_authorization_requests"].as_bool() != Some(true) {
-        return Err(
+        return Err(OAuthError::Metadata(
             "the authorization server does not require pushed authorization requests".into(),
-        );
+        ));
     }
-    let endpoint = |key: &str| -> Result<Url, String> {
+    let endpoint = |key: &str| -> Result<Url, OAuthError> {
         let u = meta[key]
             .as_str()
             .and_then(|s| Url::parse(s).ok())
-            .ok_or_else(|| format!("the authorization server has no {key}"))?;
-        farsight_core::net::check_url(&u, safe)
-            .map_err(|e| format!("the authorization server's {key} is not usable: {e}"))?;
+            .ok_or_else(|| {
+                OAuthError::Metadata(format!("the authorization server has no {key}"))
+            })?;
+        farsight_core::net::check_url(&u, safe).map_err(|e| {
+            OAuthError::Metadata(format!(
+                "the authorization server's {key} is not usable: {e}"
+            ))
+        })?;
         Ok(u)
     };
     let server = Server {
@@ -323,27 +382,33 @@ pub fn check_server_metadata(
         ("response_types_supported", "code"),
     ] {
         if !has(key, want) {
-            return Err(format!(
+            return Err(OAuthError::Metadata(format!(
                 "the authorization server does not list {want} in {key}"
-            ));
+            )));
         }
     }
     Ok(server)
 }
 
-async fn did_document(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Value, String> {
+async fn did_document(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Value, OAuthError> {
     let url = crate::public::handles::document_url(cfg, did)
-        .ok_or_else(|| format!("{did} has no document URL"))?;
-    let r = safe.get(&url).await.map_err(|e| e.to_string())?;
+        .ok_or_else(|| OAuthError::Document(format!("{did} has no document URL")))?;
+    let r = safe.get(&url).await?;
     match r.status {
         200 => {}
-        404 | 410 => return Err("the DID was not found".into()),
-        s => return Err(format!("the DID's directory answered HTTP {s}")),
+        404 | 410 => return Err(OAuthError::DidNotFound),
+        s => {
+            return Err(OAuthError::Document(format!(
+                "the DID's directory answered HTTP {s}"
+            )));
+        }
     }
-    let doc: Value =
-        serde_json::from_slice(&r.body).map_err(|_| "the DID document is not JSON".to_owned())?;
+    let doc: Value = serde_json::from_slice(&r.body)
+        .map_err(|_| OAuthError::Document("the DID document is not JSON".into()))?;
     if doc["id"].as_str() != Some(did.as_str()) {
-        return Err("the DID document is for another DID".into());
+        return Err(OAuthError::Document(
+            "the DID document is for another DID".into(),
+        ));
     }
     Ok(doc)
 }
@@ -351,23 +416,23 @@ async fn did_document(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Valu
 /// Finds and checks the authorization server of `did`: its DID document's
 /// PDS, that PDS's protected-resource metadata (exactly one authorization
 /// server), and that server's metadata.
-pub async fn discover(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Server, String> {
+pub async fn discover(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Server, OAuthError> {
     let doc = did_document(safe, cfg, did).await?;
-    let pds = pds_endpoint(&doc).ok_or("the DID document names no PDS")?;
-    let resource = pds
-        .join("/.well-known/oauth-protected-resource")
-        .map_err(|e| e.to_string())?;
+    let pds = pds_endpoint(&doc)
+        .ok_or_else(|| OAuthError::Document("the DID document names no PDS".into()))?;
+    let resource = pds.join("/.well-known/oauth-protected-resource")?;
     let meta = get_json(safe, &resource).await?;
     let issuer = match meta["authorization_servers"].as_array().map(Vec::as_slice) {
-        Some([one]) => one
-            .as_str()
-            .and_then(bare_origin)
-            .ok_or("the PDS names an unusable authorization server")?,
-        _ => return Err("the PDS does not name exactly one authorization server".into()),
+        Some([one]) => one.as_str().and_then(bare_origin).ok_or_else(|| {
+            OAuthError::Metadata("the PDS names an unusable authorization server".into())
+        })?,
+        _ => {
+            return Err(OAuthError::Metadata(
+                "the PDS does not name exactly one authorization server".into(),
+            ));
+        }
     };
-    let server_url = issuer
-        .join("/.well-known/oauth-authorization-server")
-        .map_err(|e| e.to_string())?;
+    let server_url = issuer.join("/.well-known/oauth-authorization-server")?;
     let server_meta = get_json(safe, &server_url).await?;
     check_server_metadata(&issuer, &server_meta, safe.config())
 }
@@ -384,11 +449,11 @@ pub struct Identity {
 
 /// Resolves a DID for display. An error means the document could not be
 /// read; a document without a handle or a PDS is not an error.
-pub async fn identity(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Identity, String> {
+pub async fn identity(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Identity, OAuthError> {
     let doc = did_document(safe, cfg, did).await?;
     let pds = pds_endpoint(&doc).and_then(|u| u.host_str().map(str::to_owned));
     let handle = match crate::public::handles::claimed_handle(&doc) {
-        Some(h) => match crate::pages::resolve_handle(safe, &h).await {
+        Some(h) => match crate::pages::handle_to_did(safe, &h).await {
             Ok(back) if back == *did => Some(h),
             _ => None,
         },
@@ -420,15 +485,14 @@ async fn dpop_post(
     key: &DpopKey,
     pairs: &[(&str, &str)],
     nonce: Option<String>,
-) -> Result<(OutboundResponse, Option<String>), String> {
+) -> Result<(OutboundResponse, Option<String>), OAuthError> {
     let mut nonce = nonce;
     let mut retried = false;
     loop {
         let proof = key.proof("POST", url, nonce.as_deref())?;
         let r = safe
             .post_form(url, &[("dpop", &proof)], form_body(pairs))
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
         let given = header(&r, "dpop-nonce").map(str::to_owned);
         let wants_nonce = (r.status == 400 || r.status == 401)
             && serde_json::from_slice::<Value>(&r.body)
@@ -460,7 +524,8 @@ fn oauth_error(r: &OutboundResponse) -> String {
 /// only, keyed by `state`.
 #[derive(Debug)]
 pub struct Flow {
-    /// PKCE verifier.
+    /// The PKCE verifier whose S256 challenge went out with the pushed
+    /// request; the token request sends the verifier itself.
     pub verifier: String,
     /// The flow's DPoP key.
     pub key: DpopKey,
@@ -489,7 +554,7 @@ pub async fn start(
     did: &str,
     state: &str,
     cookie_sha256: [u8; 32],
-) -> Result<(Flow, Url), String> {
+) -> Result<(Flow, Url), OAuthError> {
     let key = DpopKey::generate()?;
     let verifier = new_secret();
     let challenge = pkce_challenge(&verifier);
@@ -511,15 +576,17 @@ pub async fn start(
     )
     .await?;
     if !(r.status == 200 || r.status == 201) {
-        return Err(format!(
+        return Err(OAuthError::Refused(format!(
             "the pushed authorization request was refused: {}",
             oauth_error(&r)
-        ));
+        )));
     }
     let request_uri = serde_json::from_slice::<Value>(&r.body)
         .ok()
         .and_then(|b| b["request_uri"].as_str().map(str::to_owned))
-        .ok_or("the pushed authorization response has no request_uri")?;
+        .ok_or(OAuthError::Response(
+            "the pushed authorization response has no request_uri",
+        ))?;
     let mut to = server.authorize.clone();
     to.query_pairs_mut()
         .append_pair("client_id", &client.client_id)
@@ -544,7 +611,7 @@ pub async fn start(
 /// response must be a DPoP-bound grant of the `atproto` scope. The tokens
 /// are dropped here: they are never returned, stored or logged, and the
 /// flow's key — which they are bound to — is dropped with the flow.
-pub async fn redeem(safe: &SafeClient, flow: Flow, code: &str) -> Result<String, String> {
+pub async fn redeem(safe: &SafeClient, flow: Flow, code: &str) -> Result<String, OAuthError> {
     let (r, _) = dpop_post(
         safe,
         &flow.token,
@@ -560,36 +627,38 @@ pub async fn redeem(safe: &SafeClient, flow: Flow, code: &str) -> Result<String,
     )
     .await?;
     if r.status != 200 {
-        return Err(format!(
+        return Err(OAuthError::Refused(format!(
             "the token request was refused: {}",
             oauth_error(&r)
-        ));
+        )));
     }
-    let body: Value =
-        serde_json::from_slice(&r.body).map_err(|_| "the token response is not JSON".to_owned())?;
+    let body: Value = serde_json::from_slice(&r.body)
+        .map_err(|_| OAuthError::Response("the token response is not JSON"))?;
     read_token_response(&body)
 }
 
 /// The `sub` of a token response that is a DPoP-bound grant of the
 /// `atproto` scope.
-pub fn read_token_response(body: &Value) -> Result<String, String> {
+pub fn read_token_response(body: &Value) -> Result<String, OAuthError> {
     if !body["token_type"]
         .as_str()
         .is_some_and(|t| t.eq_ignore_ascii_case("DPoP"))
     {
-        return Err("the token response is not DPoP-bound".into());
+        return Err(OAuthError::Response("the token response is not DPoP-bound"));
     }
     if !body["scope"]
         .as_str()
         .is_some_and(|s| s.split_ascii_whitespace().any(|x| x == SCOPE))
     {
-        return Err("the token response does not grant the atproto scope".into());
+        return Err(OAuthError::Response(
+            "the token response does not grant the atproto scope",
+        ));
     }
     body["sub"]
         .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| "the token response has no sub".to_owned())
+        .ok_or(OAuthError::Response("the token response has no sub"))
 }
 
 /// What a callback's `state` and cookie matched.
@@ -690,7 +759,7 @@ impl FlowStore {
             .retain(|_, f| now.saturating_duration_since(f.created) <= self.ttl);
     }
 
-    /// Flows held.
+    /// Flows held now, expired ones not yet swept included.
     pub fn len(&self) -> usize {
         self.flows.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -707,9 +776,10 @@ type Cached<T> = Mutex<Option<(String, Instant, T)>>;
 /// handle for display, and the clock of the `sub`-mismatch warning.
 #[derive(Debug, Default)]
 pub struct OAuthState {
-    /// Flows in progress.
+    /// Flows in progress, keyed by `state`: put at `POST /enter`, taken
+    /// once by the callback.
     pub flows: FlowStore,
-    discovery: Cached<Result<Server, String>>,
+    discovery: Cached<Result<Server, OAuthError>>,
     handle: Cached<Option<String>>,
     last_mismatch_warning: Mutex<Option<Instant>>,
 }
@@ -724,7 +794,7 @@ impl OAuthState {
         safe: &SafeClient,
         cfg: &Config,
         did: &Did,
-    ) -> Result<Server, String> {
+    ) -> Result<Server, OAuthError> {
         {
             let c = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((d, at, r)) = c.as_ref() {

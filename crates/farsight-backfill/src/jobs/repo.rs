@@ -3,13 +3,15 @@
 //! (early stamp only) → list each present collection with range reconcile
 //! → done.
 
+use farsight_storage::codes::sql::{DEBT_CAPPED, JOB_REPO, RECORD_UNKNOWN, REPO_RUNNING, TRACKED};
 use std::collections::{BTreeSet, HashSet};
 
 use chrono::{DateTime, Utc};
 use farsight_core::record::parse_record;
 use farsight_core::{AtUri, Collection, Did, RecordKey};
 use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Reconcile, Write, WriteAction};
-use farsight_storage::codes::{DebtReason, actor_status};
+use farsight_storage::codes::{ActorStatus, DebtReason, JobKind, Priority, RequesterKey, Tier};
+use farsight_storage::ids::{ListId, RepoRunId, RunId, Stamp};
 use farsight_storage::repo_events::RepoEvent;
 use farsight_storage::transition::Event;
 use farsight_storage::txn::Gates;
@@ -65,15 +67,45 @@ fn net_stop(e: NetError) -> Stop {
     }
 }
 
-/// The stamp of a run.
+/// The stamp of a run: the rev its listing writes carry, and how it
+/// was read.
 #[derive(Debug, Clone, Copy)]
-pub struct Stamp {
+pub struct ListingStamp {
     /// `R` (decoded rev).
-    pub rev: i64,
+    pub rev: Stamp,
     /// When it was read (database clock).
     pub read_at: DateTime<Utc>,
     /// Taken late (after describeRepo).
     pub late: bool,
+}
+
+/// The run a listing's `backfill_cursors` rows belong to. The job kind
+/// decides what the row's `run_id` holds: a repo job's own number, or the
+/// `list_fetch_runs` row of a fetch run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorRun {
+    /// A repo job's run.
+    Repo(RepoRunId),
+    /// A list fetch run.
+    ListFetch(RunId),
+}
+
+impl CursorRun {
+    /// `backfill_cursors.job_kind`.
+    pub fn job_kind(self) -> JobKind {
+        match self {
+            CursorRun::Repo(_) => JobKind::Repo,
+            CursorRun::ListFetch(_) => JobKind::ListFetch,
+        }
+    }
+
+    /// `backfill_cursors.run_id`.
+    pub fn id(self) -> i64 {
+        match self {
+            CursorRun::Repo(id) => id.get(),
+            CursorRun::ListFetch(id) => id.get(),
+        }
+    }
 }
 
 /// What a listing produced.
@@ -83,7 +115,7 @@ pub struct Listing {
     pub refused: u64,
     /// Reconcile skipped for a collection (seen-set overflow).
     pub reconcile_skipped: bool,
-    /// Requests made.
+    /// Outbound requests the listing made (added to the job's cost).
     pub cost: u64,
     /// At least one page ran deletes-only.
     pub deletes_only: bool,
@@ -109,10 +141,11 @@ impl GatePolicy {
     pub fn new(req: &JobReq, large: bool) -> GatePolicy {
         GatePolicy {
             admin: req.admin(),
-            gated: req.tier >= 2
-                || req.requester.starts_with("token:")
-                || req.requester == "system:resync"
-                || req.requester == "system:lists",
+            gated: req.tier != Tier::OnDemand
+                || matches!(
+                    req.requester,
+                    RequesterKey::Token(_) | RequesterKey::Resync | RequesterKey::Lists
+                ),
             large,
         }
     }
@@ -155,9 +188,8 @@ pub async fn list_collection(
     pds: &Pds,
     did: &Did,
     k: Collection,
-    stamp: Stamp,
-    job_kind: i16,
-    run_id: i64,
+    stamp: ListingStamp,
+    run: CursorRun,
     policy: GatePolicy,
 ) -> Result<Listing, Stop> {
     let pool = &ctx.pool;
@@ -174,8 +206,8 @@ pub async fn list_collection(
         )
         .bind(id)
         .bind(k.code())
-        .bind(job_kind)
-        .bind(run_id)
+        .bind(run.job_kind())
+        .bind(run.id())
         .fetch_optional(pool)
         .await?;
         if let Some((c, p)) = row {
@@ -194,15 +226,10 @@ pub async fn list_collection(
         if pages > MAX_PAGES {
             return Err(Stop::Yield);
         }
-        let (records, next) = xrpc::list_records(
-            &ctx.net,
-            &pds.endpoint,
-            did.as_str(),
-            k.nsid(),
-            cursor.as_deref(),
-        )
-        .await
-        .map_err(net_stop)?;
+        let (records, next) =
+            xrpc::list_records(&ctx.net, &pds.endpoint, did, k.nsid(), cursor.as_deref())
+                .await
+                .map_err(net_stop)?;
         out.cost += 1;
         if next.is_some() && next == cursor {
             return Err(Stop::Failed("listRecords cursor did not change".into()));
@@ -327,8 +354,8 @@ pub async fn list_collection(
             )
             .bind(id)
             .bind(k.code())
-            .bind(job_kind)
-            .bind(run_id)
+            .bind(run.job_kind())
+            .bind(run.id())
             .bind(stamp.rev)
             .bind(stamp.read_at)
             .bind(stamp.late)
@@ -360,9 +387,9 @@ pub async fn diverged(ctx: &Ctx, did: &Did, witness: DateTime<Utc>) -> Result<()
     let Some(id) = jobs::actor_id(pool, did.as_str()).await? else {
         return Ok(());
     };
-    let lists: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM lists WHERE owner_id = $1 AND track_state IN (1, 2, 3, 4) ORDER BY id",
-    )
+    let lists: Vec<ListId> = sqlx::query_scalar(&format!(
+        "SELECT id FROM lists WHERE owner_id = $1 AND track_state IN {TRACKED} ORDER BY id"
+    ))
     .bind(id)
     .fetch_all(pool)
     .await?;
@@ -390,35 +417,35 @@ pub async fn diverged(ctx: &Ctx, did: &Did, witness: DateTime<Utc>) -> Result<()
     Ok(())
 }
 
-async fn holds_rows(pool: &PgPool, did: &str) -> Result<bool, sqlx::Error> {
+async fn holds_rows(pool: &PgPool, did: &Did) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM actors a WHERE a.did = $1 AND (
+        &format!("SELECT EXISTS (SELECT 1 FROM actors a WHERE a.did = $1 AND (
             a.authored_blocks > 0 OR a.authored_listblocks > 0 OR a.authored_lists > 0
             OR a.owned_items > 0
-            OR EXISTS (SELECT 1 FROM lists l WHERE l.owner_id = a.id AND l.record_state <> 0)
-            OR EXISTS (SELECT 1 FROM list_blocks b WHERE b.author_id = a.id)))",
+            OR EXISTS (SELECT 1 FROM lists l WHERE l.owner_id = a.id AND l.record_state <> {RECORD_UNKNOWN})
+            OR EXISTS (SELECT 1 FROM list_blocks b WHERE b.author_id = a.id)))"),
     )
-    .bind(did)
+    .bind(did.as_str())
     .fetch_one(pool)
     .await
 }
 
-async fn owns_tracked_list(pool: &PgPool, did: &str) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
+async fn owns_tracked_list(pool: &PgPool, did: &Did) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(&format!(
         "SELECT EXISTS (SELECT 1 FROM lists l JOIN actors a ON a.id = l.owner_id
-                        WHERE a.did = $1 AND l.track_state IN (1, 2, 3, 4))",
-    )
-    .bind(did)
+                        WHERE a.did = $1 AND l.track_state IN {TRACKED})"
+    ))
+    .bind(did.as_str())
     .fetch_one(pool)
     .await
 }
 
-async fn read_stamp(ctx: &Ctx, pds: &Pds, did: &Did, late: bool) -> Result<Stamp, Stop> {
-    let rev = xrpc::latest_rev(&ctx.net, &pds.endpoint, did.as_str())
+async fn read_stamp(ctx: &Ctx, pds: &Pds, did: &Did, late: bool) -> Result<ListingStamp, Stop> {
+    let rev = xrpc::latest_rev(&ctx.net, &pds.endpoint, did)
         .await
         .map_err(net_stop)?;
     let read_at = jobs::db_now(&ctx.pool).await?;
-    Ok(Stamp { rev, read_at, late })
+    Ok(ListingStamp { rev, read_at, late })
 }
 
 /// Applies an account status learned from the relay (status only from
@@ -437,7 +464,7 @@ pub async fn apply_status(
         counters: &ctx.counters,
     };
     let mut b = Batch::new(Origin::Discovery {
-        requester: "system:sweep".into(),
+        requester: RequesterKey::Sweep,
     });
     b.events.push(RepoEvent::Account {
         did: did.clone(),
@@ -457,12 +484,12 @@ pub async fn apply_status(
 async fn relay_verdict(ctx: &Ctx, did: &Did, cost: &mut u64) -> Option<Outcome> {
     let relay = ctx.cfg().backfill.relay_url.clone();
     *cost += 1;
-    match xrpc::repo_status(&ctx.net, &relay, did.as_str()).await {
+    match xrpc::repo_status(&ctx.net, &relay, did).await {
         Ok(s) if !s.active => {
             let hidden = s
                 .status
                 .as_deref()
-                .is_some_and(|st| actor_status::is_hidden(actor_status::from_upstream(Some(st))));
+                .is_some_and(|st| ActorStatus::from_upstream(Some(st)).is_hidden());
             if hidden {
                 if let Err(e) = apply_status(ctx, did, false, s.status.clone()).await {
                     tracing::warn!(did = %did, error = ?e, "recording relay status failed");
@@ -544,10 +571,10 @@ async fn requeue_yielded(ctx: &Ctx, req: &JobReq) {
             let _ = farsight_storage::queue::enqueue(
                 &mut conn,
                 id,
-                farsight_storage::queue::JobKind::Repo,
+                JobKind::Repo,
                 req.tier,
-                farsight_storage::repo_events::priority::NORMAL,
-                &req.requester,
+                Priority::Normal,
+                req.requester,
                 None,
             )
             .await;
@@ -555,39 +582,40 @@ async fn requeue_yielded(ctx: &Ctx, req: &JobReq) {
     }
 }
 
-type AttemptErr = (Stop, Option<i64>);
+type AttemptErr = (Stop, Option<Stamp>);
 
 async fn attempt(
     ctx: &Ctx,
     req: &JobReq,
     point: Option<DateTime<Utc>>,
     cost: &mut u64,
-) -> Result<(Outcome, Option<i64>), AttemptErr> {
+) -> Result<(Outcome, Option<Stamp>), AttemptErr> {
     let pool = &ctx.pool;
     let did = &req.did;
     let e = |s: Stop| (s, None);
     // An actor already known as hidden: the relay confirms (inactive) or
     // contradicts it (the status is updated and the repo listed).
-    let status: Option<i16> = sqlx::query_scalar("SELECT status FROM actors WHERE did = $1")
-        .bind(did.as_str())
-        .fetch_optional(pool)
-        .await
-        .map_err(|x| e(x.into()))?;
-    if status.is_some_and(actor_status::is_hidden) {
+    let status: Option<ActorStatus> =
+        sqlx::query_scalar("SELECT status FROM actors WHERE did = $1")
+            .bind(did.as_str())
+            .fetch_optional(pool)
+            .await
+            .map_err(|x| e(x.into()))?;
+    if status.is_some_and(ActorStatus::is_hidden) {
         if let Some(o) = relay_verdict(ctx, did, cost).await {
             return Ok((o, None));
         }
         apply_status(ctx, did, true, None).await.map_err(e)?;
     }
     // Resume this DID's own run if it is fresh (< 72 h).
-    let resume: Option<(i64, i64, DateTime<Utc>, bool)> = sqlx::query_as(
+    let resume: Option<(RepoRunId, Stamp, DateTime<Utc>, bool)> = sqlx::query_as(&format!(
         "SELECT s.current_run_id, c.stamp_rev, c.stamp_read_at, c.late_stamp
          FROM backfill_state s JOIN actors a ON a.id = s.actor_id
-         JOIN backfill_cursors c ON c.actor_id = s.actor_id AND c.job_kind = 1
+         JOIN backfill_cursors c ON c.actor_id = s.actor_id AND c.job_kind = {JOB_REPO}
               AND c.run_id = s.current_run_id
          WHERE a.did = $1 AND c.stamp_read_at > now() - interval '72 hours'
-         LIMIT 1",
-    )
+         LIMIT 1"
+    ))
     .bind(did.as_str())
     .fetch_optional(pool)
     .await
@@ -595,7 +623,7 @@ async fn attempt(
     let (run_id, mut stamp) = match resume {
         Some((run, rev, at, late)) => (
             run,
-            Some(Stamp {
+            Some(ListingStamp {
                 rev,
                 read_at: at,
                 late,
@@ -604,7 +632,7 @@ async fn attempt(
         None => {
             let mut b = [0u8; 8];
             let _ = getrandom::getrandom(&mut b);
-            (i64::from_le_bytes(b) & i64::MAX, None)
+            (RepoRunId::new(i64::from_le_bytes(b) & i64::MAX), None)
         }
     };
     let resumed = stamp.is_some();
@@ -612,12 +640,12 @@ async fn attempt(
         .await
         .map_err(|x| e(x.into()))?
     {
-        sqlx::query(
+        sqlx::query(&format!(
             "INSERT INTO backfill_state (actor_id, state, current_run_id, current_run_point)
-             VALUES ($1, 2, $2, $3)
-             ON CONFLICT (actor_id) DO UPDATE SET state = 2, current_run_id = $2,
-               current_run_point = $3",
-        )
+             VALUES ($1, {REPO_RUNNING}, $2, $3)
+             ON CONFLICT (actor_id) DO UPDATE SET state = {REPO_RUNNING}, current_run_id = $2,
+               current_run_point = $3"
+        ))
         .bind(id)
         .bind(run_id)
         .bind(point)
@@ -663,10 +691,10 @@ async fn list_repo(
     ctx: &Ctx,
     req: &JobReq,
     pds: &Pds,
-    stamp: &mut Option<Stamp>,
+    stamp: &mut Option<ListingStamp>,
     resumed: bool,
     point: Option<DateTime<Utc>>,
-    run_id: i64,
+    run_id: RepoRunId,
     cost: &mut u64,
 ) -> Result<Outcome, Stop> {
     let pool = &ctx.pool;
@@ -674,16 +702,16 @@ async fn list_repo(
     let policy = GatePolicy::new(req, host_is_large(ctx, pds));
     let mut deletes_only = policy.deletes_only(ctx.gates.load());
     // 2. Stamp first if D holds rows.
-    if stamp.is_none() && holds_rows(pool, did.as_str()).await? {
+    if stamp.is_none() && holds_rows(pool, did).await? {
         *stamp = Some(read_stamp(ctx, pds, did, false).await?);
         *cost += 1;
     }
     // 3. describeRepo.
-    let collections = xrpc::describe_repo(&ctx.net, &pds.endpoint, did.as_str())
+    let collections = xrpc::describe_repo(&ctx.net, &pds.endpoint, did)
         .await
         .map_err(net_stop)?;
     *cost += 1;
-    let tracked = owns_tracked_list(pool, did.as_str()).await?;
+    let tracked = owns_tracked_list(pool, did).await?;
     let present: BTreeSet<Collection> = REPO_COLLECTIONS
         .iter()
         .copied()
@@ -702,7 +730,7 @@ async fn list_repo(
     }
     // Divergence check against the previous listing stamp (fresh runs).
     if let (Some(s), false) = (*stamp, resumed) {
-        let prev: Option<i64> = sqlx::query_scalar(
+        let prev: Option<Stamp> = sqlx::query_scalar(
             "SELECT s.backfill_rev FROM backfill_state s JOIN actors a ON a.id = s.actor_id
              WHERE a.did = $1",
         )
@@ -750,7 +778,7 @@ async fn list_repo(
     let mut refused = 0u64;
     let mut skipped = false;
     for k in &present {
-        let l = list_collection(ctx, pds, did, *k, stamp, 1, run_id, policy).await?;
+        let l = list_collection(ctx, pds, did, *k, stamp, CursorRun::Repo(run_id), policy).await?;
         *cost += l.cost;
         deletes_only |= l.deletes_only;
         refused += l.refused;
@@ -766,9 +794,9 @@ async fn list_repo(
     }
     // A clean run of an author holding a `capped` debt re-evaluates its
     // uncounted listblocks.
-    let capped: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM relist_debt WHERE actor_id = $1 AND reason = 3)",
-    )
+    let capped: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM relist_debt WHERE actor_id = $1 AND reason = {DEBT_CAPPED})"
+    ))
     .bind(id)
     .fetch_one(pool)
     .await?;

@@ -4,13 +4,16 @@
 use farsight_core::Did;
 
 use crate::error::XrpcError;
+use farsight_core::ListPurpose;
 
-/// Default page size.
+/// Page size when `limit` is absent.
 pub const DEFAULT_LIMIT: i64 = 100;
-/// Maximum page size.
+/// Largest `limit` accepted. A larger one is `InvalidRequest`, not
+/// clamped.
 pub const MAX_LIMIT: i64 = 1000;
 
-/// Parsed query parameters.
+/// Parsed query parameters: decoded `(name, value)` pairs in the order
+/// sent. A name may repeat.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Params(Vec<(String, String)>);
 
@@ -24,12 +27,13 @@ impl Params {
         )
     }
 
-    /// From explicit pairs.
+    /// Parameters from already-decoded pairs: how the web UI calls a
+    /// handler in-process, without a query string.
     pub fn from_pairs(pairs: Vec<(String, String)>) -> Params {
         Params(pairs)
     }
 
-    /// The first value of `name`.
+    /// The first value of `name`; `None` when the parameter is absent.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.0
             .iter()
@@ -95,14 +99,14 @@ pub fn parse_did(name: &str, v: &str) -> Result<Did, XrpcError> {
 }
 
 /// A list purpose filter (`modlist`, `curatelist`, `referencelist`,
-/// `other`) as its storage code.
-pub fn purpose_code(v: Option<&str>) -> Result<Option<i16>, XrpcError> {
+/// `other`); `None` when the parameter is absent.
+pub fn purpose_filter(v: Option<&str>) -> Result<Option<ListPurpose>, XrpcError> {
     match v {
         None => Ok(None),
-        Some("modlist") => Ok(Some(1)),
-        Some("curatelist") => Ok(Some(2)),
-        Some("referencelist") => Ok(Some(3)),
-        Some("other") => Ok(Some(0)),
+        Some("modlist") => Ok(Some(ListPurpose::Mod)),
+        Some("curatelist") => Ok(Some(ListPurpose::Curate)),
+        Some("referencelist") => Ok(Some(ListPurpose::Reference)),
+        Some("other") => Ok(Some(ListPurpose::Other)),
         Some(o) => Err(XrpcError::invalid(format!("unknown purpose {o:?}"))),
     }
 }

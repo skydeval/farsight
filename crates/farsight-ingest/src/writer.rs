@@ -39,9 +39,10 @@ use crate::frame::{Body, InEvent, Protocol};
 use crate::metrics as m;
 use crate::stats::IngestStats;
 
-/// Batch size bound.
+/// Most events in one batch, which is one transaction.
 pub const BATCH_MAX: usize = 500;
-/// Batch time bound.
+/// Longest a batch waits for more events after its first before it is
+/// applied.
 pub const BATCH_WINDOW: Duration = Duration::from_millis(250);
 /// Attempts of one event alone before it is poisoned.
 pub const POISON_STRIKES: u32 = 3;
@@ -85,16 +86,16 @@ pub enum Item {
     Session {
         /// Instance URL (as configured).
         url: String,
-        /// Negotiated protocol.
+        /// The protocol the session speaks.
         protocol: Protocol,
     },
     /// A gap to record (witness µs).
     Gap {
-        /// Start.
+        /// Start of the gap, witness µs.
         from_us: i64,
-        /// End.
+        /// End of the gap, witness µs.
         to_us: i64,
-        /// Cause.
+        /// Why the stream has the gap; stored with it.
         cause: GapCause,
     },
     /// The session ended.
@@ -113,14 +114,14 @@ pub fn dt(us: i64) -> DateTime<Utc> {
 pub struct Writer {
     /// Ingest pool (4 connections).
     pub pool: PgPool,
-    /// Limits.
+    /// Caps handed to `apply` with every batch.
     pub limits: Limits,
     /// Gates, published by the server's budget monitor and read once
     /// per batch.
     pub gates: Arc<SharedGates>,
     /// Counter sink (flushed by the caller's task).
     pub counters: Arc<CounterSink>,
-    /// Shared stats.
+    /// Counters shared with the reader and the embedding process.
     pub stats: Arc<IngestStats>,
     /// Fault injection (harness only).
     #[cfg(feature = "harness")]
@@ -178,7 +179,7 @@ fn to_write(op: &CommitOp, witness_us: i64) -> Write {
         author: op.author.clone(),
         collection: op.collection,
         rkey: op.rkey.clone(),
-        stamp: op.rev.as_i64(),
+        stamp: farsight_storage::ids::Stamp::from_tid(op.rev),
         witness: Some(dt(witness_us)),
         action: match &op.action {
             CommitAction::Delete => WriteAction::Delete,

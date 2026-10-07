@@ -24,10 +24,12 @@ use crate::resume::Cursor;
 /// The four indexed collections (`wantedCollections` / `collections`).
 pub const COLLECTIONS: [&str; 4] = farsight_core::nsid::INDEXED_COLLECTIONS;
 
-/// v2 subprotocol.
+/// Websocket subprotocol the v2 handshake asks for
+/// (`Sec-WebSocket-Protocol`).
 pub const V2_SUBPROTOCOL: &str = "xrpc.v1.json";
 
-/// Handshake timeout.
+/// Longest the TCP, TLS and websocket handshake may take together; past it
+/// the connect fails as [`ConnectError::Transport`].
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Why a connection was not established.
@@ -59,7 +61,8 @@ pub enum ReadError {
     /// A message that is not a decodable frame.
     #[error("{0}")]
     Frame(#[from] frame::FrameError),
-    /// zstd failure.
+    /// A binary message that zstd could not expand with the session's
+    /// dictionary, or that expands past [`dict::MAX_FRAME_BYTES`].
     #[error("decompress: {0}")]
     Decompress(String),
 }
@@ -104,14 +107,16 @@ pub fn endpoint(base: &str, protocol: Protocol, cursor: Cursor, compress: bool) 
     format!("{base}{path}?{}", q.join("&"))
 }
 
-/// An open session.
+/// An open websocket session with one instance, on one protocol.
 pub struct Session {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    /// Negotiated protocol.
+    /// The protocol the session was opened with; every frame is decoded as
+    /// this.
     pub protocol: Protocol,
     /// Dictionary for binary frames, if compression was requested.
     dict: Option<&'static [u8]>,
-    /// The URL connected to.
+    /// The full endpoint URL connected to, query string (collections,
+    /// cursor, compression) included.
     pub url: String,
     /// The instance base URL (as passed to [`connect`]).
     pub url_base: String,

@@ -5,6 +5,7 @@
 #![warn(missing_docs)]
 
 pub mod aturi;
+pub mod bucket;
 pub mod cloudflare;
 pub mod config;
 pub mod did;

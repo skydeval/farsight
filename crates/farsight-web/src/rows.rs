@@ -9,7 +9,8 @@
 //! [`SortIndexes`]: farsight_storage::ui_rows::SortIndexes
 
 use farsight_api::error::XrpcError;
-use farsight_storage::ui_rows::{self, Filter, NamingRow, Row, Section};
+use farsight_storage::ids::ActorId;
+use farsight_storage::ui_rows::{self, Filter, NamingRow, Row, Section, SectionKey};
 
 use crate::pages::WebState;
 
@@ -47,7 +48,7 @@ impl<R> Numbered<R> {
 pub async fn numbered(
     st: &WebState,
     section: Section,
-    key: i64,
+    key: SectionKey,
     filter: Filter<'_>,
     number: i64,
     limit: i64,
@@ -72,8 +73,8 @@ pub async fn numbered(
 /// by shown time.
 pub async fn numbered_naming(
     st: &WebState,
-    subject: i64,
-    excluded: &[i64],
+    subject: ActorId,
+    excluded: &[ActorId],
     find: Option<&ui_rows::Find>,
     number: i64,
     limit: i64,

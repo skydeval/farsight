@@ -8,14 +8,17 @@
 //! complete-with-debts does not clear, so without the bound it would be
 //! re-fed at once).
 
+use farsight_storage::codes::sql::{
+    JOB_LIST_FETCH, JOB_REPO, REPO_FAILED, TRACK_SERVED, TRACK_UNFETCHED,
+};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use farsight_core::Did;
-use farsight_storage::codes::{CapType, DebtReason};
+use farsight_storage::codes::{CapType, DebtReason, Priority, RequesterKey, Tier};
+use farsight_storage::ids::ActorId;
 use farsight_storage::keys::{self, CapKind, HostFacts, Limits};
-use farsight_storage::queue::{self, Enqueued, JobKind, SYSTEM_RESYNC};
-use farsight_storage::repo_events::priority;
+use farsight_storage::queue::{self, Enqueued, JobKind};
 use farsight_storage::txn::Gates;
 
 use crate::ctx::Ctx;
@@ -30,11 +33,12 @@ const UNDER: f64 = 0.9;
 /// What the feeder knows about one debt.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DebtView {
-    /// Reason.
+    /// `relist_debt.reason`: which rule of [`eligible`] applies.
     pub reason: DebtReason,
     /// Cap or rate named by the debt.
     pub cap_type: Option<CapType>,
-    /// `since_witness`.
+    /// `relist_debt.since_witness`: the witness time the debt dates from.
+    /// A run whose coverage point is at or after it has covered the debt.
     pub since: DateTime<Utc>,
     /// Author is on a large host.
     pub large: bool,
@@ -46,9 +50,12 @@ pub struct DebtView {
     pub admissions: (i64, i64),
     /// Interns charged / limit today to the author's cause key.
     pub interns: (i64, i64),
-    /// The last run's end, its point, and whether it failed.
+    /// `backfill_state.backfilled_at` (server time): when the author's
+    /// last run that listed to the end, or found the account inactive,
+    /// finished. A failed run does not move it. `None` before the first.
     pub last_run: Option<DateTime<Utc>>,
-    /// `backfilled_witness` of the last run.
+    /// `backfill_state.backfilled_witness`: the coverage point of that
+    /// run, on the witness clock.
     pub last_point: Option<DateTime<Utc>>,
     /// `backfill_state.next_attempt_at` (failed runs).
     pub next_attempt: Option<DateTime<Utc>>,
@@ -139,7 +146,7 @@ pub fn eligible(d: &DebtView, gates: Gates, limits: &Limits, now: DateTime<Utc>)
 
 #[derive(sqlx::FromRow)]
 struct Row {
-    actor_id: i64,
+    actor_id: ActorId,
     did: String,
     reason: i16,
     cap_type: Option<i16>,
@@ -169,24 +176,24 @@ pub async fn pass(ctx: &Ctx) -> Result<u64, farsight_storage::StorageError> {
     // Actors with a debt, not running and without a waiting repo entry,
     // oldest debt first.
     let rows: Vec<Row> = sqlx::query_as(
-            "SELECT d.actor_id, a.did, d.reason, d.cap_type, d.since_witness,
+            &format!("SELECT d.actor_id, a.did, d.reason, d.cap_type, d.since_witness,
                     a.admission_key, a.resolve_failures, a.pds_host_id IS NOT NULL AS resolved,
                     h.cap_key, h.ip_bucket, COALESCE(h.large, false) AS large,
                     a.authored_blocks, a.authored_listblocks, a.authored_lists, a.fetch_triggers,
                     b.backfilled_at, b.backfilled_witness,
-                    CASE WHEN b.state = 4 THEN b.next_attempt_at END AS next_attempt_at
+                    CASE WHEN b.state = {REPO_FAILED} THEN b.next_attempt_at END AS next_attempt_at
              FROM relist_debt d JOIN actors a ON a.id = d.actor_id
              LEFT JOIN pds_hosts h ON h.id = a.pds_host_id
              LEFT JOIN backfill_state b ON b.actor_id = d.actor_id
-             WHERE NOT EXISTS (SELECT 1 FROM backfill_queue q WHERE q.actor_id = d.actor_id AND q.kind = 1)
+             WHERE NOT EXISTS (SELECT 1 FROM backfill_queue q WHERE q.actor_id = d.actor_id AND q.kind = {JOB_REPO})
                AND NOT EXISTS (SELECT 1 FROM job_leases j WHERE j.did = a.did AND j.lease_until > now())
-             ORDER BY d.created_at LIMIT $1",
+             ORDER BY d.created_at LIMIT $1"),
         )
         .bind(PASS)
         .fetch_all(pool)
         .await?;
     let mut fed = 0u64;
-    let mut done: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut done: std::collections::HashSet<ActorId> = std::collections::HashSet::new();
     let today = now.date_naive();
     for r in rows {
         let actor = r.actor_id;
@@ -248,9 +255,9 @@ pub async fn pass(ctx: &Ctx) -> Result<u64, farsight_storage::StorageError> {
             &mut conn,
             actor,
             JobKind::Repo,
-            1,
-            priority::NORMAL,
-            SYSTEM_RESYNC,
+            Tier::OnDemand,
+            Priority::Normal,
+            RequesterKey::Resync,
             cap,
         )
         .await?
@@ -277,16 +284,16 @@ async fn feed_list_fetches(
 ) -> Result<u64, farsight_storage::StorageError> {
     let pool = &ctx.pool;
     let cooldown = ctx.cfg().backfill.owner_fetch_cooldown.get().as_secs_f64();
-    let owners: Vec<i64> = sqlx::query_scalar(
-        "SELECT DISTINCT l.owner_id FROM lists l
-         WHERE ((l.track_state IN (1, 4) AND l.phase1_epoch = l.admit_epoch AND l.fetch_run_id IS NULL)
-                OR (l.track_state IN (2, 3) AND l.refresh_requested))
-           AND NOT EXISTS (SELECT 1 FROM backfill_queue q WHERE q.actor_id = l.owner_id AND q.kind = 2)
+    let owners: Vec<ActorId> = sqlx::query_scalar(
+        &format!("SELECT DISTINCT l.owner_id FROM lists l
+         WHERE ((l.track_state IN {TRACK_UNFETCHED} AND l.phase1_epoch = l.admit_epoch AND l.fetch_run_id IS NULL)
+                OR (l.track_state IN {TRACK_SERVED} AND l.refresh_requested))
+           AND NOT EXISTS (SELECT 1 FROM backfill_queue q WHERE q.actor_id = l.owner_id AND q.kind = {JOB_LIST_FETCH})
            AND NOT EXISTS (SELECT 1 FROM list_fetch_runs r WHERE r.owner_id = l.owner_id
                              AND (r.finished_at IS NULL
                                   OR (r.started_at > now() - make_interval(secs => $2)
-                                      AND l.track_state IN (2, 3))))
-         LIMIT $1",
+                                      AND l.track_state IN {TRACK_SERVED})))
+         LIMIT $1"),
     )
     .bind(PASS)
     .bind(cooldown)
@@ -299,9 +306,9 @@ async fn feed_list_fetches(
             &mut conn,
             o,
             JobKind::ListFetch,
-            1,
-            priority::NORMAL,
-            crate::jobs::list_phase1::SYSTEM_LISTS,
+            Tier::OnDemand,
+            Priority::Normal,
+            RequesterKey::Lists,
             Some(limits.system_queue_cap),
         )
         .await?

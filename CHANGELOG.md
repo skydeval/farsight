@@ -9,6 +9,24 @@ database schema; each entry says so where it does.
 
 ## [Unreleased]
 
+### Added
+
+- For contributors: the integration harnesses for stages 1 and 3 to 9
+  now run every night on GitHub Actions and can be started by hand
+  (`.github/workflows/harness.yml`). Each stage is a job of its own and
+  keeps its log.
+- For contributors: every push and pull request is also built with
+  `--locked`, checked with `cargo deny` against the new `deny.toml`
+  (advisories, licences, crate sources) and measured for unit test
+  coverage, which the job prints in its summary.
+
+### Changed
+
+- For contributors: stored codes, row ids and record stamps are typed
+  throughout the Rust code (`farsight-storage/src/codes.rs`, `ids.rs`),
+  and failures in the web UI, the backfill jobs and the server tasks
+  are error enums. Nothing an operator sees changes.
+
 ### Fixed
 
 - Backfill: a host answering `429` with an enormous `Retry-After`
@@ -24,6 +42,9 @@ database schema; each entry says so where it does.
   never fell back to `listRepos` as documented and retried without
   end. It now falls back, also in the middle of a cycle, and asks the
   relay again before every full cycle.
+- Sweep: a cycle's "failed for good" and "done" figures could come out
+  one short for an account whose job was cut off at shutdown. The
+  account and the figure now change together.
 - Firehose: after about seven disconnects in the life of a process
   every reconnect waited 30 seconds. The wait now starts again at
   half a second after a session that ran well for a minute.

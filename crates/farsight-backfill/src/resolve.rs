@@ -30,7 +30,7 @@ pub const NEGATIVE_TTL: Duration = Duration::from_secs(24 * 3600);
 pub const MEMORY_TTL: Duration = Duration::from_secs(3600);
 const MEMORY_CAP: usize = 200_000;
 
-/// A resolved PDS.
+/// A resolved PDS: where a DID's repo is read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pds {
     /// Base URL, e.g. `https://pds.example`.
@@ -54,7 +54,8 @@ pub enum ResolveError {
     Transient(String),
 }
 
-/// The resolver.
+/// The resolver: DID → [`Pds`] through `actors.pds_host_id`, the
+/// in-memory caches, then the PLC directory or the `did:web` host.
 pub struct Resolver {
     net: Arc<Net>,
     pool: PgPool,
@@ -97,7 +98,11 @@ pub fn ip_block(ip: IpAddr) -> String {
 }
 
 impl Resolver {
-    /// A resolver.
+    /// A resolver with empty caches. From `config` it takes the PLC
+    /// directory's URL, the hosts allowed over plain HTTP, the large
+    /// hosts and the extra CDN ranges, and keeps them for its lifetime: a
+    /// change to any of them restarts the run. `dns` looks up a host's
+    /// address for its cap bucket.
     pub fn new(
         net: Arc<Net>,
         pool: PgPool,
@@ -309,7 +314,7 @@ impl Resolver {
         } else {
             self.ip_bucket(&pds.host).await
         };
-        let host_id: i32 = sqlx::query_scalar(
+        let host_id: farsight_storage::ids::HostId = sqlx::query_scalar(
             "INSERT INTO pds_hosts (host, cap_key, ip_bucket, large) VALUES ($1, $2, $3, $4)
              ON CONFLICT (host) DO UPDATE SET cap_key = EXCLUDED.cap_key,
                ip_bucket = COALESCE(EXCLUDED.ip_bucket, pds_hosts.ip_bucket), large = EXCLUDED.large

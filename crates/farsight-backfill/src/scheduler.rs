@@ -14,11 +14,20 @@
 //! it ends: a job that panics is logged, counted and costs its slot
 //! nothing.
 
+use farsight_storage::codes::sql::{
+    CYCLE_REPAIR, JOB_LIST_FETCH, JOB_REPO, MEMBER_OUTSTANDING, TIER_ACTIVE, TIER_ON_DEMAND,
+    TIER_SWEEP, TRACK_MISSING,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use std::hash::Hash;
+
 use farsight_core::Did;
+use farsight_core::bucket::{Bucket, Rate};
+use farsight_storage::codes::{CycleKind, JobKind, Priority, RequesterKey, Tier};
+use farsight_storage::ids::{ActorId, QueueId};
 use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
 
@@ -27,10 +36,6 @@ use crate::jobs::{self, JobReq, JobResult, Outcome};
 use crate::lanes::{self, Item, Lanes};
 use crate::metrics as m;
 
-/// Requester of sweep members (interning charged to `system:sweep`).
-pub const SYSTEM_SWEEP: &str = "system:sweep";
-/// Requester of repair-cycle members.
-pub const SYSTEM_REPAIR: &str = "system:repair";
 /// High-priority picks per normal pick within a requester.
 pub const HIGH_PER_NORMAL: u32 = 4;
 /// What a job is charged when it is dispatched, in outbound requests: the
@@ -38,10 +43,24 @@ pub const HIGH_PER_NORMAL: u32 = 4;
 pub const DISPATCH_CHARGE: u64 = 1;
 /// The task name panics of jobs are counted under.
 pub const JOB_TASK: &str = "backfill_job";
+/// What the tier-3 pacing counts as elapsed on its first use: the bucket
+/// starts empty, so the first sweep job is dispatched at once only at a
+/// rate of one a second or more.
+pub const TIER3_HEAD_START: Duration = Duration::from_secs(1);
+
+/// The tier-3 rate for `per_hour` repos an hour: the bucket has room for
+/// one second of it, and for one job at least.
+fn tier3_rate(per_hour: u64) -> Rate {
+    let per_sec = per_hour as f64 / 3600.0;
+    Rate {
+        per_sec,
+        burst: per_sec.max(1.0),
+    }
+}
 
 /// Charges `requester` for a job being dispatched.
-pub fn charge_dispatch(charged: &mut HashMap<String, f64>, requester: &str) {
-    *charged.entry(requester.to_owned()).or_insert(0.0) += DISPATCH_CHARGE as f64;
+pub fn charge_dispatch<K: Eq + Hash>(charged: &mut HashMap<K, f64>, requester: K) {
+    *charged.entry(requester).or_insert(0.0) += DISPATCH_CHARGE as f64;
 }
 
 /// What a finished job of cost `cost` still owes after its dispatch
@@ -51,26 +70,34 @@ pub fn remaining_charge(cost: u64) -> u64 {
 }
 
 /// Charges `requester` the rest of a finished job's cost.
-pub fn charge_finish(charged: &mut HashMap<String, f64>, requester: &str, cost: u64) {
-    *charged.entry(requester.to_owned()).or_insert(0.0) += remaining_charge(cost) as f64;
+pub fn charge_finish<K: Eq + Hash>(charged: &mut HashMap<K, f64>, requester: K, cost: u64) {
+    *charged.entry(requester).or_insert(0.0) += remaining_charge(cost) as f64;
 }
 
 /// Picks the tier to serve: among tiers with work, the one furthest below
 /// its guaranteed share (running / share), so every share is a minimum and
 /// unused share flows to the others.
-pub fn pick_tier(running: [usize; 3], shares: [u32; 3], has_work: [bool; 3]) -> Option<usize> {
-    (0..3).filter(|t| has_work[*t]).min_by(|a, b| {
-        let ra = running[*a] as f64 / f64::from(shares[*a].max(1));
-        let rb = running[*b] as f64 / f64::from(shares[*b].max(1));
-        ra.partial_cmp(&rb)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(b))
-    })
+pub fn pick_tier(running: [usize; 3], shares: [u32; 3], has_work: [bool; 3]) -> Option<Tier> {
+    Tier::ALL
+        .iter()
+        .copied()
+        .filter(|t| has_work[t.index()])
+        .min_by(|a, b| {
+            let (a, b) = (a.index(), b.index());
+            let ra = running[a] as f64 / f64::from(shares[a].max(1));
+            let rb = running[b] as f64 / f64::from(shares[b].max(1));
+            ra.partial_cmp(&rb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        })
 }
 
 /// Cost-based DRR across requesters: the least-charged requester with work
 /// goes next; a requester new to the round starts at the current minimum.
-pub fn pick_requester(charged: &mut HashMap<String, f64>, with_work: &[String]) -> Option<String> {
+pub fn pick_requester<K: Clone + Eq + Hash + Ord>(
+    charged: &mut HashMap<K, f64>,
+    with_work: &[K],
+) -> Option<K> {
     let floor = with_work
         .iter()
         .filter_map(|r| charged.get(r))
@@ -101,12 +128,12 @@ pub fn want_high(streak: u32) -> bool {
 #[derive(Debug, Clone)]
 enum Work {
     Queue {
-        actor_id: i64,
+        actor_id: ActorId,
         did: String,
-        kind: i16,
-        tier: i16,
-        priority: i16,
-        requester: String,
+        kind: JobKind,
+        tier: Tier,
+        priority: Priority,
+        requester: RequesterKey,
     },
     List {
         cand: Box<lanes::Candidate>,
@@ -114,32 +141,30 @@ enum Work {
     },
     Member {
         did: String,
-        requester: &'static str,
+        requester: RequesterKey,
     },
 }
 
 #[derive(Default)]
 struct State {
     running: [usize; 3],
-    charged: HashMap<String, f64>,
-    streak: HashMap<String, u32>,
+    charged: HashMap<RequesterKey, f64>,
+    streak: HashMap<RequesterKey, u32>,
     inflight_dids: HashSet<String>,
     inflight_items: HashSet<Item>,
     lanes: Lanes,
     member_cursor: Option<String>,
     completions: VecDeque<Instant>,
-    tier3_tokens: f64,
-    tier3_last: Option<Instant>,
+    tier3: Option<Bucket>,
 }
 
 impl Work {
     /// The tier-1 requester the job is charged to, as far as it is known
     /// before the job runs.
-    fn requester(&self) -> &str {
+    fn requester(&self) -> RequesterKey {
         match self {
-            Work::Queue { requester, .. } => requester,
-            Work::List { .. } => crate::jobs::list_phase1::SYSTEM_LISTS,
-            Work::Member { requester, .. } => requester,
+            Work::Queue { requester, .. } | Work::Member { requester, .. } => *requester,
+            Work::List { .. } => RequesterKey::Lists,
         }
     }
 }
@@ -150,7 +175,7 @@ impl Work {
 /// reason, a panic included.
 struct Running {
     sched: Arc<Scheduler>,
-    tier: usize,
+    tier: Tier,
     work: Work,
 }
 
@@ -158,7 +183,8 @@ impl Drop for Running {
     fn drop(&mut self) {
         {
             let mut s = self.sched.st();
-            s.running[self.tier] = s.running[self.tier].saturating_sub(1);
+            let i = self.tier.index();
+            s.running[i] = s.running[i].saturating_sub(1);
             match &self.work {
                 Work::Queue { did, .. } | Work::Member { did, .. } => {
                     s.inflight_dids.remove(did);
@@ -188,7 +214,15 @@ pub struct Scheduler {
     panic_dids: Mutex<HashSet<String>>,
 }
 
-type QueueRow = (i64, i64, String, i16, i16, i16, String);
+type QueueRow = (
+    QueueId,
+    ActorId,
+    String,
+    JobKind,
+    Tier,
+    Priority,
+    RequesterKey,
+);
 
 impl Scheduler {
     /// A scheduler over `ctx`.
@@ -252,38 +286,28 @@ impl Scheduler {
         if per_hour == 0 {
             return true;
         }
-        let rate = per_hour as f64 / 3600.0;
-        let mut s = self.st();
-        let now = Instant::now();
-        let el = s
-            .tier3_last
-            .map_or(1.0, |t| now.duration_since(t).as_secs_f64());
-        s.tier3_tokens = (s.tier3_tokens + el * rate).min(rate.max(1.0));
-        s.tier3_last = Some(now);
-        if s.tier3_tokens >= 1.0 {
-            s.tier3_tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+        self.st()
+            .tier3
+            .get_or_insert(Bucket::unused(0.0, TIER3_HEAD_START))
+            .take(Instant::now(), tier3_rate(per_hour))
     }
 
     async fn has_work(&self, pool: &PgPool) -> Result<[bool; 3], sqlx::Error> {
         let (t1, t2, t3): (bool, bool, bool) = sqlx::query_as(
-            "SELECT EXISTS (SELECT 1 FROM backfill_queue WHERE tier = 1
+            &format!("SELECT EXISTS (SELECT 1 FROM backfill_queue WHERE tier = {TIER_ON_DEMAND}
                               AND (not_before IS NULL OR not_before <= now())),
-                    EXISTS (SELECT 1 FROM backfill_queue WHERE tier = 2
+                    EXISTS (SELECT 1 FROM backfill_queue WHERE tier = {TIER_ACTIVE}
                               AND (not_before IS NULL OR not_before <= now())),
-                    EXISTS (SELECT 1 FROM backfill_queue WHERE tier = 3
+                    EXISTS (SELECT 1 FROM backfill_queue WHERE tier = {TIER_SWEEP}
                               AND (not_before IS NULL OR not_before <= now()))
                     OR EXISTS (SELECT 1 FROM cycle_outstanding o JOIN sweep_cycles c ON c.id = o.cycle_id
-                               WHERE o.state = 1 AND c.completed_at IS NULL)",
+                               WHERE o.state = {MEMBER_OUTSTANDING} AND c.completed_at IS NULL)"),
         )
         .fetch_one(pool)
         .await?;
         let lists: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM list_jobs WHERE not_before IS NULL OR not_before <= now())
-                 OR EXISTS (SELECT 1 FROM lists WHERE track_state = 6 AND next_retry_at <= now())",
+            &format!("SELECT EXISTS (SELECT 1 FROM list_jobs WHERE not_before IS NULL OR not_before <= now())
+                 OR EXISTS (SELECT 1 FROM lists WHERE track_state = {TRACK_MISSING} AND next_retry_at <= now())"),
         )
         .fetch_one(pool)
         .await?;
@@ -293,7 +317,7 @@ impl Scheduler {
     async fn claim_queue(
         &self,
         sql_filter: &str,
-        args: (i16, Option<&str>, Option<i16>),
+        args: (Tier, Option<RequesterKey>, Option<Priority>),
     ) -> Result<Option<Work>, sqlx::Error> {
         let inflight: Vec<String> = self.st().inflight_dids.iter().cloned().collect();
         let sql = format!(
@@ -327,26 +351,28 @@ impl Scheduler {
 
     async fn pick_tier1(&self) -> Result<Option<Work>, sqlx::Error> {
         let pool = &self.ctx.pool;
-        let mut reqs: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT requester FROM backfill_queue
-             WHERE tier = 1 AND kind <> 2 AND (not_before IS NULL OR not_before <= now())",
+        // Read as text: an entry whose requester this build does not
+        // know is left waiting, and the others are served.
+        let stored: Vec<String> = sqlx::query_scalar(
+            &format!("SELECT DISTINCT requester FROM backfill_queue
+             WHERE tier = {TIER_ON_DEMAND} AND kind <> {JOB_LIST_FETCH} AND (not_before IS NULL OR not_before <= now())"),
         )
         .fetch_all(pool)
         .await?;
+        let mut reqs: Vec<RequesterKey> = stored
+            .iter()
+            .filter_map(|r| RequesterKey::parse(r))
+            .collect();
         let candidates = lanes::load(pool).await?;
-        if !candidates.is_empty()
-            && !reqs
-                .iter()
-                .any(|r| r == crate::jobs::list_phase1::SYSTEM_LISTS)
-        {
-            reqs.push(crate::jobs::list_phase1::SYSTEM_LISTS.to_owned());
+        if !candidates.is_empty() && !reqs.contains(&RequesterKey::Lists) {
+            reqs.push(RequesterKey::Lists);
         }
         reqs.sort();
         loop {
             let Some(r) = pick_requester(&mut self.st().charged, &reqs) else {
                 return Ok(None);
             };
-            if r == crate::jobs::list_phase1::SYSTEM_LISTS {
+            if r == RequesterKey::Lists {
                 let picked = {
                     let mut s = self.st();
                     let inflight_items = s.inflight_items.clone();
@@ -382,19 +408,20 @@ impl Scheduler {
                 continue;
             }
             let streak = *self.st().streak.get(&r).unwrap_or(&0);
-            let pref = if want_high(streak) { 1 } else { 0 };
+            let pref = if want_high(streak) {
+                Priority::High
+            } else {
+                Priority::Normal
+            };
             if let Some(w) = self
                 .claim_queue(
-                    "AND q.requester = $3 AND q.kind <> 2",
-                    (1, Some(r.as_str()), Some(pref)),
+                    &format!("AND q.requester = $3 AND q.kind <> {JOB_LIST_FETCH}"),
+                    (Tier::OnDemand, Some(r), Some(pref)),
                 )
                 .await?
             {
                 if let Work::Queue { priority, .. } = &w {
-                    self.note_priority(
-                        &r,
-                        *priority == farsight_storage::repo_events::priority::HIGH,
-                    );
+                    self.note_priority(r, *priority == Priority::High);
                 }
                 return Ok(Some(w));
             }
@@ -406,7 +433,7 @@ impl Scheduler {
         if !self.tier3_token() {
             return Ok(None);
         }
-        if let Some(w) = self.claim_queue("", (3, None, None)).await? {
+        if let Some(w) = self.claim_queue("", (Tier::Sweep, None, None)).await? {
             return Ok(Some(w));
         }
         let full_enabled = self.ctx.cfg().backfill.sweep.enabled;
@@ -419,14 +446,14 @@ impl Scheduler {
         };
         // Members are dispatched straight from cycle_outstanding (no
         // actors row needed); failed members retry via the queue.
-        let row: Option<(String, i16)> = sqlx::query_as(
-            "SELECT o.did, c.kind FROM cycle_outstanding o JOIN sweep_cycles c ON c.id = o.cycle_id
-             WHERE o.state = 1 AND c.completed_at IS NULL AND o.did > $1 AND o.did <> ALL($2)
-               AND ($3 OR c.kind = 2) AND ($4 OR c.kind <> 2)
+        let row: Option<(String, CycleKind)> = sqlx::query_as(
+            &format!("SELECT o.did, c.kind FROM cycle_outstanding o JOIN sweep_cycles c ON c.id = o.cycle_id
+             WHERE o.state = {MEMBER_OUTSTANDING} AND c.completed_at IS NULL AND o.did > $1 AND o.did <> ALL($2)
+               AND ($3 OR c.kind = {CYCLE_REPAIR}) AND ($4 OR c.kind <> {CYCLE_REPAIR})
                AND NOT EXISTS (SELECT 1 FROM job_leases j WHERE j.did = o.did AND j.lease_until > now())
                AND NOT EXISTS (SELECT 1 FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
-                               WHERE a.did = o.did AND q.kind = 1)
-             ORDER BY o.did LIMIT 1",
+                               WHERE a.did = o.did AND q.kind = {JOB_REPO})
+             ORDER BY o.did LIMIT 1"),
         )
         .bind(&cursor)
         .bind(&inflight)
@@ -439,10 +466,9 @@ impl Scheduler {
                 self.st().member_cursor = Some(did.clone());
                 Ok(Some(Work::Member {
                     did,
-                    requester: if kind == 2 {
-                        SYSTEM_REPAIR
-                    } else {
-                        SYSTEM_SWEEP
+                    requester: match kind {
+                        CycleKind::Repair => RequesterKey::Repair,
+                        CycleKind::Full => RequesterKey::Sweep,
                     },
                 }))
             }
@@ -454,7 +480,7 @@ impl Scheduler {
         }
     }
 
-    async fn pick(&self) -> Result<Option<(usize, Work)>, sqlx::Error> {
+    async fn pick(&self) -> Result<Option<(Tier, Work)>, sqlx::Error> {
         let mut has = self.has_work(&self.ctx.pool).await?;
         let shares: [u32; 3] = {
             let s = &self.ctx.cfg().backfill.tier_shares;
@@ -470,13 +496,13 @@ impl Scheduler {
                 break;
             };
             let w = match t {
-                0 => self.pick_tier1().await?,
-                1 => self.claim_queue("", (2, None, None)).await?,
-                _ => self.pick_tier3().await?,
+                Tier::OnDemand => self.pick_tier1().await?,
+                Tier::Active => self.claim_queue("", (Tier::Active, None, None)).await?,
+                Tier::Sweep => self.pick_tier3().await?,
             };
             match w {
                 Some(w) => return Ok(Some((t, w))),
-                None => has[t] = false,
+                None => has[t.index()] = false,
             }
         }
         Ok(None)
@@ -523,10 +549,10 @@ impl Scheduler {
         (s.running, s.inflight_dids.len() + s.inflight_items.len())
     }
 
-    fn start(self: &Arc<Self>, tier: usize, work: Work) {
+    fn start(self: &Arc<Self>, tier: Tier, work: Work) {
         {
             let mut s = self.st();
-            s.running[tier] += 1;
+            s.running[tier.index()] += 1;
             match &work {
                 Work::Queue { did, .. } | Work::Member { did, .. } => {
                     s.inflight_dids.insert(did.clone());
@@ -539,7 +565,7 @@ impl Scheduler {
                 }
             }
             // Charged now, so the next pick already sees this job.
-            if tier == 0 {
+            if tier == Tier::OnDemand {
                 charge_dispatch(&mut s.charged, work.requester());
             }
             if let Work::List { lane, .. } = &work {
@@ -563,16 +589,16 @@ impl Scheduler {
     }
 
     /// Runs one dispatched job, logs it and settles its cost.
-    async fn run_job(&self, tier: usize, work: &Work) {
+    async fn run_job(&self, tier: Tier, work: &Work) {
         let started = Instant::now();
         let (result, requester, lane) = self.execute(work).await;
         // One line per job at the default level.
         let (kind, subject) = match work {
             Work::Queue { kind, did, .. } => (
                 match kind {
-                    2 => "list_fetch",
-                    3 => "discovery",
-                    _ => "repo",
+                    JobKind::ListFetch => "list_fetch",
+                    JobKind::Discovery => "discovery",
+                    JobKind::Repo => "repo",
                 },
                 did.clone(),
             ),
@@ -586,8 +612,8 @@ impl Scheduler {
             Outcome::Failed { error, terminal } => tracing::info!(
                 kind,
                 subject,
-                tier = tier + 1,
-                requester,
+                tier = tier.code(),
+                requester = requester.to_string(),
                 outcome = result.outcome.label(),
                 terminal,
                 error,
@@ -598,8 +624,8 @@ impl Scheduler {
             o => tracing::info!(
                 kind,
                 subject,
-                tier = tier + 1,
-                requester,
+                tier = tier.code(),
+                requester = requester.to_string(),
                 outcome = o.label(),
                 cost = result.cost,
                 ms = started.elapsed().as_millis() as u64,
@@ -608,8 +634,8 @@ impl Scheduler {
         }
         let mut s = self.st();
         // The dispatch charge is already in; the rest of the cost follows.
-        if tier == 0 {
-            charge_finish(&mut s.charged, &requester, result.cost);
+        if tier == Tier::OnDemand {
+            charge_finish(&mut s.charged, requester, result.cost);
         }
         if let Some(l) = lane {
             let rest = remaining_charge(result.cost);
@@ -622,7 +648,7 @@ impl Scheduler {
         }
     }
 
-    async fn execute(&self, work: &Work) -> (JobResult, String, Option<String>) {
+    async fn execute(&self, work: &Work) -> (JobResult, RequesterKey, Option<String>) {
         let ctx = &self.ctx;
         #[cfg(feature = "harness")]
         if self.dry {
@@ -652,29 +678,30 @@ impl Scheduler {
                             outcome: Outcome::Clean,
                             cost: 0,
                         },
-                        requester.clone(),
+                        *requester,
                         None,
                     );
                 };
                 let r = match kind {
-                    3 => {
+                    JobKind::Discovery => {
                         if jobs::acquire_lease(&ctx.pool, did, &ctx.lease_owner)
                             .await
                             .unwrap_or(false)
                         {
-                            let r = jobs::discovery::run(ctx, &d, requester).await;
+                            let r = jobs::discovery::run(ctx, &d, *requester).await;
                             jobs::release_lease(&ctx.pool, did, &ctx.lease_owner).await;
                             r
                         } else {
-                            self.requeue(*actor_id, 3, *qt, requester, 60).await;
+                            self.requeue(*actor_id, JobKind::Discovery, *qt, *requester, 60)
+                                .await;
                             JobResult {
                                 outcome: Outcome::Busy,
                                 cost: 0,
                             }
                         }
                     }
-                    2 => jobs::list_fetch::run(ctx, *actor_id, &d).await,
-                    _ => {
+                    JobKind::ListFetch => jobs::list_fetch::run(ctx, *actor_id, &d).await,
+                    JobKind::Repo => {
                         if jobs::acquire_lease(&ctx.pool, did, &ctx.lease_owner)
                             .await
                             .unwrap_or(false)
@@ -682,7 +709,7 @@ impl Scheduler {
                             let req = JobReq {
                                 did: d,
                                 tier: *qt,
-                                requester: requester.clone(),
+                                requester: *requester,
                             };
                             let r = jobs::repo::run(ctx, &req).await;
                             jobs::release_lease(&ctx.pool, did, &ctx.lease_owner).await;
@@ -690,7 +717,8 @@ impl Scheduler {
                         } else {
                             // A job for the DID is running: this waiting
                             // entry (force / system) runs after it.
-                            self.requeue(*actor_id, 1, *qt, requester, 60).await;
+                            self.requeue(*actor_id, JobKind::Repo, *qt, *requester, 60)
+                                .await;
                             JobResult {
                                 outcome: Outcome::Busy,
                                 cost: 0,
@@ -698,7 +726,7 @@ impl Scheduler {
                         }
                     }
                 };
-                (r, requester.clone(), None)
+                (r, *requester, None)
             }
             Work::List { cand, lane } => {
                 let r = match &cand.item {
@@ -713,11 +741,7 @@ impl Scheduler {
                         },
                     },
                 };
-                (
-                    r,
-                    crate::jobs::list_phase1::SYSTEM_LISTS.to_owned(),
-                    Some(lane.clone()),
-                )
+                (r, RequesterKey::Lists, Some(lane.clone()))
             }
             Work::Member { did, requester } => {
                 let Ok(d) = Did::parse(did) else {
@@ -726,7 +750,7 @@ impl Scheduler {
                             outcome: Outcome::Clean,
                             cost: 0,
                         },
-                        (*requester).to_owned(),
+                        *requester,
                         None,
                     );
                 };
@@ -739,35 +763,37 @@ impl Scheduler {
                             outcome: Outcome::Busy,
                             cost: 0,
                         },
-                        (*requester).to_owned(),
+                        *requester,
                         None,
                     );
                 }
                 let req = JobReq {
                     did: d,
-                    tier: 3,
-                    requester: (*requester).to_owned(),
+                    tier: Tier::Sweep,
+                    requester: *requester,
                 };
                 let r = jobs::repo::run(ctx, &req).await;
                 jobs::release_lease(&ctx.pool, did, &ctx.lease_owner).await;
-                (r, (*requester).to_owned(), None)
+                (r, *requester, None)
             }
         }
     }
 
-    async fn requeue(&self, actor_id: i64, kind: i16, tier: i16, requester: &str, delay_s: u64) {
+    async fn requeue(
+        &self,
+        actor_id: ActorId,
+        kind: JobKind,
+        tier: Tier,
+        requester: RequesterKey,
+        delay_s: u64,
+    ) {
         if let Ok(mut conn) = self.ctx.pool.acquire().await {
-            let job_kind = match kind {
-                2 => farsight_storage::queue::JobKind::ListFetch,
-                3 => farsight_storage::queue::JobKind::Discovery,
-                _ => farsight_storage::queue::JobKind::Repo,
-            };
             let _ = farsight_storage::queue::enqueue(
                 &mut conn,
                 actor_id,
-                job_kind,
+                kind,
                 tier,
-                farsight_storage::repo_events::priority::NORMAL,
+                Priority::Normal,
                 requester,
                 None,
             )
@@ -787,20 +813,21 @@ impl Scheduler {
     /// Harness: records the pick (`backfill_state.backfilled_at` =
     /// `clock_timestamp()`), costs 1 request, does nothing else.
     #[cfg(feature = "harness")]
-    async fn dry_run(&self, work: &Work) -> (JobResult, String, Option<String>) {
+    async fn dry_run(&self, work: &Work) -> (JobResult, RequesterKey, Option<String>) {
         let (actor, requester) = match work {
             Work::Queue {
                 actor_id,
                 requester,
                 ..
-            } => (Some(*actor_id), requester.clone()),
-            Work::List { .. } => (None, crate::jobs::list_phase1::SYSTEM_LISTS.to_owned()),
-            Work::Member { requester, .. } => (None, (*requester).to_owned()),
+            } => (Some(*actor_id), *requester),
+            Work::List { .. } => (None, RequesterKey::Lists),
+            Work::Member { requester, .. } => (None, *requester),
         };
         if let Some(a) = actor {
+            use farsight_storage::codes::sql::REPO_DONE;
             let _ = sqlx::query(
-                "INSERT INTO backfill_state (actor_id, state, backfilled_at) VALUES ($1, 3, clock_timestamp())
-                 ON CONFLICT (actor_id) DO UPDATE SET state = 3, backfilled_at = clock_timestamp()",
+                &format!("INSERT INTO backfill_state (actor_id, state, backfilled_at) VALUES ($1, {REPO_DONE}, clock_timestamp())
+                 ON CONFLICT (actor_id) DO UPDATE SET state = {REPO_DONE}, backfilled_at = clock_timestamp()"),
             )
             .bind(a)
             .execute(&self.ctx.pool)
@@ -819,9 +846,9 @@ impl Scheduler {
 
     /// Bumps the high/normal streak after a tier-1 pick (called by the
     /// claim path with the picked priority).
-    pub fn note_priority(&self, requester: &str, high: bool) {
+    pub fn note_priority(&self, requester: RequesterKey, high: bool) {
         let mut s = self.st();
-        let e = s.streak.entry(requester.to_owned()).or_insert(0);
+        let e = s.streak.entry(requester).or_insert(0);
         if high {
             *e += 1;
         } else {
@@ -831,15 +858,15 @@ impl Scheduler {
 
     /// Publishes queue depth and throughput gauges.
     pub async fn publish_gauges(&self) {
-        if let Ok(rows) = sqlx::query_as::<_, (i16, i64)>(
+        if let Ok(rows) = sqlx::query_as::<_, (Tier, i64)>(
             "SELECT tier, count(*) FROM backfill_queue GROUP BY tier",
         )
         .fetch_all(&self.ctx.pool)
         .await
         {
-            for t in 1..=3i16 {
-                let n = rows.iter().find(|(x, _)| *x == t).map_or(0, |(_, n)| *n);
-                metrics::gauge!(m::QUEUE_DEPTH, "tier" => t.to_string()).set(n as f64);
+            for t in Tier::ALL {
+                let n = rows.iter().find(|(x, _)| x == t).map_or(0, |(_, n)| *n);
+                metrics::gauge!(m::QUEUE_DEPTH, "tier" => t.label()).set(n as f64);
             }
         }
         metrics::gauge!(m::REPOS_PER_HOUR).set(self.repos_last_hour() as f64);
@@ -851,15 +878,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tier3_pacing_starts_empty_and_holds_one_job_at_least() {
+        let t0 = Instant::now();
+        // 1800 an hour is one every two seconds, with room for one.
+        let rate = tier3_rate(1800);
+        assert_eq!((rate.per_sec, rate.burst), (0.5, 1.0));
+        let mut b = Bucket::unused(0.0, TIER3_HEAD_START);
+        // The first look finds half a token.
+        assert!(!b.take(t0, rate));
+        assert!(b.take(t0 + Duration::from_secs(1), rate));
+        assert!(!b.take(t0 + Duration::from_secs(2), rate));
+        assert!(b.take(t0 + Duration::from_secs(3), rate));
+        // A long pause saves up one job, not more.
+        assert!(b.take(t0 + Duration::from_secs(3600), rate));
+        assert!(!b.take(t0 + Duration::from_secs(3600), rate));
+        // 7200 an hour is two a second: the first look dispatches, and
+        // the bucket holds two.
+        let rate = tier3_rate(7200);
+        assert_eq!((rate.per_sec, rate.burst), (2.0, 2.0));
+        let mut b = Bucket::unused(0.0, TIER3_HEAD_START);
+        assert!(b.take(t0, rate));
+        assert!(b.take(t0, rate));
+        assert!(!b.take(t0, rate));
+    }
+
+    #[test]
     fn shares_are_minimums() {
         // All tiers busy: the one furthest below its share goes next.
         // 20/60 = 0.33, 8/25 = 0.32, 5/15 = 0.33: tier 2 is furthest below.
-        assert_eq!(pick_tier([20, 8, 5], [60, 25, 15], [true; 3]), Some(1));
-        assert_eq!(pick_tier([10, 8, 5], [60, 25, 15], [true; 3]), Some(0));
+        assert_eq!(
+            pick_tier([20, 8, 5], [60, 25, 15], [true; 3]),
+            Some(Tier::Active)
+        );
+        assert_eq!(
+            pick_tier([10, 8, 5], [60, 25, 15], [true; 3]),
+            Some(Tier::OnDemand)
+        );
         // Unused share flows: only tier 3 has work.
         assert_eq!(
             pick_tier([0, 0, 30], [60, 25, 15], [false, false, true]),
-            Some(2)
+            Some(Tier::Sweep)
         );
         assert_eq!(pick_tier([0, 0, 0], [60, 25, 15], [false; 3]), None);
     }
@@ -890,7 +948,7 @@ mod tests {
         let mut served: HashMap<String, u32> = HashMap::new();
         for _ in 0..8 {
             let r = pick_requester(&mut c, &reqs).unwrap();
-            charge_dispatch(&mut c, &r);
+            charge_dispatch(&mut c, r.clone());
             *served.entry(r).or_default() += 1;
         }
         assert_eq!(served["a"], 4, "{served:?}");

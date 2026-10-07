@@ -6,6 +6,11 @@
 //! tombstones, nightly the rest, purges continuously). Time is injectable
 //! (`now`) so the harness can test TTLs without waiting.
 
+use crate::codes::sql::{
+    FETCH_CANCELLED, JOB_LIST_FETCH, JOB_REPO, RECORD_DELETED, RECORD_UNKNOWN, TRACK_RETAINED,
+    TRACK_UNTRACKED,
+};
+use crate::ids::{ListId, RunId};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use farsight_core::Did;
 use sqlx::PgPool;
@@ -63,27 +68,32 @@ pub async fn drop_old_rates(pool: &PgPool, today: NaiveDate) -> Result<u64> {
 
 /// Deletes cursor rows of runs that are no longer current (nightly).
 pub async fn drop_orphaned_cursors(pool: &PgPool) -> Result<u64> {
-    Ok(sqlx::query(
+    Ok(sqlx::query(&format!(
         "DELETE FROM backfill_cursors c
-         WHERE (c.job_kind = 1 AND NOT EXISTS (
+         WHERE (c.job_kind = {JOB_REPO} AND NOT EXISTS (
                   SELECT 1 FROM backfill_state s
                   WHERE s.actor_id = c.actor_id AND s.current_run_id = c.run_id))
-            OR (c.job_kind = 2 AND NOT EXISTS (
+            OR (c.job_kind = {JOB_LIST_FETCH} AND NOT EXISTS (
                   SELECT 1 FROM list_fetch_runs r
-                  WHERE r.id = c.run_id AND r.finished_at IS NULL))",
-    )
+                  WHERE r.id = c.run_id AND r.finished_at IS NULL))"
+    ))
     .execute(pool)
     .await?
     .rows_affected())
 }
 
-const PLACEHOLDER_UNREFERENCED: &str = "
-    l.record_state = 0 AND l.track_state = 0
+/// SQL condition: list `l` is a placeholder nothing refers to.
+fn placeholder_unreferenced() -> String {
+    format!(
+        "
+    l.record_state = {RECORD_UNKNOWN} AND l.track_state = {TRACK_UNTRACKED}
     AND NOT EXISTS (SELECT 1 FROM list_blocks x WHERE x.list_id = l.id)
     AND NOT EXISTS (SELECT 1 FROM list_items x WHERE x.list_id = l.id)
     AND NOT EXISTS (SELECT 1 FROM subject_lists x WHERE x.list_id = l.id)
     AND NOT EXISTS (SELECT 1 FROM list_jobs x WHERE x.list_id = l.id)
-    AND NOT EXISTS (SELECT 1 FROM list_sched_keys x WHERE x.list_id = l.id)";
+    AND NOT EXISTS (SELECT 1 FROM list_sched_keys x WHERE x.list_id = l.id)"
+    )
+}
 
 /// Placeholder-list cleanup (nightly): deletes `lists` rows with
 /// `record_state = unknown`, `track_state = untracked` and no reference
@@ -93,9 +103,10 @@ const PLACEHOLDER_UNREFERENCED: &str = "
 /// L either commits first (the re-check sees it) or runs after and
 /// re-interns L. Returns rows deleted.
 pub async fn cleanup_placeholder_lists(pool: &PgPool, limit: i64) -> Result<u64> {
-    let candidates: Vec<(i64, String, String)> = sqlx::query_as(&format!(
+    let candidates: Vec<(ListId, String, String)> = sqlx::query_as(&format!(
         "SELECT l.id, a.did, l.rkey FROM lists l JOIN actors a ON a.id = l.owner_id
-         WHERE {PLACEHOLDER_UNREFERENCED} ORDER BY l.id LIMIT $1"
+         WHERE {unreferenced} ORDER BY l.id LIMIT $1",
+        unreferenced = placeholder_unreferenced()
     ))
     .bind(limit)
     .fetch_all(pool)
@@ -108,7 +119,8 @@ pub async fn cleanup_placeholder_lists(pool: &PgPool, limit: i64) -> Result<u64>
             .execute(&mut *tx)
             .await?;
         deleted += sqlx::query(&format!(
-            "DELETE FROM lists l WHERE l.id = $1 AND {PLACEHOLDER_UNREFERENCED}"
+            "DELETE FROM lists l WHERE l.id = $1 AND {unreferenced}",
+            unreferenced = placeholder_unreferenced()
         ))
         .bind(id)
         .execute(&mut *tx)
@@ -119,7 +131,7 @@ pub async fn cleanup_placeholder_lists(pool: &PgPool, limit: i64) -> Result<u64>
     Ok(deleted)
 }
 
-async fn list_owner_key(pool: &PgPool, list_id: i64) -> Result<Option<(String, String)>> {
+async fn list_owner_key(pool: &PgPool, list_id: ListId) -> Result<Option<(String, String)>> {
     Ok(sqlx::query_as(
         "SELECT a.did, l.rkey FROM lists l JOIN actors a ON a.id = l.owner_id WHERE l.id = $1",
     )
@@ -128,14 +140,15 @@ async fn list_owner_key(pool: &PgPool, list_id: i64) -> Result<Option<(String, S
     .await?)
 }
 
-/// Result of one purge pass.
+/// What one call of [`process_purges`] did, over all the lists it visited.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PurgeReport {
-    /// Items deleted.
+    /// `list_items` rows deleted.
     pub items_deleted: u64,
     /// Lists whose purge finished (PD fired).
-    pub finished: Vec<i64>,
-    /// Transitions fired.
+    pub finished: Vec<ListId>,
+    /// The transitions the pass fired, in `transitions`; the report's other
+    /// fields are left at zero.
     pub report: ApplyReport,
 }
 
@@ -149,7 +162,7 @@ pub async fn process_purges(
     counters: &CounterSink,
     max_lists: i64,
 ) -> Result<PurgeReport> {
-    let lists: Vec<i64> =
+    let lists: Vec<ListId> =
         sqlx::query_scalar("SELECT id FROM lists WHERE track_state = $1 ORDER BY id LIMIT $2")
             .bind(TrackState::Purging.code())
             .bind(max_lists)
@@ -223,7 +236,7 @@ pub async fn expire_grace(
     counters: &CounterSink,
     now: DateTime<Utc>,
 ) -> Result<ApplyReport> {
-    let lists: Vec<i64> = sqlx::query_scalar(
+    let lists: Vec<ListId> = sqlx::query_scalar(
         "SELECT id FROM lists WHERE track_state = $1 AND retain_until <= $2 ORDER BY id",
     )
     .bind(TrackState::Retained.code())
@@ -253,7 +266,7 @@ pub async fn fire_event(
     pool: &PgPool,
     limits: &Limits,
     counters: &CounterSink,
-    list_id: i64,
+    list_id: ListId,
     event: Event,
     args: FireArgs,
 ) -> Result<ApplyReport> {
@@ -267,7 +280,7 @@ async fn fire_event_guarded(
     pool: &PgPool,
     limits: &Limits,
     counters: &CounterSink,
-    list_id: i64,
+    list_id: ListId,
     event: Event,
     args: FireArgs,
     grace_now: Option<DateTime<Utc>>,
@@ -287,8 +300,8 @@ async fn fire_event_guarded(
         let proceed = match grace_now {
             Some(now) => {
                 sqlx::query_scalar::<_, bool>(
-                    "SELECT track_state = 3 AND retain_until IS NOT NULL AND retain_until <= $2
-                 FROM lists WHERE id = $1",
+                    &format!("SELECT track_state = {TRACK_RETAINED} AND retain_until IS NOT NULL AND retain_until <= $2
+                 FROM lists WHERE id = $1"),
                 )
                 .bind(list_id)
                 .bind(now)
@@ -329,7 +342,7 @@ pub async fn purge_account_batch(
         let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
         t.lock_authors(&[keys::author_lock_key(did.as_str())].into_iter().collect())
             .await?;
-        let Some(author_id) = t.actor_id(did.as_str()).await? else {
+        let Some(author_id) = t.actor_id(did).await? else {
             return Ok(true);
         };
         let author = t.author(did).await?;
@@ -357,8 +370,8 @@ pub async fn purge_account_batch(
         .bind(batch)
         .fetch_all(&mut *t.conn)
         .await?;
-        let own_lists: Vec<(i64, String, i16)> = sqlx::query_as(
-            "SELECT id, rkey, record_state FROM lists WHERE owner_id = $1 AND record_state <> 2",
+        let own_lists: Vec<(ListId, String, i16)> = sqlx::query_as(
+            &format!("SELECT id, rkey, record_state FROM lists WHERE owner_id = $1 AND record_state <> {RECORD_DELETED}"),
         )
         .bind(author_id)
         .fetch_all(&mut *t.conn)
@@ -383,9 +396,9 @@ pub async fn purge_account_batch(
         item_delete_rows(&mut t, &author, &item_keys, None, None).await?;
         for (list_id, _, record_state) in &own_lists {
             sqlx::query(
-                "UPDATE lists SET record_state = 2, purpose = NULL, name = NULL, created_at = NULL,
+                &format!("UPDATE lists SET record_state = {RECORD_DELETED}, purpose = NULL, name = NULL, created_at = NULL,
                    description = NULL, avatar_cid = NULL
-                 WHERE id = $1",
+                 WHERE id = $1"),
             )
             .bind(*list_id)
             .execute(&mut *t.conn)
@@ -402,10 +415,10 @@ pub async fn purge_account_batch(
                 .await?;
         }
         // Cancel any running fetch run for the owner.
-        sqlx::query(
-            "UPDATE list_fetch_runs SET finished_at = now(), outcome = 4
-             WHERE owner_id = $1 AND finished_at IS NULL",
-        )
+        sqlx::query(&format!(
+            "UPDATE list_fetch_runs SET finished_at = now(), outcome = {FETCH_CANCELLED}
+             WHERE owner_id = $1 AND finished_at IS NULL"
+        ))
         .bind(author_id)
         .execute(&mut *t.conn)
         .await?;
@@ -436,8 +449,8 @@ pub async fn promote_claimed(
     pool: &PgPool,
     limits: &Limits,
     counters: &CounterSink,
-    list_id: i64,
-    run_id: i64,
+    list_id: ListId,
+    run_id: RunId,
     args: FireArgs,
 ) -> Result<bool> {
     let Some((owner, rkey)) = list_owner_key(pool, list_id).await? else {
@@ -495,7 +508,7 @@ pub async fn purge_for_divergence_batch(
         let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
         t.lock_authors(&[keys::author_lock_key(did.as_str())].into_iter().collect())
             .await?;
-        let Some(author_id) = t.actor_id(did.as_str()).await? else {
+        let Some(author_id) = t.actor_id(did).await? else {
             return Ok(true);
         };
         let author = t.author(did).await?;
@@ -571,7 +584,7 @@ pub async fn retry_deferred(
     counters: &CounterSink,
     now: DateTime<Utc>,
 ) -> Result<ApplyReport> {
-    let lists: Vec<i64> = sqlx::query_scalar(
+    let lists: Vec<ListId> = sqlx::query_scalar(
         "SELECT id FROM lists WHERE track_state = $1 AND next_retry_at <= $2 AND listblock_count > 0 ORDER BY id",
     )
     .bind(TrackState::Deferred.code())
@@ -617,18 +630,18 @@ pub async fn accounts_pending_purge(pool: &PgPool, limit: i64) -> Result<Vec<Did
         // walks the whole table through its primary key looking for
         // matches that are rarely there: minutes for ten million
         // accounts, before the server serves.
-        "WITH d AS MATERIALIZED (
+        &format!("WITH d AS MATERIALIZED (
            SELECT id, did, authored_blocks, authored_listblocks, owned_items
            FROM actors WHERE status = $1)
          SELECT did FROM d a
          WHERE (a.authored_blocks > 0 OR a.authored_listblocks > 0 OR a.owned_items > 0
-                OR EXISTS (SELECT 1 FROM lists l WHERE l.owner_id = a.id AND l.record_state <> 2)
+                OR EXISTS (SELECT 1 FROM lists l WHERE l.owner_id = a.id AND l.record_state <> {RECORD_DELETED})
                 OR EXISTS (SELECT 1 FROM blocks_history h WHERE h.author_id = a.id)
                 OR EXISTS (SELECT 1 FROM list_blocks_history h WHERE h.author_id = a.id)
                 OR EXISTS (SELECT 1 FROM list_items_history h WHERE h.owner_id = a.id))
-         ORDER BY id LIMIT $2",
+         ORDER BY id LIMIT $2"),
     )
-    .bind(crate::codes::actor_status::DELETED)
+    .bind(crate::codes::ActorStatus::Deleted)
     .bind(limit)
     .fetch_all(pool)
     .await?;

@@ -33,7 +33,9 @@ impl LagTracker {
         LagTracker::default()
     }
 
-    /// Records one commit event.
+    /// Records one commit event: its witness time and the time inside its
+    /// rev, both in microseconds since the epoch. The oldest sample leaves
+    /// once [`WINDOW`] are held.
     pub fn record(&mut self, witness_us: i64, rev_us: i64) {
         if self.samples.len() == WINDOW {
             self.samples.pop_front();
@@ -41,7 +43,7 @@ impl LagTracker {
         self.samples.push_back((witness_us, rev_us));
     }
 
-    /// Samples held.
+    /// Samples held; at most [`WINDOW`].
     pub fn len(&self) -> usize {
         self.samples.len()
     }

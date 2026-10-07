@@ -7,24 +7,25 @@ use sqlx::{PgExecutor, PgPool};
 
 use crate::error::Result;
 
-/// One API key.
+/// One API key: an `api_tokens` row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApiToken {
     /// `api_tokens.id`.
     pub id: i32,
     /// Operator-chosen name.
     pub name: String,
-    /// SHA-256 of the token.
+    /// SHA-256 of the token, as raw bytes; the token itself is never
+    /// stored.
     pub sha256: Vec<u8>,
     /// Scopes: `read`, `backfill`, `backfill:high`.
     pub scopes: Vec<String>,
     /// Per-key read rate override (requests/s).
     pub read_rps: Option<f32>,
-    /// Creation time.
+    /// When the key was created, on the database's clock.
     pub created_at: DateTime<Utc>,
     /// Last authenticated use (approximate).
     pub last_used_at: Option<DateTime<Utc>>,
-    /// Revocation time.
+    /// When the key was revoked; `None` while it is live.
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
@@ -138,7 +139,9 @@ pub struct AdminSession {
     pub csrf: Vec<u8>,
 }
 
-/// Creates a session.
+/// Stores a new session under the SHA-256 of its id, with its CSRF token
+/// and, for the record, the client address and `User-Agent` it was opened
+/// from.
 pub async fn create_session(
     pool: &PgPool,
     id_sha256: &[u8],

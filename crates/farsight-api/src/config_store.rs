@@ -73,7 +73,9 @@ pub enum EditError {
     /// The edit touches keys set from the environment.
     #[error("locked by environment variables: {}", .0.join(", "))]
     EnvLocked(Vec<String>),
-    /// The result does not load.
+    /// The edited text is not TOML, or the start-up loader refuses it;
+    /// carries the parser's or loader's message. Also what a plain-message
+    /// refusal of an edit closure becomes.
     #[error("{0}")]
     Invalid(String),
     /// The edit would change who may sign in to the admin UI.
@@ -87,6 +89,14 @@ pub enum EditError {
     Io(String),
 }
 
+/// An edit's closure may refuse with a plain message: the result is not
+/// accepted ([`EditError::Invalid`]).
+impl From<&str> for EditError {
+    fn from(message: &str) -> EditError {
+        EditError::Invalid(message.to_owned())
+    }
+}
+
 /// What an edit changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EditReport {
@@ -96,7 +106,10 @@ pub struct EditReport {
     pub restart_required: Vec<String>,
 }
 
-/// The live configuration.
+/// The live configuration: the loaded config in force, the path of the
+/// `config.toml` it was read from, and the environment captured at
+/// start-up, against which every edit is loaded again. Edits are
+/// serialized by an internal lock.
 #[derive(Debug)]
 pub struct ConfigStore {
     path: PathBuf,
@@ -147,7 +160,8 @@ impl ConfigStore {
         }
     }
 
-    /// The config in force.
+    /// The config in force, as a shared snapshot. A stored edit swaps in a
+    /// new `Arc`, so a snapshot a request holds never changes under it.
     pub fn current(&self) -> Arc<LoadedConfig> {
         self.current
             .read()
@@ -155,7 +169,7 @@ impl ConfigStore {
             .clone()
     }
 
-    /// The file path.
+    /// Path of the `config.toml` that edits read and rewrite.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -173,7 +187,7 @@ impl ConfigStore {
     /// Edits the file's TOML table with `f`, validates, and stores it.
     pub async fn edit(
         &self,
-        f: impl FnOnce(&mut toml::Table) -> Result<(), String>,
+        f: impl FnOnce(&mut toml::Table) -> Result<(), EditError>,
     ) -> Result<EditReport, EditError> {
         let _guard = self.edit_lock.lock().await;
         if self.current().from_env_only {
@@ -183,7 +197,7 @@ impl ConfigStore {
         let mut table: toml::Table = text
             .parse()
             .map_err(|e: toml::de::Error| EditError::Invalid(e.to_string()))?;
-        f(&mut table).map_err(EditError::Invalid)?;
+        f(&mut table)?;
         let new_text =
             toml::to_string_pretty(&table).map_err(|e| EditError::Invalid(e.to_string()))?;
         self.store_locked(&text, &new_text)

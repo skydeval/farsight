@@ -49,9 +49,10 @@ use farsight_core::record::BlockRecord;
 use farsight_core::{Collection, Did, Record, RecordKey};
 use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Write, WriteAction};
 use farsight_storage::counters::CounterSink;
+use farsight_storage::ids::{ActorId, ListId, Stamp};
 use farsight_storage::keys::Limits;
 use farsight_storage::txn::Gates;
-use farsight_storage::ui_rows::{self, Filter, Order, Section};
+use farsight_storage::ui_rows::{self, Filter, Order, Section, SectionKey};
 use serde_json::Value;
 use sqlx::PgPool;
 
@@ -1004,7 +1005,7 @@ async fn check_future_dates(
         author: Did::parse(author).expect("did"),
         collection: Collection::Block,
         rkey: RecordKey::parse(&rkey).expect("rkey"),
-        stamp: stamp + i,
+        stamp: Stamp::new(stamp + i),
         witness: Some(witness),
         action: WriteAction::Upsert(Record::Block(BlockRecord {
             subject: subject.clone(),
@@ -1145,6 +1146,14 @@ async fn check_ties(c: &mut Checks, a: &Srv, pool: &PgPool, w: &World) -> Result
     Ok(())
 }
 
+/// The key of `section` for an id read from the database as a number.
+fn section_key(section: Section, id: i64) -> SectionKey {
+    match section {
+        Section::IncomingBlocks | Section::OutgoingBlocks => ActorId::new(id).into(),
+        Section::ListBlockers | Section::ListMembers => ListId::new(id).into(),
+    }
+}
+
 async fn check_plans(c: &mut Checks, pool: &PgPool, w: &World) -> Result<(), String> {
     c.section("5. each section's query runs on its expression index");
     let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
@@ -1164,9 +1173,17 @@ async fn check_plans(c: &mut Checks, pool: &PgPool, w: &World) -> Result<(), Str
             excluded: &[],
         };
         for offset in [0, 50] {
-            let plan = ui_rows::explain(&mut conn, section_, key, Order::Shown, filter, offset, 50)
-                .await
-                .map_err(|e| e.to_string())?;
+            let plan = ui_rows::explain(
+                &mut conn,
+                section_,
+                section_key(section_, key),
+                Order::Shown,
+                filter,
+                offset,
+                50,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             let text = plan.join("\n");
             let good = uses_index(&text, section_);
             ok &= good;
@@ -2961,7 +2978,7 @@ async fn ingest(pool: &PgPool, ctx: &ApplyCtx<'_>, from: i64, count: i64) -> Res
                 author: Did::parse(&did("wca", 1 + (k % 200) as u64)).expect("did"),
                 collection: Collection::Block,
                 rkey: RecordKey::parse(&format!("3kw{k:010}")).expect("rkey"),
-                stamp: stamp + k,
+                stamp: Stamp::new(stamp + k),
                 witness: Some(now),
                 action: WriteAction::Upsert(Record::Block(BlockRecord {
                     subject: Did::parse(&did("wcs", 1 + (k % 2000) as u64)).expect("did"),
@@ -3056,7 +3073,7 @@ async fn check_write_cost(c: &mut Checks, pg: &Pg) -> Result<(), String> {
 async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Result<(), String> {
     c.section("28. plans of representative queries");
     let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-    let excluded: Vec<i64> = sqlx::query_scalar(&format!(
+    let excluded: Vec<ActorId> = sqlx::query_scalar(&format!(
         "SELECT author_id FROM blocks WHERE subject_id = {} ORDER BY author_id LIMIT 500",
         w.w18_id
     ))
@@ -3116,9 +3133,17 @@ async fn check_representative(c: &mut Checks, pool: &PgPool, w: &World) -> Resul
     let mut ok = true;
     let mut detail = Vec::new();
     for (name, section_, key, filter, offset) in cases {
-        let plan = ui_rows::explain(&mut conn, section_, key, Order::Shown, filter, offset, 50)
-            .await
-            .map_err(|e| e.to_string())?;
+        let plan = ui_rows::explain(
+            &mut conn,
+            section_,
+            section_key(section_, key),
+            Order::Shown,
+            filter,
+            offset,
+            50,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let text = plan.join("\n");
         // A page deep into a section may read the section's rows through
         // another index on its key and sort them; it never scans the

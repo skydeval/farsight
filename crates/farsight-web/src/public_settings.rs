@@ -21,7 +21,7 @@ use askama::Template;
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use farsight_api::config_store::EditReport;
+use farsight_api::config_store::{EditError, EditReport};
 use farsight_core::config::{
     self, Config, MAX_EXCLUDED_DIDS, MAX_INSTANCE_DESCRIPTION, MAX_PUBLIC_CONTACT,
     validate_record_viewer_url,
@@ -90,19 +90,22 @@ pub struct Settings {
 /// shown again as it was typed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct View {
-    /// Master toggle.
+    /// `access.public_ui`: the switch for the whole public UI. Turning
+    /// it on goes through the confirmation page.
     pub enabled: bool,
-    /// Description.
+    /// `public_ui.instance_description`, as typed.
     pub instance_description: String,
-    /// Contact.
+    /// `public_ui.contact`, as typed.
     pub contact: String,
-    /// Outgoing section.
+    /// `public_ui.show_outgoing_blocks`: whether an account's page shows
+    /// the lists it subscribes to as block lists.
     pub show_outgoing_blocks: bool,
     /// The home page's "Top blockers" lists.
     pub show_top_blockers: bool,
     /// The home page's "Most blocked" lists.
     pub show_top_blocked: bool,
-    /// Preview image tag.
+    /// `public_ui.show_opengraph_image`: whether pages carry the
+    /// link-preview image tag.
     pub show_opengraph_image: bool,
     /// Record viewer URL template.
     pub record_viewer_url: String,
@@ -120,17 +123,21 @@ pub struct View {
     pub handle_rps: String,
     /// Background handle checks per second; 0 = off.
     pub handle_pass_rps: String,
-    /// Theme default.
+    /// `public_ui.dark_mode_default`, as the config spells it.
     pub dark_mode_default: String,
-    /// Crawlers.
+    /// `public_ui.crawlable`: whether `/robots.txt` and `X-Robots-Tag`
+    /// let crawlers index the pages.
     pub crawlable: bool,
-    /// Page views per second.
+    /// `public_ui.rate_limit_rps`: page views per second per client
+    /// address, as typed.
     pub rate_limit_rps: String,
-    /// Burst.
+    /// `public_ui.rate_limit_burst`: the burst of the same limit, as
+    /// typed.
     pub rate_limit_burst: String,
-    /// Concurrent renders.
+    /// `public_ui.query_concurrency`: public pages rendered at once, as
+    /// typed; at most `max_concurrency`.
     pub query_concurrency: String,
-    /// Handle cache lifetime.
+    /// `public_ui.handle_cache_ttl`, in the config's duration spelling.
     pub handle_cache_ttl: String,
     /// Excluded DIDs, one per line.
     pub excluded_dids: String,
@@ -139,7 +146,8 @@ pub struct View {
 }
 
 impl View {
-    /// The config in force.
+    /// The form filled from config `c`: what a plain view of the page
+    /// shows.
     pub fn of(c: &Config) -> View {
         let p = &c.public_ui;
         View {
@@ -169,7 +177,9 @@ impl View {
         }
     }
 
-    /// A submitted form, as typed.
+    /// The form as it was submitted, unvalidated: text fields as typed,
+    /// a checkbox on when its name was sent. `c` supplies what the form
+    /// does not carry.
     pub fn submitted(form: &HashMap<String, String>, c: &Config) -> View {
         let s = |k: &str| form.get(k).cloned().unwrap_or_default();
         let b = |k: &str| form.contains_key(k);
@@ -208,9 +218,44 @@ impl View {
     }
 }
 
+/// Why a change to the settings was refused. The text is shown on the
+/// settings page.
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsError {
+    /// A submitted value is not acceptable. The text names the field and
+    /// what it accepts.
+    #[error("{0}")]
+    Field(String),
+    /// A section the values go into is something other than a table in
+    /// the config file.
+    #[error("`{0}` in config.toml is not a table")]
+    NotATable(String),
+    /// The configuration comes from the environment.
+    #[error(
+        "The configuration is managed through the environment (FARSIGHT_SKIP_WIZARD); change it \
+         there."
+    )]
+    ManagedExternally,
+    /// The config store refused the edit.
+    #[error(transparent)]
+    Edit(#[from] farsight_api::config_store::EditError),
+    /// The config file, or the text submitted for it, does not parse.
+    #[error(transparent)]
+    TomlDe(#[from] toml::de::Error),
+    /// The changed table could not be written as TOML.
+    #[error(transparent)]
+    TomlSer(#[from] toml::ser::Error),
+    /// The resulting config does not load.
+    #[error(transparent)]
+    Config(#[from] config::ConfigError),
+    /// The text submitted for the whole file is not TOML.
+    #[error("Not valid TOML: {0}")]
+    NotToml(#[source] Box<SettingsError>),
+}
+
 /// Parses the DID list of the multi-line field: one DID per line, blank
 /// lines ignored, repeats dropped.
-pub fn parse_excluded(text: &str) -> Result<Vec<String>, String> {
+pub fn parse_excluded(text: &str) -> Result<Vec<String>, SettingsError> {
     let mut out: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (i, line) in text.lines().enumerate() {
@@ -220,59 +265,63 @@ pub fn parse_excluded(text: &str) -> Result<Vec<String>, String> {
         }
         if Did::parse(d).is_err() {
             let shown: String = d.chars().take(80).collect();
-            return Err(format!(
+            return Err(SettingsError::Field(format!(
                 "Excluded accounts, line {}: {shown:?} is not a DID. Enter one DID per line \
                  (did:plc:… or did:web:…); handles are not accepted.",
                 i + 1
-            ));
+            )));
         }
         if seen.insert(d.to_owned()) {
             out.push(d.to_owned());
         }
     }
     if out.len() > MAX_EXCLUDED_DIDS {
-        return Err(format!(
+        return Err(SettingsError::Field(format!(
             "Excluded accounts: {} DIDs; at most {MAX_EXCLUDED_DIDS} are allowed.",
             out.len()
-        ));
+        )));
     }
     Ok(out)
 }
 
-fn number(field: &str, raw: &str, min: u32, max: u32) -> Result<u32, String> {
+fn number(field: &str, raw: &str, min: u32, max: u32) -> Result<u32, SettingsError> {
     match raw.trim().parse::<u32>() {
         Ok(n) if (min..=max).contains(&n) => Ok(n),
-        _ => Err(format!(
+        _ => Err(SettingsError::Field(format!(
             "{field} must be a whole number between {min} and {max}."
-        )),
+        ))),
     }
 }
 
 impl Settings {
-    /// Validates a submitted form.
-    pub fn parse(v: &View) -> Result<Settings, String> {
+    /// Validates a submitted form into the values to store. The error
+    /// names the first field that is not acceptable.
+    pub fn parse(v: &View) -> Result<Settings, SettingsError> {
         if v.instance_description.chars().count() > MAX_INSTANCE_DESCRIPTION {
-            return Err(format!(
+            return Err(SettingsError::Field(format!(
                 "The description is longer than {MAX_INSTANCE_DESCRIPTION} characters."
-            ));
+            )));
         }
         if v.contact.chars().count() > MAX_PUBLIC_CONTACT {
-            return Err(format!(
+            return Err(SettingsError::Field(format!(
                 "The contact is longer than {MAX_PUBLIC_CONTACT} characters."
-            ));
+            )));
         }
         if !matches!(v.dark_mode_default.as_str(), "light" | "dark" | "system") {
-            return Err("The default theme must be light, dark or system.".into());
+            return Err(SettingsError::Field(
+                "The default theme must be light, dark or system.".into(),
+            ));
         }
         let ttl = v.handle_cache_ttl.trim();
         if ttl.parse::<ConfigDuration>().is_err() {
-            return Err(
+            return Err(SettingsError::Field(
                 "The handle cache lifetime must be a duration such as 30m, 1h or 1d.".into(),
-            );
+            ));
         }
         let viewer = v.record_viewer_url.trim();
         if !viewer.is_empty() {
-            validate_record_viewer_url(viewer).map_err(|r| format!("Record viewer URL: {r}"))?;
+            validate_record_viewer_url(viewer)
+                .map_err(|r| SettingsError::Field(format!("Record viewer URL: {r}")))?;
         }
         let card_rps = number("Profile cards per second", &v.card_rps, 1, 1_000)?;
         let card_burst = number("Profile card burst", &v.card_burst, 1, 10_000)?;
@@ -321,12 +370,15 @@ impl Settings {
     }
 
     /// Writes the values into a `config.toml` table.
-    pub fn apply(&self, t: &mut toml::Table) -> Result<(), String> {
-        fn section<'a>(t: &'a mut toml::Table, name: &str) -> Result<&'a mut toml::Table, String> {
+    pub fn apply(&self, t: &mut toml::Table) -> Result<(), SettingsError> {
+        fn section<'a>(
+            t: &'a mut toml::Table,
+            name: &str,
+        ) -> Result<&'a mut toml::Table, SettingsError> {
             t.entry(name)
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()))
                 .as_table_mut()
-                .ok_or_else(|| format!("`{name}` in config.toml is not a table"))
+                .ok_or_else(|| SettingsError::NotATable(name.to_owned()))
         }
         section(t, "access")?.insert("public_ui".into(), self.enabled.into());
         let p = section(t, "public_ui")?;
@@ -460,38 +512,35 @@ struct ConfirmPage {
 
 /// The config a change would produce, loaded and validated exactly as at
 /// start-up, without writing anything.
-fn dry_run(st: &WebState, change: &Change) -> Result<Config, String> {
+fn dry_run(st: &WebState, change: &Change) -> Result<Config, SettingsError> {
     let store = &st.api.config;
     if store.current().from_env_only {
-        return Err(
-            "The configuration is managed through the environment (FARSIGHT_SKIP_WIZARD); \
-             change it there."
-                .into(),
-        );
+        return Err(SettingsError::ManagedExternally);
     }
     let text = match change {
         Change::File(t) => t.clone(),
         Change::Form(s) => {
-            let current = store.file_text().map_err(|e| e.to_string())?;
-            let mut table: toml::Table = current
-                .parse()
-                .map_err(|e: toml::de::Error| e.to_string())?;
+            let current = store.file_text()?;
+            let mut table: toml::Table = current.parse()?;
             s.apply(&mut table)?;
-            toml::to_string_pretty(&table).map_err(|e| e.to_string())?
+            toml::to_string_pretty(&table)?
         }
     };
     config::load_from_parts(Some(&text), store.env())
         .map(|l| l.config)
-        .map_err(|e| e.to_string())
+        .map_err(SettingsError::from)
 }
 
-async fn commit(st: &WebState, change: &Change) -> Result<EditReport, String> {
+async fn commit(st: &WebState, change: &Change) -> Result<EditReport, SettingsError> {
     let store = &st.api.config;
     let r = match change {
-        Change::Form(s) => store.edit(|t| s.apply(t)).await,
+        Change::Form(s) => {
+            store
+                .edit(|t| s.apply(t).map_err(|e| EditError::Invalid(e.to_string())))
+                .await
+        }
         Change::File(text) => store.replace(text).await,
-    }
-    .map_err(|e| e.to_string())?;
+    }?;
     let _ = farsight_api::config_store::notify_config(&st.api.pool).await;
     Ok(r)
 }
@@ -511,7 +560,7 @@ pub(crate) fn confirmation(
     st: &WebState,
     admin: &Admin,
     change: Change,
-) -> Result<Option<Response>, String> {
+) -> Result<Option<Response>, SettingsError> {
     let next = dry_run(st, &change)?;
     let on_now = st.api.config.current().config.access.public_ui;
     if !next.access.public_ui || on_now {
@@ -542,7 +591,7 @@ pub(crate) fn confirmation(
 fn outcome(
     st: &WebState,
     admin: &Admin,
-    result: Result<EditReport, String>,
+    result: Result<EditReport, SettingsError>,
     typed: Option<View>,
     note: Option<String>,
 ) -> Response {
@@ -562,7 +611,7 @@ fn outcome(
             page.restart = report.restart_required;
         }
         Err(e) => {
-            page.error = Some(e);
+            page.error = Some(e.to_string());
             if let Some(v) = typed {
                 page.p = v;
             }
@@ -664,12 +713,19 @@ mod tests {
             parse_excluded(&format!("{D1}\n\n  {D2}  \r\n{D1}\n")).unwrap(),
             [D1, D2]
         );
-        let e = parse_excluded(&format!("{D1}\nalice.example\n")).unwrap_err();
+        let e = parse_excluded(&format!("{D1}\nalice.example\n"))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("line 2") && e.contains("alice.example"), "{e}");
         let many: String = (0..=MAX_EXCLUDED_DIDS)
             .map(|i| format!("did:web:h{i}.example\n"))
             .collect();
-        assert!(parse_excluded(&many).unwrap_err().contains("at most"));
+        assert!(
+            parse_excluded(&many)
+                .unwrap_err()
+                .to_string()
+                .contains("at most")
+        );
         assert!(parse_excluded("").unwrap().is_empty());
     }
 
@@ -725,7 +781,7 @@ mod tests {
             ..ok.clone()
         })
         .unwrap_err();
-        assert_eq!(e, "Record viewer URL: `{rkey}` is missing.");
+        assert_eq!(e.to_string(), "Record viewer URL: `{rkey}` is missing.");
         assert!(
             Settings::parse(&View {
                 card_rps: "0".into(),

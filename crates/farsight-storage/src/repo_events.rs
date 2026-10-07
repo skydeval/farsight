@@ -12,53 +12,48 @@
 use chrono::{DateTime, Utc};
 use farsight_core::Did;
 
-use crate::codes::{DebtReason, TrackState, actor_status};
+use crate::codes::{ActorStatus, DebtReason, Priority, RequesterKey, Tier, TrackState};
 use crate::error::Result;
-use crate::queue::{self, JobKind, SYSTEM_RESYNC};
+use crate::ids::{ActorId, ListId};
+use crate::queue::{self, JobKind};
 use crate::tracking::FireArgs;
 use crate::transition::Event;
 use crate::txn::Txn;
-
-/// Queue priority codes (`backfill_queue.priority`; higher runs first).
-pub mod priority {
-    /// `normal`.
-    pub const NORMAL: i16 = 0;
-    /// `high`.
-    pub const HIGH: i16 = 1;
-}
 
 /// A non-commit event for one repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoEvent {
     /// `identity`: handle or DID document changed.
     Identity {
-        /// The DID.
+        /// The repo whose handle or DID document changed.
         did: Did,
-        /// Witness time.
+        /// Witness time of the event.
         witness: DateTime<Utc>,
     },
     /// `account`: status change.
     Account {
-        /// The DID.
+        /// The account whose status changed.
         did: Did,
-        /// Witness time.
+        /// Witness time of the event. It is stored as the account's
+        /// `status_at`, and an event older than the stored one is skipped.
         witness: DateTime<Utc>,
-        /// `active`.
+        /// The event's `active` flag.
         active: bool,
         /// Upstream status when inactive.
         status: Option<String>,
     },
     /// `#sync` (v2 only): the repo's commit chain broke; re-list it.
     Sync {
-        /// The DID.
+        /// The repo to list again.
         did: Did,
-        /// Witness time.
+        /// Witness time of the event; the `resync` debt it leaves is
+        /// cleared only by a run whose coverage point is at or after it.
         witness: DateTime<Utc>,
     },
 }
 
 impl RepoEvent {
-    /// The repo DID.
+    /// The repo the event is about, whichever kind it is.
     pub fn did(&self) -> &Did {
         match self {
             RepoEvent::Identity { did, .. }
@@ -75,20 +70,20 @@ impl RepoEvent {
 }
 
 /// The stored status code for an upstream account event.
-pub fn status_code(active: bool, status: Option<&str>) -> i16 {
+pub fn status_code(active: bool, status: Option<&str>) -> ActorStatus {
     if active {
-        actor_status::ACTIVE
+        ActorStatus::Active
     } else {
         match status {
-            None => actor_status::UNKNOWN,
-            Some(s) => actor_status::from_upstream(Some(s)),
+            None => ActorStatus::Unknown,
+            Some(s) => ActorStatus::from_upstream(Some(s)),
         }
     }
 }
 
 /// Owner keys (DID, list rkey) of a DID's `unavailable` lists, for lock
 /// discovery. Read-only.
-pub async fn unavailable_list_keys(t: &mut Txn<'_>, did: &Did) -> Result<Vec<(i64, String)>> {
+pub async fn unavailable_list_keys(t: &mut Txn<'_>, did: &Did) -> Result<Vec<(ListId, String)>> {
     Ok(sqlx::query_as(
         "SELECT l.id, l.rkey FROM lists l JOIN actors a ON a.id = l.owner_id
          WHERE a.did = $1 AND l.track_state = $2",
@@ -136,9 +131,9 @@ impl Txn<'_> {
                     &mut *self.conn,
                     author.id,
                     JobKind::Repo,
-                    1,
-                    priority::NORMAL,
-                    SYSTEM_RESYNC,
+                    Tier::OnDemand,
+                    Priority::Normal,
+                    RequesterKey::Resync,
                     Some(system_queue_cap),
                 )
                 .await?;
@@ -152,14 +147,15 @@ impl Txn<'_> {
                 status,
             } => {
                 let new = status_code(*active, status.as_deref());
-                let known: Option<(i64, i16, bool, Option<DateTime<Utc>>)> = sqlx::query_as(
-                    "SELECT a.id, a.status, COALESCE(s.inactive_at_listing, false), a.status_at
+                let known: Option<(ActorId, ActorStatus, bool, Option<DateTime<Utc>>)> =
+                    sqlx::query_as(
+                        "SELECT a.id, a.status, COALESCE(s.inactive_at_listing, false), a.status_at
                      FROM actors a LEFT JOIN backfill_state s ON s.actor_id = a.id
                      WHERE a.did = $1",
-                )
-                .bind(did.as_str())
-                .fetch_optional(&mut *self.conn)
-                .await?;
+                    )
+                    .bind(did.as_str())
+                    .fetch_optional(&mut *self.conn)
+                    .await?;
                 self.report.repo_events += 1;
                 let Some((id, old, inactive_at_listing, status_at)) = known else {
                     // An unknown DID becoming active gets no row and no
@@ -186,16 +182,16 @@ impl Txn<'_> {
                 if new != old {
                     self.notify = true;
                 }
-                if new == actor_status::DESYNCHRONIZED && old != actor_status::DESYNCHRONIZED {
+                if new == ActorStatus::Desynchronized && old != ActorStatus::Desynchronized {
                     self.add_debt(id, DebtReason::Resync, None, Some(*witness))
                         .await?;
                     self.report.resyncs += 1;
                 }
-                if *active && (actor_status::is_hidden(old) || inactive_at_listing) {
+                if *active && (old.is_hidden() || inactive_at_listing) {
                     self.add_debt(id, DebtReason::Resync, None, Some(*witness))
                         .await?;
                     self.report.resyncs += 1;
-                    let lists: Vec<(i64, String)> = sqlx::query_as(
+                    let lists: Vec<(ListId, String)> = sqlx::query_as(
                         "SELECT id, rkey FROM lists WHERE owner_id = $1 AND track_state = $2
                          ORDER BY id",
                     )
@@ -212,7 +208,7 @@ impl Txn<'_> {
                             .await?;
                     }
                 }
-                if new == actor_status::DELETED && old != actor_status::DELETED {
+                if new == ActorStatus::Deleted && old != ActorStatus::Deleted {
                     self.report.deleted_accounts.push(did.clone());
                 }
             }
@@ -243,7 +239,7 @@ pub async fn record_poisoned(
                 .collect(),
         )
         .await?;
-        t.lock_new_dids(&[did.as_str()]).await?;
+        t.lock_new_dids(&[did]).await?;
         let author = t.author(did).await?;
         sqlx::query("INSERT INTO op_errors (component, did, message) VALUES ('ingest', $1, $2)")
             .bind(did.as_str())
@@ -256,9 +252,9 @@ pub async fn record_poisoned(
             &mut *t.conn,
             author.id,
             JobKind::Repo,
-            1,
-            priority::NORMAL,
-            SYSTEM_RESYNC,
+            Tier::OnDemand,
+            Priority::Normal,
+            RequesterKey::Resync,
             Some(limits.system_queue_cap),
         )
         .await?;
@@ -276,17 +272,17 @@ mod tests {
 
     #[test]
     fn status_codes() {
-        assert_eq!(status_code(true, None), actor_status::ACTIVE);
-        assert_eq!(status_code(true, Some("deactivated")), actor_status::ACTIVE);
+        assert_eq!(status_code(true, None), ActorStatus::Active);
+        assert_eq!(status_code(true, Some("deactivated")), ActorStatus::Active);
         assert_eq!(
             status_code(false, Some("takendown")),
-            actor_status::TAKENDOWN
+            ActorStatus::Takendown
         );
         assert_eq!(
             status_code(false, Some("throttled")),
-            actor_status::THROTTLED
+            ActorStatus::Throttled
         );
-        assert_eq!(status_code(false, Some("weird")), actor_status::UNKNOWN);
-        assert_eq!(status_code(false, None), actor_status::UNKNOWN);
+        assert_eq!(status_code(false, Some("weird")), ActorStatus::Unknown);
+        assert_eq!(status_code(false, None), ActorStatus::Unknown);
     }
 }

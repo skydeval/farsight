@@ -8,7 +8,11 @@ pub mod repo;
 
 use chrono::{DateTime, Utc};
 use farsight_core::Did;
-use farsight_storage::codes::{DebtReason, RunOutcome};
+use farsight_storage::codes::sql::{
+    JOB_REPO, MEMBER_OUTSTANDING, MEMBER_TERMINAL, REPO_DONE, REPO_FAILED, RUN_FAILED, RUN_INACTIVE,
+};
+use farsight_storage::codes::{DebtReason, JobKind, Priority, RequesterKey, RunOutcome, Tier};
+use farsight_storage::ids::{ActorId, Stamp};
 use farsight_storage::keys;
 use farsight_storage::txn::{Gates, Txn};
 use sqlx::PgPool;
@@ -22,36 +26,69 @@ pub const LEASE: std::time::Duration = std::time::Duration::from_secs(600);
 /// What a job is for (who asked, which tier).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobReq {
-    /// The repo.
+    /// The account whose repo the job lists; also the key of the job's
+    /// lease.
     pub did: Did,
-    /// Tier 1–3.
-    pub tier: i16,
-    /// `token:<id>`, `admin`, `system:lists`, `system:resync`,
-    /// `system:firehose`, `system:sweep`, `system:repair`.
-    pub requester: String,
+    /// The tier the job was dispatched from; a retry is queued in it.
+    pub tier: Tier,
+    /// Who asked for the job.
+    pub requester: RequesterKey,
 }
 
 impl JobReq {
     /// Admin-requested jobs run normally under the budget gate.
     pub fn admin(&self) -> bool {
-        self.requester == "admin"
+        self.requester == RequesterKey::Admin
     }
+}
+
+/// Why a job's step failed. Its text is what the job's failure records
+/// (`Outcome::Failed`).
+#[derive(Debug, thiserror::Error)]
+pub enum JobError {
+    /// A statement failed.
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+    /// The storage layer refused or failed.
+    #[error(transparent)]
+    Storage(#[from] farsight_storage::StorageError),
+    /// A PDS, the relay or the backlink index could not be read.
+    #[error(transparent)]
+    Net(#[from] crate::net::NetError),
+    /// The DID did not resolve.
+    #[error(transparent)]
+    Resolve(#[from] crate::resolve::ResolveError),
+    /// Recording an account's status stopped. The text is the stop in
+    /// its debug form.
+    #[error("{0:?}")]
+    Status(repo::Stop),
+    /// A fetched record does not parse.
+    #[error(transparent)]
+    Record(#[from] farsight_core::record::RecordError),
+    /// A record key is not valid.
+    #[error(transparent)]
+    RecordKey(#[from] farsight_core::aturi::RecordKeyError),
 }
 
 /// How a job ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// Clean.
+    /// Listed and reconciled to the end with nothing refused: clears the
+    /// debts raised up to the job's coverage point and sets
+    /// `clean_witness`.
     Clean,
-    /// Complete-with-debts.
+    /// Listed and reconciled to the end, but an insert was refused, a
+    /// reconcile was skipped or listblocks stay uncounted; each shortfall
+    /// is recorded as a debt and none is cleared.
     CompleteWithDebts,
-    /// Inactive.
+    /// The relay confirms the account inactive; nothing was listed.
     Inactive,
     /// Failed (terminal after `backfill.terminal_after`).
     Failed {
-        /// The error.
+        /// The failure's text, stored in `backfill_state.last_error`.
         error: String,
-        /// Terminal now.
+        /// Whether the DID has been failing for `backfill.terminal_after`
+        /// or longer. Jobs return `false`; [`finish_repo`] sets it.
         terminal: bool,
     },
     /// The page bound was reached: continue from the cursor later (not a
@@ -62,7 +99,7 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// Metric label.
+    /// The `outcome` label of `farsight_backfill_repos_total`.
     pub fn label(&self) -> &'static str {
         match self {
             Outcome::Clean => "clean",
@@ -79,9 +116,9 @@ impl Outcome {
 /// charge).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobResult {
-    /// Outcome.
+    /// How the job ended.
     pub outcome: Outcome,
-    /// Outbound requests made.
+    /// Outbound requests the job made, whatever its outcome.
     pub cost: u64,
 }
 
@@ -103,7 +140,8 @@ pub async fn acquire_lease(pool: &PgPool, did: &str, owner: &str) -> Result<bool
     Ok(got.is_some())
 }
 
-/// Extends the lease.
+/// Extends the lease to [`LEASE`] from now. Does nothing if `owner` no
+/// longer holds it.
 pub async fn renew_lease(pool: &PgPool, did: &str, owner: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE job_leases SET lease_until = now() + make_interval(secs => $3)
@@ -117,7 +155,8 @@ pub async fn renew_lease(pool: &PgPool, did: &str, owner: &str) -> Result<(), sq
     Ok(())
 }
 
-/// Releases the lease.
+/// Deletes the lease if `owner` holds it. A failure is ignored: the lease
+/// then runs out by itself.
 pub async fn release_lease(pool: &PgPool, did: &str, owner: &str) {
     let _ = sqlx::query("DELETE FROM job_leases WHERE did = $1 AND lease_owner = $2")
         .bind(did)
@@ -129,14 +168,14 @@ pub async fn release_lease(pool: &PgPool, did: &str, owner: &str) {
 /// The DID's `actors.id`, creating the row (under its intern lock, charged
 /// to its own key and never refused) when a job needs it: an inactive
 /// outcome, a failure that must be queued, a debt.
-pub async fn intern(ctx: &Ctx, did: &Did) -> Result<i64, farsight_storage::StorageError> {
+pub async fn intern(ctx: &Ctx, did: &Did) -> Result<ActorId, farsight_storage::StorageError> {
     let limits = ctx.limits();
     let mut tx = ctx.pool.begin().await?;
     let (id, deltas) = {
         let mut t = Txn::start(&mut tx, &limits, Gates::default()).await?;
         t.lock_authors(&[keys::author_lock_key(did.as_str())].into_iter().collect())
             .await?;
-        t.lock_new_dids(&[did.as_str()]).await?;
+        t.lock_new_dids(&[did]).await?;
         let a = t.author(did).await?;
         let (_, d) = t.finish();
         (a.id, d)
@@ -147,7 +186,7 @@ pub async fn intern(ctx: &Ctx, did: &Did) -> Result<i64, farsight_storage::Stora
 }
 
 /// `actors.id` of `did` without creating it.
-pub async fn actor_id(pool: &PgPool, did: &str) -> Result<Option<i64>, sqlx::Error> {
+pub async fn actor_id(pool: &PgPool, did: &str) -> Result<Option<ActorId>, sqlx::Error> {
     sqlx::query_scalar("SELECT id FROM actors WHERE did = $1")
         .bind(did)
         .fetch_optional(pool)
@@ -177,64 +216,56 @@ pub fn retry_delay(
 /// Cycle membership: a clean, complete-with-debts or inactive job that
 /// **started** after a running cycle's start deletes the DID's
 /// outstanding row there; a terminal failure marks it terminal.
+///
+/// The row and the cycle's counter change in one statement, so a job cut
+/// off at shutdown cannot leave a member settled and not counted.
 pub async fn settle_membership(
     pool: &PgPool,
-    did: &str,
+    did: &Did,
     job_start: DateTime<Utc>,
     terminal: bool,
 ) -> Result<(), sqlx::Error> {
-    if terminal {
-        let cycles: Vec<i64> = sqlx::query_scalar(
-            "UPDATE cycle_outstanding o SET state = 2 FROM sweep_cycles c
-             WHERE o.did = $1 AND o.state = 1 AND c.id = o.cycle_id
-               AND c.completed_at IS NULL AND c.started_at < $2
-             RETURNING o.cycle_id",
+    let sql = if terminal {
+        format!(
+            "WITH settled AS (
+               UPDATE cycle_outstanding o SET state = {MEMBER_TERMINAL} FROM sweep_cycles c
+               WHERE o.did = $1 AND o.state = {MEMBER_OUTSTANDING} AND c.id = o.cycle_id
+                 AND c.completed_at IS NULL AND c.started_at < $2
+               RETURNING o.cycle_id)
+             UPDATE sweep_cycles SET failed_terminal = failed_terminal + 1
+             WHERE id IN (SELECT cycle_id FROM settled)"
         )
-        .bind(did)
-        .bind(job_start)
-        .fetch_all(pool)
-        .await?;
-        if !cycles.is_empty() {
-            sqlx::query(
-                "UPDATE sweep_cycles SET failed_terminal = failed_terminal + 1 WHERE id = ANY($1)",
-            )
-            .bind(&cycles)
-            .execute(pool)
-            .await?;
-        }
     } else {
-        let cycles: Vec<i64> = sqlx::query_scalar(
-            "DELETE FROM cycle_outstanding o USING sweep_cycles c
-             WHERE o.did = $1 AND c.id = o.cycle_id
-               AND c.completed_at IS NULL AND c.started_at < $2
-             RETURNING o.cycle_id",
-        )
-        .bind(did)
+        "WITH settled AS (
+           DELETE FROM cycle_outstanding o USING sweep_cycles c
+           WHERE o.did = $1 AND c.id = o.cycle_id
+             AND c.completed_at IS NULL AND c.started_at < $2
+           RETURNING o.cycle_id)
+         UPDATE sweep_cycles SET done = done + 1
+         WHERE id IN (SELECT cycle_id FROM settled)"
+            .to_owned()
+    };
+    sqlx::query(&sql)
+        .bind(did.as_str())
         .bind(job_start)
-        .fetch_all(pool)
+        .execute(pool)
         .await?;
-        if !cycles.is_empty() {
-            sqlx::query("UPDATE sweep_cycles SET done = done + 1 WHERE id = ANY($1)")
-                .bind(&cycles)
-                .execute(pool)
-                .await?;
-        }
-    }
     Ok(())
 }
 
 /// What `finish_repo` writes.
 #[derive(Debug, Clone)]
 pub struct Finish<'a> {
-    /// The job.
+    /// The job that ran: its DID, tier and requester.
     pub req: &'a JobReq,
     /// Its coverage point `clock(job start)`.
     pub point: Option<DateTime<Utc>>,
     /// Server time of the job start (cycle membership).
     pub job_start: DateTime<Utc>,
     /// The listing stamp `R`, if one was read.
-    pub stamp: Option<i64>,
-    /// The outcome.
+    pub stamp: Option<Stamp>,
+    /// How the job says it ended. [`finish_repo`] returns it with
+    /// `terminal` decided for a failure.
     pub outcome: &'a Outcome,
 }
 
@@ -258,16 +289,16 @@ pub async fn finish_repo(
             let clean = outcome == Outcome::Clean;
             if let Some(id) = id {
                 sqlx::query(
-                    "INSERT INTO backfill_state (actor_id, state, backfilled_at, backfilled_witness,
+                    &format!("INSERT INTO backfill_state (actor_id, state, backfilled_at, backfilled_witness,
                         clean_witness, last_outcome, backfill_rev, attempts, inactive_at_listing)
-                     VALUES ($1, 3, now(), $2, CASE WHEN $3 THEN $2 END, $4, $5, 0, false)
-                     ON CONFLICT (actor_id) DO UPDATE SET state = 3, backfilled_at = now(),
+                     VALUES ($1, {REPO_DONE}, now(), $2, CASE WHEN $3 THEN $2 END, $4, $5, 0, false)
+                     ON CONFLICT (actor_id) DO UPDATE SET state = {REPO_DONE}, backfilled_at = now(),
                        backfilled_witness = $2,
                        clean_witness = CASE WHEN $3 THEN $2 ELSE backfill_state.clean_witness END,
                        last_outcome = $4, backfill_rev = COALESCE($5, backfill_state.backfill_rev),
                        attempts = 0, next_attempt_at = NULL, first_failed_at = NULL,
                        last_error = NULL, current_run_id = NULL, current_run_point = NULL,
-                       inactive_at_listing = false",
+                       inactive_at_listing = false"),
                 )
                 .bind(id)
                 .bind(f.point)
@@ -281,42 +312,44 @@ pub async fn finish_repo(
                         farsight_storage::debts::clear_for_clean_run(pool, id, p).await?;
                     }
                 }
-                sqlx::query("DELETE FROM backfill_cursors WHERE actor_id = $1 AND job_kind = 1")
-                    .bind(id)
-                    .execute(pool)
-                    .await?;
+                sqlx::query(&format!(
+                    "DELETE FROM backfill_cursors WHERE actor_id = $1 AND job_kind = {JOB_REPO}"
+                ))
+                .bind(id)
+                .execute(pool)
+                .await?;
             }
-            settle_membership(pool, did, f.job_start, false).await?;
+            settle_membership(pool, &f.req.did, f.job_start, false).await?;
         }
         Outcome::Inactive => {
             let id = id.expect("interned above");
-            sqlx::query(
+            sqlx::query(&format!(
                 "INSERT INTO backfill_state (actor_id, state, backfilled_at, backfilled_witness,
                     last_outcome, attempts, inactive_at_listing)
-                 VALUES ($1, 3, now(), $2, 3, 0, true)
-                 ON CONFLICT (actor_id) DO UPDATE SET state = 3, backfilled_at = now(),
-                   backfilled_witness = $2, last_outcome = 3, attempts = 0,
+                 VALUES ($1, {REPO_DONE}, now(), $2, {RUN_INACTIVE}, 0, true)
+                 ON CONFLICT (actor_id) DO UPDATE SET state = {REPO_DONE}, backfilled_at = now(),
+                   backfilled_witness = $2, last_outcome = {RUN_INACTIVE}, attempts = 0,
                    next_attempt_at = NULL, first_failed_at = NULL, last_error = NULL,
-                   current_run_id = NULL, current_run_point = NULL, inactive_at_listing = true",
-            )
+                   current_run_id = NULL, current_run_point = NULL, inactive_at_listing = true"
+            ))
             .bind(id)
             .bind(f.point)
             .execute(pool)
             .await?;
-            settle_membership(pool, did, f.job_start, false).await?;
+            settle_membership(pool, &f.req.did, f.job_start, false).await?;
         }
         Outcome::Failed { error, terminal } => {
             let id = id.expect("interned above");
             let cfg = ctx.cfg();
             let (attempts, first): (i32, DateTime<Utc>) = sqlx::query_as(
-                "INSERT INTO backfill_state (actor_id, state, attempts, first_failed_at, last_error,
+                &format!("INSERT INTO backfill_state (actor_id, state, attempts, first_failed_at, last_error,
                     last_outcome)
-                 VALUES ($1, 4, 1, now(), $2, 4)
-                 ON CONFLICT (actor_id) DO UPDATE SET state = 4,
+                 VALUES ($1, {REPO_FAILED}, 1, now(), $2, {RUN_FAILED})
+                 ON CONFLICT (actor_id) DO UPDATE SET state = {REPO_FAILED},
                    attempts = backfill_state.attempts + 1,
                    first_failed_at = COALESCE(backfill_state.first_failed_at, now()),
-                   last_error = $2, last_outcome = 4, current_run_point = NULL
-                 RETURNING attempts, first_failed_at",
+                   last_error = $2, last_outcome = {RUN_FAILED}, current_run_point = NULL
+                 RETURNING attempts, first_failed_at"),
             )
             .bind(id)
             .bind(&*error)
@@ -338,7 +371,7 @@ pub async fn finish_repo(
                 let witness = f.point.unwrap_or(now);
                 farsight_storage::debts::add_debt(pool, id, DebtReason::Unreachable, None, witness)
                     .await?;
-                settle_membership(pool, did, f.job_start, true).await?;
+                settle_membership(pool, &f.req.did, f.job_start, true).await?;
             } else {
                 // Retried with backoff through the queue (failed cycle
                 // members are queued, which interns them).
@@ -346,17 +379,17 @@ pub async fn finish_repo(
                 farsight_storage::queue::enqueue(
                     &mut conn,
                     id,
-                    farsight_storage::queue::JobKind::Repo,
+                    JobKind::Repo,
                     f.req.tier,
-                    farsight_storage::repo_events::priority::NORMAL,
-                    &f.req.requester,
+                    Priority::Normal,
+                    f.req.requester,
                     None,
                 )
                 .await?;
-                sqlx::query(
+                sqlx::query(&format!(
                     "UPDATE backfill_queue SET not_before = now() + make_interval(secs => $2)
-                     WHERE actor_id = $1 AND kind = 1",
-                )
+                     WHERE actor_id = $1 AND kind = {JOB_REPO}"
+                ))
                 .bind(id)
                 .bind(delay.as_secs_f64())
                 .execute(&mut *conn)
@@ -365,7 +398,7 @@ pub async fn finish_repo(
         }
         Outcome::Yielded | Outcome::Busy => {}
     }
-    metrics::counter!(m::REPOS_TOTAL, "tier" => f.req.tier.to_string(), "outcome" => outcome.label())
+    metrics::counter!(m::REPOS_TOTAL, "tier" => f.req.tier.label(), "outcome" => outcome.label())
         .increment(1);
     Ok(outcome)
 }

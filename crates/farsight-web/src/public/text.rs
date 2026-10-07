@@ -38,7 +38,8 @@ pub fn paragraphs(s: &str) -> Vec<String> {
 pub struct Stamp {
     /// `datetime` attribute (RFC 3339, UTC).
     pub iso: String,
-    /// Visible text.
+    /// The element's text: `YYYY-MM-DD HH:MM:SS UTC`. The page's script
+    /// may rewrite it in the viewer's timezone.
     pub text: String,
     /// The same without the zone, for a table whose page states the zone
     /// once.
@@ -46,7 +47,7 @@ pub struct Stamp {
 }
 
 impl Stamp {
-    /// From a time.
+    /// The stamp of `t`, to the second (fractions are dropped).
     pub fn of(t: DateTime<Utc>) -> Stamp {
         Stamp {
             iso: t.to_rfc3339_opts(SecondsFormat::Secs, true),

@@ -7,6 +7,7 @@ use farsight_core::record::{BlockRecord, ListBlockRecord, ListItemRecord};
 use farsight_core::{AtUri, Collection, Did, Record, RecordKey};
 use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Reconcile, Write, WriteAction};
 use farsight_storage::counters::CounterSink;
+use farsight_storage::ids::Stamp;
 use farsight_storage::keys::Limits;
 use farsight_storage::txn::Gates;
 use farsight_storage::{history, janitor};
@@ -48,7 +49,7 @@ fn block(author: &str, rkey: &str, subject: &str, stamp: i64, w: DateTime<Utc>) 
         author: d(author),
         collection: Collection::Block,
         rkey: rk(rkey),
-        stamp,
+        stamp: Stamp::new(stamp),
         witness: Some(w),
         action: WriteAction::Upsert(Record::Block(BlockRecord {
             subject: d(subject),
@@ -69,7 +70,7 @@ fn listblock(
         author: d(author),
         collection: Collection::ListBlock,
         rkey: rk(rkey),
-        stamp,
+        stamp: Stamp::new(stamp),
         witness: Some(w),
         action: WriteAction::Upsert(Record::ListBlock(ListBlockRecord {
             subject: AtUri::new(d(owner), Collection::List, rk(list)),
@@ -83,7 +84,7 @@ fn item(owner: &str, rkey: &str, list: &str, subject: &str, stamp: i64, w: DateT
         author: d(owner),
         collection: Collection::ListItem,
         rkey: rk(rkey),
-        stamp,
+        stamp: Stamp::new(stamp),
         witness: Some(w),
         action: WriteAction::Upsert(Record::ListItem(ListItemRecord {
             subject: d(subject),
@@ -98,7 +99,7 @@ fn delete(author: &str, c: Collection, rkey: &str, stamp: i64, w: DateTime<Utc>)
         author: d(author),
         collection: c,
         rkey: rk(rkey),
-        stamp,
+        stamp: Stamp::new(stamp),
         witness: Some(w),
         action: WriteAction::Delete,
     }
@@ -142,7 +143,7 @@ impl Env {
         b.reconciles = vec![Reconcile {
             author: d(author),
             collection: c,
-            stamp,
+            stamp: Stamp::new(stamp),
             after: None,
             through: None,
             keep: keep.iter().map(|k| rk(k)).collect(),

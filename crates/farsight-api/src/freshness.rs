@@ -15,13 +15,18 @@ use serde_json::{Map, Value, json};
 /// A scope's coverage while it is being composed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cov {
-    /// Level.
+    /// `coverage.level`. [`Cov::lower`] and [`Cov::combine`] only ever
+    /// lower it.
     pub level: Level,
     /// `completeSince` (only while the level is not `partial`).
     pub complete_since: Option<DateTime<Utc>>,
-    /// Reason codes.
+    /// `coverage.reasons`: the codes that explain a level below
+    /// `complete`, a lowered `indexedAt` or a counted exclusion. A set, so
+    /// the response lists each once, sorted.
     pub reasons: BTreeSet<&'static str>,
-    /// `indexedAt`.
+    /// `indexedAt`: the scope's watermark on the witness clock, at or
+    /// before `firehoseAppliedThrough`. `None` before the first firehose
+    /// batch, when the field is left out of the response.
     pub indexed_at: Option<DateTime<Utc>>,
 }
 
@@ -48,7 +53,8 @@ impl Cov {
         self.reasons.insert(reason);
     }
 
-    /// Caps `indexedAt`.
+    /// Lowers `indexedAt` to at most `t`. An unset `indexedAt` becomes
+    /// `t`.
     pub fn cap_indexed(&mut self, t: DateTime<Utc>) {
         self.indexed_at = Some(match self.indexed_at {
             Some(i) if i < t => i,
@@ -56,7 +62,9 @@ impl Cov {
         });
     }
 
-    /// The minimum of two scopes.
+    /// The coverage of a response that depends on both scopes: the lower
+    /// level, the later `completeSince` (none at `partial`), the union of
+    /// the reasons and the earlier `indexedAt`.
     pub fn combine(mut self, other: Cov) -> Cov {
         let level = self.level.min(other.level);
         self.complete_since = if level == Level::Partial {
@@ -76,11 +84,6 @@ impl Cov {
     }
 }
 
-/// Storage code of `block`.
-pub const BLOCK: i16 = 1;
-/// Storage code of `listblock`.
-pub const LISTBLOCK: i16 = 2;
-
 /// Which discovery scope a subject-scope check uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubjectKind {
@@ -93,7 +96,7 @@ pub enum SubjectKind {
 /// The snapshot as seen by one response.
 #[derive(Debug, Clone, Copy)]
 pub struct View<'a> {
-    /// The global snapshot.
+    /// The global snapshot the response is composed on.
     pub snap: &'a GlobalSnapshot,
     /// `firehose.tuning.synthetic_gap_lag`.
     pub lag: Duration,
@@ -139,7 +142,7 @@ impl View<'_> {
     }
 
     /// Network scope for collection `k`.
-    pub fn network(&self, k: i16) -> Cov {
+    pub fn network(&self, k: Collection) -> Cov {
         let s = network_scope(self.snap, k, self.lag);
         Cov {
             level: s.level,
@@ -154,7 +157,7 @@ impl View<'_> {
     /// scope (`assisted`).
     pub fn network_or_subject(
         &self,
-        k: i16,
+        k: Collection,
         x: Option<&ActorCoverage>,
         kind: SubjectKind,
     ) -> (Cov, bool) {
@@ -203,8 +206,8 @@ impl View<'_> {
     /// listblock, plus the pending-list table.
     pub fn global(&self) -> Cov {
         let mut c = self
-            .network(Collection::Block.code())
-            .combine(self.network(Collection::ListBlock.code()));
+            .network(Collection::Block)
+            .combine(self.network(Collection::ListBlock));
         self.apply_pending_table(&mut c);
         c
     }
@@ -260,13 +263,10 @@ impl View<'_> {
     }
 }
 
-/// Wire name of a level.
+/// The level as `coverage.level` spells it (`partial`, `assisted`,
+/// `complete`).
 pub fn level_name(l: Level) -> &'static str {
-    match l {
-        Level::Complete => "complete",
-        Level::Assisted => "assisted",
-        Level::Partial => "partial",
-    }
+    l.api_name()
 }
 
 /// RFC 3339 with microseconds (truncated, so a watermark is never
@@ -307,7 +307,7 @@ mod tests {
                 ..FirehoseState::default()
             },
             baseline: baseline.then(|| Baseline {
-                cycle_id: 1,
+                cycle_id: farsight_storage::ids::CycleId::new(1),
                 collections: vec![1, 2, 3, 4],
                 s_c: Some(t(100)),
                 completed_witness: Some(t(500)),
@@ -331,19 +331,19 @@ mod tests {
             subject_block: true,
             ..ActorCoverage::default()
         };
-        let (c, assisted) = v.network_or_subject(BLOCK, Some(&x), SubjectKind::Block);
+        let (c, assisted) = v.network_or_subject(Collection::Block, Some(&x), SubjectKind::Block);
         assert!(assisted);
         assert_eq!(c.level, Level::Assisted);
         assert_eq!(c.complete_since, Some(t(900)));
         // List-chain scope was not confirmed.
-        let (c, _) = v.network_or_subject(LISTBLOCK, Some(&x), SubjectKind::ListChain);
+        let (c, _) = v.network_or_subject(Collection::ListBlock, Some(&x), SubjectKind::ListChain);
         assert_eq!(c.level, Level::Partial);
         // Truncated.
         let x = ActorCoverage {
             truncated: true,
             ..x
         };
-        let (c, _) = v.network_or_subject(LISTBLOCK, Some(&x), SubjectKind::ListChain);
+        let (c, _) = v.network_or_subject(Collection::ListBlock, Some(&x), SubjectKind::ListChain);
         assert!(c.reasons.contains("discovery_truncated"));
     }
 
@@ -351,7 +351,7 @@ mod tests {
     fn combine_takes_minimum() {
         let s = snap(Protocol::V2, true);
         let v = View { snap: &s, lag: LAG };
-        let mut a = v.network(BLOCK);
+        let mut a = v.network(Collection::Block);
         assert_eq!(a.level, Level::Complete);
         let b = a.clone();
         a.partial("list_pending");

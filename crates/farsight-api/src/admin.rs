@@ -1,14 +1,17 @@
 //! Backfill endpoints (see `docs/design/api.md`) and the unstable admin
 //! procedures.
 
+use farsight_storage::codes::sql::CYCLE_REPAIR;
 use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use farsight_core::Did;
+use farsight_core::{Collection, Did};
 use farsight_ingest::Control;
 use farsight_storage::backfill_api::{self, BackfillStatus, Request, RequestOutcome, Requester};
+use farsight_storage::codes::{CycleKind, CycleSource, RequesterKey};
+use farsight_storage::ids::{CycleId, OpErrorId};
 use farsight_storage::keys::Limits;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -53,7 +56,7 @@ pub async fn get_backfill_status(st: &Arc<ApiState>, p: &Params) -> Result<Reply
     let actor = p.did("actor")?;
     let discovery = !st.config.current().config.backfill.backlinks.url.is_empty();
     let mut tx = st.read_tx().await?;
-    let s = backfill_api::status(&mut tx, actor.as_str(), discovery).await?;
+    let s = backfill_api::status(&mut tx, &actor, discovery).await?;
     tx.rollback().await?;
     Ok(Reply::ok(Value::Object(status_json(&actor, &s))))
 }
@@ -138,7 +141,7 @@ pub async fn request_backfill(
         }
     };
     let mut conn = st.pool.acquire().await?;
-    let s = backfill_api::status(&mut conn, actor.as_str(), !source.is_empty()).await?;
+    let s = backfill_api::status(&mut conn, &actor, !source.is_empty()).await?;
     let mut m = status_json(&actor, &s);
     m.insert("enqueued".into(), json!(enqueued));
     m.insert("downgraded".into(), json!(downgraded));
@@ -153,13 +156,14 @@ pub async fn list_errors(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcEr
     let limit = p.limit()?;
     let before = crate::cursor::id(p.get("cursor"))?;
     let mut tx = st.read_tx().await?;
-    let rows = farsight_storage::queries::op_errors(&mut tx, before, limit).await?;
+    let rows =
+        farsight_storage::queries::op_errors(&mut tx, before.map(OpErrorId::new), limit).await?;
     tx.rollback().await?;
     let errors: Vec<Value> = rows
         .iter()
         .map(|(id, at, component, did, host, message)| {
             let mut m = Map::new();
-            m.insert("id".into(), json!(id));
+            m.insert("id".into(), json!(id.get()));
             m.insert("at".into(), json!(ts(*at)));
             m.insert("component".into(), json!(component));
             if let Some(d) = did {
@@ -175,7 +179,7 @@ pub async fn list_errors(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcEr
     let mut body = json!({ "errors": errors });
     if rows.len() as i64 == limit {
         if let Some(last) = rows.last() {
-            body["cursor"] = json!(crate::cursor::encode(&[json!(last.0)]));
+            body["cursor"] = json!(crate::cursor::encode(&[json!(last.0.get())]));
         }
     }
     Ok(Reply::ok(body))
@@ -283,23 +287,24 @@ pub async fn pause_repair(st: &Arc<ApiState>, body: &Bytes) -> Result<Reply, Xrp
 /// be written (a config managed through the environment), nothing is
 /// cancelled. Jobs already running finish; what they wrote is kept.
 /// Returns the cancelled cycle, if there was one.
-pub async fn cancel_repair_cycle(st: &ApiState) -> Result<Option<i64>, XrpcError> {
+pub async fn cancel_repair_cycle(st: &ApiState) -> Result<Option<CycleId>, XrpcError> {
     set_repair_auto_start(st, false).await?;
     let mut tx = st.pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('farsight:start_repair'))")
         .execute(&mut *tx)
         .await?;
-    let cycle: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM sweep_cycles WHERE kind = 2 AND completed_at IS NULL
-         ORDER BY id DESC LIMIT 1",
-    )
+    let cycle: Option<CycleId> = sqlx::query_scalar(&format!(
+        "SELECT id FROM sweep_cycles WHERE kind = {CYCLE_REPAIR} AND completed_at IS NULL
+         ORDER BY id DESC LIMIT 1"
+    ))
     .fetch_optional(&mut *tx)
     .await?;
     let Some(id) = cycle else {
         tx.rollback().await?;
         return Ok(None);
     };
-    sqlx::query("DELETE FROM backfill_queue WHERE requester = 'system:repair'")
+    sqlx::query("DELETE FROM backfill_queue WHERE requester = $1")
+        .bind(RequesterKey::Repair)
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM cycle_outstanding WHERE cycle_id = $1")
@@ -329,7 +334,7 @@ pub async fn cancel_repair(st: &Arc<ApiState>) -> Result<Reply, XrpcError> {
     let cycle = cancel_repair_cycle(st).await?;
     let mut m = Map::new();
     if let Some(c) = cycle {
-        m.insert("cycle".into(), json!(c));
+        m.insert("cycle".into(), json!(c.get()));
     }
     m.insert("autoStart".into(), json!(false));
     Ok(Reply::ok(Value::Object(m)))
@@ -339,8 +344,10 @@ pub async fn cancel_repair(st: &Arc<ApiState>) -> Result<Reply, XrpcError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepairStart {
     /// The repair cycle (new, or the one already pending).
-    pub cycle: Option<i64>,
-    /// Its `repair_from`.
+    pub cycle: Option<CycleId>,
+    /// `sweep_cycles.repair_from` of that cycle: for a new one, the
+    /// earliest `from_at` among the gaps. `None` when there was nothing to
+    /// repair.
     pub from: Option<DateTime<Utc>>,
     /// Closed, unhealed gaps it covers.
     pub gaps: i64,
@@ -368,9 +375,9 @@ pub async fn start_repair_cycle(st: &ApiState) -> Result<RepairStart, XrpcError>
             gaps: 0,
         });
     }
-    let existing: Option<(i64, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT id, repair_from FROM sweep_cycles WHERE kind = 2 AND completed_at IS NULL
-         ORDER BY id DESC LIMIT 1",
+    let existing: Option<(CycleId, Option<DateTime<Utc>>)> = sqlx::query_as(
+        &format!("SELECT id, repair_from FROM sweep_cycles WHERE kind = {CYCLE_REPAIR} AND completed_at IS NULL
+         ORDER BY id DESC LIMIT 1"),
     )
     .fetch_optional(&mut *tx)
     .await?;
@@ -380,11 +387,14 @@ pub async fn start_repair_cycle(st: &ApiState) -> Result<RepairStart, XrpcError>
             // Repairs enumerate the relay's listRepos whatever the sweep
             // source; the backfill process sets S_C, claims the gaps and
             // falls back to known DIDs if the relay is down.
-            let id: i64 = sqlx::query_scalar(
+            let id: CycleId = sqlx::query_scalar(
                 "INSERT INTO sweep_cycles (kind, source, collections, started_at, repair_from)
-                 VALUES (2, 'relay_repos', '{1,2,3,4}', now(), $1) RETURNING id",
+                 VALUES ($2, $3, $4, now(), $1) RETURNING id",
             )
             .bind(from)
+            .bind(CycleKind::Repair)
+            .bind(CycleSource::RelayRepos)
+            .bind(Collection::ALL.map(Collection::code).to_vec())
             .fetch_one(&mut *tx)
             .await?;
             (id, from)
@@ -406,7 +416,7 @@ pub async fn start_repair(st: &Arc<ApiState>) -> Result<Reply, XrpcError> {
     let r = start_repair_cycle(st).await?;
     let mut m = Map::new();
     if let Some(c) = r.cycle {
-        m.insert("cycle".into(), json!(c));
+        m.insert("cycle".into(), json!(c.get()));
     }
     if let Some(f) = r.from {
         m.insert("from".into(), json!(ts(f)));

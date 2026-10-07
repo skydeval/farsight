@@ -6,6 +6,7 @@
 //! logged, counted and recorded like a failed one, and the job runs again
 //! at its next time.
 
+use farsight_storage::ids::{ActorId, ListId};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,6 +21,8 @@ use farsight_storage::tracking::FireArgs;
 use farsight_storage::transition::Event;
 use farsight_storage::{debts, firehose, history, janitor, recount};
 use farsight_web::ServerStatus;
+
+use crate::error::TaskError;
 use sqlx::PgPool;
 use tokio::sync::watch;
 
@@ -31,6 +34,10 @@ pub const STORAGE_BUDGET_RATIO: &str = "farsight_storage_budget_ratio";
 pub const STORAGE_TABLE_BYTES: &str = "farsight_storage_table_bytes";
 /// `farsight_records{collection}`.
 pub const RECORDS: &str = "farsight_records";
+/// The tables `farsight_storage_table_bytes{table}` is published for,
+/// each with its indexes. Those named `*_history` are also summed for the
+/// dashboard.
+///
 /// `farsight_abuse_capped_total{kind}` is counted where batches are
 /// applied (ingest writer, backfill jobs); the monitor only publishes
 /// gauges.
@@ -58,15 +65,18 @@ pub const RECOUNT_BATCH: i64 = 1000;
 
 /// What the jobs share.
 pub struct TaskCtx {
-    /// Tasks pool.
+    /// The tasks pool: the jobs' own connections, apart from the API's
+    /// and ingest's.
     pub pool: PgPool,
-    /// Live config.
+    /// Live config, read at each run so a hot key applies to the next
+    /// one.
     pub config: Arc<ConfigStore>,
     /// Counter sink for janitor writes.
     pub counters: Arc<CounterSink>,
     /// Gates published to every writer.
     pub gates: Arc<SharedGates>,
-    /// Dashboard status.
+    /// What the dashboard shows of the jobs' measurements: the budget
+    /// monitor's sizes and gate state, and the size of the history tables.
     pub status: Arc<ServerStatus>,
     /// `storage.block_history_enabled` as it was at start: the server
     /// applies a change of the flag at restart.
@@ -76,7 +86,8 @@ pub struct TaskCtx {
 }
 
 impl TaskCtx {
-    /// A context.
+    /// A context with an empty gate state and no growth samples.
+    /// `history_enabled` is taken from `config` as it is now.
     pub fn new(
         pool: PgPool,
         config: Arc<ConfigStore>,
@@ -104,10 +115,11 @@ impl TaskCtx {
     }
 }
 
-type JobFn =
-    fn(
-        Arc<TaskCtx>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
+type JobFn = fn(
+    Arc<TaskCtx>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<String, TaskError>> + Send>,
+>;
 
 struct Job {
     name: &'static str,
@@ -271,7 +283,7 @@ pub async fn run_scheduler(ctx: Arc<TaskCtx>, mut stop: watch::Receiver<bool>) {
                     Ok(r) => r,
                     Err(message) => {
                         farsight_core::task::report_panic(name, &message);
-                        Err(format!("panicked: {message}"))
+                        Err(TaskError::Panicked(message))
                     }
                 };
                 match result {
@@ -289,7 +301,7 @@ pub async fn run_scheduler(ctx: Arc<TaskCtx>, mut stop: watch::Receiver<bool>) {
                             &ctx.pool,
                             &format!("task:{name}"),
                             None,
-                            &e,
+                            &e.to_string(),
                         )
                         .await;
                     }
@@ -299,14 +311,10 @@ pub async fn run_scheduler(ctx: Arc<TaskCtx>, mut stop: watch::Receiver<bool>) {
     }
 }
 
-fn err(e: impl std::fmt::Display) -> String {
-    e.to_string()
-}
-
 /// Lists to fire GF on while a refusal is active: `pending`, not yet
 /// claimed by a run, owned by a non-large (or unresolved) owner; at the
 /// ceiling, every owner.
-async fn gf_candidates(pool: &PgPool, include_large: bool) -> Result<Vec<i64>, sqlx::Error> {
+async fn gf_candidates(pool: &PgPool, include_large: bool) -> Result<Vec<ListId>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT l.id FROM lists l
          JOIN actors o ON o.id = l.owner_id
@@ -326,7 +334,7 @@ async fn go_candidates(
     pool: &PgPool,
     cause: DeferCause,
     limit: i64,
-) -> Result<Vec<i64>, sqlx::Error> {
+) -> Result<Vec<ListId>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT id FROM lists WHERE track_state = $1 AND deferred_by = $2 AND listblock_count > 0
          ORDER BY admitted_at NULLS LAST, id LIMIT $3",
@@ -342,27 +350,22 @@ async fn go_candidates(
 /// the gate state machine, publishes gates to every writer, records global
 /// refusal intervals, fires **GF** on unclaimed pending lists while
 /// refusing and **GO** on lists the gate deferred once it reopens.
-async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, String> {
+async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
     let cfg = ctx.config.current();
     let budget = Budget {
         budget_bytes: cfg.config.storage.budget_bytes,
         ceiling_bytes: cfg.config.storage.effective_hard_ceiling(),
     };
-    let bytes = gates::measure_database_bytes(&ctx.pool)
-        .await
-        .map_err(err)?;
+    let bytes = gates::measure_database_bytes(&ctx.pool).await?;
     let prev = *ctx.gate_state.lock().unwrap_or_else(|e| e.into_inner());
     let next = gates::next_gate_state(prev, bytes, budget);
     ctx.gates.store(next.gates);
     *ctx.gate_state.lock().unwrap_or_else(|e| e.into_inner()) = next;
     let witness = firehose::read_state(&ctx.pool)
-        .await
-        .map_err(err)?
+        .await?
         .applied_through
         .unwrap_or_else(Utc::now);
-    gates::record_refusal_transition(&ctx.pool, prev, next, witness)
-        .await
-        .map_err(err)?;
+    gates::record_refusal_transition(&ctx.pool, prev, next, witness).await?;
     let ratio = if budget.budget_bytes > 0 {
         bytes as f64 / budget.budget_bytes as f64
     } else {
@@ -379,10 +382,7 @@ async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, String> {
         } else {
             DeferCause::Budget
         };
-        for id in gf_candidates(&ctx.pool, next.gates.ceiling_refusing)
-            .await
-            .map_err(err)?
-        {
+        for id in gf_candidates(&ctx.pool, next.gates.ceiling_refusing).await? {
             janitor::fire_event(
                 &ctx.pool,
                 &limits,
@@ -391,8 +391,7 @@ async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, String> {
                 Event::GateFail(cause),
                 FireArgs::default(),
             )
-            .await
-            .map_err(err)?;
+            .await?;
             fired += 1;
         }
     }
@@ -404,10 +403,7 @@ async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, String> {
         if !open {
             continue;
         }
-        for id in go_candidates(&ctx.pool, cause, GO_PER_PASS)
-            .await
-            .map_err(err)?
-        {
+        for id in go_candidates(&ctx.pool, cause, GO_PER_PASS).await? {
             janitor::fire_event(
                 &ctx.pool,
                 &limits,
@@ -416,8 +412,7 @@ async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, String> {
                 Event::GateOpen,
                 FireArgs::default(),
             )
-            .await
-            .map_err(err)?;
+            .await?;
             reopened += 1;
         }
     }
@@ -475,10 +470,8 @@ fn growth_warning(ctx: &TaskCtx, bytes: u64) -> Option<String> {
     })
 }
 
-async fn purges(ctx: Arc<TaskCtx>) -> Result<String, String> {
-    let r = janitor::process_purges(&ctx.pool, &ctx.limits(), &ctx.counters, 100)
-        .await
-        .map_err(err)?;
+async fn purges(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    let r = janitor::process_purges(&ctx.pool, &ctx.limits(), &ctx.counters, 100).await?;
     Ok(if r.items_deleted > 0 || !r.finished.is_empty() {
         format!(
             "purged {} items; {} lists finished",
@@ -490,10 +483,8 @@ async fn purges(ctx: Arc<TaskCtx>) -> Result<String, String> {
     })
 }
 
-async fn grace_expiry(ctx: Arc<TaskCtx>) -> Result<String, String> {
-    let r = janitor::expire_grace(&ctx.pool, &ctx.limits(), &ctx.counters, Utc::now())
-        .await
-        .map_err(err)?;
+async fn grace_expiry(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    let r = janitor::expire_grace(&ctx.pool, &ctx.limits(), &ctx.counters, Utc::now()).await?;
     Ok(if r.transitions.is_empty() {
         String::new()
     } else {
@@ -501,25 +492,19 @@ async fn grace_expiry(ctx: Arc<TaskCtx>) -> Result<String, String> {
     })
 }
 
-async fn tombstones(ctx: Arc<TaskCtx>) -> Result<String, String> {
+async fn tombstones(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
     let ttl = ctx.config.current().config.storage.tombstone_ttl.get();
-    let n = janitor::purge_tombstones(&ctx.pool, Utc::now(), ttl)
-        .await
-        .map_err(err)?;
+    let n = janitor::purge_tombstones(&ctx.pool, Utc::now(), ttl).await?;
     Ok(format!("{n} tombstones past TTL deleted"))
 }
 
-async fn clock(ctx: Arc<TaskCtx>) -> Result<String, String> {
-    let n = firehose::maintain_clock(&ctx.pool, Utc::now())
-        .await
-        .map_err(err)?;
+async fn clock(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    let n = firehose::maintain_clock(&ctx.pool, Utc::now()).await?;
     Ok(format!("{n} firehose_clock rows thinned or expired"))
 }
 
-async fn resync_expiry(ctx: Arc<TaskCtx>) -> Result<String, String> {
-    let n = debts::expire_resyncs(&ctx.pool, Utc::now(), RESYNC_TERMINAL)
-        .await
-        .map_err(err)?;
+async fn resync_expiry(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    let n = debts::expire_resyncs(&ctx.pool, Utc::now(), RESYNC_TERMINAL).await?;
     Ok(if n > 0 {
         format!("{n} resync debts became unreachable")
     } else {
@@ -527,25 +512,23 @@ async fn resync_expiry(ctx: Arc<TaskCtx>) -> Result<String, String> {
     })
 }
 
-async fn admin_sessions(ctx: Arc<TaskCtx>) -> Result<String, String> {
+async fn admin_sessions(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
     farsight_storage::auth::expire_sessions(
         &ctx.pool,
         farsight_web::pages::SESSION_IDLE,
         farsight_web::pages::SESSION_ABSOLUTE,
     )
-    .await
-    .map_err(err)?;
+    .await?;
     Ok(String::new())
 }
 
-async fn storage_metrics(ctx: Arc<TaskCtx>) -> Result<String, String> {
+async fn storage_metrics(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
     let mut history_bytes = 0u64;
     for t in TABLES {
         let n: Option<i64> = sqlx::query_scalar("SELECT pg_total_relation_size(to_regclass($1))")
             .bind(t)
             .fetch_one(&ctx.pool)
-            .await
-            .map_err(err)?;
+            .await?;
         metrics::gauge!(STORAGE_TABLE_BYTES, "table" => t).set(n.unwrap_or(0) as f64);
         if t.ends_with("_history") {
             history_bytes += n.unwrap_or(0).max(0) as u64;
@@ -557,8 +540,7 @@ async fn storage_metrics(ctx: Arc<TaskCtx>) -> Result<String, String> {
         "SELECT name, COALESCE(sum(value), 0)::bigint FROM stats_counters GROUP BY name",
     )
     .fetch_all(&ctx.pool)
-    .await
-    .map_err(err)?;
+    .await?;
     for (name, v) in rows {
         let collection = match name.as_str() {
             "blocks" => "block",
@@ -572,19 +554,15 @@ async fn storage_metrics(ctx: Arc<TaskCtx>) -> Result<String, String> {
     Ok(String::new())
 }
 
-async fn deferred_retry(ctx: Arc<TaskCtx>) -> Result<String, String> {
-    let r = janitor::retry_deferred(&ctx.pool, &ctx.limits(), &ctx.counters, Utc::now())
-        .await
-        .map_err(err)?;
+async fn deferred_retry(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    let r = janitor::retry_deferred(&ctx.pool, &ctx.limits(), &ctx.counters, Utc::now()).await?;
     Ok(format!("{} deferred lists retried", r.transitions.len()))
 }
 
-async fn placeholder_lists(ctx: Arc<TaskCtx>) -> Result<String, String> {
+async fn placeholder_lists(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
     let mut total = 0;
     loop {
-        let n = janitor::cleanup_placeholder_lists(&ctx.pool, 10_000)
-            .await
-            .map_err(err)?;
+        let n = janitor::cleanup_placeholder_lists(&ctx.pool, 10_000).await?;
         total += n;
         if n == 0 {
             break;
@@ -596,10 +574,8 @@ async fn placeholder_lists(ctx: Arc<TaskCtx>) -> Result<String, String> {
 /// Purges of `deleted` accounts that are not finished: one that was
 /// interrupted, or that the ingest writer gave up on. An account whose
 /// purge fails is recorded and the others still run.
-async fn account_purges(ctx: Arc<TaskCtx>) -> Result<String, String> {
-    let pending = janitor::accounts_pending_purge(&ctx.pool, 1000)
-        .await
-        .map_err(err)?;
+async fn account_purges(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    let pending = janitor::accounts_pending_purge(&ctx.pool, 1000).await?;
     let limits = ctx.limits();
     let (mut purged, mut failed) = (0u32, 0u32);
     for did in &pending {
@@ -625,15 +601,13 @@ async fn account_purges(ctx: Arc<TaskCtx>) -> Result<String, String> {
     })
 }
 
-async fn rate_tables(ctx: Arc<TaskCtx>) -> Result<String, String> {
-    let n = janitor::drop_old_rates(&ctx.pool, Utc::now().date_naive())
-        .await
-        .map_err(err)?;
+async fn rate_tables(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    let n = janitor::drop_old_rates(&ctx.pool, Utc::now().date_naive()).await?;
     Ok(format!("{n} rate rows older than 2 days deleted"))
 }
 
 /// The daily history retention pass. With `"0s"` it does not run.
-async fn history_retention(ctx: Arc<TaskCtx>) -> Result<String, String> {
+async fn history_retention(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
     let retention = ctx
         .config
         .current()
@@ -644,35 +618,29 @@ async fn history_retention(ctx: Arc<TaskCtx>) -> Result<String, String> {
     if retention.is_zero() {
         return Ok(String::new());
     }
-    let r = history::prune(&ctx.pool, Utc::now(), retention)
-        .await
-        .map_err(err)?;
+    let r = history::prune(&ctx.pool, Utc::now(), retention).await?;
     Ok(format!(
         "history past retention deleted: {} blocks, {} listblocks, {} listitems, {} windows",
         r.rows[0], r.rows[1], r.rows[2], r.windows
     ))
 }
 
-async fn orphaned_cursors(ctx: Arc<TaskCtx>) -> Result<String, String> {
-    let n = janitor::drop_orphaned_cursors(&ctx.pool)
-        .await
-        .map_err(err)?;
+async fn orphaned_cursors(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    let n = janitor::drop_orphaned_cursors(&ctx.pool).await?;
     Ok(format!("{n} orphaned cursor rows deleted"))
 }
 
 /// Nightly exact recount: batched, each list under its list lock;
 /// repairs drift, re-runs the transition function where a repair
 /// crosses zero, and alerts on any drift.
-async fn counter_recount(ctx: Arc<TaskCtx>) -> Result<String, String> {
+async fn counter_recount(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
     let limits = ctx.limits();
     let mut drift = Vec::new();
     let mut checked = 0u64;
-    let mut after = 0i64;
+    let mut after = ListId::new(0);
     loop {
         let (r, last) =
-            recount::recount_lists(&ctx.pool, &limits, &ctx.counters, after, RECOUNT_BATCH)
-                .await
-                .map_err(err)?;
+            recount::recount_lists(&ctx.pool, &limits, &ctx.counters, after, RECOUNT_BATCH).await?;
         checked += r.checked;
         drift.extend(r.drift);
         match last {
@@ -680,11 +648,9 @@ async fn counter_recount(ctx: Arc<TaskCtx>) -> Result<String, String> {
             None => break,
         }
     }
-    let mut after = 0i64;
+    let mut after = ActorId::new(0);
     loop {
-        let (r, last) = recount::recount_actors(&ctx.pool, after, RECOUNT_BATCH)
-            .await
-            .map_err(err)?;
+        let (r, last) = recount::recount_actors(&ctx.pool, after, RECOUNT_BATCH).await?;
         checked += r.checked;
         drift.extend(r.drift);
         match last {
@@ -710,9 +676,7 @@ async fn counter_recount(ctx: Arc<TaskCtx>) -> Result<String, String> {
 }
 
 /// Nightly exact rebuild of the approximate counters.
-async fn counter_rebuild(ctx: Arc<TaskCtx>) -> Result<String, String> {
-    recount::rebuild_approximate_counters(&ctx.pool, 100_000)
-        .await
-        .map_err(err)?;
+async fn counter_rebuild(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    recount::rebuild_approximate_counters(&ctx.pool, 100_000).await?;
     Ok("approximate counters rebuilt".into())
 }

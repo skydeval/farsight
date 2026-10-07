@@ -2,15 +2,16 @@
 //! enumeration and status, the PLC export, and a backlink index with the
 //! public `/links` shape (see `docs/design/backfill.md`).
 
-use farsight_core::Tid;
+use farsight_core::{Did, Tid};
+use farsight_storage::ids::Stamp;
 use serde_json::Value;
 use url::Url;
 
-use crate::net::{Net, NetError};
+use crate::net::{Net, NetError, RECORD_NOT_FOUND, REPO_NOT_FOUND};
 
 /// Repo-level errors that trigger the re-resolve / relay-status rule.
 pub const REPO_ERRORS: [&str; 4] = [
-    "RepoNotFound",
+    REPO_NOT_FOUND,
     "RepoDeactivated",
     "RepoTakendown",
     "RepoSuspended",
@@ -21,7 +22,7 @@ pub const REPO_ERRORS: [&str; 4] = [
 pub fn is_repo_level(e: &NetError) -> bool {
     match e {
         NetError::Http { name, .. } => {
-            REPO_ERRORS.contains(&name.as_str()) || name == "RecordNotFound"
+            REPO_ERRORS.contains(&name.as_str()) || name == RECORD_NOT_FOUND
         }
         NetError::Transport(m) => m.contains("onnection refused"),
         _ => false,
@@ -53,17 +54,21 @@ fn s(v: &Value, k: &str) -> Option<String> {
 }
 
 /// Decodes a rev (TID) into the stored stamp.
-pub fn rev_stamp(rev: &str) -> Result<i64, NetError> {
+pub fn rev_stamp(rev: &str) -> Result<Stamp, NetError> {
     Tid::parse(rev)
-        .map(Tid::as_i64)
+        .map(Stamp::from_tid)
         .map_err(|e| NetError::Decode(format!("rev {rev:?}: {e}")))
 }
 
 /// `com.atproto.repo.describeRepo`: the repo's collections.
-pub async fn describe_repo(net: &Net, pds: &str, did: &str) -> Result<Vec<String>, NetError> {
+pub async fn describe_repo(net: &Net, pds: &str, did: &Did) -> Result<Vec<String>, NetError> {
     let v = net
         .get_json(
-            &xrpc(pds, "com.atproto.repo.describeRepo", &[("repo", did)])?,
+            &xrpc(
+                pds,
+                "com.atproto.repo.describeRepo",
+                &[("repo", did.as_str())],
+            )?,
             "describeRepo",
         )
         .await?;
@@ -79,10 +84,14 @@ pub async fn describe_repo(net: &Net, pds: &str, did: &str) -> Result<Vec<String
 }
 
 /// `com.atproto.sync.getLatestCommit`: the stamp `R` (decoded rev).
-pub async fn latest_rev(net: &Net, pds: &str, did: &str) -> Result<i64, NetError> {
+pub async fn latest_rev(net: &Net, pds: &str, did: &Did) -> Result<Stamp, NetError> {
     let v = net
         .get_json(
-            &xrpc(pds, "com.atproto.sync.getLatestCommit", &[("did", did)])?,
+            &xrpc(
+                pds,
+                "com.atproto.sync.getLatestCommit",
+                &[("did", did.as_str())],
+            )?,
             "getLatestCommit",
         )
         .await?;
@@ -92,9 +101,9 @@ pub async fn latest_rev(net: &Net, pds: &str, did: &str) -> Result<i64, NetError
 /// One listed record: its URI and value.
 #[derive(Debug, Clone)]
 pub struct Listed {
-    /// `uri`.
+    /// `uri`: the record's `at://` URI, as the PDS returned it.
     pub uri: String,
-    /// `value`.
+    /// `value`: the record itself, not yet parsed.
     pub value: Value,
 }
 
@@ -103,12 +112,12 @@ pub struct Listed {
 pub async fn list_records(
     net: &Net,
     pds: &str,
-    did: &str,
+    did: &Did,
     collection: &str,
     cursor: Option<&str>,
 ) -> Result<(Vec<Listed>, Option<String>), NetError> {
     let mut q = vec![
-        ("repo", did),
+        ("repo", did.as_str()),
         ("collection", collection),
         ("limit", "100"),
         ("reverse", "true"),
@@ -141,7 +150,7 @@ pub async fn list_records(
 pub async fn get_record(
     net: &Net,
     pds: &str,
-    did: &str,
+    did: &Did,
     collection: &str,
     rkey: &str,
 ) -> Result<Option<Value>, NetError> {
@@ -150,14 +159,18 @@ pub async fn get_record(
             &xrpc(
                 pds,
                 "com.atproto.repo.getRecord",
-                &[("repo", did), ("collection", collection), ("rkey", rkey)],
+                &[
+                    ("repo", did.as_str()),
+                    ("collection", collection),
+                    ("rkey", rkey),
+                ],
             )?,
             "getRecord",
         )
         .await
     {
         Ok(v) => Ok(v.get("value").cloned()),
-        Err(NetError::Http { name, .. }) if name == "RecordNotFound" => Ok(None),
+        Err(NetError::Http { name, .. }) if name == RECORD_NOT_FOUND => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -165,17 +178,21 @@ pub async fn get_record(
 /// A relay's view of a repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoStatus {
-    /// `active`.
+    /// `active`; a response without the field reads as active.
     pub active: bool,
     /// `status` when inactive.
     pub status: Option<String>,
 }
 
 /// `com.atproto.sync.getRepoStatus` at the relay.
-pub async fn repo_status(net: &Net, relay: &str, did: &str) -> Result<RepoStatus, NetError> {
+pub async fn repo_status(net: &Net, relay: &str, did: &Did) -> Result<RepoStatus, NetError> {
     let v = net
         .get_json(
-            &xrpc(relay, "com.atproto.sync.getRepoStatus", &[("did", did)])?,
+            &xrpc(
+                relay,
+                "com.atproto.sync.getRepoStatus",
+                &[("did", did.as_str())],
+            )?,
             "getRepoStatus",
         )
         .await?;
@@ -188,11 +205,12 @@ pub async fn repo_status(net: &Net, relay: &str, did: &str) -> Result<RepoStatus
 /// One `listRepos` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedRepo {
-    /// DID.
+    /// `did`. An entry without one is dropped.
     pub did: String,
-    /// Latest rev, if reported.
+    /// `rev`: the repo's latest rev (a TID) as the relay knows it, if
+    /// reported. A repair cycle reads its time to pick candidates.
     pub rev: Option<String>,
-    /// `active`.
+    /// `active`; an entry without the field reads as active.
     pub active: bool,
     /// `status` when inactive.
     pub status: Option<String>,
@@ -262,7 +280,8 @@ pub async fn list_repos_by_collection(
 /// One PLC export operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportOp {
-    /// DID.
+    /// `did`: the DID the operation belongs to. A DID appears once per
+    /// operation, so the same one can recur across the export.
     pub did: String,
     /// The PDS endpoint the operation sets, if any.
     pub pds: Option<String>,
@@ -314,7 +333,7 @@ pub struct Backlink {
     pub did: String,
     /// Its collection.
     pub collection: String,
-    /// Its record key.
+    /// Its record key, as the index reports it. Not validated here.
     pub rkey: String,
 }
 

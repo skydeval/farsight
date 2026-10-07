@@ -6,7 +6,8 @@ pub const DEADLOCK_SQLSTATE: &str = "40P01";
 /// Errors from the storage layer.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    /// A database error.
+    /// An error from sqlx: the connection, the pool, or a statement
+    /// Postgres refused.
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
     /// Running migrations failed.
@@ -59,5 +60,6 @@ impl StorageError {
     }
 }
 
-/// Result alias.
+/// The crate's result type: the error is [`StorageError`] unless another is
+/// named.
 pub type Result<T, E = StorageError> = std::result::Result<T, E>;

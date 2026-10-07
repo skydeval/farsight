@@ -27,7 +27,7 @@ use axum::response::Response;
 use farsight_api::params::Params;
 use farsight_api::{handlers, public_ui};
 use farsight_core::{Did, RecordKey};
-use farsight_storage::codes::actor_status;
+use farsight_storage::codes::ActorStatus;
 use farsight_storage::public::{self as store, Counted};
 use farsight_storage::queries::{self, ActorRef};
 use farsight_storage::ui_rows::{Filter, Find, Row, Section as Rows};
@@ -44,7 +44,9 @@ use super::{
     COUNT_CAP, Cache, Chrome, Fail, OG_ACCOUNT, OG_INSTANCE, OG_LIST, PAGE_ROWS, Req, Withheld,
     chrome, metrics as m, page, redirect,
 };
-use crate::pages::resolve_handle;
+use crate::pages::handle_to_did;
+use farsight_storage::ids::ActorId;
+use farsight_storage::ui_rows::SectionKey;
 
 /// Longest the filter box waits for a handle to resolve.
 pub const RESOLVE_FIND_WAIT: Duration = Duration::from_secs(3);
@@ -67,7 +69,8 @@ pub const DEFAULT_DESCRIPTION: &str = "Farsight is an independent index of publi
 #[derive(Debug, Clone, Template)]
 #[template(path = "_who.html")]
 pub struct Who {
-    /// The DID.
+    /// The DID: the link's `title`, and its text while no verified
+    /// handle is known.
     pub did: String,
     /// Its public page.
     pub href: String,
@@ -132,13 +135,15 @@ pub struct Toggle {
 /// An account row with one author-stated time.
 #[derive(Debug, Clone)]
 pub struct PartyRow {
-    /// The account.
+    /// The account the row is about: the blocker, the member or the
+    /// subscriber, by section.
     pub who: Who,
     /// `createdAt` / `addedAt`, as stated by the record's author.
     pub when: Option<Stamp>,
 }
 
-/// A section.
+/// One table of a public page with what stands around it: its count,
+/// its filter note, its rows and its page controls.
 #[derive(Debug, Clone)]
 pub struct Section<R> {
     /// Bounded record count, shown from 1 up; `None` when it is zero or
@@ -151,13 +156,15 @@ pub struct Section<R> {
     pub toggle: Option<Toggle>,
     /// What the table says under its filter box, while it is filtered.
     pub note: Option<String>,
-    /// Rows shown.
+    /// The rows of this page that are shown: those of the query, less
+    /// the ones counted in `pending`.
     pub rows: Vec<R>,
     /// Rows of this page held back because their account's handle has
     /// not been checked yet. The page's script reads the page again
     /// until there are none.
     pub pending: usize,
-    /// Page controls.
+    /// The numbered page controls; they render as nothing for a section
+    /// of one page.
     pub pager: Pager,
     /// Empty-state line: only on a first page with nothing after it.
     pub empty: Option<&'static str>,
@@ -190,7 +197,7 @@ pub struct HeldRow {
 pub struct HistoryView {
     /// Handles, as the account claimed them; not verified.
     pub handles: Vec<HeldRow>,
-    /// Hosts.
+    /// The hostnames of the PDS endpoints the log's operations set.
     pub hosts: Vec<HeldRow>,
     /// Why there is nothing to list, if there is not.
     pub note: Option<&'static str>,
@@ -329,7 +336,7 @@ pub(crate) fn purpose_words(p: &str) -> &'static str {
 
 async fn actor_row(r: &Req<'_>, did: &Did) -> Result<Option<ActorRef>, Fail> {
     let mut conn = r.st.api.pool.acquire().await?;
-    Ok(queries::actor(&mut conn, did.as_str()).await?)
+    Ok(queries::actor(&mut conn, did).await?)
 }
 
 /// The batched status lookup of a page's DIDs (the withheld rule).
@@ -370,9 +377,9 @@ impl Shown<'_> {
             return false;
         }
         match self.status.get(did).map(|a| a.status) {
-            Some(actor_status::TAKENDOWN) => self.taken_down,
-            Some(actor_status::SUSPENDED) => true,
-            Some(s) => !actor_status::is_hidden(s),
+            Some(ActorStatus::Takendown) => self.taken_down,
+            Some(ActorStatus::Suspended) => true,
+            Some(s) => !s.is_hidden(),
             None => true,
         }
     }
@@ -380,8 +387,8 @@ impl Shown<'_> {
     /// The tag a row naming `did` carries.
     fn tag(&self, did: &str) -> Option<&'static str> {
         match self.status.get(did).map(|a| a.status) {
-            Some(actor_status::TAKENDOWN) => Some(TAKEN_DOWN),
-            Some(actor_status::SUSPENDED) => Some(SUSPENDED),
+            Some(ActorStatus::Takendown) => Some(TAKEN_DOWN),
+            Some(ActorStatus::Suspended) => Some(SUSPENDED),
             _ => None,
         }
     }
@@ -395,7 +402,7 @@ impl Shown<'_> {
 async fn total(
     r: &Req<'_>,
     what: Counted,
-    key: i64,
+    key: SectionKey,
     w: &Withheld,
     taken_down: bool,
     find: Option<&Find>,
@@ -426,7 +433,7 @@ struct Counts {
 #[allow(clippy::too_many_arguments)]
 async fn counts(
     r: &Req<'_>,
-    key: Option<(Counted, i64)>,
+    key: Option<(Counted, SectionKey)>,
     w: &Withheld,
     taken_down: bool,
     base: &str,
@@ -477,7 +484,7 @@ async fn counts(
 
 /// The listblock records on the lists naming an account, added up;
 /// `None` when the query fails or times out.
-async fn naming_listblocks(r: &Req<'_>, subject: i64, w: &Withheld) -> Option<i64> {
+async fn naming_listblocks(r: &Req<'_>, subject: ActorId, w: &Withheld) -> Option<i64> {
     let mut tx = r.st.api.read_tx().await.ok()?;
     let n = farsight_storage::ui_rows::lists_naming_listblocks(&mut tx, subject, &w.ids)
         .await
@@ -487,7 +494,7 @@ async fn naming_listblocks(r: &Req<'_>, subject: i64, w: &Withheld) -> Option<i6
 }
 
 /// The same for the lists naming an account.
-async fn naming_total(r: &Req<'_>, subject: i64, w: &Withheld, find: Option<&Find>) -> Total {
+async fn naming_total(r: &Req<'_>, subject: ActorId, w: &Withheld, find: Option<&Find>) -> Total {
     let n = async {
         let mut tx = r.st.api.read_tx().await.ok()?;
         let n = farsight_storage::ui_rows::lists_naming_count(
@@ -562,7 +569,7 @@ async fn finder(r: &Req<'_>, q: &Params) -> Result<Option<Finder>, Fail> {
     let text = raw.trim_start_matches('@');
     let id_of = |did: Did| async move {
         let mut conn = r.st.api.pool.acquire().await?;
-        Ok::<_, Fail>(queries::actor(&mut conn, did.as_str()).await?.map(|a| a.id))
+        Ok::<_, Fail>(queries::actor(&mut conn, &did).await?.map(|a| a.id))
     };
     if let Ok(did) = Did::parse(text) {
         return Ok(Some(Finder {
@@ -582,7 +589,7 @@ async fn finder(r: &Req<'_>, q: &Params) -> Result<Option<Finder>, Fail> {
         && take_budget(r.st, r.config())
     {
         let found =
-            tokio::time::timeout(RESOLVE_FIND_WAIT, resolve_handle(&r.st.safe, &whole)).await;
+            tokio::time::timeout(RESOLVE_FIND_WAIT, handle_to_did(&r.st.safe, &whole)).await;
         if let Ok(Ok(did)) = found {
             ids.extend(id_of(did).await?);
         }
@@ -900,7 +907,7 @@ async fn resolve(r: &Req<'_>, handle: &str, typed: &str) -> Result<Did, Fail> {
     if !take_budget(r.st, cfg) {
         return Err(Fail::Busy);
     }
-    let found = tokio::time::timeout(SEARCH_RESOLVE_WAIT, resolve_handle(&r.st.safe, handle)).await;
+    let found = tokio::time::timeout(SEARCH_RESOLVE_WAIT, handle_to_did(&r.st.safe, handle)).await;
     match found {
         Ok(Ok(did)) => Ok(did),
         _ => {
@@ -934,8 +941,8 @@ async fn resolve(r: &Req<'_>, handle: &str, typed: &str) -> Result<Did, Fail> {
 /// to the lookup rate class.
 pub async fn search(r: &Req<'_>, q: &Params) -> Result<Response, Fail> {
     let typed = q.get("q").unwrap_or("").trim().to_owned();
-    let target = search::parse(&typed).map_err(|message| Fail::Bad {
-        message,
+    let target = search::parse(&typed).map_err(|e| Fail::Bad {
+        message: e.to_string(),
         link: None,
     })?;
     let (authority, rkey) = match target {
@@ -959,13 +966,14 @@ pub async fn search(r: &Req<'_>, q: &Params) -> Result<Response, Fail> {
 /// A list naming the subject.
 #[derive(Debug, Clone)]
 pub struct ListRow {
-    /// at-uri.
+    /// The list's at-uri: shown in place of a name when the list has
+    /// none.
     pub uri: String,
     /// Its public page.
     pub href: String,
     /// Name, if the record has one.
     pub name: Option<String>,
-    /// Owner.
+    /// The list's owner, as an account cell.
     pub owner: Who,
     /// `addedAt`, as stated by the list's owner.
     pub added: Option<Stamp>,
@@ -1048,7 +1056,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         .await?
         .body;
     let block_page = match actor {
-        Some(a) => numbered(Rows::IncomingBlocks, a.id, b_page).await?,
+        Some(a) => numbered(Rows::IncomingBlocks, a.id.into(), b_page).await?,
         None => Default::default(),
     };
     // Called for its freshness; the rows are read below.
@@ -1064,7 +1072,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let show_outgoing = cfg.public_ui.show_outgoing_blocks;
     let (out_page, out_fresh) = if show_outgoing {
         let page = match actor {
-            Some(a) => numbered(Rows::OutgoingBlocks, a.id, o_page).await?,
+            Some(a) => numbered(Rows::OutgoingBlocks, a.id.into(), o_page).await?,
             None => Default::default(),
         };
         (page, Some(public_ui::outgoing_freshness(api, did).await?))
@@ -1129,7 +1137,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
 
     let b = counts(
         r,
-        actor.map(|a| (Counted::IncomingBlocks, a.id)),
+        actor.map(|a| (Counted::IncomingBlocks, a.id.into())),
         &withheld,
         taken_down,
         &base,
@@ -1223,7 +1231,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         Some(f) => {
             let o = counts(
                 r,
-                actor.map(|a| (Counted::OutgoingBlocks, a.id)),
+                actor.map(|a| (Counted::OutgoingBlocks, a.id.into())),
                 &withheld,
                 taken_down,
                 &base,
@@ -1464,7 +1472,7 @@ pub async fn list(
     }
     let info = {
         let mut conn = r.st.api.pool.acquire().await?;
-        queries::list_info(&mut conn, owner.as_str(), rkey.as_str()).await?
+        queries::list_info(&mut conn, owner, rkey.as_str()).await?
     };
     let Some(info) = info else {
         return Err(Fail::NotFound {
@@ -1490,12 +1498,27 @@ pub async fn list(
     let taken_down = paging::taken_down(q);
     let filter = row_filter(&withheld, taken_down, None);
     let member_page = if show_members {
-        crate::rows::numbered(r.st, Rows::ListMembers, info.id, filter, m_page, PAGE_ROWS).await?
+        crate::rows::numbered(
+            r.st,
+            Rows::ListMembers,
+            info.id.into(),
+            filter,
+            m_page,
+            PAGE_ROWS,
+        )
+        .await?
     } else {
         Default::default()
     };
-    let blocker_page =
-        crate::rows::numbered(r.st, Rows::ListBlockers, info.id, filter, k_page, PAGE_ROWS).await?;
+    let blocker_page = crate::rows::numbered(
+        r.st,
+        Rows::ListBlockers,
+        info.id.into(),
+        filter,
+        k_page,
+        PAGE_ROWS,
+    )
+    .await?;
     let blockers_fresh = public_ui::listblock_freshness(api)?;
 
     let mut dids: Vec<String> = member_page.rows.iter().map(|m| m.did.clone()).collect();
@@ -1523,7 +1546,7 @@ pub async fn list(
     let members = if show_members {
         let m = counts(
             r,
-            Some((Counted::ListMembers, info.id)),
+            Some((Counted::ListMembers, info.id.into())),
             &withheld,
             taken_down,
             &base,
@@ -1566,7 +1589,7 @@ pub async fn list(
 
     let k = counts(
         r,
-        Some((Counted::ListBlockers, info.id)),
+        Some((Counted::ListBlockers, info.id.into())),
         &withheld,
         taken_down,
         &base,

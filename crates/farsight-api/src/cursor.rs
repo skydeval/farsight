@@ -98,4 +98,117 @@ mod tests {
         assert!(id_rkey(Some(&encode(&[json!(1), json!(2)]))).is_err());
         assert!(id_id_rkey(Some(&encode(&[json!(1), json!("r")]))).is_err());
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// What a client may put where a number belongs.
+        fn number() -> impl Strategy<Value = String> {
+            prop_oneof![
+                any::<i64>().prop_map(|n| n.to_string()),
+                any::<u64>().prop_map(|n| n.to_string()),
+                any::<f64>().prop_map(|x| format!("{x:?}")),
+                "-?[0-9]{1,40}",
+                "-?[0-9]{1,5}(\\.[0-9]{1,5})?[eE][+-]?[0-9]{1,4}",
+                "\"-?[0-9]{1,20}\"",
+                Just("null".to_owned()),
+                Just("[1]".to_owned()),
+            ]
+        }
+
+        fn plain_i64(token: &str) -> Option<i64> {
+            token.parse::<i64>().ok().filter(|n| n.to_string() == token)
+        }
+
+        fn all_fail(c: &str) -> bool {
+            id(Some(c)).is_err()
+                && id_rkey(Some(c)).is_err()
+                && id_id_rkey(Some(c)).is_err()
+                && micros_id(Some(c)).is_err()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Any string as a cursor: every decoder returns, and at most
+            /// one of the four shapes accepts it apart from the two that
+            /// share an arity.
+            #[test]
+            fn decoding_arbitrary_strings_is_total(
+                c in prop_oneof![
+                    any::<String>(),
+                    "[A-Za-z0-9_=+/ -]{0,64}",
+                    prop::collection::vec(any::<u8>(), 0..64).prop_map(|b| URL_SAFE_NO_PAD.encode(b)),
+                ],
+            ) {
+                let accepted = [
+                    id(Some(&c)).is_ok(),
+                    id_rkey(Some(&c)).is_ok() || micros_id(Some(&c)).is_ok(),
+                    id_id_rkey(Some(&c)).is_ok(),
+                ];
+                prop_assert!(accepted.iter().filter(|a| **a).count() <= 1);
+                prop_assert!(!(id_rkey(Some(&c)).is_ok() && micros_id(Some(&c)).is_ok()));
+            }
+
+            /// What is encoded is what is decoded, for every integer and
+            /// every string, with or without space around the cursor.
+            #[test]
+            fn encoded_keys_round_trip(
+                a in any::<i64>(),
+                b in any::<i64>(),
+                r in any::<String>(),
+                pad in "[ \\t\\n]{0,3}",
+            ) {
+                let wrap = |c: String| format!("{pad}{c}{pad}");
+                let c = wrap(encode(&[json!(a)]));
+                prop_assert_eq!(id(Some(&c)).unwrap(), Some(a));
+                let c = wrap(encode(&[json!(a), json!(r)]));
+                prop_assert_eq!(id_rkey(Some(&c)).unwrap(), Some((a, r.clone())));
+                prop_assert!(micros_id(Some(&c)).is_err() && id(Some(&c)).is_err());
+                let c = wrap(encode(&[json!(a), json!(b), json!(r)]));
+                prop_assert_eq!(id_id_rkey(Some(&c)).unwrap(), Some((a, b, r.clone())));
+                prop_assert!(id_rkey(Some(&c)).is_err());
+                let c = wrap(encode(&[json!(a), json!(b)]));
+                prop_assert_eq!(micros_id(Some(&c)).unwrap(), Some((a, b)));
+                prop_assert!(id_rkey(Some(&c)).is_err() && id_id_rkey(Some(&c)).is_err());
+            }
+
+            /// A cursor holding anything where an id belongs is accepted
+            /// only if that is a plain integer in the `i64` range, and
+            /// then yields that integer.
+            #[test]
+            fn an_id_is_taken_only_as_a_plain_integer(n in number(), m in number()) {
+                let one = URL_SAFE_NO_PAD.encode(format!("[{n}]"));
+                prop_assert_eq!(id(Some(&one)).ok().flatten(), plain_i64(&n));
+                let two = URL_SAFE_NO_PAD.encode(format!("[{n},{m}]"));
+                prop_assert_eq!(
+                    micros_id(Some(&two)).ok().flatten(),
+                    plain_i64(&n).zip(plain_i64(&m))
+                );
+                let keyed = URL_SAFE_NO_PAD.encode(format!("[{n},\"k\"]"));
+                prop_assert_eq!(
+                    id_rkey(Some(&keyed)).ok().flatten(),
+                    plain_i64(&n).map(|n| (n, "k".to_owned()))
+                );
+            }
+
+            /// JSON that is not an array of the right length is not a
+            /// cursor of any shape.
+            #[test]
+            fn other_json_is_not_a_cursor(
+                text in prop_oneof![
+                    Just("null".to_owned()),
+                    Just("{}".to_owned()),
+                    Just("[]".to_owned()),
+                    Just("\"a\"".to_owned()),
+                    any::<i64>().prop_map(|n| n.to_string()),
+                    prop::collection::vec(any::<i64>(), 4..9)
+                        .prop_map(|v| serde_json::to_string(&v).unwrap()),
+                ],
+            ) {
+                prop_assert!(all_fail(&URL_SAFE_NO_PAD.encode(text)));
+            }
+        }
+    }
 }

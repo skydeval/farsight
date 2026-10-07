@@ -12,6 +12,8 @@
 //! as an empty handle, and never replaces a verified one. The memory
 //! layer stays in front of it.
 
+use crate::codes::sql::GONE;
+use farsight_core::Did;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -21,7 +23,8 @@ use sqlx::PgConnection;
 
 use crate::error::Result;
 
-/// Default capacity.
+/// Most DIDs the memory layer holds by default. When it is full the least
+/// recently used entry leaves.
 pub const DEFAULT_CAPACITY: usize = 50_000;
 
 #[derive(Debug)]
@@ -42,7 +45,7 @@ struct Inner {
     tick: u64,
 }
 
-/// A cached answer.
+/// What the memory layer holds for a DID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cached {
     /// A handle verified in both directions.
@@ -178,12 +181,14 @@ impl HandleCache {
 /// A row of `handle_cache`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
-    /// The DID.
+    /// The account; the row's key.
     pub did: String,
     /// Its handle, as last verified; empty: the last check found none to
     /// show.
     pub handle: String,
-    /// When that was.
+    /// When the stored answer was established, on the database's clock. A
+    /// check that established nothing is dated six days back, so that the
+    /// handle pass takes the account up again a day later.
     pub resolved_at: DateTime<Utc>,
 }
 
@@ -209,13 +214,13 @@ pub async fn stored(conn: &mut PgConnection, dids: &[String]) -> Result<Vec<Stor
 
 /// Stores `handle` as the handle of `did`, verified now. Replaces what
 /// was stored for the DID.
-pub async fn store(conn: &mut PgConnection, did: &str, handle: &str) -> Result<()> {
+pub async fn store(conn: &mut PgConnection, did: &Did, handle: &str) -> Result<()> {
     sqlx::query(
         "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, $2, now())
          ON CONFLICT (did) DO UPDATE
            SET handle = EXCLUDED.handle, resolved_at = EXCLUDED.resolved_at",
     )
-    .bind(did)
+    .bind(did.as_str())
     .bind(handle)
     .execute(conn)
     .await?;
@@ -224,13 +229,13 @@ pub async fn store(conn: &mut PgConnection, did: &str, handle: &str) -> Result<(
 
 /// Records that a check of `did`, made now, found no handle to show.
 /// A verified handle already stored for the DID is left as it is.
-pub async fn store_none(conn: &mut PgConnection, did: &str) -> Result<()> {
+pub async fn store_none(conn: &mut PgConnection, did: &Did) -> Result<()> {
     sqlx::query(
         "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, '', now())
          ON CONFLICT (did) DO UPDATE SET resolved_at = EXCLUDED.resolved_at
            WHERE handle_cache.handle = ''",
     )
-    .bind(did)
+    .bind(did.as_str())
     .execute(conn)
     .await?;
     Ok(())
@@ -240,11 +245,11 @@ pub async fn store_none(conn: &mut PgConnection, did: &str) -> Result<()> {
 /// means the profile has no avatar.
 pub async fn avatar_stored(
     conn: &mut PgConnection,
-    did: &str,
+    did: &Did,
 ) -> Result<Option<(String, DateTime<Utc>)>> {
     Ok(
         sqlx::query_as("SELECT cid, checked_at FROM avatar_cache WHERE did = $1")
-            .bind(did)
+            .bind(did.as_str())
             .fetch_optional(conn)
             .await?,
     )
@@ -252,12 +257,12 @@ pub async fn avatar_stored(
 
 /// Stores the avatar CID read for `did` now; `None` for a profile
 /// without one.
-pub async fn avatar_store(conn: &mut PgConnection, did: &str, cid: Option<&str>) -> Result<()> {
+pub async fn avatar_store(conn: &mut PgConnection, did: &Did, cid: Option<&str>) -> Result<()> {
     sqlx::query(
         "INSERT INTO avatar_cache (did, cid, checked_at) VALUES ($1, $2, now())
          ON CONFLICT (did) DO UPDATE SET cid = EXCLUDED.cid, checked_at = EXCLUDED.checked_at",
     )
-    .bind(did)
+    .bind(did.as_str())
     .bind(cid.unwrap_or(""))
     .execute(conn)
     .await?;
@@ -267,12 +272,12 @@ pub async fn avatar_store(conn: &mut PgConnection, did: &str, cid: Option<&str>)
 /// Records that `did` definitely has no handle to show, as of now. A
 /// handle stored for it is replaced: its document no longer names it, or
 /// the handle now belongs to another account.
-pub async fn store_gone(conn: &mut PgConnection, did: &str) -> Result<()> {
+pub async fn store_gone(conn: &mut PgConnection, did: &Did) -> Result<()> {
     sqlx::query(
         "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, '', now())
          ON CONFLICT (did) DO UPDATE SET handle = '', resolved_at = EXCLUDED.resolved_at",
     )
-    .bind(did)
+    .bind(did.as_str())
     .execute(conn)
     .await?;
     Ok(())
@@ -286,13 +291,13 @@ const UNKNOWN_AGE: &str = "interval '6 days'";
 /// not be resolved back. A stored handle equal to the claim is kept as
 /// it is (the host may only be unreachable); any other stored handle is
 /// no longer the account's and is replaced by "nothing to show".
-pub async fn store_unresolved(conn: &mut PgConnection, did: &str, claim: &str) -> Result<()> {
+pub async fn store_unresolved(conn: &mut PgConnection, did: &Did, claim: &str) -> Result<()> {
     sqlx::query(&format!(
         "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, '', now() - {UNKNOWN_AGE})
          ON CONFLICT (did) DO UPDATE SET handle = '', resolved_at = EXCLUDED.resolved_at
            WHERE handle_cache.handle <> $2"
     ))
-    .bind(did)
+    .bind(did.as_str())
     .bind(claim)
     .execute(conn)
     .await?;
@@ -301,13 +306,13 @@ pub async fn store_unresolved(conn: &mut PgConnection, did: &str, claim: &str) -
 
 /// Records that a check of `did` established nothing. A stored handle is
 /// left as it is.
-pub async fn store_unknown(conn: &mut PgConnection, did: &str) -> Result<()> {
+pub async fn store_unknown(conn: &mut PgConnection, did: &Did) -> Result<()> {
     sqlx::query(&format!(
         "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, '', now() - {UNKNOWN_AGE})
          ON CONFLICT (did) DO UPDATE SET resolved_at = EXCLUDED.resolved_at
            WHERE handle_cache.handle = ''"
     ))
-    .bind(did)
+    .bind(did.as_str())
     .execute(conn)
     .await?;
     Ok(())
@@ -325,9 +330,9 @@ pub async fn due_take(conn: &mut PgConnection, limit: i64) -> Result<Vec<String>
 }
 
 /// A queued account was checked.
-pub async fn due_done(conn: &mut PgConnection, did: &str) -> Result<()> {
+pub async fn due_done(conn: &mut PgConnection, did: &Did) -> Result<()> {
     sqlx::query("DELETE FROM handle_due WHERE did = $1")
-        .bind(did)
+        .bind(did.as_str())
         .execute(conn)
         .await?;
     Ok(())
@@ -335,9 +340,9 @@ pub async fn due_done(conn: &mut PgConnection, did: &str) -> Result<()> {
 
 /// A queued account's check established nothing: not before `secs` from
 /// now.
-pub async fn due_later(conn: &mut PgConnection, did: &str, secs: i64) -> Result<()> {
+pub async fn due_later(conn: &mut PgConnection, did: &Did, secs: i64) -> Result<()> {
     sqlx::query("UPDATE handle_due SET asked_at = now() + $2 * interval '1 second' WHERE did = $1")
-        .bind(did)
+        .bind(did.as_str())
         .bind(secs)
         .execute(conn)
         .await?;
@@ -367,15 +372,15 @@ pub async fn pass_batch(
     none_retry_secs: i64,
 ) -> Result<(Vec<String>, i64)> {
     let end = after.saturating_add(window);
-    let rows: Vec<(i64, String)> = sqlx::query_as(
+    let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
         "SELECT a.id, a.did FROM actors a
-         WHERE a.id > $1 AND a.id <= $2 AND a.status NOT IN (1, 4)
+         WHERE a.id > $1 AND a.id <= $2 AND a.status NOT IN {GONE}
            AND NOT EXISTS (
              SELECT 1 FROM handle_cache h
              WHERE h.did = a.did
                AND (h.handle <> '' OR h.resolved_at > now() - $3 * interval '1 second'))
-         ORDER BY a.id LIMIT $4",
-    )
+         ORDER BY a.id LIMIT $4"
+    ))
     .bind(after)
     .bind(end)
     .bind(none_retry_secs)

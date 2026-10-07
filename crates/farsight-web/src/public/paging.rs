@@ -190,7 +190,7 @@ pub enum Total {
     Unknown,
 }
 
-/// One control.
+/// One control of a section's page row, before it is given an address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     /// A page that is not the current one.

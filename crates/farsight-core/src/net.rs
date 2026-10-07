@@ -24,7 +24,8 @@ pub const MAX_REDIRECTS: u8 = 3;
 pub const IDLE_CONNECTION: Duration = Duration::from_secs(10);
 /// Per-request timeout.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Response body cap.
+/// Largest response body read, in bytes (2 MiB). A longer one fails with
+/// [`OutboundError::TooLarge`].
 pub const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Settings for [`SafeClient`].
@@ -36,7 +37,7 @@ pub struct SafeClientConfig {
     pub max_redirects: u8,
     /// Whole-request timeout.
     pub timeout: Duration,
-    /// Body size cap.
+    /// Largest response body read, in bytes.
     pub max_body_bytes: u64,
     /// `farsight/<version> (+https://<hostname>; <contact>)`.
     pub user_agent: String,
@@ -78,26 +79,29 @@ pub enum OutboundError {
     /// The host resolved to (or is) a forbidden address.
     #[error("address {addr} not allowed: {reason}")]
     ForbiddenAddress {
-        /// The address.
+        /// The address refused: a literal in the URL, or one the name
+        /// resolved to.
         addr: IpAddr,
-        /// Which rule refused it.
+        /// Which rule refused it, as [`blocked_ip_reason`] words it.
         reason: &'static str,
     },
     /// Redirect limit exceeded.
     #[error("too many redirects")]
     TooManyRedirects,
-    /// Response exceeded the body cap.
+    /// Response exceeded the body cap; carries the cap in bytes.
     #[error("response body exceeds {0} bytes")]
     TooLarge(u64),
     /// Timed out.
     #[error("request timed out")]
     Timeout,
-    /// Transport error.
+    /// Any other failure of DNS, the connection or HTTP; carries the error
+    /// text.
     #[error("transport error: {0}")]
     Transport(String),
 }
 
-/// A completed response.
+/// A completed response with its body read in full. Any status is a
+/// response: the caller decides what a 404 or a 500 means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundResponse {
     /// HTTP status.
