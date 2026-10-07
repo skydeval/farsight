@@ -63,6 +63,11 @@ indexes, so it misses everyone else. Farsight closes that gap.
 - It does not decide block policy. For example, it reports each list's
   purpose, and the consumer decides how to treat it.
 
+What the API leaves out is deliberate; see
+[the API's design](docs/design/api.md#what-the-api-leaves-out-and-why).
+A fork that changes the API should serve it under its own namespace,
+not under `app.nearhorizon.farsight.*`.
+
 ## Quick start
 
 ```sh

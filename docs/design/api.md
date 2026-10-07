@@ -699,6 +699,32 @@ basis).
 - The binary's version follows the lexicon set: a major version means
   an NSID was removed.
 
+## What the API leaves out, and why
+
+The API answers what an AppView needs in order to enforce blocks:
+whether a block stands between two accounts, and who blocks a given
+account. It is kept to that on purpose. These are design decisions,
+not gaps waiting to be filled:
+
+- **No listing of an account's outgoing blocks.** `checkBlocks`
+  reports both directions for a named pair; nothing returns "everyone
+  this account blocks". An AppView reads that from its own users'
+  repositories.
+- **No removed records.** Blocks and list memberships that were stored
+  and later removed are kept for the operator and shown only on the
+  admin pages (see [history.md](history.md)). No endpoint returns them.
+- **No rankings.** Nothing returns the most-blocked or most-blocking
+  accounts.
+- **No profiles.** No handles, display names, avatars or other account
+  data: Farsight indexes four record collections and nothing else.
+
+### Changing the API
+
+The method names under `app.nearhorizon.farsight.*` belong to this
+project. A fork that adds, removes or changes methods should serve its
+API under a namespace of its own, so that a client can tell which API
+it is talking to and what that API promises.
+
 ## Using the API from an AppView
 
 Farsight knows nothing about any AppView; the integration is four
