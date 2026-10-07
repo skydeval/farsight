@@ -26,6 +26,9 @@ database schema; each entry says so where it does.
   throughout the Rust code (`farsight-storage/src/codes.rs`, `ids.rs`),
   and failures in the web UI, the backfill jobs and the server tasks
   are error enums. Nothing an operator sees changes.
+- The database schema is one initial migration, and the database checks
+  every stored code: a column that holds a code accepts only the codes
+  its enumeration defines. Schema version 1.
 
 ### Fixed
 

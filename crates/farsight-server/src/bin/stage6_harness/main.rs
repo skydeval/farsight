@@ -723,8 +723,9 @@ async fn seed_world(h: &H) -> Result<World, String> {
     }
     // Blocks naming S: 60 active blockers, one per hidden status, and E.
     h.sql(&format!(
-        "INSERT INTO blocks (author_id, rkey, subject_id, created_at, rev)
-         SELECT a.id, '3lb' || lpad(g::text, 9, '0'), {s}, now() - interval '3 days', 1
+        "INSERT INTO blocks (author_id, rkey, subject_id, created_at, rev, first_seen, last_seen)
+         SELECT a.id, '3lb' || lpad(g::text, 9, '0'), {s}, now() - interval '3 days', 1,
+                now() - interval '3 days', now() - interval '3 days'
          FROM generate_series(1, 60) g JOIN actors a ON a.did = {}",
         did_sql("blk", "g")
     ))
@@ -734,8 +735,9 @@ async fn seed_world(h: &H) -> Result<World, String> {
     }
     // Blocks by S: three active targets, one hidden, and E.
     h.sql(&format!(
-        "INSERT INTO blocks (author_id, rkey, subject_id, created_at, rev)
-         SELECT {s}, '3lo' || lpad(g::text, 9, '0'), a.id, now() - interval '3 days', 1
+        "INSERT INTO blocks (author_id, rkey, subject_id, created_at, rev, first_seen, last_seen)
+         SELECT {s}, '3lo' || lpad(g::text, 9, '0'), a.id, now() - interval '3 days', 1,
+                now() - interval '3 days', now() - interval '3 days'
          FROM generate_series(1, 3) g JOIN actors a ON a.did = {}",
         did_sql("tgt", "g")
     ))
@@ -753,8 +755,9 @@ async fn seed_world(h: &H) -> Result<World, String> {
         .map_err(|e| e.to_string())?;
     seed::item(p, o1, "3li0subject", l, s).await?;
     h.sql(&format!(
-        "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev)
-         SELECT {o1}, '3lm' || lpad(g::text, 9, '0'), {l}, a.id, now() - interval '3 days', 1
+        "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev, first_seen, last_seen)
+         SELECT {o1}, '3lm' || lpad(g::text, 9, '0'), {l}, a.id, now() - interval '3 days', 1,
+                now() - interval '3 days', now() - interval '3 days'
          FROM generate_series(1, 60) g JOIN actors a ON a.did = {}",
         did_sql("mem", "g")
     ))
@@ -767,8 +770,9 @@ async fn seed_world(h: &H) -> Result<World, String> {
     ))
     .await?;
     h.sql(&format!(
-        "INSERT INTO list_blocks (author_id, rkey, list_id, counted, witnessed_at, created_at, rev)
-         SELECT a.id, '3lk' || g, {l}, true, now() - interval '3 days', now() - interval '3 days', 1
+        "INSERT INTO list_blocks (author_id, rkey, list_id, counted, witnessed_at, created_at, rev, first_seen, last_seen)
+         SELECT a.id, '3lk' || g, {l}, true, now() - interval '3 days', now() - interval '3 days', 1,
+                now() - interval '3 days', now() - interval '3 days'
          FROM generate_series(1, 3) g JOIN actors a ON a.did = {}",
         did_sql("lbk", "g")
     ))

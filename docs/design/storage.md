@@ -14,9 +14,9 @@ budget in the setup wizard) is in
 
 ## Schema version and migrations
 
-The schema is thirteen migration files, `0001` to `0013`, in
+The schema is one migration file, `0001_initial.sql`, in
 `crates/farsight-storage/migrations/`, embedded in the binaries. The
-schema version is **13**.
+schema version is **1**.
 
 - `schema_version` holds one row with one column, `version`. Each
   migration ends with `UPDATE schema_version SET version = <n>`, where
@@ -24,7 +24,7 @@ schema version is **13**.
   last migration applied.
 - Only `farsight-server` runs migrations, at start. After running them
   it reads `schema_version` and refuses to continue unless the value
-  equals the version the build expects (`SCHEMA_VERSION = 13`).
+  equals the version the build expects (`SCHEMA_VERSION = 1`).
 - `farsight-backfill` never migrates. At start it polls
   `schema_version` every 5 seconds and begins work only when the value
   equals its own `SCHEMA_VERSION`.
@@ -48,7 +48,14 @@ migration; see [the sort indexes](#the-sort-indexes).
 - There are no foreign keys on the hot tables. Integrity is kept by the
   write path and checked by nightly recounts.
 - Enumerations are `SMALLINT` codes; the codes are listed with each
-  table and defined in `crates/farsight-storage/src/codes.rs`.
+  table and defined in `crates/farsight-storage/src/codes.rs`. Every
+  column that stores a code has a `CHECK` constraint, named
+  `<table>_<column>_code`, that allows the codes of its enumeration and
+  nothing else; a nullable column may also be NULL. The same holds for
+  the two text columns with a fixed set of values, `sweep_cycles.source`
+  and `top_lists.kind`. The constraints are left out of the listings
+  below. A build fails its tests if an enumeration and its constraint
+  differ.
 - Times named `…_witness`, `first_seen`, `last_seen` and `removed_at`
   are on the witness clock described in
   [coverage](coverage.md#the-witness-clock), not
@@ -115,7 +122,7 @@ in [security](security.md); `admission_key`, `readmit_day` and
 ([list indexing](list-indexing.md)). `flags` is display only.
 
 **`actors` rows are never deleted.** An in-memory DID-to-id cache
-relies on it, and the first migration installs two triggers
+relies on it, and the migration installs two triggers
 (`actors_never_deleted`, `actors_never_truncated`) that raise an
 exception on `DELETE` and on `TRUNCATE`.
 
@@ -137,8 +144,8 @@ CREATE TABLE blocks (
   subject_id BIGINT NOT NULL,
   created_at TIMESTAMPTZ,
   rev        BIGINT NOT NULL,
-  first_seen TIMESTAMPTZ,
-  last_seen  TIMESTAMPTZ,
+  first_seen TIMESTAMPTZ NOT NULL,
+  last_seen  TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (author_id, rkey)
 );
 CREATE INDEX blocks_by_subject ON blocks (subject_id, author_id, rkey);
@@ -152,8 +159,8 @@ CREATE TABLE list_blocks (
   sched_key    TEXT COLLATE "C",
   created_at   TIMESTAMPTZ,
   rev          BIGINT NOT NULL,
-  first_seen   TIMESTAMPTZ,
-  last_seen    TIMESTAMPTZ,
+  first_seen   TIMESTAMPTZ NOT NULL,
+  last_seen    TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (author_id, rkey)
 );
 CREATE INDEX list_blocks_by_list ON list_blocks (list_id, author_id, rkey);
@@ -188,7 +195,6 @@ CREATE TABLE lists (
   next_retry_at     TIMESTAMPTZ,
   description       TEXT,
   avatar_cid        TEXT,
-  about_read        BOOLEAN NOT NULL DEFAULT false,
   UNIQUE (owner_id, rkey)
 );
 CREATE INDEX lists_by_state ON lists (track_state) WHERE track_state <> 0;
@@ -200,8 +206,8 @@ CREATE TABLE list_items (
   subject_id BIGINT NOT NULL,
   created_at TIMESTAMPTZ,
   rev        BIGINT NOT NULL,
-  first_seen TIMESTAMPTZ,
-  last_seen  TIMESTAMPTZ,
+  first_seen TIMESTAMPTZ NOT NULL,
+  last_seen  TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (owner_id, rkey)
 );
 CREATE INDEX list_items_by_subject ON list_items (subject_id, list_id);
@@ -235,7 +241,6 @@ CREATE INDEX tombstones_by_age ON tombstones (deleted_at);
   2 curation, 3 reference), `name`, `created_at`, `rev`, `description`
   (the record's text, truncated to 300 characters) and `avatar_cid`
   (the CID of the record's avatar blob; the image is never stored).
-  `about_read` is set when a record is applied and is not read.
   Everything else is tracking state: `track_state`
   (0 untracked, 1 pending, 2 ready, 3 retained, 4 unavailable,
   5 purging, 6 missing, 7 dead, 8 deferred), `deferred_by` (1 budget,

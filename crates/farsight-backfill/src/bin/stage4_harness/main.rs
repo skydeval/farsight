@@ -471,7 +471,7 @@ async fn check_outcomes(h: &H, c: &mut Checks) -> Res<()> {
     // A cycle started before the jobs: each job settles its membership.
     let cycle = h
         .i64("INSERT INTO sweep_cycles (kind, source, collections, started_at, effective_start)
-              VALUES (1, 'harness', '{1,2,3,4}', now() - interval '1 minute', now() - interval '1 minute')
+              VALUES (1, 'relay_collections', '{1,2,3,4}', now() - interval '1 minute', now() - interval '1 minute')
               RETURNING id")
         .await?;
     for x in [&a, &b, &cc, &d] {

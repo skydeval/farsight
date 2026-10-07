@@ -2705,11 +2705,11 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let building = log.find("sort index: building");
     let migrations: i64 = n(&pool, "SELECT count(*) FROM _sqlx_migrations").await?;
     c.check(
-        "a fresh database: the server is live in its normal start-up time, the thirteen migrations create no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
+        "a fresh database: the server is live in its normal start-up time, the one migration creates no sort index, and the four appear afterwards, built by the server task (the log's first \"building\" line comes after \"serving\")",
         have == 4
             && health.status == 200
             && e.came_up < Duration::from_secs(60)
-            && migrations == 13
+            && migrations == 1
             && serving.is_some()
             && building.is_some()
             && serving < building

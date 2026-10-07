@@ -1346,6 +1346,170 @@ mod tests {
         assert!(found.is_empty(), "bare codes in SQL:\n{}", found.join("\n"));
     }
 
+    /// Every column that stores a code has a CHECK in the schema that
+    /// allows exactly the codes of its enum. An enum that gains a code
+    /// fails here until the schema allows it, and so does a CHECK the
+    /// schema names that is not compared below.
+    #[test]
+    fn the_schema_checks_every_code() {
+        use crate::history::Cause;
+        use crate::top::Kind;
+        use farsight_core::{Collection, ListPurpose};
+
+        fn numbers(codes: impl IntoIterator<Item = i16>) -> String {
+            let mut v: Vec<i16> = codes.into_iter().collect();
+            v.sort_unstable();
+            v.dedup();
+            let v: Vec<String> = v.iter().map(i16::to_string).collect();
+            v.join(", ")
+        }
+        fn texts<'a>(spellings: impl IntoIterator<Item = &'a str>) -> String {
+            let v: Vec<String> = spellings.into_iter().map(|s| format!("'{s}'")).collect();
+            v.join(", ")
+        }
+        macro_rules! of {
+            ($e:ident) => {
+                numbers($e::ALL.iter().map(|v| v.code()))
+            };
+        }
+        let one_of = |column: &str, codes: String| format!("{column} IN ({codes})");
+
+        // The enums whose `from_code` is written by hand know no code
+        // their `ALL` leaves out.
+        let collections = numbers(Collection::ALL.iter().map(|c| c.code()));
+        let purposes = numbers(ListPurpose::ALL.iter().map(|p| p.code()));
+        assert_eq!(
+            numbers((-1..100).filter_map(|c| Collection::from_code(c).map(Collection::code))),
+            collections
+        );
+        assert_eq!(
+            numbers((-1..100).map(|c| ListPurpose::from_code(c).code())),
+            purposes
+        );
+        // `list_deleted` is a cause of removed list memberships only.
+        let causes = of!(Cause);
+        let causes_of_records = numbers(
+            Cause::ALL
+                .iter()
+                .filter(|c| **c != Cause::ListDeleted)
+                .map(|c| c.code()),
+        );
+        // Cursors exist for repo jobs and list fetches only.
+        let cursor_kinds = numbers([JobKind::Repo.code(), JobKind::ListFetch.code()]);
+
+        let want = [
+            ("actors_status_code", one_of("status", of!(ActorStatus))),
+            (
+                "lists_record_state_code",
+                one_of("record_state", of!(RecordState)),
+            ),
+            (
+                "lists_deferred_by_code",
+                one_of("deferred_by", of!(DeferCause)),
+            ),
+            ("lists_purpose_code", one_of("purpose", purposes)),
+            (
+                "lists_track_state_code",
+                one_of("track_state", of!(TrackState)),
+            ),
+            (
+                "lists_purge_then_code",
+                one_of("purge_then", of!(TrackState)),
+            ),
+            (
+                "tombstones_collection_code",
+                one_of("collection", collections.clone()),
+            ),
+            (
+                "firehose_state_protocol_code",
+                one_of("protocol", of!(Protocol)),
+            ),
+            (
+                "firehose_cursors_protocol_code",
+                one_of("protocol", of!(Protocol)),
+            ),
+            ("firehose_gaps_cause_code", one_of("cause", of!(GapCause))),
+            (
+                "backfill_state_state_code",
+                one_of("state", of!(BackfillState)),
+            ),
+            (
+                "backfill_state_last_outcome_code",
+                one_of("last_outcome", of!(RunOutcome)),
+            ),
+            (
+                "backfill_cursors_collection_code",
+                one_of("collection", collections.clone()),
+            ),
+            (
+                "backfill_cursors_job_kind_code",
+                one_of("job_kind", cursor_kinds),
+            ),
+            ("backfill_queue_kind_code", one_of("kind", of!(JobKind))),
+            ("backfill_queue_tier_code", one_of("tier", of!(Tier))),
+            (
+                "backfill_queue_priority_code",
+                one_of("priority", of!(Priority)),
+            ),
+            (
+                "list_fetch_runs_outcome_code",
+                one_of("outcome", of!(FetchOutcome)),
+            ),
+            (
+                "discovery_state_state_code",
+                one_of("state", of!(DiscoveryRun)),
+            ),
+            ("sweep_cycles_kind_code", one_of("kind", of!(CycleKind))),
+            (
+                "sweep_cycles_source_code",
+                one_of("source", texts(CycleSource::ALL.iter().map(|s| s.as_str()))),
+            ),
+            (
+                "sweep_cycles_collections_code",
+                format!("collections <@ ARRAY[{collections}]::SMALLINT[]"),
+            ),
+            (
+                "cycle_outstanding_state_code",
+                one_of("state", of!(MemberState)),
+            ),
+            (
+                "subject_coverage_scope_code",
+                one_of("scope", of!(SubjectScope)),
+            ),
+            ("relist_debt_reason_code", one_of("reason", of!(DebtReason))),
+            (
+                "relist_debt_cap_type_code",
+                one_of("cap_type", of!(CapType)),
+            ),
+            (
+                "blocks_history_cause_code",
+                one_of("cause", causes_of_records.clone()),
+            ),
+            (
+                "list_blocks_history_cause_code",
+                one_of("cause", causes_of_records),
+            ),
+            ("list_items_history_cause_code", one_of("cause", causes)),
+            (
+                "top_lists_kind_code",
+                one_of("kind", texts(Kind::ALL.iter().map(|k| k.key()))),
+            ),
+        ];
+        let mut schema = String::new();
+        for m in crate::MIGRATOR.iter() {
+            schema.push_str(&m.sql);
+        }
+        for (name, check) in &want {
+            let line = format!("  CONSTRAINT {name} CHECK ({check})");
+            assert!(schema.contains(&line), "the schema lacks `{line}`");
+        }
+        let named = schema
+            .lines()
+            .filter(|l| l.starts_with("  CONSTRAINT "))
+            .count();
+        assert_eq!(named, want.len(), "a CHECK is not compared with its enum");
+    }
+
     #[test]
     fn tracked_matches_design_table() {
         let tracked: Vec<TrackState> = TrackState::ALL

@@ -86,8 +86,8 @@ pub async fn list(
 
 pub async fn block(pool: &PgPool, author: i64, rkey: &str, subject: i64) -> Result<(), String> {
     sqlx::query(
-        "INSERT INTO blocks (author_id, rkey, subject_id, created_at, rev)
-         VALUES ($1, $2, $3, now(), 1) ON CONFLICT DO NOTHING",
+        "INSERT INTO blocks (author_id, rkey, subject_id, created_at, rev, first_seen, last_seen)
+         VALUES ($1, $2, $3, now(), 1, now(), now()) ON CONFLICT DO NOTHING",
     )
     .bind(author)
     .bind(rkey)
@@ -106,10 +106,11 @@ pub async fn listblock(
     witnessed_ago_secs: Option<i64>,
 ) -> Result<(), String> {
     sqlx::query(
-        "INSERT INTO list_blocks (author_id, rkey, list_id, counted, witnessed_at, created_at, rev)
+        "INSERT INTO list_blocks (author_id, rkey, list_id, counted, witnessed_at, created_at, rev,
+                                  first_seen, last_seen)
          VALUES ($1, $2, $3, true,
                  CASE WHEN $4::bigint IS NULL THEN NULL ELSE now() - make_interval(secs => $4) END,
-                 now(), 1)
+                 now(), 1, now(), now())
          ON CONFLICT (author_id, rkey) DO UPDATE SET list_id = EXCLUDED.list_id,
            witnessed_at = EXCLUDED.witnessed_at",
     )
@@ -131,8 +132,8 @@ pub async fn item(
     subject: i64,
 ) -> Result<(), String> {
     sqlx::query(
-        "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev)
-         VALUES ($1, $2, $3, $4, now(), 1) ON CONFLICT DO NOTHING",
+        "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev, first_seen, last_seen)
+         VALUES ($1, $2, $3, $4, now(), 1, now(), now()) ON CONFLICT DO NOTHING",
     )
     .bind(owner)
     .bind(rkey)
@@ -195,8 +196,8 @@ pub async fn pagination(pool: &PgPool) -> Result<Pagination, String> {
     exec(
         pool,
         &format!(
-            "INSERT INTO blocks (author_id, rkey, subject_id, created_at, rev)
-             SELECT a.id, '3lpg' || lpad(g::text, 9, '0'), {s}, now(), 1
+            "INSERT INTO blocks (author_id, rkey, subject_id, created_at, rev, first_seen, last_seen)
+             SELECT a.id, '3lpg' || lpad(g::text, 9, '0'), {s}, now(), 1, now(), now()
              FROM generate_series(1, {N}) g JOIN actors a ON a.did = {}
              ON CONFLICT DO NOTHING",
             did_sql("pgb", "g")
@@ -207,8 +208,8 @@ pub async fn pagination(pool: &PgPool) -> Result<Pagination, String> {
     exec(
         pool,
         &format!(
-            "INSERT INTO list_blocks (author_id, rkey, list_id, counted, created_at, rev)
-             SELECT a.id, '3llb' || lpad(g::text, 9, '0'), {big}, true, now(), 1
+            "INSERT INTO list_blocks (author_id, rkey, list_id, counted, created_at, rev, first_seen, last_seen)
+             SELECT a.id, '3llb' || lpad(g::text, 9, '0'), {big}, true, now(), 1, now(), now()
              FROM generate_series(1, {N}) g JOIN actors a ON a.did = {}
              ON CONFLICT DO NOTHING",
             did_sql("pgb", "g")
@@ -218,8 +219,8 @@ pub async fn pagination(pool: &PgPool) -> Result<Pagination, String> {
     exec(
         pool,
         &format!(
-            "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev)
-             SELECT {o}, '3lmi' || lpad(g::text, 9, '0'), {big}, a.id, now(), 1
+            "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev, first_seen, last_seen)
+             SELECT {o}, '3lmi' || lpad(g::text, 9, '0'), {big}, a.id, now(), 1, now(), now()
              FROM generate_series(1, {N}) g JOIN actors a ON a.did = {}
              ON CONFLICT DO NOTHING",
             did_sql("pgm", "g")
@@ -242,8 +243,8 @@ pub async fn pagination(pool: &PgPool) -> Result<Pagination, String> {
     exec(
         pool,
         &format!(
-            "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev)
-             SELECT {o}, '3lni' || lpad(g::text, 9, '0'), l.id, {s}, now(), 1
+            "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev, first_seen, last_seen)
+             SELECT {o}, '3lni' || lpad(g::text, 9, '0'), l.id, {s}, now(), 1, now(), now()
              FROM generate_series(1, {N}) g
              JOIN lists l ON l.owner_id = {o} AND l.rkey = 'naming' || lpad(g::text, 5, '0')
              ON CONFLICT DO NOTHING"

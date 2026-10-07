@@ -1590,13 +1590,12 @@ async fn list_upsert(
     }
     let list_id: ListId = sqlx::query_scalar(&format!(
         "INSERT INTO lists (owner_id, rkey, record_state, purpose, name, created_at, rev,
-                            description, avatar_cid, about_read)
-         VALUES ($1, $2, {RECORD_PRESENT}, $3, $4, $5, $6, $7, $8, true)
+                            description, avatar_cid)
+         VALUES ($1, $2, {RECORD_PRESENT}, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (owner_id, rkey) DO UPDATE SET record_state = {RECORD_PRESENT},
            purpose = EXCLUDED.purpose, name = EXCLUDED.name,
            created_at = EXCLUDED.created_at, rev = EXCLUDED.rev,
-           description = EXCLUDED.description, avatar_cid = EXCLUDED.avatar_cid,
-           about_read = true
+           description = EXCLUDED.description, avatar_cid = EXCLUDED.avatar_cid
          RETURNING id"
     ))
     .bind(author.id)

@@ -13,8 +13,8 @@ it, and it is shown only on the admin pages.
 
 ## What is stored
 
-Four tables, created by migration `0008_history.sql`; their columns and
-indexes are listed in [storage](storage.md#history).
+Four tables; their columns and indexes are listed in
+[storage](storage.md#history).
 
 | Table | One row per |
 |---|---|

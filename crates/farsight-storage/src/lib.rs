@@ -40,13 +40,14 @@ use sqlx::postgres::PgPoolOptions;
 
 pub use error::{Result, StorageError};
 
-/// The embedded migration set (one file per logical group).
+/// The embedded migration set: `0001_initial.sql` creates the whole
+/// schema.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build expects: the number of the last
 /// migration, which each migration writes into `schema_version`.
 /// `farsight-backfill` polls for it before starting work.
-pub const SCHEMA_VERSION: i32 = 13;
+pub const SCHEMA_VERSION: i32 = 1;
 
 /// How often `farsight-backfill` polls `schema_version`.
 pub const SCHEMA_POLL: Duration = Duration::from_secs(5);

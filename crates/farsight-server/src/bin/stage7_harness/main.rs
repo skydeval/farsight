@@ -987,8 +987,8 @@ async fn check_loopback_flow(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<Strin
         .await?;
     let migrations = ctx.n("SELECT max(version) FROM _sqlx_migrations").await?;
     c.check(
-        "admin_sessions has six columns; the newest migration is 13 (the handle cache, the lists' descriptions, the handle queue, the avatar references and the top lists, which touch no auth table)",
-        schema == 6 && migrations == 13,
+        "admin_sessions has six columns, and one migration creates the schema",
+        schema == 6 && migrations == 1,
         format!("{schema} columns, migration {migrations}"),
     );
     Ok(admin_cookie)

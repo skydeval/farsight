@@ -88,6 +88,14 @@ pub enum ListPurpose {
 }
 
 impl ListPurpose {
+    /// Every purpose.
+    pub const ALL: [ListPurpose; 4] = [
+        ListPurpose::Mod,
+        ListPurpose::Curate,
+        ListPurpose::Reference,
+        ListPurpose::Other,
+    ];
+
     /// Maps a lexicon purpose token.
     pub fn from_token(s: &str) -> ListPurpose {
         match s {
