@@ -1,8 +1,10 @@
-//! Handles on public pages (design §3.6, §8.6). A page shows a handle
-//! only when it has been verified in both directions:
+//! Handles on public pages (see `docs/design/api.md` and
+//! `docs/design/web-ui.md`). A page shows a handle only when it has
+//! been verified in both directions:
 //!
 //! 1. read the DID document — did:plc from `backfill.plc_url`, did:web
-//!    from its host — through the safe client (§11.3);
+//!    from its host — through the safe client (see
+//!    `docs/design/security.md`);
 //! 2. take the first `at://` entry of `alsoKnownAs`;
 //! 3. resolve that handle forward and require the result to equal the DID.
 //!
@@ -89,9 +91,9 @@ impl Outcome {
     }
 }
 
-/// Takes one resolution from the process-wide budget (§3.6:
-/// `public_ui.handle_rps`, not per client). Search resolves handles from the same
-/// budget.
+/// Takes one resolution from the process-wide budget
+/// (`public_ui.handle_rps`, not per client). Search resolves handles from
+/// the same budget.
 pub fn take_budget(st: &WebState, cfg: &Config) -> bool {
     let limit = Class::PublicHandle.limit(cfg, None);
     st.api

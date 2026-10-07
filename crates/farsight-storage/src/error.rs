@@ -13,12 +13,12 @@ pub enum StorageError {
     #[error("migrations: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
     /// Every retry of a transaction hit a deadlock abort. Deadlock retries
-    /// never count toward poisoned-event handling (design §4.3); callers
-    /// must not treat this as a poisoned event.
+    /// never count toward poisoned-event handling; callers must not treat
+    /// this as a poisoned event.
     #[error("deadlock retries exhausted after {0} attempts")]
     DeadlockRetriesExhausted(u32),
-    /// A listing stamp read more than 72 h ago (design §7.3 invariant; the
-    /// §5.2 resume rule). The job must restart with a fresh stamp.
+    /// A listing stamp read more than 72 h ago. The job must restart with a
+    /// fresh stamp.
     #[error("listing stamp read at {0} is older than 72 h")]
     StaleStamp(chrono::DateTime<chrono::Utc>),
     /// The database schema is not the version this build expects.

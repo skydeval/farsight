@@ -1,6 +1,6 @@
-//! API keys (`api_tokens`) and admin UI sessions (`admin_sessions`)
-//! (design §3.5, §8.6). Secrets are stored only as SHA-256 hashes; the
-//! API compares hashes in constant time.
+//! API keys (`api_tokens`) and admin UI sessions (`admin_sessions`).
+//! Secrets are stored only as SHA-256 hashes; the API compares hashes
+//! in constant time.
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgExecutor, PgPool};
@@ -109,7 +109,7 @@ pub async fn revoke_token<'e>(ex: impl PgExecutor<'e>, id: i32) -> Result<bool> 
     )
 }
 
-/// Revokes every key (config reset, §8.6).
+/// Revokes every key (config reset).
 pub async fn revoke_all_tokens<'e>(ex: impl PgExecutor<'e>) -> Result<u64> {
     Ok(
         sqlx::query("UPDATE api_tokens SET revoked_at = now() WHERE revoked_at IS NULL")
@@ -214,7 +214,7 @@ pub async fn delete_session<'e>(ex: impl PgExecutor<'e>, id_sha256: &[u8]) -> Re
     Ok(())
 }
 
-/// Revokes every admin session (admin-token rotation, reset; §8.6).
+/// Revokes every admin session (admin-token rotation, reset).
 pub async fn delete_all_sessions<'e>(ex: impl PgExecutor<'e>) -> Result<u64> {
     Ok(sqlx::query("DELETE FROM admin_sessions")
         .execute(ex)

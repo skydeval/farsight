@@ -1,5 +1,5 @@
-// Browser probes of the stage-8 harness (Mode A): what only a browser can
-// show about the admin pages after UI v2.4.3 — the header stays at the top
+// Browser probes of the stage-8 harness: what only a browser can
+// show about the admin pages — the header stays at the top
 // while the page scrolls, account links open profile cards for a signed-in
 // admin, a card request that is refused never puts another page into the
 // card, times are rewritten to the viewer's timezone by the script the

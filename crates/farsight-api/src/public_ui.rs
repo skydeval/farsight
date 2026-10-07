@@ -1,5 +1,5 @@
-//! The query interface the public UI calls in-process (design §8.6; no
-//! NSID, no XRPC, outside the stable contract of §12.1).
+//! The query interface the public UI calls in-process (no NSID, no XRPC,
+//! outside the stable contract; see `docs/design/web-ui.md`).
 //!
 //! Most public page sections are built from the handlers behind the stable
 //! read queries, called as the API calls them. Two sections have no NSID
@@ -7,9 +7,9 @@
 //! coverage code from the same kind of snapshot, so the UI adds no rule:
 //!
 //! - an account's **outgoing blocks**: the X side that `checkBlocks`
-//!   reports at response level for `actor = subject` (§3.7.5 item 5);
-//! - the **listblocks on a list**: network scope for `listblock` (§3.7.5
-//!   item 1).
+//!   reports at response level for `actor = subject` (see
+//!   `docs/design/coverage.md`);
+//! - the **listblocks on a list**: network scope for `listblock`.
 
 use std::sync::Arc;
 

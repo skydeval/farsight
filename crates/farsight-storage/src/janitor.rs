@@ -1,5 +1,6 @@
-//! Janitor tasks (design §4.4 purge/GE, §5.2 cursors, §7.1 rate tables,
-//! §7.3 tombstones, §7.4 account purge, §11.2 placeholder cleanup).
+//! Janitor tasks: list purges and the end of grace, cursor and rate-table
+//! cleanup, tombstone expiry, account purges and placeholder cleanup (see
+//! `docs/design/storage.md` and `docs/design/list-indexing.md`).
 //!
 //! Each function is one pass; the server schedules them (hourly
 //! tombstones, nightly the rest, purges continuously). Time is injectable
@@ -19,11 +20,11 @@ use crate::tracking::FireArgs;
 use crate::transition::Event;
 use crate::txn::{ApplyReport, Gates, Txn};
 
-/// Items deleted per purge transaction (§4.4 "10k-row batches").
+/// Items deleted per purge transaction.
 pub const PURGE_BATCH: i64 = 10_000;
 
-/// Deletes tombstones older than the TTL (§7.3; hourly). The TTL is
-/// measured from `deleted_at`, the time the delete was processed.
+/// Deletes tombstones older than the TTL (hourly). The TTL is measured
+/// from `deleted_at`, the time the delete was processed.
 pub async fn purge_tombstones(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -39,7 +40,7 @@ pub async fn purge_tombstones(
 }
 
 /// Drops `admission_rate`, `intern_rate` and `history_rate` rows older than 2 days
-/// (§7.1; nightly).
+/// (nightly).
 pub async fn drop_old_rates(pool: &PgPool, today: NaiveDate) -> Result<u64> {
     let cutoff = today - ChronoDuration::days(2);
     let a = sqlx::query("DELETE FROM admission_rate WHERE utc_day < $1")
@@ -60,7 +61,7 @@ pub async fn drop_old_rates(pool: &PgPool, today: NaiveDate) -> Result<u64> {
     Ok(a + i + h)
 }
 
-/// Deletes cursor rows of runs that are no longer current (§5.2; nightly).
+/// Deletes cursor rows of runs that are no longer current (nightly).
 pub async fn drop_orphaned_cursors(pool: &PgPool) -> Result<u64> {
     Ok(sqlx::query(
         "DELETE FROM backfill_cursors c
@@ -84,7 +85,7 @@ const PLACEHOLDER_UNREFERENCED: &str = "
     AND NOT EXISTS (SELECT 1 FROM list_jobs x WHERE x.list_id = l.id)
     AND NOT EXISTS (SELECT 1 FROM list_sched_keys x WHERE x.list_id = l.id)";
 
-/// Placeholder-list cleanup (§11.2; nightly): deletes `lists` rows with
+/// Placeholder-list cleanup (nightly): deletes `lists` rows with
 /// `record_state = unknown`, `track_state = untracked` and no reference
 /// from `list_blocks`, `list_items`, `subject_lists`, `list_jobs` or
 /// `list_sched_keys`. Each deletion takes list(L) exclusive and re-checks
@@ -138,7 +139,7 @@ pub struct PurgeReport {
     pub report: ApplyReport,
 }
 
-/// Runs one batch of every `purging` list (§4.4 purge→X): deletes up to
+/// Runs one batch of every `purging` list (purge→X): deletes up to
 /// [`PURGE_BATCH`] items under author(owner) + list(L) exclusive,
 /// re-checking `purging`; fires **PD** when none remain.
 pub async fn process_purges(
@@ -183,8 +184,8 @@ pub async fn process_purges(
                 .fetch_all(&mut *t.conn)
                 .await?;
                 // Recorded only while the list's record is deleted and its
-                // owner is not (§4.4, §7.8); `item_delete_row` checks both.
-                // Every other drain is a change of tracking.
+                // owner is not; `item_delete_row` checks both. Every other
+                // drain is a change of tracking.
                 let drained = Removal::listing(Cause::ListDeleted);
                 for rk in &rkeys {
                     if item_delete_row(&mut t, &author, rk, Some(&drained)).await? {
@@ -214,7 +215,7 @@ pub async fn process_purges(
     Ok(out)
 }
 
-/// Fires **GE** on `retained` lists whose grace ended (§4.4).
+/// Fires **GE** on `retained` lists whose grace ended.
 pub async fn expire_grace(
     pool: &PgPool,
     limits: &Limits,
@@ -308,10 +309,10 @@ async fn fire_event_guarded(
     Ok(report)
 }
 
-/// Account purge of `did` (§7.4), one batch: deletes up to `batch` of the
-/// DID's authored `blocks`, `list_blocks` (counter path) and `list_items`
-/// under author(D) plus the list locks the batch touches, and fires **RD**
-/// on the DID's lists (their items are then purged by
+/// Account purge of `did`, one batch: deletes up to `batch` of the DID's
+/// authored `blocks`, `list_blocks` (counter path) and `list_items` under
+/// author(D) plus the list locks the batch touches, and fires **RD** on
+/// the DID's lists (their items are then purged by
 /// [`process_purges`]). Returns `true` when nothing authored remains.
 /// Rows where the DID is the *subject* stay; the `lists` rows stay with
 /// `record_state = deleted`.
@@ -403,7 +404,7 @@ pub async fn purge_account_batch(
             t.fire(*list_id, Event::RecordDeleted, FireArgs::default())
                 .await?;
         }
-        // Cancel any running fetch run for the owner (§4.4 notes).
+        // Cancel any running fetch run for the owner.
         sqlx::query(
             "UPDATE list_fetch_runs SET finished_at = now(), outcome = 4
              WHERE owner_id = $1 AND finished_at IS NULL",
@@ -416,7 +417,7 @@ pub async fn purge_account_batch(
             && (items.len() as i64) < batch;
         if done {
             // The purge writes no history, and deletes the history the DID
-            // authored, in batches, after the live rows (§7.4).
+            // authored, in batches, after the live rows.
             let n = history::delete_authored(&mut *t.conn, author_id, batch).await?;
             done = (n as i64) < batch;
         }
@@ -429,11 +430,11 @@ pub async fn purge_account_batch(
     Ok(done)
 }
 
-/// Run end of a list fetch run (§5.5): under list(L) exclusive, fires
-/// **OK** on `list_id` only if it is still claimed by `run_id` for its
-/// current epoch (`fetch_run_id = run_id AND fetch_run_epoch =
-/// admit_epoch`), so a list re-admitted after run start is never promoted.
-/// Returns whether OK fired.
+/// Run end of a list fetch run: under list(L) exclusive, fires **OK** on
+/// `list_id` only if it is still claimed by `run_id` for its current epoch
+/// (`fetch_run_id = run_id AND fetch_run_epoch = admit_epoch`), so a list
+/// re-admitted after run start is never promoted. Returns whether OK
+/// fired.
 pub async fn promote_claimed(
     pool: &PgPool,
     limits: &Limits,
@@ -477,11 +478,11 @@ pub async fn promote_claimed(
     Ok(fired)
 }
 
-/// Divergence purge of `did` (§5.2 "Divergence check"), one batch: the
-/// repo went backwards, so everything authored under its discarded history
-/// goes — blocks, listblocks (counter path), listitems and tombstones — and
-/// the DID's `lists` rows lose their stored rev (the record fields stay;
-/// the fresh listing re-applies them, which a stored rev from the discarded
+/// Divergence purge of `did` (the divergence check), one batch: the repo
+/// went backwards, so everything authored under its discarded history goes
+/// — blocks, listblocks (counter path), listitems and tombstones — and the
+/// DID's `lists` rows lose their stored rev (the record fields stay; the
+/// fresh listing re-applies them, which a stored rev from the discarded
 /// history would refuse as newer). Unlike an account purge no **RD** fires:
 /// the caller fires **DV** on the DID's tracked lists *before* this.
 /// Returns `true` when nothing authored remains.
@@ -566,7 +567,7 @@ pub async fn purge_for_divergence_batch(
     Ok(done)
 }
 
-/// The daily retry task (§4.4): fires **GO** on `deferred` lists whose
+/// The daily retry task: fires **GO** on `deferred` lists whose
 /// `next_retry_at` has passed (lists deferred by the owner re-admission
 /// budget get the next UTC midnight). Lists deferred by the budget, the
 /// ceiling or a bucket cap are re-opened by the budget monitor / counter
@@ -600,8 +601,8 @@ pub async fn retry_deferred(
     Ok(out)
 }
 
-/// Purges every authored row of an account that became `deleted`
-/// (§7.4), batch by batch, firing RD on its lists.
+/// Purges every authored row of an account that became `deleted`, batch
+/// by batch, firing RD on its lists.
 pub async fn purge_account(
     pool: &PgPool,
     limits: &Limits,
@@ -614,8 +615,8 @@ pub async fn purge_account(
 
 /// Accounts with status `deleted` that still author rows, live or in
 /// history (a purge was interrupted, e.g. by a crash after the status
-/// commit; or a replayed event wrote a history row later, §7.4). Ingest
-/// runs these at start-up.
+/// commit; or a replayed event wrote a history row later). Ingest runs
+/// these at start-up.
 pub async fn accounts_pending_purge(pool: &PgPool, limit: i64) -> Result<Vec<Did>> {
     let dids: Vec<String> = sqlx::query_scalar(
         // The deleted accounts are read first, in one pass over `actors`.

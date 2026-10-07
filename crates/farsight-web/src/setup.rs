@@ -1,8 +1,8 @@
-//! Setup mode (design §8.2–§8.5): the setup-token gate and the ten-step
-//! wizard. Nothing here touches the database except the storage step's
-//! connection test; completion writes `config.toml` (first writer wins),
-//! deletes the token and signals the server to switch to normal mode
-//! in-process.
+//! Setup mode (see `docs/design/web-ui.md`): the setup-token gate and
+//! the ten-step wizard. Nothing here touches the database except the
+//! storage step's connection test; completion writes `config.toml`
+//! (first writer wins), deletes the token and signals the server to
+//! switch to normal mode in-process.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -27,7 +27,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::common::{self, cookie, ct_eq, random_id, read_cookie, render_private};
 use crate::setup_token::{self, SetupToken};
 
-/// Setup session cookie (§8.3).
+/// Setup session cookie.
 pub const SESSION_COOKIE: &str = "farsight_setup";
 /// Failures per minute from one client before responses are delayed.
 pub const FAILURES_PER_MIN: usize = 5;
@@ -36,7 +36,7 @@ pub const FAILURE_DELAY: Duration = Duration::from_secs(2);
 /// Delayed responses held at once (beyond: immediate 429).
 pub const MAX_DELAYED: usize = 64;
 
-/// The ten steps (§8.4), by URL slug.
+/// The ten steps, by URL slug.
 pub const STEPS: [(&str, &str); 10] = [
     ("token", "Setup token"),
     ("welcome", "Welcome"),
@@ -51,7 +51,7 @@ pub const STEPS: [(&str, &str); 10] = [
 ];
 
 /// The wizard's answers, held server-side per session until the final
-/// write (§8.4).
+/// write.
 #[derive(Debug, Clone)]
 pub struct Wizard {
     /// Steps validated so far (by index).
@@ -165,7 +165,7 @@ impl Wizard {
         }
     }
 
-    /// `storage.budget_bytes`: 70% of the disk entered (§8.4 step 5).
+    /// `storage.budget_bytes`: 70% of the disk entered.
     pub fn budget_bytes(&self) -> u64 {
         self.disk_gb.saturating_mul(1_000_000_000) / 10 * 7
     }
@@ -193,7 +193,7 @@ impl Wizard {
         c.access = AccessConfig {
             reads: self.reads,
             cors: c.access.cors,
-            // Only with the operator's confirmation (§8.4 step 6).
+            // Only with the operator's confirmation.
             public_ui: self.public_ui && self.public_confirmed,
             admin_ui: self.admin_ui,
             admin_did: if self.admin_ui {
@@ -267,7 +267,7 @@ impl SetupState {
     }
 
     /// Whether a verified session was active in the last hour (postpones
-    /// rotation, §8.3).
+    /// rotation).
     pub fn session_active(&self) -> bool {
         self.sessions
             .lock()
@@ -277,8 +277,8 @@ impl SetupState {
     }
 
     /// The token in force, rotating it if expired (a new token is printed
-    /// and every setup session ends, §8.3). Returns whether it rotated.
-    /// Called at boot and every minute.
+    /// and every setup session ends). Returns whether it rotated. Called
+    /// at boot and every minute.
     pub fn check_token(&self) -> std::io::Result<(SetupToken, bool)> {
         let (t, rotated) = setup_token::current_or_rotate(&self.token_path, self.session_active())?;
         if rotated {
@@ -345,7 +345,8 @@ pub struct StepNav {
     pub class: &'static str,
 }
 
-/// The §10 projection table rows: (stage, data + indexes, with overhead).
+/// The rows of the size projection table: (stage, data + indexes, with
+/// overhead).
 pub const PROJECTION: [(&str, &str, &str); 4] = [
     ("Day one", "< 100 MB", "< 150 MB"),
     ("30 days, firehose only", "~2–8 GB", "~2.5–10 GB"),
@@ -373,7 +374,7 @@ pub struct SetupPage {
     pub w: Wizard,
     /// Show the admin token (until saved).
     pub show_token: bool,
-    /// Disk warning (§8.4 step 5).
+    /// Disk warning.
     pub disk_warning: Option<String>,
     /// Budget, formatted.
     pub budget_text: String,
@@ -395,7 +396,7 @@ pub struct SetupPage {
 }
 
 impl SetupPage {
-    /// The §10 projection table.
+    /// The size projection table.
     pub fn projection(&self) -> &'static [(&'static str, &'static str, &'static str)] {
         &PROJECTION
     }
@@ -480,7 +481,7 @@ fn step_index(slug: &str) -> Option<usize> {
     STEPS.iter().position(|(s, _)| *s == slug)
 }
 
-/// Redacts secrets in a config TOML for display (§8.4 step 9).
+/// Redacts secrets in a config TOML for display.
 pub fn redacted_toml(c: &Config) -> String {
     let mut c = c.clone();
     if !c.auth.admin_token_sha256.is_empty() {
@@ -634,7 +635,7 @@ async fn submit_token(
         }
     };
     // The submitted token is always checked first, in constant time; a
-    // correct token is never refused by any limiter (§8.3).
+    // correct token is never refused by any limiter.
     if setup_token::matches(submitted, &token) {
         let raw = random_id();
         let id = common::sha256(&raw);
@@ -1104,9 +1105,9 @@ async fn save_step(
     if let Err(e) = result {
         return render_step(&st, &id, slug, Some(e));
     }
-    // The admin DID is shown resolved before the step advances (§8.4
-    // step 6): the first submit of a DID looks it up, the second confirms
-    // it. A DID that does not resolve advances only with "use anyway".
+    // The admin DID is shown resolved before the step advances: the
+    // first submit of a DID looks it up, the second confirms it. A DID
+    // that does not resolve advances only with "use anyway".
     if slug == "access" {
         let Some(w) = st.with_session(&id, |s| s.wizard.clone()) else {
             return common::redirect("/setup");
@@ -1126,7 +1127,7 @@ async fn save_step(
             return render_step(&st, &id, slug, None);
         }
         // Turning the public UI on is confirmed on a page that lists what
-        // becomes public (§8.4 step 6); the step is not done before that.
+        // becomes public; the step is not done before that.
         if w.public_ui && !w.public_confirmed {
             st.with_session(&id, |s| s.wizard.done[i] = false);
             let mut p = page(&st, slug, snapshot(&st, &id), None);
@@ -1162,7 +1163,7 @@ async fn resolve_admin_did(st: &SetupState, w: &Wizard) -> Result<crate::oauth::
 }
 
 /// Subscribes to `url` for at most `limit` and reports events, lag and v2
-/// support (§8.4 step 4).
+/// support.
 pub async fn test_firehose(url: &str, limit: Duration) -> (Vec<String>, bool) {
     use farsight_ingest::conn::{self, ConnectError};
     use farsight_ingest::frame::{Frame, Protocol};
@@ -1246,7 +1247,7 @@ async fn firehose_test(
             Some("Enter at least one ws:// or wss:// URL.".into()),
         );
     }
-    // ≤ 10 s in total (§8.4 step 4), split across the instances.
+    // ≤ 10 s in total, split across the instances.
     let per = Duration::from_secs(10) / urls.len().max(1) as u32;
     let mut report = Vec::new();
     let mut any_v2 = false;
@@ -1263,8 +1264,8 @@ async fn firehose_test(
     render_step(&st, &id, "firehose", None)
 }
 
-/// Checks a Postgres DSN for the storage step (§8.4 step 8): connect,
-/// version ≥ 15, and the database empty or holding Farsight migrations.
+/// Checks a Postgres DSN for the storage step: connect, version ≥ 15,
+/// and the database empty or holding Farsight migrations.
 pub async fn test_storage(dsn: &str) -> (Vec<String>, bool) {
     use sqlx::Connection;
     let mut lines = Vec::new();
@@ -1472,7 +1473,7 @@ async fn finish(
     if let Some(dir) = st.config_path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // First writer wins (§8.3).
+    // First writer wins.
     match farsight_core::config::write_new(&st.config_path, &text) {
         Ok(true) => {}
         Ok(false) => {

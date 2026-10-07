@@ -1,5 +1,5 @@
-//! Public UI metrics (design §13). `page` is the matched route, never the
-//! path, so the label set is fixed.
+//! Public UI metrics (see `docs/design/operations.md`). `page` is the
+//! matched route, never the path, so the label set is fixed.
 
 use std::time::Duration;
 

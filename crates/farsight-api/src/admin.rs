@@ -1,5 +1,5 @@
-//! Backfill endpoints (design §3.3) and the unstable admin procedures
-//! (§3.4).
+//! Backfill endpoints (see `docs/design/api.md`) and the unstable admin
+//! procedures.
 
 use std::sync::Arc;
 
@@ -48,7 +48,7 @@ fn status_json(actor: &Did, s: &BackfillStatus) -> Map<String, Value> {
     m
 }
 
-/// `query.getBackfillStatus`: a pure read (§3.3).
+/// `query.getBackfillStatus`: a pure read.
 pub async fn get_backfill_status(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcError> {
     let actor = p.did("actor")?;
     let discovery = !st.config.current().config.backfill.backlinks.url.is_empty();
@@ -72,8 +72,7 @@ fn parse_body<T: for<'de> Deserialize<'de>>(body: &Bytes) -> Result<T, XrpcError
     serde_json::from_slice(body).map_err(|e| XrpcError::invalid(format!("invalid input: {e}")))
 }
 
-/// `admin.requestBackfill` (§3.3). JSON body, or the query-parameter form
-/// (D1).
+/// `admin.requestBackfill`. JSON body, or the query-parameter form.
 pub async fn request_backfill(
     st: &Arc<ApiState>,
     caller: &Caller,
@@ -183,7 +182,7 @@ pub async fn list_errors(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcEr
 }
 
 /// `admin.restartFirehose`: drops the session; the reader reconnects from
-/// the persisted cursor (§6.3).
+/// the persisted cursor.
 pub async fn restart_firehose(st: &Arc<ApiState>) -> Result<Reply, XrpcError> {
     let Some(i) = &st.ingest else {
         return Err(XrpcError::invalid("ingest is not running"));
@@ -347,8 +346,8 @@ pub struct RepairStart {
     pub gaps: i64,
 }
 
-/// Requests a repair cycle over every closed, unhealed gap (§7.5: one
-/// repair covers all of them from `min(from_at)`; an open gap waits). An
+/// Requests a repair cycle over every closed, unhealed gap (one repair
+/// covers all of them from `min(from_at)`; an open gap waits). An
 /// unfinished repair cycle is reused. The backfill process runs it.
 pub async fn start_repair_cycle(st: &ApiState) -> Result<RepairStart, XrpcError> {
     let mut tx = st.pool.begin().await?;
@@ -378,9 +377,9 @@ pub async fn start_repair_cycle(st: &ApiState) -> Result<RepairStart, XrpcError>
     let (cycle, from) = match existing {
         Some((id, f)) => (id, f),
         None => {
-            // §7.5: repairs enumerate the relay's listRepos whatever the
-            // sweep source; the backfill process sets S_C, claims the gaps
-            // and falls back to known DIDs if the relay is down.
+            // Repairs enumerate the relay's listRepos whatever the sweep
+            // source; the backfill process sets S_C, claims the gaps and
+            // falls back to known DIDs if the relay is down.
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO sweep_cycles (kind, source, collections, started_at, repair_from)
                  VALUES (2, 'relay_repos', '{1,2,3,4}', now(), $1) RETURNING id",

@@ -1,7 +1,8 @@
-//! Periodic tasks (design §3.7.3, §4.2, §4.4, §7.1, §7.3, §11.2): one
-//! process-wide scheduler with jitter. Each job runs in its own task and
-//! never overlaps itself; a slow nightly job does not delay the budget
-//! monitor.
+//! Periodic tasks (see `docs/design/coverage.md`,
+//! `docs/design/list-indexing.md`, `docs/design/storage.md` and
+//! `docs/design/security.md`): one process-wide scheduler with jitter.
+//! Each job runs in its own task and never overlaps itself; a slow
+//! nightly job does not delay the budget monitor.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -45,10 +46,10 @@ const TABLES: [&str; 11] = [
     "firehose_clock",
 ];
 
-/// Resync debts older than this become `unreachable` (§3.7.3, §6.2).
+/// Resync debts older than this become `unreachable`.
 pub const RESYNC_TERMINAL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Lists fired GO per budget-monitor pass after reopening (rate-limited,
-/// oldest first; §11.2).
+/// oldest first).
 pub const GO_PER_PASS: i64 = 200;
 /// Batch size of the nightly recount.
 pub const RECOUNT_BATCH: i64 = 1000;
@@ -66,7 +67,7 @@ pub struct TaskCtx {
     /// Dashboard status.
     pub status: Arc<ServerStatus>,
     /// `storage.block_history_enabled` as it was at start: the server
-    /// applies a change of the flag at restart (§7.7).
+    /// applies a change of the flag at restart.
     pub history_enabled: bool,
     gate_state: Mutex<GateState>,
     samples: Mutex<VecDeque<(DateTime<Utc>, u64)>>,
@@ -274,7 +275,7 @@ fn err(e: impl std::fmt::Display) -> String {
 
 /// Lists to fire GF on while a refusal is active: `pending`, not yet
 /// claimed by a run, owned by a non-large (or unresolved) owner; at the
-/// ceiling, every owner (§5.5, §11.2).
+/// ceiling, every owner.
 async fn gf_candidates(pool: &PgPool, include_large: bool) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT l.id FROM lists l
@@ -307,9 +308,9 @@ async fn go_candidates(
     .await
 }
 
-/// The budget monitor (§11.2, every minute): measures `pg_database_size`,
-/// drives the gate state machine, publishes gates to every writer, records
-/// global refusal intervals, fires **GF** on unclaimed pending lists while
+/// The budget monitor (every minute): measures `pg_database_size`, drives
+/// the gate state machine, publishes gates to every writer, records global
+/// refusal intervals, fires **GF** on unclaimed pending lists while
 /// refusing and **GO** on lists the gate deferred once it reopens.
 async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, String> {
     let cfg = ctx.config.current();
@@ -409,8 +410,8 @@ async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, String> {
     })
 }
 
-/// Sustained growth above 2× the trailing average (§11.2). Samples are
-/// hourly and in memory, so the check needs three days of uptime.
+/// Sustained growth above 2× the trailing average. Samples are hourly
+/// and in memory, so the check needs three days of uptime.
 fn growth_warning(ctx: &TaskCtx, bytes: u64) -> Option<String> {
     let now = Utc::now();
     let mut s = ctx.samples.lock().unwrap_or_else(|e| e.into_inner());
@@ -520,7 +521,7 @@ async fn storage_metrics(ctx: Arc<TaskCtx>) -> Result<String, String> {
             history_bytes += n.unwrap_or(0).max(0) as u64;
         }
     }
-    // The dashboard shows history next to the budget (§11.2).
+    // The dashboard shows history next to the budget.
     ctx.status.update(|s| s.history_bytes = Some(history_bytes));
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT name, COALESCE(sum(value), 0)::bigint FROM stats_counters GROUP BY name",
@@ -569,7 +570,7 @@ async fn rate_tables(ctx: Arc<TaskCtx>) -> Result<String, String> {
     Ok(format!("{n} rate rows older than 2 days deleted"))
 }
 
-/// The daily history retention pass (§7.7). With `"0s"` it does not run.
+/// The daily history retention pass. With `"0s"` it does not run.
 async fn history_retention(ctx: Arc<TaskCtx>) -> Result<String, String> {
     let retention = ctx
         .config
@@ -597,8 +598,8 @@ async fn orphaned_cursors(ctx: Arc<TaskCtx>) -> Result<String, String> {
     Ok(format!("{n} orphaned cursor rows deleted"))
 }
 
-/// Nightly exact recount (§4.2, §7.1): batched, each list under its list
-/// lock; repairs drift, re-runs the transition function where a repair
+/// Nightly exact recount: batched, each list under its list lock;
+/// repairs drift, re-runs the transition function where a repair
 /// crosses zero, and alerts on any drift.
 async fn counter_recount(ctx: Arc<TaskCtx>) -> Result<String, String> {
     let limits = ctx.limits();
@@ -646,7 +647,7 @@ async fn counter_recount(ctx: Arc<TaskCtx>) -> Result<String, String> {
     Ok(format!("{checked} rows recounted, {} drifted", drift.len()))
 }
 
-/// Nightly exact rebuild of the approximate counters (§7.1).
+/// Nightly exact rebuild of the approximate counters.
 async fn counter_rebuild(ctx: Arc<TaskCtx>) -> Result<String, String> {
     recount::rebuild_approximate_counters(&ctx.pool, 100_000)
         .await

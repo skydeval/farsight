@@ -1,6 +1,7 @@
-//! The XRPC error shape (design §3.1): `{ "error", "message" }` with a
-//! fixed set of names. Errors are never cached (`Cache-Control:
-//! no-store`, §9.4); `AuthRequired` adds `WWW-Authenticate: Bearer`.
+//! The XRPC error shape (see `docs/design/api.md`): `{ "error",
+//! "message" }` with a fixed set of names. Errors are never cached
+//! (`Cache-Control: no-store`); `AuthRequired` adds `WWW-Authenticate:
+//! Bearer`.
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -80,7 +81,7 @@ impl XrpcError {
         }
     }
 
-    /// `503 SetupRequired` (every `/xrpc/*` while in setup mode, §8.2).
+    /// `503 SetupRequired` (every `/xrpc/*` while in setup mode).
     pub fn setup_required() -> XrpcError {
         XrpcError::new(
             StatusCode::SERVICE_UNAVAILABLE,

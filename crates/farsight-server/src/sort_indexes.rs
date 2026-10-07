@@ -1,8 +1,8 @@
-//! The UI sort indexes (design §7.6): four indexes that order the UI's
-//! row tables by shown time, built here, after the server has started
-//! serving, and never by a migration. A build inside the migration
-//! transaction would outlast a health check on a large table and be
-//! rolled back by the restart, on every start.
+//! The UI sort indexes (see `docs/design/storage.md`): four indexes
+//! that order the UI's row tables by shown time, built here, after the
+//! server has started serving, and never by a migration. A build inside
+//! the migration transaction would outlast a health check on a large
+//! table and be rolled back by the restart, on every start.
 //!
 //! One task per server process:
 //!

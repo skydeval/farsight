@@ -1,26 +1,23 @@
-//! `farsight-stage9-harness`: Phase B Mode A for UI v2.5.2 — the public
-//! UI at the root, the admin UI under `/admin` behind a session, the two
-//! switches (`access.public_ui`, `access.admin_ui`), that no page has a
-//! second address, the static assets, `robots.txt`, and the wizard's
-//! access step.
+//! `farsight-stage9-harness`: integration tests of the public UI at the
+//! root, the admin UI under `/admin` behind a session, the two switches
+//! (`access.public_ui`, `access.admin_ui`), that no page has a second
+//! address, the static assets, `robots.txt`, and the wizard's access
+//! step.
 //!
-//! Sections, with the numbers the stage kickoff gives its probes:
+//! Sections:
 //!
-//! - 1: routing in the four switch combinations (1–4), sessions (10–12);
-//! - 2: config (5–9);
-//! - 3: no second address for any page (13–16);
-//! - 4: static assets (17–21);
-//! - 5: `/` of an API-only instance (22–23);
-//! - 6: the wizard (24–27);
-//! - 7: `robots.txt` (28–30), the client metadata (31–32);
-//! - 8: what the routing relies on from axum (33–34), metric labels (36),
-//!   the admin card (38);
-//! - 9: in a browser, with `--browser`: the access step without script
-//!   (25), htmx and a refused poll (35), times on the new paths (37), the
-//!   admin card on hover (38).
-//!
-//! Probes 39–43 are the stage-6, stage-7 and stage-8 harnesses, run again
-//! with their paths moved.
+//! - 1: routing in the four switch combinations, sessions;
+//! - 2: config;
+//! - 3: one address for each page;
+//! - 4: static assets;
+//! - 5: `/` of an API-only instance;
+//! - 6: the wizard;
+//! - 7: `robots.txt`, the client metadata;
+//! - 8: what the routing relies on from axum, metric labels, the admin
+//!   card;
+//! - 9: in a browser, with `--browser`: the access step without script,
+//!   htmx and a refused poll, times on the admin pages, the admin card on
+//!   hover.
 //!
 //! Sessions are created in the database, as in the stage-6 harness; the
 //! sign-in itself is the stage-7 harness's subject.
@@ -392,7 +389,7 @@ async fn seed_world(pool: &sqlx::PgPool) -> Result<World, String> {
 
 /// Public UI on, admin UI on.
 async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<(), String> {
-    c.section("1a. public UI on, admin UI on (probes 1, 10–12)");
+    c.section("1a. public UI on, admin UI on");
     let home = a.get("/").await?;
     c.check(
         "/ is the public home: 200, cacheable, its search form posts to /search, no admin or sign-in link",
@@ -453,7 +450,7 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
     );
     all(
         c,
-        "every admin page without a session: 303 to /enter, never the page (D1)",
+        "every admin page without a session: 303 to /enter, never the page",
         a,
         None,
         &ADMIN_PAGES,
@@ -518,8 +515,7 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
             && dash.text.contains("href=\"/admin/settings\"")
             && dash.text.contains("action=\"/admin/logout\"")
             && dash.text.contains("src=\"/static/admin.js?v=")
-            && !dash.text.contains("/static/public.js")
-            && !dash.text.contains("farsight.js"),
+            && !dash.text.contains("/static/public.js"),
         support::truncate(&dash.text, 120),
     );
     let page = a.admin_get(cookie, &lookup).await?;
@@ -583,7 +579,7 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
 
 /// Public UI on, admin UI off (and an admin DID in the file).
 async fn check_public_only(c: &mut Checks, b: &Srv, cookie: &str, w: &World) -> Result<(), String> {
-    c.section("1b. public UI on, admin UI off (probes 2, 9)");
+    c.section("1b. public UI on, admin UI off");
     let home = b.get("/").await?;
     let did = b.get(&format!("/did/{}", w.subject)).await?;
     c.check(
@@ -611,7 +607,7 @@ async fn check_public_only(c: &mut Checks, b: &Srv, cookie: &str, w: &World) -> 
     ]);
     all(
         c,
-        "every admin page, the sign-in, its callback, the client metadata and the old admin addresses: the bare 404",
+        "every admin page, the sign-in, its callback, the client metadata and an admin page's path at the root: the bare 404",
         b,
         None,
         &gone,
@@ -634,7 +630,7 @@ async fn check_public_only(c: &mut Checks, b: &Srv, cookie: &str, w: &World) -> 
         )
         .await?;
     c.check(
-        "the client metadata asked for under the instance's own hostname: still the bare 404 (probe 32)",
+        "the client metadata asked for under the instance's own hostname: the bare 404",
         bare(&meta),
         brief(&meta),
     );
@@ -654,7 +650,7 @@ async fn check_public_only(c: &mut Checks, b: &Srv, cookie: &str, w: &World) -> 
 
 /// Public UI off, admin UI on, reads gated.
 async fn check_admin_only(c: &mut Checks, s: &Srv, cookie: &str, w: &World) -> Result<(), String> {
-    c.section("1c. public UI off, admin UI on, reads = api_key (probes 3, 11)");
+    c.section("1c. public UI off, admin UI on, reads = api_key");
     let root = s.get("/").await?;
     c.check(
         "/ redirects to /admin: 303, no-store (not a permanent redirect: the public UI can be turned on)",
@@ -664,10 +660,10 @@ async fn check_admin_only(c: &mut Checks, s: &Srv, cookie: &str, w: &World) -> R
     let did = format!("/did/{}", w.subject);
     let card = format!("/card/{}", w.subject);
     let list = format!("/list/{}/3kaaaaaaaaaa2", w.subject);
-    let old = format!("/public/did/{}", w.subject);
+    let prefixed = format!("/public/did/{}", w.subject);
     all(
         c,
-        "every public page, the old public addresses and an unknown path: the bare 404",
+        "every public page, a path under /public and an unknown path: the bare 404",
         s,
         None,
         &[
@@ -677,7 +673,7 @@ async fn check_admin_only(c: &mut Checks, s: &Srv, cookie: &str, w: &World) -> R
             "/search?q=x",
             "/public",
             "/public/search?q=x",
-            old.as_str(),
+            prefixed.as_str(),
             "/public/static/public.css",
             "/public/nonsense",
             "/nonsense",
@@ -720,7 +716,7 @@ async fn check_admin_only(c: &mut Checks, s: &Srv, cookie: &str, w: &World) -> R
 
 /// Neither UI.
 async fn check_api_only(c: &mut Checks, d: &Srv, w: &World) -> Result<(), String> {
-    c.section("1d. neither UI: API only (probes 4, 22, 23)");
+    c.section("1d. neither UI: API only");
     let root = d.get("/").await?;
     c.check(
         "/ is a short text page: 200, text/plain, public, max-age=300, nosniff",
@@ -791,7 +787,7 @@ async fn check_api_only(c: &mut Checks, d: &Srv, w: &World) -> Result<(), String
 // ------------------------------------------------------------------ 2. config
 
 async fn check_config(c: &mut Checks, pg: &Pg, a: &Srv, cookie: &str) -> Result<(), String> {
-    c.section("2. config: unknown keys, admin_ui at restart only (probes 5–9)");
+    c.section("2. config: unknown keys, admin_ui at restart only");
     // No admin DID: unconfigured, and it loads.
     pg.create_db("s9e").await?;
     let e = Srv::start(
@@ -807,7 +803,7 @@ async fn check_config(c: &mut Checks, pg: &Pg, a: &Srv, cookie: &str) -> Result<
     let enter = e.get("/enter").await?;
     let dash = e.get("/admin").await?;
     c.check(
-        "with the admin UI on and no admin DID the instance loads and is unconfigured: the log says so, /enter says so, /admin redirects there (probe 7)",
+        "with the admin UI on and no admin DID the instance loads and is unconfigured: the log says so, /enter says so, /admin redirects there",
         e.log().contains("admin sign-in is not configured")
             && enter.status == 200
             && enter.text.contains("set-admin-did")
@@ -828,7 +824,7 @@ async fn check_config(c: &mut Checks, pg: &Pg, a: &Srv, cookie: &str) -> Result<
     );
     let (failed, log) = Srv::refused("f", &text).await?;
     c.check(
-        "public_ui = true with reads = \"api_key\": the process exits non-zero naming access.public_ui (probe 8)",
+        "public_ui = true with reads = \"api_key\": the process exits non-zero naming access.public_ui",
         failed && log.contains("access.public_ui"),
         format!("failed {failed}: {}", support::truncate(log.trim(), 200)),
     );
@@ -894,7 +890,7 @@ async fn check_config(c: &mut Checks, pg: &Pg, a: &Srv, cookie: &str) -> Result<
     let after = std::fs::read_to_string(a.config_path()).map_err(|e| e.to_string())?;
     let still = a.admin_get(cookie, "/admin").await?;
     c.check(
-        "a Settings save with admin_ui = false is refused with the restart message; config.toml is untouched and the admin UI is still there (probe 6, D4)",
+        "a Settings save with admin_ui = false is refused with the restart message; config.toml is untouched and the admin UI is still there",
         r.status == 200 && r.text.contains(NEEDS_RESTART) && after == before && still.status == 200,
         format!("{} | file unchanged: {} | /admin {}", r.status, after == before, still.status),
     );
@@ -903,7 +899,7 @@ async fn check_config(c: &mut Checks, pg: &Pg, a: &Srv, cookie: &str) -> Result<
     let p = a.pause_sweep(true).await?;
     let file = std::fs::read_to_string(a.config_path()).map_err(|e| e.to_string())?;
     c.check(
-        "pausing the sweep over XRPC works, and that edit adds no admin_ui to a file that does not set it (D10)",
+        "pausing the sweep over XRPC works, and that edit adds no admin_ui to a file that does not set it",
         p.status == 200 && !file.contains("admin_ui"),
         p.short(),
     );
@@ -928,13 +924,18 @@ async fn check_config(c: &mut Checks, pg: &Pg, a: &Srv, cookie: &str) -> Result<
     Ok(())
 }
 
-// ----------------------------------------------------------- 3. old addresses
+// ------------------------------------------------- 3. one address per page
 
-/// The pages have one address each. The addresses they had before
-/// anything was released (`/public/…`, and the admin pages at the root)
-/// are not routes: they get what any unknown path gets.
-async fn check_old_paths(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<(), String> {
-    c.section("3. no second address for any page");
+/// The pages have one address each. Any other path, such as one under
+/// `/public` or an admin page's path at the root, is not a route: it gets
+/// what any unknown path gets.
+async fn check_unknown_paths(
+    c: &mut Checks,
+    a: &Srv,
+    cookie: &str,
+    w: &World,
+) -> Result<(), String> {
+    c.section("3. one address for each page");
     let s = &w.subject;
     let paths: Vec<String> = vec![
         "/public".into(),
@@ -961,7 +962,6 @@ async fn check_old_paths(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Re
         "/logout".into(),
         "/ops/backfill".into(),
         "/settings/token".into(),
-        "/static/farsight.js".into(),
         "/nonsense".into(),
         // Paths that would name another host if a prefix were stripped.
         "/public//evil.example.com/x".into(),
@@ -980,7 +980,7 @@ async fn check_old_paths(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Re
         }
     }
     c.check(
-        "every address a page might once have had — under /public, or an admin page at the root — is an unknown path: the bare 404, no Location, with or without a session",
+        "a path under /public, an admin page's path at the root and a path that would name another host if a prefix were stripped are unknown paths: the bare 404, no Location, with or without a session",
         bad.is_empty(),
         if bad.is_empty() {
             format!("{} paths", paths.len())
@@ -1000,7 +1000,7 @@ async fn check_old_paths(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Re
 // ------------------------------------------------------------------ 4. static
 
 async fn check_static(c: &mut Checks, servers: &[(&str, &Srv)]) -> Result<(), String> {
-    c.section("4. static assets: five files at /static, in every configuration (probes 17–21)");
+    c.section("4. static assets: five files at /static, in every configuration");
     let mut bad = Vec::new();
     let mut sizes = Vec::new();
     for (name, s) in servers {
@@ -1018,13 +1018,9 @@ async fn check_static(c: &mut Checks, servers: &[(&str, &Srv)]) -> Result<(), St
                 sizes.push(format!("{path} {}", r.text.len()));
             }
         }
-        let js = s.get("/static/farsight.js").await?;
-        if !bare(&js) {
-            bad.push(format!("{name} /static/farsight.js: {}", brief(&js)));
-        }
     }
     c.check(
-        "the five files answer 200 (type, public, max-age=3600, nosniff) on all four servers, the API-only one included; /static/farsight.js is gone (D7, D9)",
+        "the five files answer 200 (type, public, max-age=3600, nosniff) on all four servers, the API-only one included",
         bad.is_empty(),
         if bad.is_empty() { sizes.join(", ") } else { bad.join(" | ") },
     );
@@ -1176,13 +1172,13 @@ impl Wiz {
 }
 
 async fn check_wizard(c: &mut Checks, pg: &Pg) -> Result<(), String> {
-    c.section("6. the wizard's access step (probes 24–27)");
+    c.section("6. the wizard's access step");
     pg.create_db("s9w1").await?;
     let w = Wiz::start("w1").await?;
     w.to_access().await?;
     let page = w.get("/setup/access").await?;
     c.check(
-        "the step has the two boxes, neither ticked, and no Web UI select (probe 24, D5)",
+        "the step has the two boxes, neither ticked, and no Web UI select",
         page.status == 200
             && page.text.contains("id=\"public_ui\" name=\"public_ui\">")
             && page.text.contains("id=\"admin_ui\" name=\"admin_ui\">")
@@ -1197,7 +1193,7 @@ async fn check_wizard(c: &mut Checks, pg: &Pg) -> Result<(), String> {
         .find("<div class=\"revealed\" id=\"admin-did-field\">");
     let did_at = page.text.find("name=\"admin_did\"");
     c.check(
-        "the admin DID field is in the page, after the admin box, inside the block a stylesheet rule hides while the box is unticked; the page has no script (probe 25)",
+        "the admin DID field is in the page, after the admin box, inside the block a stylesheet rule hides while the box is unticked; the page has no script",
         matches!((box_at, field_at, did_at), (Some(b), Some(f), Some(d)) if b < f && f < d)
             && css.text.contains("input.reveals:not(:checked) ~ .revealed { display: none; }")
             && !page.text.contains("<script"),
@@ -1257,7 +1253,7 @@ async fn check_wizard(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     anyway.push(("use_anyway", "on"));
     let confirm = w.post("/setup/access", &anyway).await?;
     c.check(
-        "with the public UI ticked the step answers with the confirmation page: what becomes public (hostname, contact, blocks, lists, members, cards and the avatar fetch), a confirm button and a way back (probe 26)",
+        "with the public UI ticked the step answers with the confirmation page: what becomes public (hostname, contact, blocks, lists, members, cards and the avatar fetch), a confirm button and a way back",
         confirm.status == 200
             && confirm.text.contains("id=\"confirm-public\"")
             && confirm.text.contains(&format!("https://{HOSTNAME}/"))
@@ -1286,7 +1282,7 @@ async fn check_wizard(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     let done = w.post("/setup/finish", &[]).await?;
     let text = std::fs::read_to_string(w.srv.config_path()).unwrap_or_default();
     c.check(
-        "done page, both on: the admin UI at /admin, sign-in at /enter with the DID, the public UI at / (probe 27)",
+        "done page, both on: the admin UI at /admin, sign-in at /enter with the DID, the public UI at /",
         done.status == 200
             && done.text.contains("The admin UI is at <code>/admin</code>")
             && done.text.contains(ADMIN_DID)
@@ -1417,14 +1413,14 @@ async fn check_robots_and_metadata(
     s: &Srv,
     d: &Srv,
 ) -> Result<(), String> {
-    c.section("7. robots.txt and the client metadata (probes 28–32)");
+    c.section("7. robots.txt and the client metadata");
     let ra = a.get("/robots.txt").await?;
     let lines: Vec<&str> = ra.text.lines().collect();
     let closed = [
         "/admin", "/enter", "/setup", "/xrpc/", "/search", "/card/", "/health", "/livez",
     ];
     c.check(
-        "public UI on and crawlable: the admin UI, sign-in, wizard, API, search, cards and health are closed; Allow: / comes last (probe 28)",
+        "public UI on and crawlable: the admin UI, sign-in, wizard, API, search, cards and health are closed; Allow: / comes last",
         ra.status == 200
             && cc(&ra) == "public, max-age=300"
             && lines.first() == Some(&"User-agent: *")
@@ -1445,7 +1441,7 @@ async fn check_robots_and_metadata(
         }
     }
     c.check(
-        "every other configuration, the API-only one included: 200 and Disallow: / (probes 29, 30)",
+        "every other configuration, the API-only one included: 200 and Disallow: /",
         same.is_empty(),
         same.join(" | "),
     );
@@ -1454,7 +1450,7 @@ async fn check_robots_and_metadata(
     let ms = s.get_with(path, &[("host", HOSTNAME)]).await?;
     let root = format!("https://{HOSTNAME}/");
     c.check(
-        "the client metadata is the same document with the public UI on or off: client_uri is the hostname's root, the callback is /enter/callback (probe 31, D8)",
+        "the client metadata is the same document with the public UI on or off: client_uri is the hostname's root, the callback is /enter/callback",
         ma.status == 200
             && ma.text == ms.text
             && ma.body["client_uri"] == root.as_str()
@@ -1474,7 +1470,7 @@ async fn check_contracts(
     cookie: &str,
     w: &World,
 ) -> Result<(), String> {
-    c.section("8. what the routing relies on (probes 33, 34, 36, 38)");
+    c.section("8. what the routing relies on");
     let post = |s: &Srv, path: &str| {
         let url = format!("{}{path}", s.base);
         let http = s.fresh();
@@ -1485,7 +1481,7 @@ async fn check_contracts(
     let p3 = post(d, "/admin").await?;
     let g = d.get("/admin/logout").await?;
     c.check(
-        "a method a route does not serve is a 405 with Allow, in every configuration: POST /did/{did}, POST /admin/lookup/did, and — on the API-only server — POST /admin and GET /admin/logout (probe 33)",
+        "a method a route does not serve is a 405 with Allow, in every configuration: POST /did/{did}, POST /admin/lookup/did, and — on the API-only server — POST /admin and GET /admin/logout",
         [&p1, &p2, &p3, &g].iter().all(|r| r.status == 405 && r.header("allow").is_some()),
         format!(
             "{} {:?} | {} | {} | {}",
@@ -1517,7 +1513,7 @@ async fn check_contracts(
     labels.sort_unstable();
     labels.dedup();
     c.check(
-        "farsight_public_ui_requests_total has one label per page; / counts as home, robots as robots, and an unknown path such as /public is counted under none (probe 36)",
+        "farsight_public_ui_requests_total has one label per page; / counts as home, robots as robots, and an unknown path such as /public is counted under none",
         labels == ["card", "did", "home", "list", "robots", "search"]
             && delta("home", "2xx") == 1.0
             && delta("robots", "2xx") == 1.0,
@@ -1541,7 +1537,7 @@ async fn check_contracts(
     let hx = a.get_with(&path, &[("hx-request", "true")]).await?;
     let card = a.admin_get(cookie, &path).await?;
     c.check(
-        "/admin/card/{did}: the bare 404 without a session, never a redirect; a fragment with one, no-store, private (probe 38)",
+        "/admin/card/{did}: the bare 404 without a session, never a redirect; a fragment with one, no-store, private",
         bare(&anon) && bare(&hx) && card.status == 200 && cc(&card) == "no-store, private" && !card.text.contains("<html"),
         format!("{} | {}", brief(&anon), brief(&card)),
     );
@@ -1551,7 +1547,9 @@ async fn check_contracts(
 // ----------------------------------------------------------- 9. the browser
 
 async fn check_browser(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<(), String> {
-    c.section("9. in a browser: the access step without script, a refused poll, times, the admin card (probes 25, 35, 37, 38)");
+    c.section(
+        "9. in a browser: the access step without script, a refused poll, times, the admin card",
+    );
     // A wizard session parked on the access step.
     let wiz = Wiz::start("wb").await?;
     wiz.to_access().await?;
@@ -1668,7 +1666,7 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
     check_admin_only(c, &s, s_cookie, &w).await?;
     check_api_only(c, &d, &w).await?;
     check_config(c, pg, &a, a_cookie).await?;
-    check_old_paths(c, &a, a_cookie, &w).await?;
+    check_unknown_paths(c, &a, a_cookie, &w).await?;
     check_static(c, &[("A", &a), ("B", &b), ("C", &s), ("D", &d)]).await?;
     check_wizard(c, pg).await?;
     check_robots_and_metadata(c, &a, &b, &s, &d).await?;
@@ -1685,7 +1683,7 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
 async fn main() -> std::process::ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| argv.iter().any(|a| a == f);
-    println!("== farsight stage-9 harness: Mode A (UI v2.5.2)");
+    println!("== farsight stage-9 harness: routing and the two UI switches");
     let pg = match Pg::start(flag("--keep")) {
         Ok(p) => p,
         Err(e) => {

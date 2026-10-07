@@ -1,6 +1,6 @@
-//! The Prometheus endpoint (design §13): `metrics.bind`, compose-network
-//! only by default, with an optional bearer token
-//! (`metrics.bearer_token_sha256`).
+//! The Prometheus endpoint (see `docs/design/operations.md`):
+//! `metrics.bind`, compose-network only by default, with an optional
+//! bearer token (`metrics.bearer_token_sha256`).
 
 use std::sync::Arc;
 

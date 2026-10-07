@@ -1,4 +1,4 @@
-//! The UI's handle cache (design §8.6), in two layers.
+//! The UI's handle cache (see `docs/design/web-ui.md`), in two layers.
 //!
 //! In memory: bounded, least recently used evicted, each entry living as
 //! long as the caller says. An entry is either a verified handle or the

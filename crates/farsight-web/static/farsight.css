@@ -1696,9 +1696,9 @@ a.record-view {
   }
 }
 
-/* Layout that used to be written on the element. A page carries no
-   inline style, so that its Content-Security-Policy can forbid it; each
-   rule here keeps the weight the attribute had. */
+/* Layout of single elements. A page carries no inline style, so that its
+   Content-Security-Policy can forbid it; these rules take precedence
+   over the general ones as an attribute would. */
 .bar-end { margin-left:auto !important;display:flex !important;gap:0.75rem !important;align-items:center !important; }
 .u-inline { display:inline !important; }
 .gaps-title { margin-top:1rem !important;color:var(--warn) !important; }

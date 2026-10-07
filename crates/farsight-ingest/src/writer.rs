@@ -1,7 +1,7 @@
-//! The single writer (§6.2): batches events (≤ 500 or 250 ms), applies
-//! each batch through `farsight-storage::apply` in one transaction with
-//! the cursor, `applied_through` and the `firehose_clock` row, and handles
-//! poisoned events.
+//! The single writer (see `docs/design/firehose.md`): batches events
+//! (≤ 500 or 250 ms), applies each batch through `farsight-storage::apply`
+//! in one transaction with the cursor, `applied_through` and the
+//! `firehose_clock` row, and handles poisoned events.
 //!
 //! Ordering: every non-event item (session start, gap, disconnect,
 //! barrier) first flushes the events before it, so gaps and the connected
@@ -32,11 +32,11 @@ use crate::frame::{Body, InEvent, Protocol};
 use crate::metrics as m;
 use crate::stats::IngestStats;
 
-/// Batch size bound (§6.2).
+/// Batch size bound.
 pub const BATCH_MAX: usize = 500;
-/// Batch time bound (§6.2).
+/// Batch time bound.
 pub const BATCH_WINDOW: Duration = Duration::from_millis(250);
-/// Attempts of one event alone before it is poisoned (§6.2).
+/// Attempts of one event alone before it is poisoned.
 pub const POISON_STRIKES: u32 = 3;
 
 /// What the reader sends the writer.
@@ -44,11 +44,11 @@ pub const POISON_STRIKES: u32 = 3;
 pub enum Item {
     /// An event of the live session.
     Event(InEvent),
-    /// Events re-read by a seam repair (§6.3). Applied like any other
-    /// event but never advance the cursor, `applied_through` or the clock:
-    /// the live session may still be catching up behind them (a resume
-    /// after an outage), and a cursor moved past un-replayed data would
-    /// make the next reconnect skip it.
+    /// Events re-read by a seam repair. Applied like any other event but
+    /// never advance the cursor, `applied_through` or the clock: the live
+    /// session may still be catching up behind them (a resume after an
+    /// outage), and a cursor moved past un-replayed data would make the
+    /// next reconnect skip it.
     Repair(Vec<InEvent>),
     /// A session to `url` speaking `protocol` started.
     Session {
@@ -80,12 +80,12 @@ pub fn dt(us: i64) -> DateTime<Utc> {
 
 /// The writer task's inputs.
 pub struct Writer {
-    /// Ingest pool (4 connections, §6.2).
+    /// Ingest pool (4 connections).
     pub pool: PgPool,
     /// Limits.
     pub limits: Limits,
-    /// Gates, published by the server's budget monitor (§11.2) and read
-    /// once per batch.
+    /// Gates, published by the server's budget monitor and read once
+    /// per batch.
     pub gates: Arc<SharedGates>,
     /// Counter sink (flushed by the caller's task).
     pub counters: Arc<CounterSink>,
@@ -105,7 +105,7 @@ struct SessionState {
 
 /// Whether an error is transient (retried forever, never a poison strike):
 /// connection loss, a restarting server, pool exhaustion, exhausted
-/// deadlock retries (§4.3: never count toward poisoned-event handling).
+/// deadlock retries (never count toward poisoned-event handling).
 pub fn is_transient(e: &StorageError) -> bool {
     match e {
         StorageError::DeadlockRetriesExhausted(_) => true,
@@ -265,8 +265,8 @@ impl Writer {
                 *session = Some(SessionState {
                     url,
                     protocol,
-                    // §6.5: every interval spent on v1 is a sync_unavailable
-                    // gap, opened at session start, closed when v2 takes over.
+                    // Every interval spent on v1 is a sync_unavailable gap,
+                    // opened at session start, closed when v2 takes over.
                     open_v1_gap: protocol == Protocol::V1,
                     close_v1_gap: protocol == Protocol::V2,
                 });
@@ -409,8 +409,8 @@ impl Writer {
             None => return,
         };
         let apply_secs = apply_started.elapsed().as_secs_f64();
-        // §6.4 (r17): an unknown DID becoming active is recorded only as a
-        // metric, under the `account` collection.
+        // An unknown DID becoming active is recorded only as a metric,
+        // under the `account` collection.
         if report.unknown_activations > 0 {
             metrics::counter!(m::EVENTS, "collection" => "account", "op" => "activate", "outcome" => "applied")
                 .increment(report.unknown_activations);
@@ -441,7 +441,7 @@ impl Writer {
         if live {
             metrics::gauge!(m::LAG).set(lag.max(0.0));
         }
-        // §7.4: purge accounts that became `deleted` (multi-transaction,
+        // Purge accounts that became `deleted` (multi-transaction,
         // after the status commit; resumed at start-up if interrupted).
         let purge_started = Instant::now();
         for did in &report.deleted_accounts {
@@ -511,10 +511,10 @@ impl Writer {
         }
     }
 
-    /// §6.2: failing batch retried; then events applied one by one; an
-    /// event failing 3 times alone is logged to `op_errors` and its DID
-    /// gets a `resync` debt and a tier-1 re-list. The batch's progress is
-    /// then persisted on its own.
+    /// Failing batch retried; then events applied one by one; an event
+    /// failing 3 times alone is logged to `op_errors` and its DID gets a
+    /// `resync` debt and a tier-1 re-list. The batch's progress is then
+    /// persisted on its own.
     async fn apply_or_poison(&self, events: &[InEvent], batch: Batch) -> Option<ApplyReport> {
         let first = match self.apply_resilient(&batch).await {
             Ok(r) => return Some(r),

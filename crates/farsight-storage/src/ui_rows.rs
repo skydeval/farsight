@@ -1,6 +1,7 @@
-//! Rows of the four UI sections that show a creation time (design §7.6,
-//! §8.6): incoming blocks, outgoing blocks, the listblocks on a list and a
-//! list's members, on the public and the admin pages alike.
+//! Rows of the four UI sections that show a creation time (see
+//! `docs/design/web-ui.md` and `docs/design/storage.md`): incoming
+//! blocks, outgoing blocks, the listblocks on a list and a list's
+//! members, on the public and the admin pages alike.
 //!
 //! Each section reads its rows here, in one of two orders:
 //!
@@ -16,7 +17,7 @@
 //!
 //! Columns and filters are the same in both orders. The API's queries
 //! ([`crate::queries`]) are not touched: their order is part of the stable
-//! contract (§12.1).
+//! contract.
 //!
 //! A fifth section, the lists naming an account ([`lists_naming`]), sorts
 //! by the same shown time — of the listitem naming the account — without
@@ -43,12 +44,12 @@ pub const SHOWN_TIME: &str = "COALESCE(LEAST(created_at, first_seen), '-infinity
 /// The same on the row alias the queries use.
 const SHOWN_B: &str = "COALESCE(LEAST(b.created_at, b.first_seen), '-infinity'::timestamptz)";
 
-/// SQL fragment: status codes hidden by default (§3.1, §7.4).
+/// SQL fragment: status codes hidden by default.
 const HIDDEN: &str = "(1, 2, 3, 4)";
 
 /// The statuses a table leaves out, as an SQL list: deactivated (1) and
 /// deleted (4) always; taken down (2) unless `takendown`; suspended (3)
-/// unless `suspended`. With neither, the API's hidden set (§3.1).
+/// unless `suspended`. With neither, the API's hidden set.
 pub fn hidden_statuses(suspended: bool, taken_down: bool) -> &'static str {
     match (suspended, taken_down) {
         (false, false) => HIDDEN,
@@ -58,7 +59,7 @@ pub fn hidden_statuses(suspended: bool, taken_down: bool) -> &'static str {
     }
 }
 
-/// Bytes one index entry is estimated at before a build (§7.6).
+/// Bytes one index entry is estimated at before a build.
 pub const ENTRY_BYTES: u64 = 62;
 
 /// Advisory lock key of the index build: one server process builds at a
@@ -292,7 +293,7 @@ impl Find {
 /// Which rows a page leaves out, in the query.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Filter<'a> {
-    /// Rows whose listed account has a hidden status (§3.1, §7.4).
+    /// Rows whose listed account has a hidden status.
     pub hide_inactive: bool,
     /// With `hide_inactive`: keep suspended accounts (a suspension is
     /// temporary; the public tables show them).
@@ -759,7 +760,7 @@ pub async fn lists_naming_listblocks(
 }
 
 /// The plan of the query [`rows`] runs, one line per plan node
-/// (`EXPLAIN (ANALYZE, COSTS OFF)`). The Phase B harness checks that each
+/// (`EXPLAIN (ANALYZE, COSTS OFF)`). The harness checks that each
 /// section's shown-time order runs on its index.
 #[cfg(feature = "harness")]
 pub async fn explain(

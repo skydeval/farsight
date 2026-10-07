@@ -1,9 +1,10 @@
-//! List-job lanes within `system:lists` (design §5.5): phase-1 checks and
-//! `list_fetch` runs share one deficit round-robin over admission keys
-//! (`list_sched_keys`) plus a shared fallback lane every waiting list is
-//! in. A list is served by whichever of its lanes reaches it first; within
-//! a lane the oldest admission goes first; a lane whose head's host has no
-//! capacity serves its next item whose host has, or yields its turn.
+//! List-job lanes within `system:lists` (see `docs/design/backfill.md`):
+//! phase-1 checks and `list_fetch` runs share one deficit round-robin over
+//! admission keys (`list_sched_keys`) plus a shared fallback lane every
+//! waiting list is in. A list is served by whichever of its lanes reaches
+//! it first; within a lane the oldest admission goes first; a lane whose
+//! head's host has no capacity serves its next item whose host has, or
+//! yields its turn.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 

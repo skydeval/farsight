@@ -24,7 +24,7 @@ pub struct RecordKeyError(pub String);
 
 /// A validated record key: 1-512 chars of `[A-Za-z0-9._:~-]`, not `.` or
 /// `..`. Ordering is bytewise, matching `COLLATE "C"` and the PDS's
-/// `listRecords` order used by range reconcile (design §5.2).
+/// `listRecords` order used by range reconcile.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RecordKey(String);
 

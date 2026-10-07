@@ -26,9 +26,9 @@ pub use record::{
 pub use tid::{Tid, TidError};
 
 /// The registrable domain (eTLD+1, Public Suffix List) of a hostname, used
-/// as the domain cap bucket and admission key (design §11.2). Falls back to
-/// the lowercased host itself when the PSL has no answer (e.g. a bare
-/// public suffix).
+/// as the domain cap bucket and admission key. Falls back to the
+/// lowercased host itself when the PSL has no answer (e.g. a bare public
+/// suffix).
 pub fn registrable_domain(host: &str) -> String {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     match psl::domain_str(&host) {

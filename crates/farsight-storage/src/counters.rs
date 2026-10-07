@@ -1,4 +1,5 @@
-//! Approximate counters (design §7.1): `stats_counters` and `host_usage`.
+//! Approximate counters (see `docs/design/storage.md`): `stats_counters`
+//! and `host_usage`.
 //!
 //! Apply transactions never touch these hot rows. Each transaction collects
 //! its deltas in a [`Deltas`]; only after the transaction **commits** are
@@ -19,7 +20,7 @@ use sqlx::PgPool;
 use crate::error::Result;
 use crate::keys::{CapKind, Limits};
 
-/// Flush period (design §7.1).
+/// Flush period.
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `stats_counters.name` values.
@@ -80,8 +81,8 @@ pub struct Deltas {
     pub stats: HashMap<&'static str, i64>,
     /// `host_usage` bucket → delta.
     pub hosts: HashMap<String, HostDelta>,
-    /// History rows written and skipped (§7.7); published as metrics when
-    /// the transaction's deltas reach the sink, never flushed to a table.
+    /// History rows written and skipped; published as metrics when the
+    /// transaction's deltas reach the sink, never flushed to a table.
     pub history: crate::history::Counts,
 }
 
@@ -123,7 +124,7 @@ pub struct FlushReport {
     /// (bucket, bits newly set).
     pub capped: Vec<(String, i16)>,
     /// (bucket, bits newly cleared) — the caller fires GO / sets
-    /// `refresh_requested` for lists waiting on them (§11.2 "Reopening").
+    /// `refresh_requested` for lists waiting on them.
     pub reopened: Vec<(String, i16)>,
 }
 

@@ -1,4 +1,4 @@
-//! Numbered pages of the public tables (design §8.6).
+//! Numbered pages of the public tables (see `docs/design/web-ui.md`).
 //!
 //! Every table holds [`PAGE_ROWS`](super::PAGE_ROWS) rows a page and ends
 //! with page controls: `← 1 2 3 4 5 … 21 →`. Each control is a plain

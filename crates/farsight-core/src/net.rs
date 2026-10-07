@@ -1,10 +1,11 @@
-//! Safe outbound HTTP client scaffolding (design §11.3).
+//! Safe outbound HTTP client scaffolding (see `docs/design/security.md`).
 //!
 //! Every request to an address learned from the network (DID documents,
 //! did:web hosts, handle domains, PDS endpoints, backlink results) goes
 //! through one client that requires `https` (except operator-allowlisted
 //! hosts), resolves DNS itself and refuses non-public addresses on every
-//! hop (max 3 redirects), and applies the size/time caps of §5.2.
+//! hop (max 3 redirects), and applies the size/time caps of the backfill
+//! jobs (see `docs/design/backfill.md`).
 //!
 //! [`OutboundClient`] is the contract (tests substitute a fake);
 //! [`SafeClient`] is the production implementation.
@@ -17,13 +18,13 @@ use url::Url;
 
 use crate::config::Config;
 
-/// Maximum redirects followed (§11.3).
+/// Maximum redirects followed.
 pub const MAX_REDIRECTS: u8 = 3;
 /// How long a connection is kept after its last request.
 pub const IDLE_CONNECTION: Duration = Duration::from_secs(10);
-/// Per-request timeout (§5.2 bounds).
+/// Per-request timeout.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Response body cap (§5.2 bounds).
+/// Response body cap.
 pub const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Settings for [`SafeClient`].
@@ -37,7 +38,7 @@ pub struct SafeClientConfig {
     pub timeout: Duration,
     /// Body size cap.
     pub max_body_bytes: u64,
-    /// `farsight/<version> (+https://<hostname>; <contact>)` (§5.3).
+    /// `farsight/<version> (+https://<hostname>; <contact>)`.
     pub user_agent: String,
 }
 
@@ -220,8 +221,8 @@ impl SafeClient {
         &self.config
     }
 
-    /// TXT records of `name` (e.g. `_atproto.<handle>`, design §8.6). A
-    /// missing name or record set is an empty list.
+    /// TXT records of `name` (e.g. `_atproto.<handle>`). A missing name
+    /// or record set is an empty list.
     pub async fn txt(&self, name: &str) -> Result<Vec<String>, OutboundError> {
         match self.dns.txt_lookup(name).await {
             Ok(r) => Ok(r
@@ -238,8 +239,8 @@ impl SafeClient {
         }
     }
 
-    /// The addresses `host` resolves to (cap buckets by address block,
-    /// §11.2). Resolution only; nothing is contacted.
+    /// The addresses `host` resolves to (cap buckets by address block).
+    /// Resolution only; nothing is contacted.
     pub async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, OutboundError> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![ip]);
@@ -447,8 +448,8 @@ fn v6_reason(a: Ipv6Addr) -> Option<&'static str> {
 
 /// Why an address must not be contacted, or `None` if it is public:
 /// loopback, private (RFC 1918, ULA), link-local (incl. 169.254.169.254),
-/// CGNAT, multicast, unspecified and reserved addresses are refused
-/// (§11.3), including IPv4 addresses embedded in IPv6 forms.
+/// CGNAT, multicast, unspecified and reserved addresses are refused,
+/// including IPv4 addresses embedded in IPv6 forms.
 pub fn blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(a) => v4_reason(a),

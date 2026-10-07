@@ -1,9 +1,9 @@
-//! The setup token (design §8.3): 128 bits from the OS CSPRNG, shown as
-//! `fst-XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX` (Crockford base32, case-insensitive,
-//! hyphens ignored), stored with its creation time in
+//! The setup token (see `docs/design/web-ui.md`): 128 bits from the OS
+//! CSPRNG, shown as `fst-XXXXX-XXXXX-XXXXX-XXXXX-XXXXXX` (Crockford base32,
+//! case-insensitive, hyphens ignored), stored with its creation time in
 //! `/etc/farsight/.setup-token` (0600), preserved across restarts while
-//! unexpired, expiring after 24 h unless a verified setup session was
-//! active in the last hour (then postponed, at most 72 h after creation).
+//! unexpired, expiring after 24 h unless a verified setup session was active
+//! in the last hour (then postponed, at most 72 h after creation).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -113,7 +113,7 @@ pub fn delete(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Prints the token (the only secret Farsight logs, §8.3).
+/// Prints the token (the only secret Farsight logs).
 pub fn print(t: &SetupToken) {
     tracing::warn!(
         setup_token = %t.token,

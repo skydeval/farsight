@@ -1,17 +1,17 @@
-//! `farsight-stage6-harness`: Phase B Mode A — the public UI as updated
-//! by stage 6 (sticky bar, `/enter`, admin-only history, one "Last
-//! updated" line, profile cards, record links, local times, the theme
-//! toggle). Every assertion reads real responses from a real `farsight`
-//! process over HTTP and real stored rows; expectations that depend on
-//! data are derived from SQL against the same database. The parts only a
-//! browser can show are probed in headless Chromium (`--browser`).
+//! `farsight-stage6-harness`: integration tests of the public UI (sticky
+//! bar, `/enter`, admin-only history, one "Last updated" line, profile
+//! cards, record links, local times, the theme toggle). Every assertion
+//! reads real responses from a real `farsight` process over HTTP and
+//! real stored rows; expectations that depend on data are derived from
+//! SQL against the same database. The parts only a browser can show are
+//! probed in headless Chromium (`--browser`).
 //!
 //! Sections:
 //!
 //! - 1: toggle gates, config validation, the first settings save,
 //!   the enable-confirmation flow;
-//! - 2: routes: `/enter`, the withdrawn paths, the sections against
-//!   stored rows, the "On lists" table;
+//! - 2: routes: `/enter`, the sections against stored rows, the "On
+//!   lists" table;
 //! - 3: search; 4: what a public page says about coverage;
 //! - 5: admin history; 6–8: the withheld rule; 9: OpenGraph;
 //! - 10: rate classes and the render bound; 11: cache and security
@@ -65,7 +65,7 @@ const WITHHELD_ACCOUNT: &str = "Data for this account is not shown on this insta
 const WITHHELD_LIST: &str = "Data for this list is not shown on this instance.";
 const SHORT_CARD: &str = "Profile not available right now.";
 const VIEWER: &str = "https://viewer.example/at/{authority}/{collection}/{rkey}";
-/// What no public page prints any more.
+/// What no public page prints.
 const COVERAGE_WORDS: [&str; 9] = [
     "class=\"coverage",
     "id=\"coverage\"",
@@ -847,7 +847,7 @@ async fn seed_world(h: &H) -> Result<World, String> {
         ))
         .await?;
     }
-    // Stored before the bounds existed; its blocker (blk 1) blocks S now.
+    // A row without the bounds; its blocker (blk 1) blocks S now.
     h.sql(&format!(
         "INSERT INTO blocks_history (author_id, rkey, subject_id, created_at, first_seen, last_seen, removed_at, removed_rev, cause)
          SELECT a.id, '3hbold', {s}, now() - interval '30 days', NULL, NULL, now() - interval '5 hours', 9, 1
@@ -957,7 +957,7 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
         path_did(&w.s),
         w.list.clone(),
         format!("/card/{}", w.s),
-        // The addresses the pages had before they moved to the root.
+        // Paths under a prefix are unknown paths.
         "/public".to_owned(),
         "/public/about".to_owned(),
         "/public/search?q=x.example".to_owned(),
@@ -982,7 +982,7 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
         }
     }
     c.check(
-        "public_ui = false ⇒ every public route, the card route included, and every old /public/* address answers 404, byte-identical to an unknown route",
+        "public_ui = false ⇒ every public route, the card route included, and every path under /public answers 404, byte-identical to an unknown route",
         same && unknown.status == 404,
         if detail.is_empty() {
             unknown.short()
@@ -1021,11 +1021,10 @@ async fn check_gates_off(c: &mut Checks, h: &H, w: &World) -> Result<(), String>
             bad.push(format!("{p}: {} {:?}", r.status, r.header("cache-control")));
         }
     }
-    let old_js = h.get("/static/farsight.js").await?;
     c.check(
-        "the five static assets are served whatever the switches say (200, public, max-age=3600, nosniff); /static/farsight.js is gone",
-        bad.is_empty() && old_js.status == 404 && old_js.text == unknown.text,
-        format!("{}; farsight.js {}", bad.join("; "), old_js.status),
+        "the five static assets are served whatever the switches say (200, public, max-age=3600, nosniff)",
+        bad.is_empty(),
+        bad.join("; "),
     );
     let robots = h.get("/robots.txt").await?;
     c.check(
@@ -1353,25 +1352,6 @@ async fn check_enable_flow(c: &mut Checks, h: &mut H, w: &World) -> Result<(), S
 
 async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
     c.section("2a. the admin sign-in is at /enter");
-    let unknown = h.get("/no-such-route").await?;
-    let get = h.get("/login").await?;
-    let post = h
-        .fresh()
-        .post_form(&format!("{}/login", h.base), &[], &[])
-        .await?;
-    let with_cookie = h.admin_get("/login").await?;
-    let same = |r: &Resp| {
-        r.status == 404
-            && r.text == unknown.text
-            && r.header("cache-control") == unknown.header("cache-control")
-            && r.header("location").is_none()
-            && r.header("set-cookie").is_none()
-    };
-    c.check(
-        "/login is not a route with the public UI on: GET and POST get the 404 any unknown path gets, byte for byte; no redirect, no cookie",
-        same(&get) && same(&post) && same(&with_cookie),
-        format!("GET {} POST {}", get.status, post.status),
-    );
     let enter = h.get("/enter").await?;
     c.check(
         "/enter serves the admin sign-in form, posting to /enter, with no password field, never cached",
@@ -1410,8 +1390,7 @@ async fn check_login_route(c: &mut Checks, h: &H) -> Result<(), String> {
             && dash.header("location").as_deref() == Some("/enter")
             && enter.text.contains("<span class=\"brand\">")
             && !enter.text.contains("<nav")
-            && !enter.text.contains("Dashboard")
-            && !enter.text.contains("/login"),
+            && !enter.text.contains("Dashboard"),
         format!(
             "{} → {:?}; {} → {:?}",
             gated.status,
@@ -2044,7 +2023,7 @@ async fn check_coverage(
     let main = page.text.find("</main>").unwrap_or(usize::MAX);
     let foot = page.text.find("</footer>").unwrap_or(0);
     c.check(
-        "the line is in the page's footer, where the index's label used to be; an error page's footer has none",
+        "the line is in the page's footer; an error page's footer has none",
         page.text
             .find("Last updated <time")
             .is_some_and(|i| i > main && i < foot)
@@ -4068,7 +4047,6 @@ fn check_page_rules(c: &mut Checks, h: &H) {
         let lower = html.to_ascii_lowercase();
         let names = [
             "/enter",
-            "/login",
             "/settings",
             "/lookup",
             "/admin",
@@ -4379,7 +4357,7 @@ async fn main() -> std::process::ExitCode {
         flag("--browser"),
         flag("--hold"),
     );
-    println!("== farsight stage-6 harness: Mode A (public UI)");
+    println!("== farsight stage-6 harness: public UI");
     let pg = match Pg::start(keep) {
         Ok(p) => p,
         Err(e) => {

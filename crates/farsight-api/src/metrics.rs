@@ -1,4 +1,5 @@
-//! API metric names (design §13). The exporter is installed by the server.
+//! API metric names (see `docs/design/operations.md`). The exporter is
+//! installed by the server.
 
 /// `farsight_query_requests_total{endpoint,status}`.
 pub const QUERY_REQUESTS: &str = "farsight_query_requests_total";

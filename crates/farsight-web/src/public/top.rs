@@ -1,4 +1,5 @@
-//! The task that counts the home page's top lists (design §8.6).
+//! The task that counts the home page's top lists (see
+//! `docs/design/web-ui.md`).
 //!
 //! It runs while the server does. Once a day, at 05:00 EST, the lists
 //! that `public_ui.show_top_blockers` / `show_top_blocked` ask for are

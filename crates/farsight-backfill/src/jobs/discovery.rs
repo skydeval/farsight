@@ -1,9 +1,10 @@
-//! Subject discovery (design §5.6): with `backfill.backlinks.url` set, find
-//! who blocks X through a backlink index — (a) blocks with `.subject = X`,
-//! (b) listitems with `.subject = X` in their list owner's repo, (c)
-//! listblocks on every list from (b) — verify every reference with
-//! `getRecord` at its author's PDS and apply it with `W = 0`, charged to
-//! the requester. Only an untruncated completion confirms subject coverage.
+//! Subject discovery (see `docs/design/backfill.md`): with
+//! `backfill.backlinks.url` set, find who blocks X through a backlink index
+//! — (a) blocks with `.subject = X`, (b) listitems with `.subject = X` in
+//! their list owner's repo, (c) listblocks on every list from (b) — verify
+//! every reference with `getRecord` at its author's PDS and apply it with
+//! `W = 0`, charged to the requester. Only an untruncated completion
+//! confirms subject coverage.
 
 use chrono::{DateTime, Utc};
 use farsight_core::record::parse_record;
@@ -110,7 +111,7 @@ impl Run<'_> {
             return Ok(());
         }
         let limits = self.ctx.limits();
-        // Admin-requested work continues under the budget (§11.2).
+        // Admin-requested work continues under the budget.
         let mut gates = self.ctx.gates.load();
         if self.requester == "admin" {
             gates.budget_refusing = false;
@@ -163,7 +164,7 @@ async fn run_inner(ctx: &Ctx, x: &Did, requester: &str, cost: &mut u64) -> Resul
     }
     let pool = &ctx.pool;
     let x_id = jobs::intern(ctx, x).await.map_err(|e| e.to_string())?;
-    // The coverage point: clock(started_at) − lag_allowance (§3.7.1).
+    // The coverage point: clock(started_at) − lag_allowance.
     let started: DateTime<Utc> = jobs::db_now(pool).await.map_err(|e| e.to_string())?;
     let point = farsight_storage::firehose::clock(pool, started)
         .await
@@ -219,8 +220,8 @@ async fn run_inner(ctx: &Ctx, x: &Did, requester: &str, cost: &mut u64) -> Resul
         }
     }
     run.flush().await?;
-    // Every list found naming X, whatever its state (§5.6); a list without
-    // a row is interned as a placeholder charged to the requester.
+    // Every list found naming X, whatever its state; a list without a
+    // row is interned as a placeholder charged to the requester.
     for list in &lists {
         record_subject_list(ctx, x_id, list, requester).await?;
     }

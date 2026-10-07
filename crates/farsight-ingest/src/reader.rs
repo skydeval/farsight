@@ -1,8 +1,8 @@
-//! The reader task (§6.1, §6.3): connects to the configured instances,
-//! detects the protocol, resumes from the persisted cursor, enforces the
-//! stall timeout, records resume gaps, fails over between instances, and
-//! feeds the bounded channel (a full channel stops reading: TCP
-//! backpressure).
+//! The reader task (see `docs/design/firehose.md`): connects to the
+//! configured instances, detects the protocol, resumes from the
+//! persisted cursor, enforces the stall timeout, records resume gaps,
+//! fails over between instances, and feeds the bounded channel (a full
+//! channel stops reading: TCP backpressure).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -24,13 +24,12 @@ use crate::writer::Item;
 /// Consecutive failed sessions on one instance before failing over.
 pub const FAILOVER_AFTER: u32 = 3;
 
-/// Seam repair settings (§6.3, `firehose.tuning.seam_repair_*`). Public
-/// instances were observed (stage-2 Phase B) to drop events witnessed
-/// within about a second of a cursor resume — at the hand-over from replay
-/// to the live tail — while a later replay of the same window returns them.
-/// The repair re-reads the window from the session's connect to the moment
-/// it caught up to live, never the whole resumed range (after a long rewind
-/// that would be hours of events).
+/// Seam repair settings (`firehose.tuning.seam_repair_*`). Public instances
+/// were observed to drop events witnessed within about a second of a cursor
+/// resume — at the hand-over from replay to the live tail — while a later
+/// replay of the same window returns them. The repair re-reads the window
+/// from the session's connect to the moment it caught up to live, never the
+/// whole resumed range (after a long rewind that would be hours of events).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeamRepair {
     /// Window start, before the connect (`seam_repair_before`).
@@ -86,7 +85,7 @@ pub struct ReaderConfig {
     pub stall_timeout: Duration,
     /// Request zstd frames.
     pub compress: bool,
-    /// Seam repair (§6.3).
+    /// Seam repair.
     pub seam: SeamRepair,
 }
 
@@ -148,9 +147,9 @@ impl Reader {
         wait.await.is_ok()
     }
 
-    /// The resume inputs for instance `url` (§6.2, r17.2): that instance's
-    /// own cursor from `firehose_cursors` if it has one — so a failback
-    /// resumes exactly where the instance left off — with the global
+    /// The resume inputs for instance `url`: that instance's own cursor
+    /// from `firehose_cursors` if it has one — so a failback resumes
+    /// exactly where the instance left off — with the global
     /// running-max `applied_through` as the gap reference. An instance
     /// without a cursor is planned as a failover (timestamp rewind).
     async fn persisted(&self, url: &str) -> Persisted {
@@ -217,7 +216,7 @@ impl Reader {
                     compress = false;
                 }
                 Err(ConnectError::CursorTooOld(msg)) => {
-                    // §6.3: gap [applied_through, first live event], resume
+                    // Gap [applied_through, first live event], resume
                     // at the live tail.
                     tracing::warn!(url, %msg, "CursorTooOld; resuming at the live tail");
                     metrics::counter!(m::RECONNECTS, "reason" => "cursor_too_old").increment(1);
@@ -248,8 +247,8 @@ impl Reader {
         let mut backoff = Duration::from_millis(500);
         loop {
             // Drain the pipeline so the persisted cursor reflects every
-            // event already read (§6.2: a dropped connection reconnects
-            // from the persisted cursor).
+            // event already read (a dropped connection reconnects from
+            // the persisted cursor).
             if !self.barrier().await {
                 return;
             }
@@ -258,7 +257,7 @@ impl Reader {
                 let t = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(us)
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
                 // Both the session copy and every instance's own cursor
-                // (r17.2: resumes read firehose_cursors).
+                // (resumes read firehose_cursors).
                 let r = sqlx::query(
                     "UPDATE firehose_state SET cursor_us = $1, applied_through = $2,
                        cursor_seq = CASE WHEN protocol = 2 THEN 1 ELSE cursor_seq END
@@ -369,7 +368,7 @@ impl Reader {
     /// seam_repair_after]` once, `seam_repair_delay` after catching up,
     /// through `apply` without position state (LWW makes the duplicates
     /// stale no-ops), to recover events the instance dropped at the
-    /// replay-to-live seam (§6.3, r17.3).
+    /// replay-to-live seam.
     fn spawn_seam_repair(
         &mut self,
         url: &str,
@@ -463,7 +462,7 @@ impl Reader {
         let mut since_gauge = 0u32;
         // The seam is where the replay hands over to the live tail: when
         // the session catches up, which for a long replay is long after the
-        // resume. The repair is anchored there (§6.3).
+        // resume. The repair is anchored there.
         let connect_us = chrono::Utc::now().timestamp_micros();
         let mut seam_trigger: Option<&'static str> = None;
         // Stream position of the last delivered event: injected events are
@@ -532,7 +531,7 @@ impl Reader {
                     clamped_notice,
                     &self.cfg.tuning,
                 );
-                // §6.3: after any resume with a prior position (skipped only
+                // After any resume with a prior position (skipped only
                 // on the first-ever start).
                 if prior {
                     seam_trigger = Some(if gap.is_some() {

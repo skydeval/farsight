@@ -1,5 +1,5 @@
 //! Streams 1–3: LWW ordering, refusal tombstones at `E − 1`, and the
-//! §4.5 "a refused listitem is never lost" race.
+//! "a refused listitem is never lost" race.
 
 use chrono::Utc;
 use farsight_core::Collection;
@@ -97,13 +97,12 @@ pub async fn s1_lww(env: &mut Env, c: &mut Checks) -> Result<()> {
     Ok(())
 }
 
-/// Stream 2: pass-14 LB — refusal tombstone at `E − 1`.
+/// Stream 2: refusal tombstone at `E − 1`.
 pub async fn s2_refusal_tombstone(env: &mut Env, c: &mut Checks) -> Result<()> {
-    // (0) The kickoff's suggested trigger: saturate blocks_per_author. Under
-    // §4.2 a subject-changing update is a delete plus an insert, so it is
-    // count-neutral and the per-author cap cannot refuse it. Recorded here
-    // so the report can say why the refusal below is provoked by the
-    // intern rate instead.
+    // (0) Saturating blocks_per_author does not refuse an update: a
+    // subject-changing update is a delete plus an insert, so it is
+    // count-neutral and the per-author cap cannot refuse it. That is why
+    // the refusal below is provoked by the intern rate instead.
     let b = plc("capauthor", 1);
     env.limits.cfg.blocks_per_author = 1;
     env.firehose(vec![block(&b, "k1", &plc("capsubj", 1), rev(10))])
@@ -120,7 +119,7 @@ pub async fn s2_refusal_tombstone(env: &mut Env, c: &mut Checks) -> Result<()> {
         .firehose(vec![block(&b, "k1", &plc("capsubj", 3), rev(12))])
         .await?;
     c.eq(
-        "blocks_per_author saturated: subject-changing update is applied (count-neutral, §4.2)",
+        "blocks_per_author saturated: subject-changing update is applied (count-neutral)",
         (r.applied, r.refused, r.refusal_tombstones),
         (1, 0, 0),
     );
@@ -279,8 +278,8 @@ async fn item_count_consistent(env: &Env, c: &mut Checks, what: &str, list_id: i
     Ok(())
 }
 
-/// Stream 3: §4.5 — a listitem refused before its list is admitted is
-/// recovered by the admission's run; one processed after the flip applies.
+/// Stream 3: a listitem refused before its list is admitted is recovered
+/// by the admission's run; one processed after the flip applies.
 pub async fn s3_refused_item(env: &mut Env, c: &mut Checks) -> Result<()> {
     let o = plc("raceowner", 1);
     let b = plc("raceblocker", 1);
@@ -346,9 +345,9 @@ pub async fn s3_refused_item(env: &mut Env, c: &mut Checks) -> Result<()> {
     let m = env.list_id(&o, "M").await?.unwrap_or(-1);
     item_count_consistent(env, c, "order 2", m).await?;
 
-    // Order 3 (§4.5 amended by r15): I moved into untracked N by an update
-    // at E is refused with a tombstone at E − 1; the later admission's
-    // run (stamp R ≥ E) applies it, an older stamp does not.
+    // Order 3: I moved into untracked N by an update at E is refused
+    // with a tombstone at E − 1; the later admission's run (stamp R ≥
+    // E) applies it, an older stamp does not.
     env.firehose(vec![listblock(&b, "lb3", &o, "N0", rev(90))])
         .await?;
     env.firehose(vec![item(&o, "i3", "N0", &x, rev(91))])

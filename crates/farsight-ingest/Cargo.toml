@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [features]
-# Builds the stage-2 Phase B harness binary and the fault-injection hooks
+# Builds the ingest harness binary and the fault-injection hooks
 # it drives. Off by default so release builds contain neither.
 harness = ["farsight-storage/harness", "dep:tracing-subscriber"]
 

@@ -1,7 +1,8 @@
-//! The in-memory global coverage snapshot (design §3.7.1): refreshed on
-//! `NOTIFY farsight_coverage`, every 10 s, and on every LISTEN reconnect,
-//! each time with one `REPEATABLE READ` transaction, so a lost
-//! notification can only delay, never falsify.
+//! The in-memory global coverage snapshot (see
+//! `docs/design/coverage.md`): refreshed on `NOTIFY farsight_coverage`,
+//! every 10 s, and on every LISTEN reconnect, each time with one
+//! `REPEATABLE READ` transaction, so a lost notification can only delay,
+//! never falsify.
 
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -108,7 +109,7 @@ pub async fn run_refresher(
                 continue;
             }
         };
-        // Every (re)connect: a full refresh (§3.7.1).
+        // Every (re)connect: a full refresh.
         if let Err(e) = holder.refresh(&pool, &limits()).await {
             tracing::warn!(error = %e, "snapshot refresh failed");
         }

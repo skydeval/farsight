@@ -1,6 +1,6 @@
-//! The home page's top lists (design §8.6): the accounts that block the
-//! most and that are blocked the most, for the last day and for all
-//! time.
+//! The home page's top lists (see `docs/design/web-ui.md`): the
+//! accounts that block the most and that are blocked the most, for the
+//! last day and for all time.
 //!
 //! None of these can be counted while a page is served: ranking every
 //! subject of `blocks` reads the whole table. A day runs from 05:00 EST

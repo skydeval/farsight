@@ -1,4 +1,4 @@
-//! `/health` and `/livez` (design §9.5, D9).
+//! `/health` and `/livez` (see `docs/design/operations.md`).
 
 use std::time::Duration;
 

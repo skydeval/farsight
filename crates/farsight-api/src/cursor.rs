@@ -1,4 +1,4 @@
-//! Opaque keyset cursors (design §3.1). Contents are unstable (§12.1):
+//! Opaque keyset cursors (see `docs/design/api.md`). Contents are unstable:
 //! base64url of a small JSON array holding the last returned sort key.
 
 use base64::Engine;
@@ -79,10 +79,10 @@ pub fn micros_id(cursor: Option<&str>) -> Result<Option<(i64, i64)>, XrpcError> 
     }
 }
 
-/// First element of a cursor of a UI section's shown-time order (design
-/// §8.6). Without the tag such a cursor, `[time, rkey]`, and one of the
-/// order the section had before, `[id, rkey]`, are both an integer and a
-/// text, and the old one would be read as a time.
+/// First element of a cursor of a UI section's shown-time order. Without
+/// the tag such a cursor, `[time, rkey]`, and one of the section's id
+/// order, `[id, rkey]`, are both an integer and a text, and the latter
+/// would be read as a time.
 pub const SHOWN_TAG: &str = "t";
 
 fn shown_time(v: &Value) -> Result<Option<i64>, XrpcError> {

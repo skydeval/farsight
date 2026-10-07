@@ -417,8 +417,8 @@ impl Http {
 pub const ADMIN_DID: &str = "did:plc:harnessadminaaaaaaaaaaaa";
 
 /// Creates an admin session for `did` the way a completed sign-in does
-/// (the row is keyed by the cookie value and the DID, design §7.1) and
-/// returns the `Cookie` header value for it.
+/// (the row is keyed by the cookie value and the DID) and returns the
+/// `Cookie` header value for it.
 pub async fn admin_session(pool: &PgPool, did: &str) -> Result<String, String> {
     let raw = farsight_web::common::random_id();
     farsight_storage::auth::create_session(

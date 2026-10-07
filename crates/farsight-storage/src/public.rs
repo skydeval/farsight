@@ -1,13 +1,14 @@
 //! Read-only queries behind the public UI and the admin history pages
-//! (design §7.7, §7.8, §8.6): removed blocks, listblocks and list
-//! memberships, bounded counts and recording windows. The rows of the live
-//! sections are read in [`crate::ui_rows`].
+//! (see `docs/design/history.md` and `docs/design/web-ui.md`): removed
+//! blocks, listblocks and list memberships, bounded counts and recording
+//! windows. The rows of the live sections are read in [`crate::ui_rows`].
 //!
 //! Two filters are part of every query here and run at query time, so a
 //! status change or a settings change shows on the next page view:
 //!
-//! - **hidden status** (§3.1, §7.4): rows whose relevant account — the
-//!   author, the list owner or the subject, whichever the page lists — is
+//! - **hidden status** (see `docs/design/api.md` and
+//!   `docs/design/storage.md`): rows whose relevant account — the author,
+//!   the list owner or the subject, whichever the page lists — is
 //!   `deactivated`, `takendown`, `suspended` or `deleted` are left out.
 //!   For `deleted` accounts this filter, not the purge, is the guarantee.
 //! - **operator exclusion**: rows whose relevant account is in `excluded`
@@ -20,7 +21,7 @@
 //! the six history indexes, which all end in `id`.
 //!
 //! All functions take a connection so the caller can run them inside one
-//! read transaction with `statement_timeout` set (§3.6).
+//! read transaction with `statement_timeout` set.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
@@ -28,7 +29,7 @@ use sqlx::PgConnection;
 use crate::codes::TrackState;
 use crate::error::Result;
 
-/// SQL fragment: status codes hidden by default (§3.1, §7.4).
+/// SQL fragment: status codes hidden by default.
 const HIDDEN: &str = "(1, 2, 3, 4)";
 
 /// Position in a history section: the last row returned.
@@ -287,7 +288,7 @@ fn list_rows(rows: Vec<ListRow>) -> Vec<Removed> {
     rows.into_iter()
         .map(|r| {
             // `purging` reads as `pending` when it will be re-admitted,
-            // else `untracked`, as `getListMembers` reports it (§3.2).
+            // else `untracked`, as `getListMembers` reports it.
             let state = r.13.and_then(TrackState::from_code).map(|s| match s {
                 TrackState::Purging => {
                     if r.14 == Some(TrackState::Untracked.code()) && r.15.unwrap_or(0) > 0 {
@@ -306,7 +307,7 @@ fn list_rows(rows: Vec<ListRow>) -> Vec<Removed> {
                     owner_did: r.2,
                     rkey: r.3,
                     name: r.10,
-                    // A deleted list has no purpose (§7.4).
+                    // A deleted list has no purpose.
                     purpose: if r.12 == Some(1) { r.11 } else { None },
                     state,
                 }),
@@ -324,7 +325,7 @@ fn list_rows(rows: Vec<ListRow>) -> Vec<Removed> {
 /// Removed listblocks authored by `author_id`, newest removal first
 /// (`list_blocks_history_by_author`). Each row names the list; rows whose
 /// list owner is hidden or excluded are left out. `lists` is outer-joined:
-/// the row can be missing (§11.2).
+/// the row can be missing.
 pub async fn list_blocks_history_by_author(
     conn: &mut PgConnection,
     author_id: i64,
@@ -347,8 +348,8 @@ pub async fn list_blocks_history_by_author(
 
 /// Removed list memberships naming `subject_id`, newest removal first
 /// (`list_items_history_by_subject`). Each row names the list; rows whose
-/// list owner is hidden or excluded are left out. `lists` is outer-joined
-/// (§7.8). `live`: the list has a live listitem naming the subject now.
+/// list owner is hidden or excluded are left out. `lists` is outer-joined.
+/// `live`: the list has a live listitem naming the subject now.
 pub async fn list_items_history_by_subject(
     conn: &mut PgConnection,
     subject_id: i64,
@@ -490,8 +491,8 @@ pub async fn bounded_count_hiding(
     .await?)
 }
 
-/// The recording windows (§7.7), oldest first: (from, to); `to` is `None`
-/// for the open one.
+/// The recording windows, oldest first: (from, to); `to` is `None` for
+/// the open one.
 pub async fn history_windows(
     conn: &mut PgConnection,
 ) -> Result<Vec<(DateTime<Utc>, Option<DateTime<Utc>>)>> {

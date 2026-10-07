@@ -23,7 +23,7 @@ pub struct Ctx {
     pub resolver: Resolver,
     /// Approximate counters of backfill's writes (shard 2).
     pub counters: Arc<CounterSink>,
-    /// Gates from backfill's own budget monitor (§11.2).
+    /// Gates from backfill's own budget monitor.
     pub gates: SharedGates,
     /// The last gate state (sweep pause at ≥ 90%).
     pub gate_state: Mutex<GateState>,
@@ -79,7 +79,7 @@ impl Ctx {
         Limits::from_config(&self.cfg())
     }
 
-    /// Whether the sweep must pause for storage (≥ 90% of budget, §11.2).
+    /// Whether the sweep must pause for storage (≥ 90% of budget).
     pub fn sweep_paused_by_storage(&self) -> bool {
         self.gate_state
             .lock()

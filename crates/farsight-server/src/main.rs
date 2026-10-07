@@ -1,8 +1,9 @@
-//! `farsight`: the composition root (design §2.1, §8.2). Decides setup
-//! vs normal mode at start-up, serves the setup wizard or ingest + API +
-//! UI, and switches between the two in-process (setup → normal when the
-//! wizard finishes, normal → setup on a config reset), independent of the
-//! container's restart policy.
+//! `farsight`: the composition root (see `docs/design/README.md` and
+//! `docs/design/web-ui.md`). Decides setup vs normal mode at start-up,
+//! serves the setup wizard or ingest + API + UI, and switches between the
+//! two in-process (setup → normal when the wizard finishes, normal →
+//! setup on a config reset), independent of the container's restart
+//! policy.
 //!
 //! `farsight setup-token [--rotate]` prints (or replaces) the setup token.
 //! `farsight set-admin-did <did> [--force]` sets the admin account in
@@ -30,8 +31,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `FARSIGHT__` key: it locates the file rather than setting a key in it.
 pub const CONFIG_PATH_ENV: &str = "FARSIGHT_CONFIG";
 
-/// Restricts the setup listener (§8.3), e.g. `127.0.0.1` or
-/// `127.0.0.1:8080`.
+/// Restricts the setup listener, e.g. `127.0.0.1` or `127.0.0.1:8080`.
 pub const SETUP_BIND_ENV: &str = "FARSIGHT_SETUP_BIND";
 
 /// How a mode ended.
@@ -53,7 +53,7 @@ fn init_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn,hyper=warn"));
-    // Structured JSON logs (§13).
+    // Structured JSON logs.
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(filter)
@@ -136,10 +136,10 @@ fn admin_did_command() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `farsight set-admin-did <did> [--force]` (design §8.6): the way to
-/// change the admin account, and the recovery when the account is lost or
-/// was mistyped. Edits `config.toml` only; the running server does not
-/// re-read the file, so the change applies at its next start.
+/// `farsight set-admin-did <did> [--force]`: the way to change the admin
+/// account, and the recovery when the account is lost or was mistyped.
+/// Edits `config.toml` only; the running server does not re-read the
+/// file, so the change applies at its next start.
 fn set_admin_did_command(args: &[String]) -> ExitCode {
     let force = args.iter().any(|a| a == "--force");
     let dids: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
@@ -283,7 +283,7 @@ async fn run() -> ExitCode {
     let metrics = metrics_http::install();
     loop {
         // An unparseable or invalid config exits non-zero and is never
-        // rewritten (§8.2).
+        // rewritten.
         let mode = match config::load(&path, &env) {
             Ok(m) => m,
             Err(e) => {

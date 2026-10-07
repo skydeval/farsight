@@ -1,7 +1,7 @@
-//! Setup mode (design §8.2–§8.3): `/setup/*`, `/livez`, `/health` (503
-//! setup body) and static assets; `/xrpc/*` ⇒ `503 SetupRequired`. No
-//! database, no firehose. Ends when the wizard writes `config.toml` or the
-//! process is asked to stop.
+//! Setup mode (see `docs/design/web-ui.md`): `/setup/*`, `/livez`,
+//! `/health` (503 setup body) and static assets; `/xrpc/*` ⇒ `503
+//! SetupRequired`. No database, no firehose. Ends when the wizard writes
+//! `config.toml` or the process is asked to stop.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -50,8 +50,8 @@ pub async fn run(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<ModeEnd, String> {
     let (state, mut completed) = farsight_web::SetupState::new(config_path, env.clone(), VERSION);
-    // Print the token on every setup-mode boot (§8.3), creating or
-    // rotating it as needed.
+    // Print the token on every setup-mode boot, creating or rotating it
+    // as needed.
     let (token, rotated) = state.check_token().map_err(|e| {
         format!(
             "cannot write the setup token next to the config ({}): {e}",

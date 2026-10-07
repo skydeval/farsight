@@ -1,5 +1,6 @@
-//! List job phase 1 — record check and gate (design §5.5), once per
-//! admission epoch, plus the `missing` re-checks.
+//! List job phase 1 — record check and gate (see
+//! `docs/design/backfill.md`), once per admission epoch, plus the
+//! `missing` re-checks.
 
 use chrono::{DateTime, Utc};
 use farsight_core::record::parse_record;
@@ -14,9 +15,9 @@ use crate::jobs::{self, JobResult, Outcome};
 use crate::resolve::ResolveError;
 use crate::xrpc;
 
-/// Weekly retry after the short schedules are exhausted (§5.5).
+/// Weekly retry after the short schedules are exhausted.
 pub const WEEKLY: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
-/// Requester of list jobs (§5.3).
+/// Requester of list jobs.
 pub const SYSTEM_LISTS: &str = "system:lists";
 
 /// A waiting list as phase 1 sees it.
@@ -149,7 +150,7 @@ async fn run_inner(ctx: &Ctx, list_id: i64, cost: &mut u64) -> Result<Outcome, S
         .map_err(|e| err(&e))?
         .unwrap_or(l.admit_epoch);
     if epoch != l.admit_epoch {
-        // A newer admission replaced this job (§5.5: results apply only if
+        // A newer admission replaced this job (results apply only if
         // the epoch is still current).
         sqlx::query("UPDATE list_jobs SET admit_epoch = $2 WHERE list_id = $1")
             .bind(list_id)
@@ -158,7 +159,7 @@ async fn run_inner(ctx: &Ctx, list_id: i64, cost: &mut u64) -> Result<Outcome, S
             .await
             .map_err(|e| err(&e))?;
     }
-    // The owner's lease, only for the getRecord call (§5.5).
+    // The owner's lease, only for the getRecord call.
     if !jobs::acquire_lease(&ctx.pool, l.owner.as_str(), &ctx.lease_owner)
         .await
         .map_err(|e| err(&e))?
@@ -180,7 +181,7 @@ async fn run_inner(ctx: &Ctx, list_id: i64, cost: &mut u64) -> Result<Outcome, S
             {
                 return Ok(Outcome::Clean);
             }
-            // Host gate (§11.2): the owner's bucket over host_list_items.
+            // Host gate: the owner's bucket over host_list_items.
             let owner_mask: i16 = sqlx::query_scalar(
                 "SELECT COALESCE(bit_or(u.capped_mask), 0)::SMALLINT FROM host_usage u
                  WHERE u.bucket = ANY(
@@ -214,7 +215,7 @@ async fn run_inner(ctx: &Ctx, list_id: i64, cost: &mut u64) -> Result<Outcome, S
                 .map_err(|e| err(&e))?;
             if l.state != TrackState::Missing {
                 // Only OA (a new epoch) revives a list that went
-                // unavailable via OI at phase 1 (§5.5).
+                // unavailable via OI at phase 1.
                 sqlx::query("DELETE FROM list_jobs WHERE list_id = $1")
                     .bind(list_id)
                     .execute(&ctx.pool)
@@ -385,7 +386,7 @@ async fn record_check(ctx: &Ctx, l: &ListRow, cost: &mut u64) -> Check {
             }
             Ok(None) | Err(_) if !bypass => {
                 // Not-found is authoritative only from the owner's current
-                // PDS after a re-resolve (§5.5).
+                // PDS after a re-resolve.
                 bypass = true;
                 continue;
             }
@@ -449,7 +450,7 @@ async fn apply_record(ctx: &Ctx, l: &ListRow, value: &serde_json::Value) -> Resu
     Ok(report.refused == 0)
 }
 
-/// The §5.5 wall-clock bound: lists `pending` longer than
+/// The wall-clock bound: lists `pending` longer than
 /// `limits.pending_max_age` since admission (queue wait included) fire
 /// **FT** (→ `unavailable`, counted). Their `list_jobs` row and lanes are
 /// untouched, so they keep their place and are served in turn.

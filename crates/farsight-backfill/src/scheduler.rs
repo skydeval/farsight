@@ -1,8 +1,8 @@
-//! The scheduler (design §5.3): a worker pool of `backfill.concurrency`,
-//! three tiers whose shares are minimums (unused share flows to the
-//! others), cost-based deficit round-robin across tier-1 requesters charged
-//! in outbound requests, `high` before `normal` 4:1 within a requester, and
-//! the list-job lanes inside `system:lists`.
+//! The scheduler (see `docs/design/backfill.md`): a worker pool of
+//! `backfill.concurrency`, three tiers whose shares are minimums (unused
+//! share flows to the others), cost-based deficit round-robin across tier-1
+//! requesters charged in outbound requests, `high` before `normal` 4:1
+//! within a requester, and the list-job lanes inside `system:lists`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -17,11 +17,11 @@ use crate::jobs::{self, JobReq, JobResult, Outcome};
 use crate::lanes::{self, Item, Lanes};
 use crate::metrics as m;
 
-/// Requester of sweep members (§11.2: interning charged to `system:sweep`).
+/// Requester of sweep members (interning charged to `system:sweep`).
 pub const SYSTEM_SWEEP: &str = "system:sweep";
 /// Requester of repair-cycle members.
 pub const SYSTEM_REPAIR: &str = "system:repair";
-/// High-priority picks per normal pick within a requester (§5.3).
+/// High-priority picks per normal pick within a requester.
 pub const HIGH_PER_NORMAL: u32 = 4;
 
 /// Picks the tier to serve: among tiers with work, the one furthest below
@@ -61,7 +61,7 @@ pub fn pick_requester(charged: &mut HashMap<String, f64>, with_work: &[String]) 
 }
 
 /// Whether the next pick of a requester with both kinds waiting should be
-/// `high`: four highs, then one normal (§5.3).
+/// `high`: four highs, then one normal.
 pub fn want_high(streak: u32) -> bool {
     streak < HIGH_PER_NORMAL
 }
@@ -150,7 +150,7 @@ impl Scheduler {
         s.completions.len()
     }
 
-    /// Whether tier-3 dispatch is paused: storage ≥ 90% (§11.2).
+    /// Whether tier-3 dispatch is paused: storage ≥ 90%.
     fn tier3_paused(&self) -> bool {
         self.ctx.sweep_paused_by_storage()
     }
@@ -327,7 +327,7 @@ impl Scheduler {
             )
         };
         // Members are dispatched straight from cycle_outstanding (no
-        // actors row needed, D4); failed members retry via the queue.
+        // actors row needed); failed members retry via the queue.
         let row: Option<(String, i16)> = sqlx::query_as(
             "SELECT o.did, c.kind FROM cycle_outstanding o JOIN sweep_cycles c ON c.id = o.cycle_id
              WHERE o.state = 1 AND c.completed_at IS NULL AND o.did > $1 AND o.did <> ALL($2)
@@ -445,7 +445,7 @@ impl Scheduler {
         tokio::spawn(async move {
             let started = Instant::now();
             let (result, requester, lane) = me.execute(&work).await;
-            // §13: one line per job at the default level.
+            // One line per job at the default level.
             let (kind, subject) = match &work {
                 Work::Queue { kind, did, .. } => (
                     match kind {

@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [features]
-# Phase B hooks (a shorter sign-in flow lifetime from the environment). Off
+# Harness hooks (a shorter sign-in flow lifetime from the environment). Off
 # by default so release builds contain none.
 harness = []
 

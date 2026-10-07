@@ -1,11 +1,11 @@
-//! `farsight-stage1-harness`: Phase B verification for stage 1 (core +
-//! storage). Built only with `--features harness`.
+//! `farsight-stage1-harness`: integration tests of the core and storage
+//! crates. Built only with `--features harness`.
 //!
 //! Starts a throwaway Postgres 16 container (ephemeral named volume),
 //! creates one fresh, migrated database per stream, drives curated event
 //! streams through `farsight-storage::apply` and the janitor, and checks
-//! the design's invariants after each. Prints PASS / FAIL / UNVERIFIED per
-//! check and per stream, then a summary. Exit code 0 only if every check
+//! the invariants after each. Prints PASS / FAIL / UNVERIFIED per check
+//! and per stream, then a summary. Exit code 0 only if every check
 //! passed.
 //!
 //! ```text
@@ -62,17 +62,17 @@ fn streams() -> Vec<Stream> {
         },
         Stream {
             n: 2,
-            name: "refusal tombstone at E − 1 (pass-14 LB)",
+            name: "refusal tombstone at E − 1",
             run: stream!(streams_lww::s2_refusal_tombstone),
         },
         Stream {
             n: 3,
-            name: "refused listitem never lost (§4.5)",
+            name: "refused listitem never lost",
             run: stream!(streams_lww::s3_refused_item),
         },
         Stream {
             n: 4,
-            name: "transition table (§4.4, every cell)",
+            name: "transition table (every cell)",
             run: stream!(streams_table::s4_transition_table),
         },
         Stream {
@@ -107,7 +107,7 @@ fn streams() -> Vec<Stream> {
         },
         Stream {
             n: 11,
-            name: "per-instance cursors (r17.2)",
+            name: "per-instance cursors",
             run: stream!(streams_more::s11_instance_cursors),
         },
     ]

@@ -1,5 +1,5 @@
-//! Firehose progress, the witness clock and gaps (design §3.7.1, §6.2,
-//! §6.3, §6.5).
+//! Firehose progress, the witness clock and gaps (see
+//! `docs/design/firehose.md` and `docs/design/coverage.md`).
 //!
 //! - Each committed ingest batch persists its cursor and the running
 //!   maximum `applied_through`, and appends one `firehose_clock` row
@@ -72,8 +72,8 @@ impl Txn<'_> {
         .bind(applied)
         .execute(&mut *self.conn)
         .await?;
-        // The instance's own cursor (§6.2, r17.2): monotonic per source_url,
-        // kept across failovers so a failback resumes from it.
+        // The instance's own cursor: monotonic per source_url, kept
+        // across failovers so a failback resumes from it.
         sqlx::query(
             "INSERT INTO firehose_cursors (source_url, protocol, cursor_seq, cursor_us,
                                           last_applied_through)
@@ -96,7 +96,7 @@ impl Txn<'_> {
     }
 }
 
-/// One instance's persisted cursor (`firehose_cursors`, §6.2).
+/// One instance's persisted cursor (`firehose_cursors`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceCursor {
     /// The instance URL.
@@ -214,7 +214,7 @@ pub async fn read_state<'e>(ex: impl PgExecutor<'e>) -> Result<FirehoseState> {
 }
 
 /// Sets the connected flag (the ingest task calls this on connect and
-/// disconnect; disconnection is a synthetic gap for coverage, §6.3).
+/// disconnect; disconnection is a synthetic gap for coverage).
 pub async fn set_connected(pool: &PgPool, connected: bool) -> Result<()> {
     sqlx::query(
         "INSERT INTO firehose_state (id, connected) VALUES (1, $1)
@@ -229,7 +229,7 @@ pub async fn set_connected(pool: &PgPool, connected: bool) -> Result<()> {
     Ok(())
 }
 
-/// `clock(t)` (§3.7.1): `applied_through` of the latest clock row with
+/// `clock(t)`: `applied_through` of the latest clock row with
 /// `server_at ≤ t` (round down); `None` before the first batch.
 pub async fn clock<'e>(ex: impl PgExecutor<'e>, t: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
     Ok(sqlx::query_scalar(
@@ -242,7 +242,7 @@ pub async fn clock<'e>(ex: impl PgExecutor<'e>, t: DateTime<Utc>) -> Result<Opti
 }
 
 /// `clock(now)` using the database clock, for coverage points taken "at the
-/// start of the work" (§3.7.1: `t` is read from the database).
+/// start of the work" (`t` is read from the database).
 pub async fn clock_now<'e>(ex: impl PgExecutor<'e>) -> Result<Option<DateTime<Utc>>> {
     Ok(sqlx::query_scalar(
         "SELECT witness_at FROM firehose_clock WHERE server_at <= clock_timestamp()
@@ -303,7 +303,7 @@ async fn notify(pool: &PgPool) -> Result<()> {
 }
 
 /// Records a closed gap `[from, to]` (`CursorTooOld`, heuristic v1 gap,
-/// failover without a safe rewind; §6.3).
+/// failover without a safe rewind).
 pub async fn record_gap(
     pool: &PgPool,
     from: DateTime<Utc>,
@@ -322,7 +322,7 @@ pub async fn record_gap(
     Ok(id)
 }
 
-/// Opens the v1-interval gap when a v1 session starts (§6.5). Idempotent:
+/// Opens the v1-interval gap when a v1 session starts. Idempotent:
 /// returns the already-open `sync_unavailable` gap if there is one.
 pub async fn open_sync_unavailable(pool: &PgPool, from: DateTime<Utc>) -> Result<i64> {
     let mut tx = pool.begin().await?;
@@ -355,7 +355,7 @@ pub async fn open_sync_unavailable(pool: &PgPool, from: DateTime<Utc>) -> Result
     Ok(id)
 }
 
-/// Closes the open v1-interval gap when a v2 session takes over (§6.5).
+/// Closes the open v1-interval gap when a v2 session takes over.
 /// Returns the closed gap's id, if one was open.
 pub async fn close_sync_unavailable(pool: &PgPool, to: DateTime<Utc>) -> Result<Option<i64>> {
     let id: Option<i64> = sqlx::query_scalar(
@@ -369,8 +369,8 @@ pub async fn close_sync_unavailable(pool: &PgPool, to: DateTime<Utc>) -> Result<
     Ok(id)
 }
 
-/// Marks gaps healed by a completed repair cycle (§7.5 step 4). Only
-/// closed gaps can be healed.
+/// Marks gaps healed by a completed repair cycle. Only closed gaps can
+/// be healed.
 pub async fn heal_gaps(
     pool: &PgPool,
     ids: &[i64],

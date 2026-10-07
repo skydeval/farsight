@@ -1,4 +1,5 @@
-//! Numeric codes of the SMALLINT enum columns of design §7.1.
+//! Numeric codes of the SMALLINT enum columns (see
+//! `docs/design/storage.md`).
 
 macro_rules! code_enum {
     ($(#[$m:meta])* $name:ident { $($(#[$vm:meta])* $var:ident = $val:literal),+ $(,)? }) => {
@@ -24,7 +25,7 @@ macro_rules! code_enum {
 }
 
 code_enum! {
-    /// `lists.track_state` (design §4.1).
+    /// `lists.track_state`.
     TrackState {
         /// No counted listblock.
         Untracked = 0,
@@ -48,7 +49,7 @@ code_enum! {
 }
 
 impl TrackState {
-    /// "Tracked" (design §4.1): only these accept listitem writes.
+    /// "Tracked": only these accept listitem writes.
     pub fn is_tracked(self) -> bool {
         matches!(
             self,
@@ -60,7 +61,7 @@ impl TrackState {
     }
 
     /// States in which a list is "waiting" for phase 1 or a fetch run and so
-    /// has `list_sched_keys` lanes (design §5.5).
+    /// has `list_sched_keys` lanes.
     pub fn is_waiting(self) -> bool {
         matches!(
             self,
@@ -68,7 +69,7 @@ impl TrackState {
         )
     }
 
-    /// API name (design §3.2 `state`).
+    /// API name (the `state` field).
     pub fn api_name(self) -> &'static str {
         match self {
             TrackState::Untracked => "untracked",
@@ -99,21 +100,21 @@ code_enum! {
 code_enum! {
     /// `lists.deferred_by`: which gate deferred the list.
     DeferCause {
-        /// Storage budget ≥ 100% (§11.2).
+        /// Storage budget ≥ 100%.
         Budget = 1,
-        /// Hard ceiling (§11.2).
+        /// Hard ceiling.
         Ceiling = 2,
-        /// Owner bucket over `host_list_items` (§5.5 phase 1).
+        /// Owner bucket over `host_list_items` (phase 1 of a list job).
         HostCap = 3,
         /// Found record refused by `lists_per_author` / `host_lists`.
         ListsCap = 4,
-        /// Owner re-admission budget (§4.4).
+        /// Owner re-admission budget.
         OwnerReadmissions = 5,
     }
 }
 
 code_enum! {
-    /// `relist_debt.reason` (§3.7.3).
+    /// `relist_debt.reason`.
     DebtReason {
         /// Terminal failure or reconcile skipped.
         Unreachable = 1,
@@ -128,7 +129,7 @@ code_enum! {
 
 code_enum! {
     /// `relist_debt.cap_type`: which cap or rate caused a `capped` /
-    /// `refused` debt (the feeder waits on it, §3.7.3).
+    /// `refused` debt (the feeder waits on it).
     CapType {
         /// `limits.blocks_per_author`.
         BlocksPerAuthor = 1,
@@ -156,18 +157,18 @@ code_enum! {
         Budget = 12,
         /// Hard ceiling.
         Ceiling = 13,
-        /// Deletes-only listing (budget gate on a job, §5.3).
+        /// Deletes-only listing (budget gate on a job).
         DeletesOnly = 14,
     }
 }
 
 impl CapType {
-    /// Daily-rate cap types: eligible once per UTC day (§3.7.3).
+    /// Daily-rate cap types: eligible once per UTC day.
     pub fn is_daily_rate(self) -> bool {
         matches!(self, CapType::AdmissionRate | CapType::InternRate)
     }
 
-    /// The `kind` label of `farsight_abuse_capped_total` (§13).
+    /// The `kind` label of `farsight_abuse_capped_total`.
     pub fn label(self) -> &'static str {
         match self {
             CapType::BlocksPerAuthor => "blocks_per_author",
@@ -197,7 +198,7 @@ code_enum! {
         Heuristic = 2,
         /// Cross-instance failover without a safe rewind.
         Failover = 3,
-        /// An interval spent on v1 (no `#sync`, §6.5).
+        /// An interval spent on v1 (no `#sync`).
         SyncUnavailable = 4,
     }
 }
@@ -213,7 +214,7 @@ code_enum! {
 }
 
 code_enum! {
-    /// `backfill_state.last_outcome` (§5.2.1).
+    /// `backfill_state.last_outcome`.
     RunOutcome {
         /// Everything listed, nothing refused, account active.
         Clean = 1,
@@ -231,7 +232,7 @@ code_enum! {
     CycleKind {
         /// Full sweep.
         Full = 1,
-        /// Repair cycle (§7.5).
+        /// Repair cycle.
         Repair = 2,
     }
 }
@@ -246,7 +247,7 @@ code_enum! {
     }
 }
 
-/// `actors.status` codes (design §7.4).
+/// `actors.status` codes.
 pub mod actor_status {
     /// `active`.
     pub const ACTIVE: i16 = 0;
@@ -265,7 +266,7 @@ pub mod actor_status {
     /// Any other upstream value (shown).
     pub const UNKNOWN: i16 = 7;
 
-    /// Hidden statuses (§3.1): rows excluded unless `includeInactive`.
+    /// Hidden statuses: rows excluded unless `includeInactive`.
     pub fn is_hidden(code: i16) -> bool {
         matches!(code, DEACTIVATED | TAKENDOWN | SUSPENDED | DELETED)
     }

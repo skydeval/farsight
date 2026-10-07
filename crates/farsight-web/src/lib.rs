@@ -1,8 +1,9 @@
-//! The Farsight web UI (design §8): server-rendered HTML (askama), one CSS
-//! file, vendored htmx, no build step, no CDN. Setup mode serves the
-//! first-run wizard; normal mode serves the admin sign-in, the dashboard, lookups, operations,
-//! settings, reset and the admin history pages, and — when the operator
-//! turns it on — the public UI at the root.
+//! The Farsight web UI (see `docs/design/web-ui.md`): server-rendered
+//! HTML (askama), one CSS file, vendored htmx, no build step, no CDN.
+//! Setup mode serves the first-run wizard; normal mode serves the admin
+//! sign-in, the dashboard, lookups, operations, settings, reset and the
+//! admin history pages, and — when the operator turns it on — the
+//! public UI at the root.
 
 #![warn(missing_docs)]
 // Handlers return early with a ready `Response` as the error value; boxing

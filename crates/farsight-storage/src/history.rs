@@ -1,5 +1,5 @@
-//! Block and list-membership history (design §7.7, §7.8): the record of
-//! rows Farsight stored and later removed.
+//! Block and list-membership history (see `docs/design/history.md`):
+//! the record of rows Farsight stored and later removed.
 //!
 //! History is display data. It takes no part in LWW, list tracking or
 //! coverage; nothing here is read by the apply path. Rows are written by
@@ -20,7 +20,7 @@ pub const SKIPPED: &str = "farsight_block_history_skipped_total";
 /// `farsight_block_history_pruned_total{table}`.
 pub const PRUNED: &str = "farsight_block_history_pruned_total";
 
-/// Rows examined per retention batch (§7.7).
+/// Rows examined per retention batch.
 pub const PRUNE_BATCH: i64 = 10_000;
 
 /// Why a live row was removed (the `cause` column).
@@ -118,7 +118,7 @@ pub struct Removal {
     /// Commit rev of the removing firehose event; `None` for a listing.
     pub rev: Option<i64>,
     /// Witness of the removing firehose event; `None` for a listing, which
-    /// uses the transaction's clock (§7.7).
+    /// uses the transaction's clock.
     pub witness: Option<DateTime<Utc>>,
 }
 
@@ -147,7 +147,7 @@ pub struct Gone<'a> {
 }
 
 /// The history row a transaction wrote last, so that a subject change
-/// whose new version is then refused can be re-labelled (§7.2).
+/// whose new version is then refused can be re-labelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Written {
     table: Table,
@@ -220,7 +220,7 @@ pub fn register_metrics() {
 }
 
 impl Txn<'_> {
-    /// The witness time `w` of a write (§7.7): the event's witness for a
+    /// The witness time `w` of a write: the event's witness for a
     /// firehose event; otherwise `clock()` of the transaction's start, or
     /// the database's `now()` while the clock is still undefined.
     pub fn seen_at(&self, witness: Option<DateTime<Utc>>) -> DateTime<Utc> {
@@ -299,7 +299,7 @@ impl Txn<'_> {
     }
 
     /// Records a removed `list_blocks` row. The target is stored as the
-    /// list's owner and rkey: `lists` rows can be deleted (§11.2).
+    /// list's owner and rkey: `lists` rows can be deleted.
     pub(crate) async fn record_listblock_removal(
         &mut self,
         author: &AuthorInfo,
@@ -334,9 +334,9 @@ impl Txn<'_> {
         Ok(())
     }
 
-    /// Records a removed `list_items` row. The caller has checked §7.8's
-    /// condition (the owner is not `deleted`; the list is tracked or its
-    /// record is deleted).
+    /// Records a removed `list_items` row. The caller has checked the
+    /// membership condition (the owner is not `deleted`; the list is
+    /// tracked or its record is deleted).
     pub(crate) async fn record_item_removal(
         &mut self,
         owner: &AuthorInfo,
@@ -376,8 +376,8 @@ impl Txn<'_> {
         self.last_history = None;
     }
 
-    /// Re-labels the history row this transaction wrote last (§7.2: a
-    /// subject change whose new version turned out to be refused is a
+    /// Re-labels the history row this transaction wrote last (a subject
+    /// change whose new version turned out to be refused is a
     /// `refused_update`). A no-op when the removal was not recorded.
     pub(crate) async fn relabel_last_history(&mut self, cause: Cause) -> Result<()> {
         let Some(w) = self.last_history.take() else {
@@ -400,9 +400,9 @@ impl Txn<'_> {
     }
 }
 
-/// Opens or closes the recording window at server start (§7.7): opens a
-/// row if history is enabled and none is open, closes the open row if it
-/// is disabled. Returns whether a window is open afterwards.
+/// Opens or closes the recording window at server start: opens a row if
+/// history is enabled and none is open, closes the open row if it is
+/// disabled. Returns whether a window is open afterwards.
 pub async fn sync_window(pool: &PgPool, enabled: bool) -> Result<bool> {
     let mut tx = pool.begin().await?;
     // One writer at a time; the table has a handful of rows.
@@ -434,8 +434,8 @@ pub struct PruneReport {
     pub windows: u64,
 }
 
-/// The daily retention pass (§7.7): walks each history table in `id` order
-/// from the lowest, in batches of [`PRUNE_BATCH`], deleting rows with
+/// The daily retention pass: walks each history table in `id` order from
+/// the lowest, in batches of [`PRUNE_BATCH`], deleting rows with
 /// `removed_at < now − retention`, and stops at the first batch that holds
 /// no expired row. Also deletes recording windows closed before the
 /// horizon. With a zero retention nothing is deleted. `now` is injectable
@@ -489,7 +489,7 @@ pub async fn prune(
 }
 
 /// Deletes up to `batch` history rows authored by `author_id` from each
-/// table (account purge, §7.4). Returns the rows deleted.
+/// table (account purge). Returns the rows deleted.
 pub(crate) async fn delete_authored(
     conn: &mut sqlx::PgConnection,
     author_id: i64,

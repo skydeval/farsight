@@ -5,9 +5,9 @@ use farsight_core::Did;
 
 use crate::error::XrpcError;
 
-/// Default page size (§3.1).
+/// Default page size.
 pub const DEFAULT_LIMIT: i64 = 100;
-/// Maximum page size (§3.1).
+/// Maximum page size.
 pub const MAX_LIMIT: i64 = 1000;
 
 /// Parsed query parameters.
@@ -47,7 +47,7 @@ impl Params {
             .collect()
     }
 
-    /// A required DID parameter. Handles are `InvalidRequest` (§3.1).
+    /// A required DID parameter. Handles are `InvalidRequest`.
     pub fn did(&self, name: &str) -> Result<Did, XrpcError> {
         let v = self
             .get(name)

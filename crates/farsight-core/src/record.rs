@@ -1,7 +1,7 @@
 //! Parsing and validation of the four indexed record types, from Jetstream
 //! JSON commit events and from `listRecords`/`getRecord` values.
 //!
-//! Admission rules (design §1.1):
+//! Admission rules (see `docs/design/README.md`):
 //! - `block`: `subject` is a valid DID.
 //! - `listblock`: `subject` is `at://<did>/app.bsky.graph.list/<rkey>`.
 //! - `list`: every record; `name` truncated to 128 chars, `purpose` mapped.
@@ -20,7 +20,7 @@ use crate::did::Did;
 use crate::nsid::Collection;
 use crate::tid::Tid;
 
-/// Maximum stored list name length, in characters (design §1.1).
+/// Maximum stored list name length, in characters.
 pub const MAX_LIST_NAME_CHARS: usize = 128;
 /// Longest stored list description, in characters (the lexicon allows
 /// 300 graphemes).
@@ -62,7 +62,7 @@ pub enum RecordError {
     /// The event's repo DID is invalid.
     #[error("invalid repo DID: {0}")]
     RepoDid(String),
-    /// The commit rev is not a TID (design §7.1: rejected).
+    /// The commit rev is not a TID (rejected).
     #[error("rev is not a TID: {0}")]
     Rev(String),
     /// The record key is invalid.
@@ -73,8 +73,8 @@ pub enum RecordError {
     Operation(String),
 }
 
-/// `app.bsky.graph.list` purpose, stored as `lists.purpose` (design §7.1:
-/// 1 mod, 2 curate, 3 reference, 0 other).
+/// `app.bsky.graph.list` purpose, stored as `lists.purpose` (1 mod, 2
+/// curate, 3 reference, 0 other).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ListPurpose {
     /// `app.bsky.graph.defs#modlist`.

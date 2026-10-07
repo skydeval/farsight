@@ -1,4 +1,4 @@
-// Browser probes of the stage-6 harness (Mode A): the parts of the public
+// Browser probes of the stage-6 harness: the parts of the public
 // UI that only a browser can show — the theme toggle and its persistence,
 // times rewritten in the visitor's timezone, the sticky bar, profile cards
 // on hover and focus, and their absence on a touch device.

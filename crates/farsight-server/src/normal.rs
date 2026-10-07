@@ -1,9 +1,10 @@
-//! Normal mode (design §2, §8.2): migrations, the API pool (separate from
-//! ingest's 4 connections), the ingest task, the coverage snapshot and its
-//! NOTIFY listener, the API and UI routers, `/health` and `/livez`, the
-//! metrics listener, the periodic tasks, the UI sort-index builder and
-//! the handle-warming worker. Ends on shutdown or on a config reset (then
-//! the caller enters setup mode in-process).
+//! Normal mode (see `docs/design/README.md` and `docs/design/web-ui.md`):
+//! migrations, the API pool (separate from ingest's 4 connections), the
+//! ingest task, the coverage snapshot and its NOTIFY listener, the API and
+//! UI routers, `/health` and `/livez`, the metrics listener, the periodic
+//! tasks, the UI sort-index builder and the handle-warming worker. Ends on
+//! shutdown or on a config reset (then the caller enters setup mode
+//! in-process).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -93,7 +94,7 @@ pub async fn run(
         schema = farsight_storage::SCHEMA_VERSION,
         "migrations applied"
     );
-    // The recording window (§7.7) opens or closes here and only here: the
+    // The recording window opens or closes here and only here: the
     // ingest writer takes `block_history_enabled` at start.
     let recording =
         farsight_storage::history::sync_window(&api_pool, cfg.storage.block_history_enabled)
@@ -112,7 +113,7 @@ pub async fn run(
     let gates = Arc::new(SharedGates::default());
     let (stop_tx, stop_rx) = watch::channel(false);
 
-    // Ingest (its own 4-connection pool, §6.2).
+    // Ingest (its own 4-connection pool).
     let mut icfg = IngestConfig::from_config(&cfg);
     icfg.gates = gates.clone();
     let ingest = Ingest::start(icfg, ingest_pool)
@@ -171,7 +172,7 @@ pub async fn run(
     farsight_web::public::warming::register();
     farsight_web::public::pass::register();
     // Which UI sections sort by shown time: read once before serving, then
-    // kept by the index builder (§7.6).
+    // kept by the index builder.
     let sort = Arc::new(farsight_storage::ui_rows::SortIndexes::default());
     sort_indexes::load(&api_pool, &sort)
         .await
@@ -240,7 +241,7 @@ pub async fn run(
                 if n % 20 == 0 {
                     limiter.sweep(Duration::from_secs(600));
                 }
-                // Opt-in daily refresh of the Cloudflare ranges (§9.3).
+                // Opt-in daily refresh of the Cloudflare ranges.
                 let proxy = config.current().config.proxy.clone();
                 if proxy.cloudflare_refresh
                     && proxy.mode == farsight_core::config::ProxyMode::Cloudflare
@@ -287,7 +288,7 @@ pub async fn run(
         .route("/health", get(health::health).with_state(api_pool.clone()))
         .route("/livez", get(health::livez))
         // One answer for every path that does not exist, and for the
-        // routes of a feature that is switched off (§8.6).
+        // routes of a feature that is switched off.
         .fallback(farsight_web::common::fallback)
         .layer(axum::middleware::from_fn_with_state(
             layer,

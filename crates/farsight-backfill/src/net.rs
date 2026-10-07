@@ -1,8 +1,9 @@
-//! Outbound requests (design §5.3, §11.3): every request to a
-//! network-learned address goes through the safe client, a per-host token
-//! bucket with a concurrency limit, `429` / `RateLimit-Remaining: 0` /
-//! `Retry-After` handling and a circuit breaker; the PLC directory has its
-//! own limiter with half reserved for the resolver.
+//! Outbound requests (see `docs/design/backfill.md` and
+//! `docs/design/security.md`): every request to a network-learned address
+//! goes through the safe client, a per-host token bucket with a
+//! concurrency limit, `429` / `RateLimit-Remaining: 0` / `Retry-After`
+//! handling and a circuit breaker; the PLC directory has its own limiter
+//! with half reserved for the resolver.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -69,9 +70,9 @@ impl NetError {
 /// only) a plain client for loopback fake services.
 #[derive(Clone)]
 pub enum Client {
-    /// The §11.3 safe client.
+    /// The safe client.
     Safe(SafeClient),
-    /// Plain HTTP for the Phase B harness's loopback fakes.
+    /// Plain HTTP for the harness's loopback fakes.
     #[cfg(feature = "harness")]
     Plain(reqwest::Client),
 }
@@ -136,7 +137,7 @@ pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Longest a request waits for a per-host slot before giving up.
 pub const MAX_SLOT_WAIT: Duration = Duration::from_secs(120);
 
-/// Per-host limits (§5.3): token bucket, concurrency, cooldown, breaker.
+/// Per-host limits: token bucket, concurrency, cooldown, breaker.
 #[derive(Debug)]
 pub struct HostLimiter {
     rps: f64,
@@ -173,7 +174,7 @@ impl HostLimiter {
     }
 
     /// Whether a request to `host` could start now (blocked-head skip of
-    /// the list-job lanes, §5.5).
+    /// the list-job lanes).
     pub fn has_capacity(&self, host: &str) -> bool {
         let mut map = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
         let burst = self.rps;
@@ -278,8 +279,8 @@ impl HostLimiter {
     }
 }
 
-/// The PLC directory limiter (§5.3, §11.2): `plc_rps` in total, half of it
-/// reserved for the resolver.
+/// The PLC directory limiter: `plc_rps` in total, half of it reserved
+/// for the resolver.
 #[derive(Debug)]
 pub struct PlcLimiter {
     reserved: Mutex<(f64, Instant)>,
@@ -380,7 +381,7 @@ fn retry_after(r: &OutboundResponse) -> Option<Duration> {
 
 /// The XRPC error name of an error body. Reference PDSes answer a repo
 /// they do not host with `InvalidRequest` "Could not find repo: <did>";
-/// that is `RepoNotFound` for the repo-level rules (§5.2, §5.5).
+/// that is `RepoNotFound` for the repo-level rules.
 pub fn error_name(body: &[u8]) -> String {
     let v = serde_json::from_slice::<Value>(body).ok();
     let field = |k: &str| v.as_ref().and_then(|v| v.get(k)).and_then(Value::as_str);

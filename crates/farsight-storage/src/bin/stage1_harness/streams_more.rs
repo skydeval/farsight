@@ -325,7 +325,7 @@ pub async fn s6_counted_stickiness(env: &mut Env, c: &mut Checks) -> Result<()> 
     // them, so it is raised for this stream to isolate the trigger cap.
     env.limits.cfg.did_admissions_per_day = 10_000;
     let cap = env.limits.cfg.listblock_fetch_triggers_per_author;
-    c.eq("trigger cap is the design default", cap, 5_000);
+    c.eq("trigger cap is the default", cap, 5_000);
     let a = plc("stickyauthor", 1);
     let owners: Vec<_> = (0..50).map(|i| plc("stickyowner", i)).collect();
     let mut n_rev = 100u64;
@@ -1018,9 +1018,8 @@ async fn queue_of(env: &Env, did: &farsight_core::Did) -> Result<Option<(i16, i1
     .await?)
 }
 
-/// Stream 10 (added in stage 2): non-commit firehose events through
-/// `apply` (§6.4, §7.4), the §5.3 queue collapse rule, and poisoned-event
-/// recording (§6.2).
+/// Stream 10: non-commit firehose events through `apply`, the queue
+/// collapse rule, and poisoned-event recording.
 pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
     use farsight_storage::codes::actor_status as st;
     use farsight_storage::repo_events::RepoEvent as E;
@@ -1142,8 +1141,8 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         "",
     );
 
-    // r17 (T4): an unknown DID becoming active gets no row and no job, only
-    // a count; its first authored record interns it and enqueues tier 2.
+    // An unknown DID becoming active gets no row and no job, only a
+    // count; its first authored record interns it and enqueues tier 2.
     let u = plc("evunknown", 1);
     let gone = plc("evunknown", 2);
     let r = events_batch(
@@ -1367,7 +1366,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
     Ok(())
 }
 
-/// Stream 11 (r17.2): per-instance cursors in `firehose_cursors`.
+/// Stream 11: per-instance cursors in `firehose_cursors`.
 pub async fn s11_instance_cursors(env: &mut Env, c: &mut Checks) -> Result<()> {
     let a = "wss://a.jetstream.test";
     let b = "wss://b.jetstream.test";

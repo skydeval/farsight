@@ -1,6 +1,7 @@
-//! The per-repo job (design §5.2, §5.2.1): resolve → stamp → describeRepo
-//! → late stamp → whole-range reconcile of absent collections (early stamp
-//! only) → list each present collection with range reconcile → done.
+//! The per-repo job (see `docs/design/backfill.md`): resolve → stamp →
+//! describeRepo → late stamp → whole-range reconcile of absent collections
+//! (early stamp only) → list each present collection with range reconcile
+//! → done.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -20,12 +21,12 @@ use crate::net::NetError;
 use crate::resolve::{Pds, ResolveError};
 use crate::xrpc;
 
-/// Pages per collection per attempt (§5.2 bounds; reaching it yields).
+/// Pages per collection per attempt (reaching it yields).
 pub const MAX_PAGES: u32 = 50_000;
 /// Rows purged per divergence-purge transaction.
 pub const PURGE_BATCH: i64 = 10_000;
 
-/// The collections a `repo` job lists (§5.2 table).
+/// The collections a `repo` job lists.
 pub const REPO_COLLECTIONS: [Collection; 4] = [
     Collection::Block,
     Collection::ListBlock,
@@ -36,7 +37,7 @@ pub const REPO_COLLECTIONS: [Collection; 4] = [
 /// Why a job step stopped.
 #[derive(Debug)]
 pub enum Stop {
-    /// A §5.2 repo-level error (re-resolve / relay status).
+    /// A repo-level error (re-resolve / relay status).
     RepoLevel(NetError),
     /// Any other failure.
     Failed(String),
@@ -71,7 +72,7 @@ pub struct Stamp {
     pub rev: i64,
     /// When it was read (database clock).
     pub read_at: DateTime<Utc>,
-    /// Taken late (after describeRepo, §5.2 step 4).
+    /// Taken late (after describeRepo).
     pub late: bool,
 }
 
@@ -88,9 +89,9 @@ pub struct Listing {
     pub deletes_only: bool,
 }
 
-/// How a job is subject to the storage gates (§5.3, §11.2), re-evaluated
-/// before every page so a job crossing the threshold mid-run goes
-/// deletes-only for its remaining pages.
+/// How a job is subject to the storage gates, re-evaluated before every
+/// page so a job crossing the threshold mid-run goes deletes-only for
+/// its remaining pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GatePolicy {
     /// Admin-requested: never deletes-only, and exempt from the budget
@@ -130,7 +131,7 @@ impl GatePolicy {
     }
 
     /// The gates handed to `apply` (admin jobs' writes continue under the
-    /// budget, §11.2).
+    /// budget).
     pub fn apply_gates(&self, mut g: Gates) -> Gates {
         if self.admin {
             g.budget_refusing = false;
@@ -147,7 +148,7 @@ pub fn host_is_large(ctx: &Ctx, pds: &Pds) -> bool {
 }
 
 /// Lists one collection of `did` with stamp `R` through its own cursor rows
-/// (§5.2 step 6) and applies each page with range reconcile.
+/// and applies each page with range reconcile.
 #[allow(clippy::too_many_arguments)]
 pub async fn list_collection(
     ctx: &Ctx,
@@ -252,7 +253,7 @@ pub async fn list_collection(
             .await;
         }
         if order_broken {
-            // §5.2: restart this collection with an in-memory seen-set.
+            // Restart this collection with an in-memory seen-set.
             tracing::warn!(did = %did, collection = %k, "rkeys not increasing; restarting with a seen-set");
             seen = Some(HashSet::new());
             cursor = None;
@@ -352,7 +353,7 @@ pub async fn list_collection(
 }
 
 /// Fires **DV** on the DID's tracked lists, purges its authored rows and
-/// adds a `resync` debt (§5.2 divergence check).
+/// adds a `resync` debt (the divergence check).
 pub async fn diverged(ctx: &Ctx, did: &Did, witness: DateTime<Utc>) -> Result<(), Stop> {
     let pool = &ctx.pool;
     let limits = ctx.limits();
@@ -420,8 +421,8 @@ async fn read_stamp(ctx: &Ctx, pds: &Pds, did: &Did, late: bool) -> Result<Stamp
     Ok(Stamp { rev, read_at, late })
 }
 
-/// Applies an account status learned from the relay (§7.4: status only
-/// from relay / Jetstream / PLC) through the normal event path.
+/// Applies an account status learned from the relay (status only from
+/// relay / Jetstream / PLC) through the normal event path.
 pub async fn apply_status(
     ctx: &Ctx,
     did: &Did,
@@ -451,7 +452,7 @@ pub async fn apply_status(
     Ok(())
 }
 
-/// The §5.2 repo-level error rule after re-resolution failed to help: the
+/// The repo-level error rule after re-resolution failed to help: the
 /// relay's `getRepoStatus` decides between **inactive** and **failed**.
 async fn relay_verdict(ctx: &Ctx, did: &Did, cost: &mut u64) -> Option<Outcome> {
     let relay = ctx.cfg().backfill.relay_url.clone();
@@ -475,7 +476,7 @@ async fn relay_verdict(ctx: &Ctx, did: &Did, cost: &mut u64) -> Option<Outcome> 
     }
 }
 
-/// Runs a `repo` job for `req.did` (§5.2). The caller holds the lease.
+/// Runs a `repo` job for `req.did`. The caller holds the lease.
 pub async fn run(ctx: &Ctx, req: &JobReq) -> JobResult {
     let mut cost = 0u64;
     let job_start = match jobs::db_now(&ctx.pool).await {
@@ -578,7 +579,7 @@ async fn attempt(
         }
         apply_status(ctx, did, true, None).await.map_err(e)?;
     }
-    // Resume this DID's own run if it is fresh (< 72 h, §5.2 Resume).
+    // Resume this DID's own run if it is fresh (< 72 h).
     let resume: Option<(i64, i64, DateTime<Utc>, bool)> = sqlx::query_as(
         "SELECT s.current_run_id, c.stamp_rev, c.stamp_read_at, c.late_stamp
          FROM backfill_state s JOIN actors a ON a.id = s.actor_id
@@ -644,7 +645,7 @@ async fn attempt(
         match list_repo(ctx, req, &pds, &mut stamp, resumed, point, run_id, cost).await {
             Ok(o) => return Ok((o, stamp.map(|s| s.rev))),
             Err(Stop::RepoLevel(err)) if !bypass => {
-                // §5.2: re-resolve bypassing the cache; if the PDS changed,
+                // Re-resolve bypassing the cache; if the PDS changed,
                 // retry there.
                 bypass = true;
                 match ctx.resolver.resolve(did, true).await {
@@ -755,7 +756,7 @@ async fn list_repo(
         refused += l.refused;
         skipped |= l.reconcile_skipped;
     }
-    // 7. Outcome (§5.2.1).
+    // 7. Outcome.
     let Some(id) = jobs::actor_id(pool, did.as_str()).await? else {
         return Ok(Outcome::Clean);
     };
@@ -764,7 +765,7 @@ async fn list_repo(
         farsight_storage::debts::add_debt(pool, id, DebtReason::Unreachable, None, witness).await?;
     }
     // A clean run of an author holding a `capped` debt re-evaluates its
-    // uncounted listblocks (§4.2).
+    // uncounted listblocks.
     let capped: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM relist_debt WHERE actor_id = $1 AND reason = 3)",
     )

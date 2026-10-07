@@ -1,8 +1,8 @@
-//! Backfill metrics (design §13), exported by `farsight-backfill` on
-//! `metrics.backfill_bind`. Host labels are bounded: the top 50 hosts by
-//! request volume keep their name, every other host is `other` (≤ 51
-//! values); series of hosts that fall out of the top 50 expire after an
-//! idle period (exporter idle timeout).
+//! Backfill metrics (see `docs/design/operations.md`), exported by
+//! `farsight-backfill` on `metrics.backfill_bind`. Host labels are
+//! bounded: the top 50 hosts by request volume keep their name, every
+//! other host is `other` (≤ 51 values); series of hosts that fall out of
+//! the top 50 expire after an idle period (exporter idle timeout).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;

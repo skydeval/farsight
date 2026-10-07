@@ -1,4 +1,5 @@
-//! Ingest metrics (design §13) and the Prometheus exporter.
+//! Ingest metrics (see `docs/design/operations.md`) and the Prometheus
+//! exporter.
 
 use std::net::SocketAddr;
 
@@ -13,7 +14,7 @@ pub const SOURCE_LAG: &str = "farsight_firehose_source_lag_seconds";
 /// `farsight_firehose_events_total{collection,op,outcome}` (counter).
 pub const EVENTS: &str = "farsight_firehose_events_total";
 /// `farsight_abuse_capped_total{kind}`: writes refused or uncounted by a
-/// cap, rate or gate (§13), counted from every applied batch.
+/// cap, rate or gate, counted from every applied batch.
 pub const ABUSE_CAPPED: &str = "farsight_abuse_capped_total";
 /// `farsight_firehose_reconnects_total{reason}` (counter).
 pub const RECONNECTS: &str = "farsight_firehose_reconnects_total";
@@ -26,12 +27,12 @@ pub const BUFFER_DEPTH: &str = "farsight_ingest_buffer_depth";
 /// `farsight_ingest_dropped_total{reason}` (counter).
 pub const DROPPED: &str = "farsight_ingest_dropped_total";
 
-/// `farsight_firehose_seam_repairs_total{trigger}` (counter; §6.3).
+/// `farsight_firehose_seam_repairs_total{trigger}` (counter).
 pub const SEAM_REPAIRS: &str = "farsight_firehose_seam_repairs_total";
 /// `farsight_firehose_seam_repair_events_total` (counter).
 pub const SEAM_REPAIR_EVENTS: &str = "farsight_firehose_seam_repair_events_total";
 
-/// Every stage-2 metric name.
+/// Every ingest metric name.
 pub const ALL: [&str; 11] = [
     SEAM_REPAIRS,
     SEAM_REPAIR_EVENTS,

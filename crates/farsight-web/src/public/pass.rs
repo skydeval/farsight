@@ -1,6 +1,6 @@
-//! The handle pass (design §8.6): a background worker that checks the
-//! handle of every account Farsight holds, so that a page's rows have
-//! their handles before anyone opens it.
+//! The handle pass (see `docs/design/web-ui.md`): a background worker
+//! that checks the handle of every account Farsight holds, so that a
+//! page's rows have their handles before anyone opens it.
 //!
 //! - **Identity changes first.** The firehose writer notes every account
 //!   an identity event names in `handle_due`; the pass serves those

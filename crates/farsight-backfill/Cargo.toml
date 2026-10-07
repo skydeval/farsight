@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [features]
-# Phase B harness support: lets the process reach loopback fake services
+# Harness support: lets the process reach loopback fake services
 # (PDS, PLC, relay) over plain HTTP, and builds the stage-4 harness. Off by
 # default so release builds keep the safe outbound client only.
 harness = ["farsight-storage/harness", "dep:reqwest"]

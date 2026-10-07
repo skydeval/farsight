@@ -1,6 +1,6 @@
 //! Shared web helpers: rendering, static assets, cookies, the proxy-safety
-//! rules of design §8.5 (relative redirects, cookie flags, CSRF and
-//! same-origin checks) and random ids.
+//! rules (relative redirects, cookie flags, CSRF and same-origin checks)
+//! and random ids.
 
 use askama::Template;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -43,7 +43,7 @@ pub fn asset_version() -> &'static str {
     &VERSION
 }
 
-/// `Cache-Control` of UI pages that show admin or setup state (§9.4).
+/// `Cache-Control` of UI pages that show admin or setup state.
 pub const NO_STORE: &str = "no-store, private";
 
 /// Renders a template; a render failure is a 500.
@@ -101,8 +101,8 @@ pub fn render_private<T: Template>(t: &T) -> Response {
     r
 }
 
-/// A static asset response (§9.4): the same in every configuration,
-/// with no gate and no rate class.
+/// A static asset response: the same in every configuration, with no
+/// gate and no rate class.
 pub fn asset(body: impl IntoResponse, content_type: &'static str) -> Response {
     (
         [
@@ -173,7 +173,7 @@ pub async fn fallback() -> Response {
     not_found()
 }
 
-/// A relative redirect (§8.5: never absolute, never to another scheme).
+/// A relative redirect (never absolute, never to another scheme).
 pub fn redirect(path: &str) -> Response {
     debug_assert!(path.starts_with('/') && !path.starts_with("//"));
     let mut r = Redirect::to(path).into_response();
@@ -182,12 +182,12 @@ pub fn redirect(path: &str) -> Response {
     r
 }
 
-/// A permanent redirect from an address a page had before v2.5 (§8.6),
-/// kept for one release. `to` is built by the caller from a fixed prefix
-/// and re-encoded path parameters — never from the request's raw path,
-/// which could name another host (`//host/…`). The request's query is
-/// carried over. A target that is not a path on this host, or not a valid
-/// header value, is answered with [`not_found`].
+/// A permanent redirect to another path on this host. `to` is built by
+/// the caller from a fixed prefix and re-encoded path parameters — never
+/// from the request's raw path, which could name another host
+/// (`//host/…`). The request's query is carried over. A target that is
+/// not a path on this host, or not a valid header value, is answered with
+/// [`not_found`].
 pub fn moved(to: &str, query: Option<&str>) -> Response {
     if !to.starts_with('/') || to.starts_with("//") || to.contains('\\') {
         return not_found();
@@ -228,8 +228,8 @@ pub fn ct_eq(a: &str, b: &str) -> bool {
 }
 
 /// A `Set-Cookie` value: host-only (no `Domain`), `Path`-scoped,
-/// `HttpOnly`, `SameSite=Strict`, `Secure` when the request was HTTPS
-/// (§8.5). `max_age = Some(0)` deletes.
+/// `HttpOnly`, `SameSite=Strict`, `Secure` when the request was HTTPS.
+/// `max_age = Some(0)` deletes.
 pub fn cookie(
     name: &str,
     value: &str,
@@ -259,10 +259,10 @@ pub fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|(_, v)| v.to_owned())
 }
 
-/// Same-origin check for state-changing requests (§8.5): when the browser
-/// sends `Sec-Fetch-Site`, it must be `same-origin`; when it sends
-/// `Origin`, its host must equal `Host`. Requests carrying neither (non-
-/// browser clients) pass; the CSRF token still applies.
+/// Same-origin check for state-changing requests: when the browser sends
+/// `Sec-Fetch-Site`, it must be `same-origin`; when it sends `Origin`,
+/// its host must equal `Host`. Requests carrying neither (non-browser
+/// clients) pass; the CSRF token still applies.
 pub fn same_origin(headers: &HeaderMap) -> bool {
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         if site != "same-origin" {

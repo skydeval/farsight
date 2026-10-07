@@ -1,12 +1,13 @@
-//! DID → PDS resolution (design §5.2 step 1, §11.2): `did:plc` through the
-//! configured PLC directory (its own limiter, resolver half reserved),
-//! `did:web` through `https://<host>/.well-known/did.json`, both via the
-//! safe client. Results are cached on `actors.pds_host_id` (TTL 7 days;
-//! `identity` events invalidate) for interned DIDs and in memory for the
-//! rest (sweep members hold no row, D4); nonexistent DIDs are negatively
-//! cached for 24 h. Resolving records the host in `pds_hosts` with its cap
-//! buckets (registrable domain, /24 or /48 address block unless a shared
-//! CDN range) and the author's admission key.
+//! DID → PDS resolution (see `docs/design/backfill.md` and
+//! `docs/design/security.md`): `did:plc` through the configured PLC
+//! directory (its own limiter, resolver half reserved), `did:web` through
+//! `https://<host>/.well-known/did.json`, both via the safe client.
+//! Results are cached on `actors.pds_host_id` (TTL 7 days; `identity`
+//! events invalidate) for interned DIDs and in memory for the rest (sweep
+//! members hold no row); nonexistent DIDs are negatively cached for 24 h.
+//! Resolving records the host in `pds_hosts` with its cap buckets
+//! (registrable domain, /24 or /48 address block unless a shared CDN
+//! range) and the author's admission key.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -21,9 +22,9 @@ use url::Url;
 
 use crate::net::{Net, NetError, PlcUse, host_key};
 
-/// Cache TTL on `actors` (§5.2).
+/// Cache TTL on `actors`.
 pub const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
-/// Negative cache for nonexistent DIDs (§11.1).
+/// Negative cache for nonexistent DIDs.
 pub const NEGATIVE_TTL: Duration = Duration::from_secs(24 * 3600);
 /// In-memory TTL for DIDs without an `actors` row.
 pub const MEMORY_TTL: Duration = Duration::from_secs(3600);
@@ -45,7 +46,7 @@ pub enum ResolveError {
     /// reachable and 404 for its document).
     #[error("DID not found")]
     NotFound,
-    /// The DID is tombstoned in PLC (deactivated: purge, §7.4).
+    /// The DID is tombstoned in PLC (deactivated: purge).
     #[error("DID tombstoned in PLC")]
     Tombstoned,
     /// Anything else; retried with backoff.
@@ -193,7 +194,7 @@ impl Resolver {
         }
     }
 
-    /// Resolves `did`; `bypass` skips every cache (§5.2 repo-level errors).
+    /// Resolves `did`; `bypass` skips every cache (repo-level errors).
     pub async fn resolve(&self, did: &Did, bypass: bool) -> Result<Pds, ResolveError> {
         if !bypass {
             if let Some(p) = self.cached(did).await {
@@ -292,7 +293,7 @@ impl Resolver {
     }
 
     async fn record(&self, did: &Did, pds: &Pds) -> Result<(), sqlx::Error> {
-        // In memory for DIDs without a row (D4).
+        // In memory for DIDs without a row.
         {
             let mut m = self.memory.lock().unwrap_or_else(|e| e.into_inner());
             if m.len() >= MEMORY_CAP {

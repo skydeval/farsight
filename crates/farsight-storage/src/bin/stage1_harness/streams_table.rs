@@ -1,11 +1,11 @@
-//! Stream 4: every defined cell of the §4.4 table, driven through the real
-//! write paths (listblock inserts/deletes for + and −, list record writes
-//! for RP and RD, the janitor for PD and GE, `fire_event` for the events
-//! the backfill stage will fire).
+//! Stream 4: every defined cell of the transition table, driven through
+//! the real write paths (listblock inserts/deletes for + and −, list
+//! record writes for RP and RD, the janitor for PD and GE, `fire_event`
+//! for the events backfill fires).
 //!
-//! The expected results below are transcribed from the design table
-//! independently of `transition.rs`, so the stream does not test the
-//! implementation against itself.
+//! The expected results below are transcribed from the table in
+//! `docs/design/list-indexing.md` independently of `transition.rs`, so
+//! the stream does not test the implementation against itself.
 
 use chrono::{DateTime, Utc};
 use farsight_core::{Collection, Did};

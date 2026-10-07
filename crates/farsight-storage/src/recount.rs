@@ -1,7 +1,8 @@
-//! Nightly recounts (design §4.2 "Nightly: recount in batches (each under
-//! the list lock), repair drift, re-run the transition function for every
-//! repaired list, alert"; §7.1 approximate-counter rebuild) and the
-//! `capped`-debt re-evaluation of uncounted listblocks (§4.2).
+//! Nightly recounts (the listblock counters, in batches, each under the
+//! list lock: repair drift, re-run the transition function for every
+//! repaired list, alert; and the rebuild of the approximate counters; see
+//! `docs/design/list-indexing.md` and `docs/design/storage.md`) and the
+//! `capped`-debt re-evaluation of uncounted listblocks.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -208,8 +209,7 @@ pub async fn recount_actors(
 /// columns of `host_usage` from the exact per-author counters, grouped by
 /// each author's current buckets. `stored_interned` is a lifetime charge
 /// with no per-row record and is left as is; placeholder-list charges in
-/// `stored_listblocks` are not reconstructed (see the stage-1 terminal
-/// report).
+/// `stored_listblocks` are not reconstructed.
 pub async fn rebuild_approximate_counters(pool: &PgPool, batch: i64) -> Result<()> {
     let exact: [(&str, &str); 5] = [
         (stat::BLOCKS, "SELECT count(*) FROM blocks"),
@@ -348,8 +348,8 @@ pub struct ReevalReport {
     pub stopped_by: Option<CapType>,
 }
 
-/// The one exception to `counted` stickiness (§4.2): during a clean run of
-/// an author holding a `capped` debt, re-evaluates the author's uncounted
+/// The one exception to `counted` stickiness: during a clean run of an
+/// author holding a `capped` debt, re-evaluates the author's uncounted
 /// listblocks in rkey order, flipping them to counted while
 /// `fetch_triggers` is under the cap and within the admission key's
 /// remaining daily rate, assigning the author's current key as

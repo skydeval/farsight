@@ -1,4 +1,5 @@
-//! Bundled Jetstream zstd dictionaries and frame decompression (§6.1).
+//! Bundled Jetstream zstd dictionaries and frame decompression (see
+//! `docs/design/firehose.md`).
 
 use std::io::Read;
 
@@ -11,8 +12,8 @@ pub const V2_DICT: &[u8] = include_bytes!("../dictionaries/subscribe_events_2026
 /// broken instance; real frames are a few KiB).
 pub const MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The zstd dictionary ID in a structured dictionary's header (RFC 8878
-/// §5: magic `0xEC30A437`, then a little-endian u32 ID).
+/// The zstd dictionary ID in a structured dictionary's header (RFC 8878,
+/// section 5: magic `0xEC30A437`, then a little-endian u32 ID).
 pub fn dictionary_id(dict: &[u8]) -> Option<u32> {
     if dict.len() < 8 || dict[..4] != [0x37, 0xa4, 0x30, 0xec] {
         return None;

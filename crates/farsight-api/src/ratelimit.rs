@@ -1,6 +1,6 @@
-//! Token-bucket rate limits (design §3.6), keyed by resolved client IP
-//! (IPv6 by /64) for anonymous callers and by token for authenticated
-//! ones. Buckets live in memory; idle ones are swept.
+//! Token-bucket rate limits (see `docs/design/api.md`), keyed by
+//! resolved client IP (IPv6 by /64) for anonymous callers and by token
+//! for authenticated ones. Buckets live in memory; idle ones are swept.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use farsight_core::config::Config;
 
-/// Rate-limit classes of §3.6 (also the `class` label of
+/// Rate-limit classes (also the `class` label of
 /// `farsight_rate_limited_total`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Class {
@@ -26,7 +26,7 @@ pub enum Class {
     /// UI sign-in attempts (starts, OAuth callbacks), per IP.
     UiLogin,
     /// UI sign-in starts: one bucket for the whole process. An address
-    /// with a recent successful sign-in is not charged (§3.6).
+    /// with a recent successful sign-in is not charged.
     UiLoginStart,
     /// Public UI page views, per IP (`public_ui.rate_limit_*`).
     PublicUi,
@@ -39,14 +39,14 @@ pub enum Class {
     PublicCardBudget,
 }
 
-/// Admin sign-in flows the whole process may start per second (§3.6).
+/// Admin sign-in flows the whole process may start per second.
 pub const UI_LOGIN_START_RPS: f64 = 1.0;
 /// Burst of the same budget.
 pub const UI_LOGIN_START_BURST: f64 = 10.0;
 
-/// Profile-card requests per second per client address (§3.6). Cards have
-/// their own class so that moving the pointer down a table does not spend
-/// the visitor's page budget.
+/// Profile-card requests per second per client address. Cards have their
+/// own class so that moving the pointer down a table does not spend the
+/// visitor's page budget.
 pub const PUBLIC_CARD_RPS: f64 = 2.0;
 /// Burst of the same class.
 pub const PUBLIC_CARD_BURST: f64 = 20.0;
@@ -97,7 +97,7 @@ impl Class {
                 f64::from(config.public_ui.rate_limit_rps),
                 f64::from(config.public_ui.rate_limit_burst),
             ),
-            // Process-wide (§3.6): `public_ui.handle_rps`.
+            // Process-wide: `public_ui.handle_rps`.
             Class::PublicHandle => Limit::new(
                 f64::from(config.public_ui.handle_rps),
                 f64::from(config.public_ui.handle_burst()),
@@ -246,7 +246,7 @@ impl RateLimiter {
 
     /// Takes one token from `(class, key)` only if the bucket holds at
     /// least `reserve + 1`: a background user of a budget leaves `reserve`
-    /// tokens for requests (§3.6, handle warming).
+    /// tokens for requests (handle warming).
     pub fn take_above(&self, class: Class, key: &str, limit: Limit, reserve: f64) -> bool {
         self.take_above_at(class, key, limit, reserve, Instant::now())
     }

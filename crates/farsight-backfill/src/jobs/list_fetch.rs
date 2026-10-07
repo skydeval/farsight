@@ -1,7 +1,7 @@
-//! List job phase 2 — the fetch run for one owner (design §5.5): claim the
-//! owner's claimable lists, list the owner's `listitem` collection through
-//! the run's own cursor, then promote every list still claimed for its
-//! epoch.
+//! List job phase 2 — the fetch run for one owner (see
+//! `docs/design/backfill.md`): claim the owner's claimable lists, list the
+//! owner's `listitem` collection through the run's own cursor, then
+//! promote every list still claimed for its epoch.
 
 use std::time::Duration;
 
@@ -90,9 +90,9 @@ async fn claimed(ctx: &Ctx, run_id: i64) -> Result<Vec<(i64, i16)>, sqlx::Error>
         .await
 }
 
-/// The §5.5 claim: under the list locks of O's lists, every list that
-/// passed phase 1 in its epoch (pending/unavailable) or asked for a
-/// refresh (ready/retained).
+/// The claim: under the list locks of O's lists, every list that passed
+/// phase 1 in its epoch (pending/unavailable) or asked for a refresh
+/// (ready/retained).
 async fn claim(
     ctx: &Ctx,
     owner_id: i64,
@@ -222,7 +222,7 @@ async fn fetch(
                     late,
                 },
                 _ => {
-                    // Stamp expired (a real failure, §5.5): fresh stamp.
+                    // Stamp expired (a real failure): fresh stamp.
                     let rev = xrpc::latest_rev(&ctx.net, &pds.endpoint, owner.as_str())
                         .await
                         .map_err(|x| e(&x))?;
@@ -278,8 +278,8 @@ async fn fetch(
             )
         }
     };
-    // Budget gate (§5.3, §5.5): runs for non-large owners go deletes-only,
-    // promote nothing and release their claim.
+    // Budget gate: runs for non-large owners go deletes-only, promote
+    // nothing and release their claim.
     let req = JobReq {
         did: owner.clone(),
         tier: 1,

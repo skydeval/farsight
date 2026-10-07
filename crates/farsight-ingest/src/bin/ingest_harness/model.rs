@@ -1,5 +1,5 @@
 //! An independent model of what storage must hold after a stream of
-//! commits: the §7.2 LWW rule replayed in plain Rust over every event the
+//! commits: the LWW rule replayed in plain Rust over every event the
 //! ingest received (via the tap), then compared with the real rows.
 //!
 //! Scope: blocks, listblocks and list records — the three collections

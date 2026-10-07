@@ -1,5 +1,5 @@
-//! The public UI (design §8.6): `/`, `/search`, `/did/…`, `/list/…`,
-//! `/card/…`, and `/robots.txt`.
+//! The public UI (see `docs/design/web-ui.md`): `/`, `/search`,
+//! `/did/…`, `/list/…`, `/card/…`, and `/robots.txt`.
 //!
 //! Anyone may look up the block relationships of a DID or a list. The
 //! surface is toggled by `access.public_ui` and shaped by `[public_ui]`,
@@ -18,10 +18,10 @@
 //! - **Responses do not depend on the caller.** A response is a function
 //!   of the path, the query string and the instance's state: no cookie is
 //!   read or set, and no request header changes the body. That is what
-//!   makes `Cache-Control: public` safe (§9.4).
-//! - **One withheld rule.** An account that is hidden (§7.4) or in
-//!   `public_ui.excluded_dids` has no page and appears in no row, and the
-//!   notice is the same for both.
+//!   makes `Cache-Control: public` safe (see `docs/design/security.md`).
+//! - **One withheld rule.** An account that is hidden (see
+//!   `docs/design/storage.md`) or in `public_ui.excluded_dids` has no
+//!   page and appears in no row, and the notice is the same for both.
 //! - **No writes.** The public UI never interns a row and never enqueues
 //!   backfill work. (A row shown as a bare DID asks the in-memory warming
 //!   worker for that account's handle; nothing is stored.)
@@ -230,7 +230,7 @@ struct ExcludedCache {
     withheld: Withheld,
 }
 
-/// A change waiting for the operator's confirmation (§8.6).
+/// A change waiting for the operator's confirmation.
 #[derive(Debug, Clone)]
 pub struct PendingEnable {
     /// When the confirmation page was rendered.
@@ -362,7 +362,7 @@ pub fn chrome(cfg: &Config, og_title: &str, og_text: &'static str, path: &str) -
 // ---------------------------------------------------------------------------
 // Responses
 
-/// How a response may be cached (§9.4).
+/// How a response may be cached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cache {
     /// `public, max-age=<s>`.
@@ -575,7 +575,7 @@ pub fn fail(cfg: &Config, f: Fail) -> Response {
     }
 }
 
-/// A relative redirect to a public page (§8.5), `no-store`.
+/// A relative redirect to a public page, `no-store`.
 pub fn redirect(cfg: &Config, to: &str) -> Response {
     debug_assert!(to.starts_with('/') && !to.starts_with("//"));
     let r = (
@@ -728,7 +728,7 @@ where
 type St = State<Arc<WebState>>;
 type Client = Option<axum::Extension<ClientIp>>;
 
-/// The text page at `/` of an instance with neither UI (§8.6).
+/// The text page at `/` of an instance with neither UI.
 const API_ONLY: &str = "Farsight\n\nThis instance exposes an ATProto block-graph API.\nSee \
                         https://atproto.com for protocol details.\n";
 

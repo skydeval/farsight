@@ -96,7 +96,7 @@ impl FromStr for Nsid {
 /// One of the four indexed collections.
 ///
 /// The numeric codes are the `tombstones.collection` / `backfill_cursors`
-/// storage codes of design §7.1 (1 block, 2 listblock, 3 list, 4 listitem).
+/// storage codes (1 block, 2 listblock, 3 list, 4 listitem).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Collection {
     /// `app.bsky.graph.block`.
@@ -139,7 +139,7 @@ impl Collection {
         }
     }
 
-    /// Storage code (design §7.1).
+    /// Storage code.
     pub fn code(self) -> i16 {
         match self {
             Collection::Block => 1,

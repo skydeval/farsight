@@ -1,7 +1,8 @@
-//! Applying §4.4 transitions to `lists` rows, and `list_sched_keys`
-//! maintenance (§5.5).
+//! Applying list transitions (see `docs/design/list-indexing.md`) to
+//! `lists` rows, and `list_sched_keys` maintenance (see
+//! `docs/design/backfill.md`).
 //!
-//! Every function here must run under list(L) **exclusive** (§4.3); the
+//! Every function here must run under list(L) **exclusive**; the
 //! transition function itself is pure (`crate::transition`).
 
 use chrono::{DateTime, Utc};
@@ -251,7 +252,7 @@ impl Txn<'_> {
         .bind(list_id)
         .fetch_one(&mut *self.conn)
         .await?;
-        // Phase 1 always runs for a new epoch (§5.5).
+        // Phase 1 always runs for a new epoch.
         sqlx::query(
             "INSERT INTO list_jobs (list_id, owner_id, admit_epoch) VALUES ($1, $2, $3)
              ON CONFLICT (list_id) DO UPDATE SET owner_id = EXCLUDED.owner_id,
@@ -280,7 +281,7 @@ impl Txn<'_> {
     }
 
     /// Recomputes a waiting list's lanes from its current counted
-    /// listblocks, by each row's stored `sched_key` (§5.5).
+    /// listblocks, by each row's stored `sched_key`.
     pub async fn rebuild_sched_keys(&mut self, list_id: i64) -> Result<()> {
         sqlx::query("DELETE FROM list_sched_keys WHERE list_id = $1")
             .bind(list_id)
@@ -330,7 +331,7 @@ impl Txn<'_> {
     /// Applies a counted-listblock count change on `list_id` (+1 or −1)
     /// under list(L) exclusive: updates `listblock_count`, the lane of
     /// `sched_key` while the list is waiting, and fires **+** / **−** on a
-    /// 0 ↔ ≥ 1 crossing (§4.2).
+    /// 0 ↔ ≥ 1 crossing.
     pub async fn change_listblock_count(
         &mut self,
         list_id: i64,

@@ -1,4 +1,5 @@
-//! What a public page says about coverage (design §3.7, §8.6).
+//! What a public page says about coverage (see `docs/design/coverage.md`
+//! and `docs/design/web-ui.md`).
 //!
 //! A public page prints no coverage level, so it claims none. What it
 //! keeps are the three places where silence would turn into a claim: an

@@ -1,12 +1,13 @@
-//! The list transition function of design §4.4, as a pure function.
+//! The list transition function (see `docs/design/list-indexing.md`), as a
+//! pure function.
 //!
 //! `transition(facts, event, ctx)` returns the new state, the new
 //! `purge_then`, and the side effects the caller applies under the list
-//! lock (see `crate::tracking`). Every cell of the §4.4 table is one match
-//! arm below and one unit test.
+//! lock (see `crate::tracking`). Every cell of the transition table is
+//! one match arm below and one unit test.
 //!
-//! Interpretations of the table that the design leaves implicit are
-//! documented at the arm and repeated in the stage-1 terminal report:
+//! Where the table leaves something implicit, the interpretation is
+//! documented at the arm:
 //! - "stay" cells return the unchanged state with `changed = false` and a
 //!   [`Effect::StayRetry`] marker where the table says "(retry)".
 //! - The owner re-admission budget for **DV** on `ready`/`retained` is
@@ -17,7 +18,7 @@
 
 use crate::codes::{DeferCause, RecordState, TrackState};
 
-/// The events of design §4.4.
+/// The events of the transition table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Event {
     /// **+**: counted listblocks 0 → ≥ 1.
@@ -90,7 +91,7 @@ pub struct ListFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ctx {
     /// Whether the owner has owner-caused re-admissions left today
-    /// (`limits.owner_readmissions_per_day`, §4.4).
+    /// (`limits.owner_readmissions_per_day`).
     pub owner_readmit_available: bool,
 }
 
@@ -200,7 +201,7 @@ fn admit(charged: bool, ctx: &Ctx) -> Outcome {
     to(TrackState::Pending, effects)
 }
 
-/// The §4.4 transition function.
+/// The transition function.
 pub fn transition(f: &ListFacts, event: Event, ctx: &Ctx) -> Outcome {
     use Event as E;
     use TrackState as S;
@@ -228,9 +229,9 @@ pub fn transition(f: &ListFacts, event: Event, ctx: &Ctx) -> Outcome {
         (S::Pending, E::Ok) => to(S::Ready, vec![Effect::Promote]),
         (S::Pending, E::FailTerminal) => to(S::Unavailable, Vec::new()),
         (S::Pending, E::OwnerInactive) => to(S::Unavailable, Vec::new()),
-        // Owner-caused (divergence): charged. See module docs / terminal
-        // report: the design lists GO, OA and first admissions as never
-        // charged and DV-caused re-admission as charged.
+        // Owner-caused (divergence): charged. See the module docs: GO, OA
+        // and first admissions are never charged; a DV-caused re-admission
+        // is.
         (S::Pending, E::Diverged) => admit(true, ctx),
         (S::Pending, _) => stay(f),
 
@@ -414,7 +415,7 @@ mod tests {
         o.state == f.state && o.purge_then == f.purge_then && !o.changed
     }
 
-    /// The cells of §4.4 that are not "—", as (state, event).
+    /// The cells of the table that are not "—", as (state, event).
     fn defined_cells() -> Vec<(S, E)> {
         let gf = E::GateFail(DeferCause::Budget);
         vec![
@@ -708,7 +709,7 @@ mod tests {
         }
     }
 
-    // ---- invariant (§4.4 ³): pending/ready/unavailable only while count > 0 ----
+    // ---- invariant: pending/ready/unavailable only while count > 0 ----
 
     fn event_strategy() -> impl Strategy<Value = (Event, i32, bool)> {
         let events: Vec<Event> = E::ALL

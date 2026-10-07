@@ -1,4 +1,5 @@
-//! The ATProto OAuth client behind the admin sign-in (design §8.6).
+//! The ATProto OAuth client behind the admin sign-in (see
+//! `docs/design/web-ui.md`).
 //!
 //! Farsight is a public client that asks for the `atproto` scope only: it
 //! authenticates one account, the configured admin DID, reads `sub` from
@@ -9,8 +10,9 @@
 //! in-memory store of flows in progress. The handlers that use it are in
 //! [`crate::enter`].
 //!
-//! Every request goes through the safe outbound client (§11.3). Nothing
-//! here logs a code, a state, a token, a cookie or a key.
+//! Every request goes through the safe outbound client (see
+//! `docs/design/security.md`). Nothing here logs a code, a state, a
+//! token, a cookie or a key.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -249,10 +251,10 @@ pub fn pds_endpoint(doc: &Value) -> Option<Url> {
 }
 
 /// Checks an authorization server's metadata against the issuer it was
-/// fetched for and against what the flow needs (design §8.6): the issuer
-/// matches, PAR is required, the endpoints are URLs the safe client
-/// accepts, and S256, ES256, the `atproto` scope and the `code` response
-/// type are supported.
+/// fetched for and against what the flow needs: the issuer matches, PAR
+/// is required, the endpoints are URLs the safe client accepts, and
+/// S256, ES256, the `atproto` scope and the `code` response type are
+/// supported.
 pub fn check_server_metadata(
     issuer: &Url,
     meta: &Value,
@@ -595,7 +597,7 @@ impl Default for FlowStore {
 
 #[cfg(feature = "harness")]
 fn flow_ttl() -> Duration {
-    // Phase B only: lets the harness watch a flow expire without waiting
+    // Harness only: lets the harness watch a flow expire without waiting
     // ten minutes.
     std::env::var("FARSIGHT_HARNESS_FLOW_TTL_SECS")
         .ok()

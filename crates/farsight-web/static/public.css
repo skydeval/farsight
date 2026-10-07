@@ -1631,7 +1631,7 @@ footer {
   .table-responsive, .table-responsive > .data-table {
     overflow: visible;
   }
-  /* Nothing is clipped to the frame's rounded corners any more, so the
+  /* Nothing is clipped to the frame's rounded corners here, so the
      corner cells are rounded themselves. */
   .data-table thead th:first-child { border-top-left-radius: var(--radius); }
   .data-table thead th:last-child { border-top-right-radius: var(--radius); }

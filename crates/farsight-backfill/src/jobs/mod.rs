@@ -1,5 +1,5 @@
-//! The per-DID jobs (design §5.2, §5.5, §5.6) and what they share: the
-//! one-per-DID lease, run outcomes (§5.2.1) and their bookkeeping.
+//! The per-DID jobs (see `docs/design/backfill.md`) and what they share: the
+//! one-per-DID lease, run outcomes and their bookkeeping.
 
 pub mod discovery;
 pub mod list_fetch;
@@ -24,7 +24,7 @@ pub const LEASE: std::time::Duration = std::time::Duration::from_secs(600);
 pub struct JobReq {
     /// The repo.
     pub did: Did,
-    /// Tier 1–3 (§5.3).
+    /// Tier 1–3.
     pub tier: i16,
     /// `token:<id>`, `admin`, `system:lists`, `system:resync`,
     /// `system:firehose`, `system:sweep`, `system:repair`.
@@ -32,7 +32,7 @@ pub struct JobReq {
 }
 
 impl JobReq {
-    /// Admin-requested jobs run normally under the budget gate (§5.3).
+    /// Admin-requested jobs run normally under the budget gate.
     pub fn admin(&self) -> bool {
         self.requester == "admin"
     }
@@ -41,13 +41,13 @@ impl JobReq {
 /// How a job ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// §5.2.1 clean.
+    /// Clean.
     Clean,
-    /// §5.2.1 complete-with-debts.
+    /// Complete-with-debts.
     CompleteWithDebts,
-    /// §5.2.1 inactive.
+    /// Inactive.
     Inactive,
-    /// §5.2.1 failed (terminal after `backfill.terminal_after`).
+    /// Failed (terminal after `backfill.terminal_after`).
     Failed {
         /// The error.
         error: String,
@@ -55,7 +55,7 @@ pub enum Outcome {
         terminal: bool,
     },
     /// The page bound was reached: continue from the cursor later (not a
-    /// failure, §5.2 bounds).
+    /// failure).
     Yielded,
     /// Another job holds the DID's lease: retried later.
     Busy,
@@ -76,7 +76,7 @@ impl Outcome {
 }
 
 /// A finished job: its outcome and cost in outbound requests (the DRR
-/// charge, §5.3).
+/// charge).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobResult {
     /// Outcome.
@@ -85,7 +85,7 @@ pub struct JobResult {
     pub cost: u64,
 }
 
-/// Takes the DID's lease; `false` if another job holds it (§5.2).
+/// Takes the DID's lease; `false` if another job holds it.
 pub async fn acquire_lease(pool: &PgPool, did: &str, owner: &str) -> Result<bool, sqlx::Error> {
     let got: Option<String> = sqlx::query_scalar(
         "INSERT INTO job_leases (did, lease_owner, lease_until)
@@ -127,8 +127,8 @@ pub async fn release_lease(pool: &PgPool, did: &str, owner: &str) {
 }
 
 /// The DID's `actors.id`, creating the row (under its intern lock, charged
-/// to its own key and never refused, §11.2) when a job needs it: an
-/// inactive outcome, a failure that must be queued, a debt.
+/// to its own key and never refused) when a job needs it: an inactive
+/// outcome, a failure that must be queued, a debt.
 pub async fn intern(ctx: &Ctx, did: &Did) -> Result<i64, farsight_storage::StorageError> {
     let limits = ctx.limits();
     let mut tx = ctx.pool.begin().await?;
@@ -154,7 +154,7 @@ pub async fn actor_id(pool: &PgPool, did: &str) -> Result<Option<i64>, sqlx::Err
         .await
 }
 
-/// Database time (every coverage instant comes from the database, §3.7.1).
+/// Database time (every coverage instant comes from the database).
 pub async fn db_now(pool: &PgPool) -> Result<DateTime<Utc>, sqlx::Error> {
     sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(pool)
@@ -174,8 +174,8 @@ pub fn retry_delay(
         .unwrap_or(std::time::Duration::from_secs(3600))
 }
 
-/// Cycle membership (§5.4): a clean, complete-with-debts or inactive job
-/// that **started** after a running cycle's start deletes the DID's
+/// Cycle membership: a clean, complete-with-debts or inactive job that
+/// **started** after a running cycle's start deletes the DID's
 /// outstanding row there; a terminal failure marks it terminal.
 pub async fn settle_membership(
     pool: &PgPool,
@@ -228,7 +228,7 @@ pub async fn settle_membership(
 pub struct Finish<'a> {
     /// The job.
     pub req: &'a JobReq,
-    /// Its coverage point `clock(job start)` (§3.7.1).
+    /// Its coverage point `clock(job start)`.
     pub point: Option<DateTime<Utc>>,
     /// Server time of the job start (cycle membership).
     pub job_start: DateTime<Utc>,
@@ -238,7 +238,7 @@ pub struct Finish<'a> {
     pub outcome: &'a Outcome,
 }
 
-/// The §5.2 step 7 / §5.2.1 bookkeeping of a repo-kind job.
+/// The bookkeeping at the end of a repo-kind job, by outcome.
 pub async fn finish_repo(
     ctx: &Ctx,
     f: &Finish<'_>,
@@ -246,7 +246,7 @@ pub async fn finish_repo(
     let pool = &ctx.pool;
     let did = f.req.did.as_str();
     let mut outcome = f.outcome.clone();
-    // D4: only DIDs Farsight holds data for, or that were requested (or
+    // Only DIDs Farsight holds data for, or that were requested (or
     // that need a row: inactive, failed), get `backfill_state`.
     let id = match (&outcome, actor_id(pool, did).await?) {
         (_, Some(id)) => Some(id),
@@ -340,8 +340,8 @@ pub async fn finish_repo(
                     .await?;
                 settle_membership(pool, did, f.job_start, true).await?;
             } else {
-                // Retried with backoff through the queue (§5.2, §5.4: failed
-                // cycle members are queued, which interns them).
+                // Retried with backoff through the queue (failed cycle
+                // members are queued, which interns them).
                 let mut conn = pool.acquire().await?;
                 farsight_storage::queue::enqueue(
                     &mut conn,

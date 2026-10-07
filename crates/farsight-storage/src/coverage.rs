@@ -1,11 +1,12 @@
-//! Coverage building blocks (design §3.7): the global snapshot, the gap
-//! predicate `covered(t)`, the pending-list effects of §3.7.4 and network
-//! scope. The API crate composes these into `freshness` objects.
+//! Coverage building blocks (see `docs/design/coverage.md`): the global
+//! snapshot, the gap predicate `covered(t)`, the effects of pending
+//! lists and network scope. The API crate composes these into
+//! `freshness` objects.
 //!
 //! The snapshot is read in **one `REPEATABLE READ` transaction**
 //! ([`read_snapshot`]) so its inputs are mutually consistent, including
-//! `firehoseAppliedThrough` (§3.7.1–§3.7.2). The API refreshes it on
-//! `NOTIFY farsight_coverage`, every 10 s and on every LISTEN reconnect.
+//! `firehoseAppliedThrough`. The API refreshes it on `NOTIFY
+//! farsight_coverage`, every 10 s and on every LISTEN reconnect.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -22,7 +23,7 @@ use crate::keys::Limits;
 /// Channel name for coverage notifications.
 pub const COVERAGE_CHANNEL: &str = "farsight_coverage";
 
-/// Snapshot refresh period (§3.7.1).
+/// Snapshot refresh period.
 pub const SNAPSHOT_REFRESH: Duration = Duration::from_secs(10);
 
 /// The latest completed full sweep cycle.
@@ -53,13 +54,13 @@ pub struct ListCounts {
     pub capped: i64,
 }
 
-/// The §3.7.4 effect of pending lists at network scope.
+/// The effect of pending lists at network scope.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingEffects {
     /// Pending lists considered (pending, plus purging lists that will be
     /// re-admitted).
     pub considered: i64,
-    /// Their ids, sorted (the live rule of §3.7.1 compares against it).
+    /// Their ids, sorted (the live rule compares against it).
     pub considered_ids: Vec<i64>,
     /// `excludedPendingLists`: no relevant listblocks, or beyond the
     /// per-owner-key bound.
@@ -74,7 +75,7 @@ pub struct PendingEffects {
     pub historical: bool,
 }
 
-/// One consistent read of every global coverage input (§3.7.1).
+/// One consistent read of every global coverage input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalSnapshot {
     /// Database time of the read.
@@ -166,7 +167,7 @@ pub struct PendingList {
     pub id: i64,
     /// Admission time (slot order: oldest first).
     pub admitted_at: Option<DateTime<Utc>>,
-    /// The owner key (§3.7.4).
+    /// The owner key.
     pub owner_key: String,
     /// Counted listblocks by covered authors.
     pub relevant: i64,
@@ -190,7 +191,7 @@ type PendingRow = (
 
 /// Reads the pending lists (and purging lists that will be re-admitted)
 /// with their relevant listblocks computed on read from current rows
-/// (§3.7.4: a covered author has no `resync` or `unreachable` debt).
+/// (a covered author has no `resync` or `unreachable` debt).
 pub async fn read_pending_lists(conn: &mut sqlx::PgConnection) -> Result<Vec<PendingList>> {
     let rows: Vec<PendingRow> = sqlx::query_as(
         "SELECT l.id, l.admitted_at, a.did, h.cap_key, COALESCE(h.large, false),
@@ -241,7 +242,7 @@ async fn read_pending_effects(
     ))
 }
 
-/// The §3.7.4 table and per-owner-key bound, as a pure function.
+/// The pending-list table and per-owner-key bound, as a pure function.
 pub fn pending_effects(lists: &[PendingList], per_owner_key: usize) -> PendingEffects {
     let mut out = PendingEffects {
         considered: lists.len() as i64,
@@ -283,7 +284,7 @@ pub fn pending_effects(lists: &[PendingList], per_owner_key: usize) -> PendingEf
 
 impl GlobalSnapshot {
     /// Whether the synthetic gap `[applied_through, ∞)` exists: the stream
-    /// is disconnected or lags more than `synthetic_gap_lag` (§3.7.1).
+    /// is disconnected or lags more than `synthetic_gap_lag`.
     pub fn synthetic_gap(&self, synthetic_gap_lag: Duration) -> bool {
         match self.firehose.applied_through {
             None => true,
@@ -294,7 +295,7 @@ impl GlobalSnapshot {
         }
     }
 
-    /// `covered(t)` (§3.7.1): `t` defined and no unhealed gap — recorded or
+    /// `covered(t)`: `t` defined and no unhealed gap — recorded or
     /// synthetic — overlaps `[t, firehoseAppliedThrough]`.
     pub fn covered(&self, t: Option<DateTime<Utc>>, synthetic_gap_lag: Duration) -> bool {
         let (Some(t), Some(a)) = (t, self.firehose.applied_through) else {
@@ -334,11 +335,11 @@ pub struct Scope {
     pub level: Level,
     /// `completeSince` (witness clock), when the level holds since a point.
     pub complete_since: Option<DateTime<Utc>>,
-    /// Reason codes (§3.7.2).
+    /// Reason codes.
     pub reasons: Vec<&'static str>,
 }
 
-/// Network scope for collection `k` (storage code, §7.1) (§3.7.5 item 1): `complete` iff a
+/// Network scope for collection `k` (storage code): `complete` iff a
 /// completed baseline covers `k`, `covered(S_C)`, protocol v2, and no
 /// global storage refusal is active.
 pub fn network_scope(s: &GlobalSnapshot, k: i16, synthetic_gap_lag: Duration) -> Scope {
@@ -352,7 +353,7 @@ pub fn network_scope(s: &GlobalSnapshot, k: i16, synthetic_gap_lag: Duration) ->
     } else if s.synthetic_gap(synthetic_gap_lag) {
         reasons.push("firehose_lagging");
     }
-    // `covered(S_C)` requires S_C defined (§3.7.1).
+    // `covered(S_C)` requires S_C defined.
     if baseline.is_some_and(|b| b.s_c.is_none()) {
         reasons.push("sweep_incomplete");
     }

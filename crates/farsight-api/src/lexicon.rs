@@ -1,6 +1,7 @@
-//! The published lexicons (design §3.1, §12), embedded, and a validator for
-//! the subset of lexicon types they use. Phase B parses every response
-//! against them; unit tests check the files load and every `ref` resolves.
+//! The published lexicons (see `docs/design/api.md`), embedded, and a
+//! validator for the subset of lexicon types they use. The harnesses parse
+//! every response against them; unit tests check the files load and every
+//! `ref` resolves.
 
 use std::collections::HashMap;
 

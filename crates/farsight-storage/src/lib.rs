@@ -1,8 +1,9 @@
 //! Postgres storage for Farsight: migrations, the shared apply path
 //! (locks, last-write-wins, list tracking), queries and coverage computation.
 //!
-//! Every writer in both binaries goes through [`apply::apply`] (design §2):
-//! firehose and backfill admission rules cannot drift.
+//! Every writer in both binaries goes through [`apply::apply`] (see
+//! `docs/design/README.md`): firehose and backfill admission rules
+//! cannot drift.
 
 #![warn(missing_docs)]
 
@@ -38,15 +39,15 @@ use sqlx::postgres::PgPoolOptions;
 
 pub use error::{Result, StorageError};
 
-/// The embedded migration set (design §7.1, one file per logical group).
+/// The embedded migration set (one file per logical group).
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build expects: the number of the last
 /// migration, which each migration writes into `schema_version`.
-/// `farsight-backfill` polls for it before starting work (design §2).
+/// `farsight-backfill` polls for it before starting work.
 pub const SCHEMA_VERSION: i32 = 13;
 
-/// How often `farsight-backfill` polls `schema_version` (design §2).
+/// How often `farsight-backfill` polls `schema_version`.
 pub const SCHEMA_POLL: Duration = Duration::from_secs(5);
 
 /// Connects a pool.
@@ -57,7 +58,7 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<PgPool>
         .await?)
 }
 
-/// Runs migrations (server only, design §2) and checks the result.
+/// Runs migrations (server only) and checks the result.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     MIGRATOR.run(pool).await?;
     match schema_version(pool).await? {
@@ -86,7 +87,7 @@ pub async fn schema_version(pool: &PgPool) -> Result<Option<i32>> {
 }
 
 /// Blocks until `schema_version` equals [`SCHEMA_VERSION`], polling every
-/// [`SCHEMA_POLL`] (`farsight-backfill` startup, design §2).
+/// [`SCHEMA_POLL`] (`farsight-backfill` startup).
 pub async fn wait_for_schema(pool: &PgPool) -> Result<()> {
     loop {
         if schema_version(pool).await? == Some(SCHEMA_VERSION) {
@@ -121,9 +122,9 @@ mod tests {
 
     #[test]
     fn no_code_deletes_actors() {
-        // Design §11.2: actors rows are never deleted. The migration adds a
-        // trigger that refuses it at runtime; this checks no statement in
-        // the crate tries.
+        // Actors rows are never deleted. The migration adds a trigger
+        // that refuses it at runtime; this checks no statement in the
+        // crate tries.
         for (name, src) in [
             ("apply.rs", include_str!("apply.rs")),
             ("janitor.rs", include_str!("janitor.rs")),

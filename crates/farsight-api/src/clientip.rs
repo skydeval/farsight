@@ -1,6 +1,6 @@
-//! Client IP resolution (design §9.1), proxy trust, the
-//! "behind Cloudflare but not trusting it" detector (§9.3) and stripping of
-//! forwarding headers from untrusted peers (§9.1).
+//! Client IP resolution (see `docs/design/security.md`), proxy trust, the
+//! "behind Cloudflare but not trusting it" detector and stripping of
+//! forwarding headers from untrusted peers.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Mutex, RwLock};
@@ -24,8 +24,8 @@ pub const FORWARDING_HEADERS: [&str; 8] = [
 ];
 
 /// The forwarding headers as received, before untrusted ones were
-/// stripped. Only the setup wizard's proxy preview (§8.4 step 7) reads it;
-/// nothing logs it.
+/// stripped. Only the setup wizard's proxy preview reads it; nothing
+/// logs it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OriginalForwarding(pub Vec<(String, String)>);
 
@@ -39,7 +39,7 @@ pub struct ClientIp {
     /// The peer is a trusted proxy.
     pub trusted_peer: bool,
     /// The request reached the proxy (or us) over HTTPS: decides the
-    /// cookie `Secure` flag (§8.5).
+    /// cookie `Secure` flag.
     pub https: bool,
 }
 
@@ -66,7 +66,7 @@ fn header_ip(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
         .map(canonical)
 }
 
-/// The algorithm of §9.1, verbatim:
+/// The algorithm:
 ///
 /// ```text
 /// if peer ∉ trusted:            client := peer   # all forwarding headers ignored
@@ -135,7 +135,7 @@ impl ProxyTrust {
 
 /// Resolves the client for one request and strips forwarding headers of
 /// untrusted peers. In setup mode (`setup = true`) `X-Forwarded-Proto` is
-/// honored for the `Secure` flag only, never for the client IP (§8.5).
+/// honored for the `Secure` flag only, never for the client IP.
 pub fn resolve_request<B>(
     req: &mut Request<B>,
     peer: SocketAddr,
@@ -165,7 +165,7 @@ pub fn resolve_request<B>(
     }
 }
 
-/// Window of the Cloudflare-share detector (§9.3: 5 minutes).
+/// Window of the Cloudflare-share detector (5 minutes).
 pub const CF_WINDOW: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
@@ -179,7 +179,7 @@ struct CfWindow {
 /// Counts requests whose peer is a Cloudflare edge while that peer is not
 /// trusted: if more than half of a 5-minute window comes from Cloudflare
 /// ranges, Farsight is behind Cloudflare without trusting it and every
-/// client shares a few rate-limit buckets (§9.3).
+/// client shares a few rate-limit buckets.
 #[derive(Debug)]
 pub struct CfTracker {
     cf: Vec<IpNet>,

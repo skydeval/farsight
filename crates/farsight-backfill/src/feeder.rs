@@ -1,4 +1,5 @@
-//! The debt feeder (design §3.7.3, §5.3): turns `relist_debt` rows into
+//! The debt feeder (see `docs/design/coverage.md` and
+//! `docs/design/backfill.md`): turns `relist_debt` rows into
 //! `system:resync` re-list jobs when, and only when, the re-list can clear
 //! them, and enqueues `list_fetch` runs for list work whose queue entry was
 //! dropped at the system-queue cap. Nothing loops: a debt whose cause still
@@ -23,7 +24,7 @@ use crate::ctx::Ctx;
 const PASS: i64 = 2000;
 /// Minimum interval between two re-lists fed for the same non-daily debt.
 pub const MIN_REFEED: Duration = Duration::from_secs(3600);
-/// Hysteresis for per-author caps (§3.7.3: under 90%).
+/// Hysteresis for per-author caps (under 90%).
 const UNDER: f64 = 0.9;
 
 /// What the feeder knows about one debt.
@@ -53,7 +54,7 @@ pub struct DebtView {
     pub next_attempt: Option<DateTime<Utc>>,
 }
 
-/// Whether a run now would be deletes-only (§5.3 budget gate).
+/// Whether a run now would be deletes-only (the budget gate).
 fn deletes_only(gates: Gates, large: bool) -> bool {
     gates.ceiling_refusing || (gates.budget_refusing && !large)
 }
@@ -71,7 +72,7 @@ fn bucket_bit(c: CapType) -> Option<i16> {
 
 const CONTENT_BITS: i16 = 1 | 2 | 4 | 8;
 
-/// §3.7.3 eligibility of one debt at `now` (UTC) under `gates` and `limits`.
+/// Eligibility of one debt at `now` (UTC) under `gates` and `limits`.
 pub fn eligible(d: &DebtView, gates: Gates, limits: &Limits, now: DateTime<Utc>) -> bool {
     let today: NaiveDate = now.date_naive();
     let ran_today = d.last_run.is_some_and(|t| t.date_naive() == today);

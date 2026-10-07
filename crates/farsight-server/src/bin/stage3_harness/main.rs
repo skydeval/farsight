@@ -1,7 +1,7 @@
-//! `farsight-stage3-harness`: Phase B Mode A — automated API conformance
-//! (stage-3 kickoff). Every assertion reads real responses from real
-//! `farsight` processes and real stored rows; expectations that depend on
-//! data are derived from SQL against the same database.
+//! `farsight-stage3-harness`: integration tests of the API's conformance.
+//! Every assertion reads real responses from real `farsight` processes
+//! and real stored rows; expectations that depend on data are derived
+//! from SQL against the same database.
 //!
 //! Phases:
 //! - **live**: a server with ingest on the public Jetstream, the pagination
@@ -10,9 +10,9 @@
 //!   the admin reset.
 //! - **coverage**: a server whose firehose URL is unreachable, so the
 //!   harness alone writes the firehose state; scripted rows, debts and list
-//!   states, and the §3.7 coverage rules on every read endpoint.
+//!   states, and the coverage rules on every read endpoint.
 //! - **cloudflare**: a server reached from a container on a Docker network
-//!   inside a Cloudflare range (the §9.3 dashboard warning).
+//!   inside a Cloudflare range (the dashboard warning).
 
 mod seed;
 mod support;
@@ -1060,9 +1060,9 @@ async fn check_rate_limits(
         false,
     )
     .await;
-    // There is no anonymous admin lookup (UI v2.5): without a session the
-    // page is a redirect to the sign-in page, and no rate class is charged
-    // for it (`ui_lookup` is charged by public search only).
+    // There is no anonymous admin lookup: without a session the page is a
+    // redirect to the sign-in page, and no rate class is charged for it
+    // (`ui_lookup` is charged by public search only).
     let mut answers = Vec::new();
     for _ in 0..8 {
         let r = ctx
@@ -1099,7 +1099,7 @@ async fn check_rate_limits(
         statuses[..5].iter().all(|s| *s != 429) && statuses[5..].iter().all(|s| *s == 429),
         format!("{statuses:?}"),
     );
-    // Cache headers (§9.4).
+    // Cache headers.
     let cc = |r: &Resp| r.header("cache-control").unwrap_or_default();
     let ip = cf_ip(30);
     let h = [("cf-connecting-ip", ip.as_str())];
@@ -1588,7 +1588,8 @@ async fn phase_coverage(
         ("missingLists", "SELECT count(*) FROM lists WHERE track_state = 6"),
         ("deferredLists", "SELECT count(*) FROM lists WHERE track_state = 8"),
         ("cappedLists", "SELECT count(*) FROM lists WHERE track_state IN (1,2,3,4) AND capped"),
-        // §3.7.4: pending lists whose counted listblocks are all by authors with a resync/unreachable debt.
+        // Pending lists whose counted listblocks are all by authors with a
+        // resync/unreachable debt.
         ("excludedPendingLists", "SELECT count(*) FROM lists l WHERE l.track_state = 1 AND NOT EXISTS (
             SELECT 1 FROM list_blocks b WHERE b.list_id = l.id AND b.counted
               AND NOT EXISTS (SELECT 1 FROM relist_debt d WHERE d.actor_id = b.author_id AND d.reason IN (1, 2)))"),
@@ -1763,7 +1764,7 @@ async fn phase_coverage(
         r.short(),
     );
 
-    // §3.7.4: a pending list with live relevant listblocks caps indexedAt.
+    // A pending list with live relevant listblocks caps indexedAt.
     let (cv, r) = v.cov("query.getIncomingListBlocks", &xq).await?;
     let cap = sql_ts(&pool, &format!("SELECT min(witnessed_at) - interval '1 microsecond' FROM list_blocks WHERE list_id = {pend}")).await?;
     c.check(
@@ -1978,7 +1979,7 @@ async fn phase_coverage(
 // -------------------------------------------------------------- cloudflare
 
 async fn phase_cloudflare(c: &mut Checks, ctx: &Ctx, pg: &Pg) -> Result<(), String> {
-    c.section("6b. Cloudflare-share warning (§9.3)");
+    c.section("6b. Cloudflare-share warning");
     // A /29 inside a published Cloudflare range, on a private Docker
     // network: requests from a container on it reach the server from a
     // Cloudflare-range peer that is not trusted.
@@ -2135,7 +2136,7 @@ async fn phase_live(c: &mut Checks, ctx: &Ctx, pg: &Pg) -> Result<(), String> {
 async fn main() -> std::process::ExitCode {
     let keep = std::env::args().any(|a| a == "--keep");
     let only: Option<String> = std::env::args().skip_while(|a| a != "--only").nth(1);
-    println!("== farsight stage-3 harness: Mode A (API conformance)");
+    println!("== farsight stage-3 harness: API conformance");
     let pg = match Pg::start(keep) {
         Ok(p) => p,
         Err(e) => {

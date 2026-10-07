@@ -1,6 +1,7 @@
-//! Handle warming (design §3.6, §8.6): a background worker verifies the
-//! handles of accounts that pages had to show as bare DIDs, so that a
-//! later view shows the handle.
+//! Handle warming (see `docs/design/api.md` and
+//! `docs/design/web-ui.md`): a background worker verifies the handles
+//! of accounts that pages had to show as bare DIDs, so that a later
+//! view shows the handle.
 //!
 //! Rendering a row never waits for an outbound request. A row whose
 //! account has no cache entry, in memory or stored — or a stored handle

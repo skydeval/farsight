@@ -1,9 +1,9 @@
-//! `farsight-stage8-harness`: Phase B Mode A for UI v2.4.3 — tables that
-//! sort by their rows' shown time, the four sort indexes and their
-//! background build, queue-driven handle warming, and the admin tables
-//! (sticky header, handles, profile cards, record cells, "First seen").
+//! `farsight-stage8-harness`: integration tests of tables that sort by
+//! their rows' shown time, the four sort indexes and their background
+//! build, queue-driven handle warming, and the admin tables (sticky
+//! header, handles, profile cards, record cells, "First seen").
 //!
-//! Sections, numbered as the stage kickoff numbers its probes:
+//! Sections:
 //!
 //! - 1–6: sort key and clamp (order, future dates, missing dates, paging
 //!   through ties, index use, cursors);
@@ -20,15 +20,13 @@
 //! - 27–28: write cost of the four indexes; plans of representative
 //!   queries.
 //!
-//! Probes 25 and 26 are the stage-7 and stage-6 harnesses, run again.
-//!
 //! Sessions are created in the database, as in the stage-6 harness; the
 //! sign-in itself is the stage-7 harness's subject.
 //!
 //! Flags: `--browser` runs `scripts/stage8-browser-probes.mjs` in the
 //! Playwright image; `--skip-live` leaves out what needs the live network
 //! (verified handles come from the real PLC directory and DNS);
-//! `--jetstream URL` names the v2 Jetstream probe 24 reads from (default
+//! `--jetstream URL` names the v2 Jetstream section 24 reads from (default
 //! `ws://127.0.0.1:16008`); `--keep` keeps the Postgres container.
 
 mod plc;
@@ -687,7 +685,7 @@ async fn seed_world(pool: &PgPool) -> Result<World, String> {
     )
     .await?;
 
-    // T2: the future-date records go through the real write path later.
+    // `t2`: its future-date records go through the real write path later.
     let (t2, t2_id) = actor(did("tfu", 1)).await?;
     let spam = did("spm", 1);
 
@@ -906,7 +904,7 @@ async fn check_order(
     let want = expected(pool, Section::IncomingBlocks, w.s_id, true).await?;
     let (got, pages) = walk(a, &public_did(&w.s), "blockers").await?;
     c.check(
-        "the public \"Blocked by\" table lists 305 records with stated dates in the future, in the past, missing, and rows stored before first_seen existed in exactly the order of the shown time, then blocker id, then record key, all descending",
+        "the public \"Blocked by\" table lists 305 records with stated dates in the future, in the past, missing, and rows without a first_seen in exactly the order of the shown time, then blocker id, then record key, all descending",
         got == want && got.len() == 305,
         format!("{} rows over {pages} pages; first differing position: {:?}", got.len(), got.iter().zip(&want).position(|(x, y)| x != y)),
     );
@@ -1232,8 +1230,8 @@ fn order_of(plan: &str) -> &'static str {
 
 async fn check_cursors(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<(), String> {
     c.section("6. cursors (admin tables) and page numbers (public tables)");
-    // No admin table pages by cursor any more: the lookups page by
-    // number, each with its own address.
+    // No admin table pages by cursor: the lookups page by number, each
+    // with its own address.
     let filler_uri = format!("at://{}/app.bsky.graph.list/filler", did("flo", 1));
     let page = a.admin_get(cookie, &lookup_list(&filler_uri)).await?;
     let msec = admin_section(&page.text, "Members").unwrap_or("");
@@ -1626,7 +1624,7 @@ async fn check_live(c: &mut Checks, pg: &Pg, skip: bool) -> Result<(), String> {
             && took < Duration::from_secs(3),
         format!("{} in {took:?}; {} held back", first.status, pending_of(&sec)),
     );
-    // The harness holds for the worker; 15 s is the kickoff's bound.
+    // The harness holds for the worker, 15 s at most.
     let mut shown = 0;
     let mut ghost_as_did = false;
     let mut left = usize::MAX;
@@ -1728,7 +1726,7 @@ async fn check_admin_card(
     let anon = b.get(&card(&known)).await?;
     let settings = b.get("/admin/settings").await?;
     c.check(
-        "anonymous: the bare 404 of a path that does not exist — same status, same body — never the 303 to /enter that the admin pages answer with: there is no redirect for a script to follow into the card (v2.4.3 §3.3)",
+        "anonymous: the bare 404 of a path that does not exist — same status, same body — never the 303 to /enter that the admin pages answer with: there is no redirect for a script to follow into the card",
         anon.status == 404
             && anon.text == nowhere.text
             && anon.header("location").is_none()
@@ -1768,18 +1766,15 @@ async fn check_admin_card(
     );
     let js = a.get("/static/admin.js").await?;
     let public_js = a.get("/static/public.js").await?;
-    let old_js = a.get("/static/farsight.js").await?;
     let page = a.admin_get(cookie, &lookup_did(&w.s)).await?;
     c.check(
-        "the three fixes of v2.4.3 §3.3 are in what the browser gets: admin pages load /static/public.js (the one UI script, ungated; its second name /static/farsight.js is gone); the script asks with credentials \"same-origin\" only for a link marked data-card-session and never injects an answer that is not a 200 or was reached through a redirect; it names no admin path",
+        "what the browser gets: admin pages load /static/admin.js and not /static/public.js; each of the two scripts asks with credentials \"same-origin\" only for a link marked data-card-session and never injects an answer that is not a 200 or was reached through a redirect; neither names an admin path",
         // The admin pages have their own script, a copy of the public one
         // that changes separately; neither names an admin path.
         js.status == 200
             && public_js.status == 200
-            && old_js.status == 404
             && page.text.contains("<script src=\"/static/admin.js?v=")
             && !page.text.contains("/static/public.js")
-            && !page.text.contains("/static/farsight.js")
             && [&js, &public_js].iter().all(|j| {
                 j.text.contains("link.hasAttribute(\"data-card-session\")")
                     && j.text.contains("credentials: session ? \"same-origin\" : \"omit\"")
@@ -1787,7 +1782,7 @@ async fn check_admin_card(
                     && !j.text.contains("/admin/")
                     && !j.text.contains("/lookup")
             }),
-        format!("public.js {} / farsight.js {}", js.status, old_js.status),
+        format!("admin.js {} / public.js {}", js.status, public_js.status),
     );
     Ok(())
 }
@@ -2950,7 +2945,7 @@ async fn check_index_build(c: &mut Checks, pg: &Pg) -> Result<(), String> {
 // ------------------------------------------------- 24. Jetstream `time`
 
 async fn check_jetstream(c: &mut Checks, url: &str) {
-    c.section("24. what a v2 Jetstream's `time` field is (T15; reported, not a gate)");
+    c.section("24. what a v2 Jetstream's `time` field is (reported, not a gate)");
     use farsight_ingest::conn;
     use farsight_ingest::frame::Protocol;
     use farsight_ingest::resume::Cursor;
@@ -3023,7 +3018,7 @@ async fn check_jetstream(c: &mut Checks, url: &str) {
         ),
     );
     println!(
-        "   T15: this source sends `witnessedAt` on {with_witness} of {commits} commit frames, so ingest's fallback to `time` is {}. Upstream source (jetstream, commit 3fa54fd): `time` is the display timestamp — the instance's witnessed time unless its operator ran a timestamp import (segment/event.go DisplayTimeUS); `witnessedAt` is never altered. Neither is taken from the PDS.",
+        "   This source sends `witnessedAt` on {with_witness} of {commits} commit frames, so ingest's fallback to `time` is {}. Upstream source (jetstream, commit 3fa54fd): `time` is the display timestamp — the instance's witnessed time unless its operator ran a timestamp import (segment/event.go DisplayTimeUS); `witnessedAt` is never altered. Neither is taken from the PDS.",
         if with_witness == commits {
             "not used here"
         } else {
@@ -3380,7 +3375,7 @@ async fn main() -> std::process::ExitCode {
             .and_then(|i| argv.get(i + 1).cloned())
             .unwrap_or_else(|| JETSTREAM.to_owned()),
     };
-    println!("== farsight stage-8 harness: Mode A (UI v2.4.3)");
+    println!("== farsight stage-8 harness: tables, sort indexes, handle warming");
     let bridge = match Bridge::create() {
         Ok(b) => b,
         Err(e) => {

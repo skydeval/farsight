@@ -1,10 +1,11 @@
-//! Read queries behind the stable XRPC endpoints (design §3.2) and the UI
-//! lookups (§8.6). Every query is keyset-paginated (§3.1): the caller
-//! passes the last key it returned, so items inserted behind the cursor
-//! are not returned and items deleted ahead of it are skipped.
+//! Read queries behind the stable XRPC endpoints (see
+//! `docs/design/api.md`) and the UI lookups (see
+//! `docs/design/web-ui.md`). Every query is keyset-paginated: the
+//! caller passes the last key it returned, so items inserted behind the
+//! cursor are not returned and items deleted ahead of it are skipped.
 //!
 //! All functions take a connection so the API can run them inside one
-//! transaction with `statement_timeout` set (§3.6).
+//! transaction with `statement_timeout` set.
 
 use std::collections::HashMap;
 
@@ -14,7 +15,7 @@ use sqlx::PgConnection;
 use crate::codes::{TrackState, actor_status};
 use crate::error::Result;
 
-/// SQL fragment: status codes hidden by default (§3.1, §7.4).
+/// SQL fragment: status codes hidden by default.
 const HIDDEN: &str = "(1, 2, 3, 4)";
 
 /// An interned actor.
@@ -22,12 +23,12 @@ const HIDDEN: &str = "(1, 2, 3, 4)";
 pub struct ActorRef {
     /// `actors.id`.
     pub id: i64,
-    /// `actors.status` (§7.4 codes).
+    /// `actors.status` code.
     pub status: i16,
 }
 
 impl ActorRef {
-    /// Hidden by default (§3.1).
+    /// Hidden by default.
     pub fn hidden(self) -> bool {
         actor_status::is_hidden(self.status)
     }
@@ -68,8 +69,8 @@ pub struct IncomingBlock {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-/// Blocks naming `subject_id`, ordered by blocker actor id then rkey
-/// (§3.2). Duplicate records from one blocker are all returned.
+/// Blocks naming `subject_id`, ordered by blocker actor id then rkey.
+/// Duplicate records from one blocker are all returned.
 pub async fn incoming_blocks(
     conn: &mut PgConnection,
     subject_id: i64,
@@ -232,10 +233,10 @@ pub async fn incoming_list_blocks_count(
 }
 
 /// Every listblock on every **ready or retained** list naming
-/// `subject_id` whose record is present (§3.2): one pair per listblock,
+/// `subject_id` whose record is present: one pair per listblock,
 /// ordered by list id, blocker actor id, listblock rkey. Uncounted
-/// listblocks are returned (they are real blocks, §4.2). A hidden list
-/// owner suppresses its lists, a hidden blocker its listblocks, unless
+/// listblocks are returned (they are real blocks). A hidden list owner
+/// suppresses its lists, a hidden blocker its listblocks, unless
 /// `include_inactive`.
 pub async fn incoming_list_blocks(
     conn: &mut PgConnection,
@@ -320,8 +321,8 @@ pub struct ListNaming {
 }
 
 /// Ready or retained lists with a present record naming `subject_id`,
-/// once per list, ordered by list id (§3.2). Hidden owners are excluded
-/// unless `include_inactive`.
+/// once per list, ordered by list id. Hidden owners are excluded unless
+/// `include_inactive`.
 pub async fn lists_naming(
     conn: &mut PgConnection,
     subject_id: i64,
@@ -379,8 +380,7 @@ pub async fn lists_naming(
         .collect())
 }
 
-/// Coverage inputs for the lists naming a subject (§3.7.5 item 4), read
-/// live.
+/// Coverage inputs for the lists naming a subject, read live.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NamingCoverage {
     /// `min(fetched_witness)` over ready/retained lists naming the subject.
@@ -389,7 +389,7 @@ pub struct NamingCoverage {
     /// `fetched_witness`.
     pub unfetched: bool,
     /// Lists naming the subject that are live `pending`, or `purging` with
-    /// `purge_then = untracked` and count > 0 (§3.7.1 live rule).
+    /// `purge_then = untracked` and count > 0 (the live rule).
     pub live_pending: Vec<i64>,
 }
 
@@ -417,8 +417,8 @@ pub async fn naming_coverage(conn: &mut PgConnection, subject_id: i64) -> Result
 }
 
 /// States of the lists discovery found naming the subject
-/// (`subject_lists(X)`) that lower subject-scope coverage (§3.7.5 item 4):
-/// pending, purging with re-admit (reported as `(Purging, true)`),
+/// (`subject_lists(X)`) that lower subject-scope coverage: pending,
+/// purging with re-admit (reported as `(Purging, true)`),
 /// `unavailable`, `deferred`, `missing`.
 pub async fn subject_list_states(
     conn: &mut PgConnection,
@@ -448,7 +448,7 @@ pub struct ListInfo {
     pub id: i64,
     /// Owner DID.
     pub owner_did: String,
-    /// Owner status (§7.4 codes).
+    /// Owner status code.
     pub owner_status: i16,
     /// Record key.
     pub rkey: String,
@@ -475,9 +475,9 @@ pub struct ListInfo {
 }
 
 impl ListInfo {
-    /// The `state` reported by `getListMembers` (§3.2): `purging` is
-    /// reported as `pending` if it will be re-admitted (`purge_then =
-    /// untracked` and count > 0), else `untracked`.
+    /// The `state` reported by `getListMembers`: `purging` is reported
+    /// as `pending` if it will be re-admitted (`purge_then = untracked`
+    /// and count > 0), else `untracked`.
     pub fn reported_state(&self) -> TrackState {
         match self.track_state {
             TrackState::Purging => {
@@ -703,7 +703,7 @@ pub struct PartyList {
 
 impl PartyList {
     /// `ready`/`retained` with a present record and a shown owner: its
-    /// items block (§3.2).
+    /// items block.
     pub fn blocks(&self, include_inactive: bool) -> bool {
         matches!(self.track_state, TrackState::Ready | TrackState::Retained)
             && self.record_state == 1
@@ -718,9 +718,9 @@ impl PartyList {
     }
 }
 
-/// Everything `checkBlocks(X, others)` reads (§3.7.5 item 5 cost model):
-/// direct blocks in both directions, the parties' listblocks joined with
-/// list states, and items naming a party on those lists.
+/// Everything `checkBlocks(X, others)` reads: direct blocks in both
+/// directions, the parties' listblocks joined with list states, and
+/// items naming a party on those lists.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckRows {
     /// `(author_id, subject_id)` of blocks between X and the others, in
@@ -812,7 +812,7 @@ pub async fn check_rows(conn: &mut PgConnection, x: i64, others: &[i64]) -> Resu
     Ok(out)
 }
 
-/// Per-actor coverage inputs (§3.7.5 items 2 and 5).
+/// Per-actor coverage inputs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActorCoverage {
     /// `discovery_state.state` code.
@@ -860,8 +860,8 @@ pub async fn actor_coverage(conn: &mut PgConnection, actor_id: i64) -> Result<Ac
     })
 }
 
-/// Index-wide counts for `getStats` (§3.2): the maintained counters
-/// (§7.1) plus the tracked-list count from the partial state index.
+/// Index-wide counts for `getStats`: the maintained counters plus the
+/// tracked-list count from the partial state index.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Counts {
     /// Stored blocks.
@@ -1044,7 +1044,7 @@ pub async fn repair_running(conn: &mut PgConnection) -> Result<Option<(i64, i64,
     .await?)
 }
 
-/// Top host buckets by lifetime interning (dashboard, §11.2).
+/// Top host buckets by lifetime interning (dashboard).
 pub async fn top_buckets(
     conn: &mut PgConnection,
     limit: i64,

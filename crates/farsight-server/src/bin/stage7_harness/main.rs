@@ -1,10 +1,10 @@
-//! `farsight-stage7-harness`: Phase B Mode A — admin sign-in through
+//! `farsight-stage7-harness`: integration tests of the admin sign-in through
 //! ATProto OAuth. Every assertion reads real responses from a real
-//! `farsight` process over HTTP, real rows, real files and real log
-//! lines. The authorization server is a stand-in ([`standin`]) on a
-//! TEST-NET-2 address the harness puts on a local bridge, which the safe
-//! outbound client treats as public; the harness itself plays the
-//! browser: it follows the redirects by hand and carries the cookies.
+//! `farsight` process over HTTP, real rows, real files and real log lines.
+//! The authorization server is a stand-in ([`standin`]) on a TEST-NET-2
+//! address the harness puts on a local bridge, which the safe outbound
+//! client treats as public; the harness itself plays the browser: it follows
+//! the redirects by hand and carries the cookies.
 //!
 //! Sections:
 //!
@@ -921,7 +921,7 @@ async fn check_loopback_flow(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<Strin
         .await?;
     let migrations = ctx.n("SELECT max(version) FROM _sqlx_migrations").await?;
     c.check(
-        "no schema change for the sign-in: admin_sessions still has six columns; the newest migration is 13 (the handle cache, the lists' descriptions, the handle queue, the avatar references and the top lists, which touch no auth table)",
+        "admin_sessions has six columns; the newest migration is 13 (the handle cache, the lists' descriptions, the handle queue, the avatar references and the top lists, which touch no auth table)",
         schema == 6 && migrations == 13,
         format!("{schema} columns, migration {migrations}"),
     );
@@ -946,7 +946,7 @@ async fn check_hosted_flow(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<(), Str
     );
     let fetched = ctx.standin.fetched_metadata();
     c.check(
-        "the stand-in fetched that client_id's document from Farsight and accepted it under the profile's client rules, with grant_types = [authorization_code] and no refresh_token (r22 §10.6 item 1, against the stand-in)",
+        "the stand-in fetched that client_id's document from Farsight and accepted it under the profile's client rules, with grant_types = [authorization_code] and no refresh_token (against the stand-in)",
         fetched.len() > fetched_before
             && fetched.last().is_some_and(|m| m["grant_types"] == serde_json::json!(["authorization_code"]))
             && ctx.standin.take_events().iter().any(|e| e.kind == "par" && e.status == 201),
@@ -1278,7 +1278,7 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         "/admin/list/did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/3kabc/history",
     ];
     let to_enter = |r: &Resp| r.status == 303 && r.header("location").as_deref() == Some("/enter");
-    // Both UIs on: the T7 configuration.
+    // Both UIs on.
     let s = Srv::with_config(
         "both",
         &ctx.config(
@@ -1429,7 +1429,7 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     );
     let robots = http.get(&format!("{}/robots.txt", s.base), &[]).await?;
     ctx.retire(s);
-    // The admin UI alone: nothing of it is public any more.
+    // The admin UI alone: nothing of it is public.
     let s = Srv::with_config(
         "adminonly",
         &ctx.config(HOSTNAME, &format!("admin_ui = true\nadmin_did = \"{D1}\"")),
@@ -1540,7 +1540,7 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         ctx.retire(s);
     }
     c.check(
-        "admin_ui = false: every admin page, /admin/card, /enter (GET and POST), /enter/callback, the client metadata, logout and the old root addresses are the bare 404, with or without the public UI",
+        "admin_ui = false: every admin page, /admin/card, /enter (GET and POST), /enter/callback, the client metadata, logout and an admin page's path at the root are the bare 404, with or without the public UI",
         disabled.is_empty(),
         disabled.join("; "),
     );
@@ -1556,7 +1556,7 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         api_only.as_ref().map(Resp::short).unwrap_or_default(),
     );
     c.check(
-        "/robots.txt is served in every configuration: 200 with both UIs on and with the admin UI alone; with the admin UI off, 200 and \"Disallow: /\" with the public UI on (crawlable is off) and with it off too, where it used to be 404; / and the admin stylesheet answer 200 in both",
+        "/robots.txt is served in every configuration: 200 with both UIs on and with the admin UI alone; with the admin UI off, 200 and \"Disallow: /\" with the public UI on (crawlable is off) and with it off too; / and the admin stylesheet answer 200 in both",
         robots.status == 200
             && robots_admin.status == 200
             && off == [(true, 200, true, 200, 200), (false, 200, true, 200, 200)],
@@ -2126,7 +2126,7 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
 async fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
-    println!("== farsight stage-7 harness: Mode A (admin sign-in)");
+    println!("== farsight stage-7 harness: admin sign-in");
     let bridge = match Bridge::create() {
         Ok(b) => b,
         Err(e) => {

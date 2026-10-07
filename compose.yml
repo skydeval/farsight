@@ -74,7 +74,7 @@ services:
       - max_wal_size=4GB
       - -c
       - random_page_cost=1.1
-      # Hot tables churn constantly: vacuum and analyze sooner (design §10).
+      # Hot tables churn constantly: vacuum and analyze sooner.
       - -c
       - autovacuum_vacuum_scale_factor=0.05
       - -c

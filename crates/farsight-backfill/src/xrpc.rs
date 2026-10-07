@@ -1,6 +1,6 @@
 //! The XRPC and HTTP calls backfill makes: PDS repo reads, relay
 //! enumeration and status, the PLC export, and a backlink index with the
-//! public `/links` shape (§5.6).
+//! public `/links` shape (see `docs/design/backfill.md`).
 
 use farsight_core::Tid;
 use serde_json::Value;
@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::net::{Net, NetError};
 
-/// Repo-level errors that trigger the §5.2 re-resolve / relay-status rule.
+/// Repo-level errors that trigger the re-resolve / relay-status rule.
 pub const REPO_ERRORS: [&str; 4] = [
     "RepoNotFound",
     "RepoDeactivated",
@@ -16,7 +16,7 @@ pub const REPO_ERRORS: [&str; 4] = [
     "RepoSuspended",
 ];
 
-/// Whether `e` is a §5.2 repo-level error (or `RecordNotFound` in a record
+/// Whether `e` is a repo-level error (or `RecordNotFound` in a record
 /// check, or a refused connection).
 pub fn is_repo_level(e: &NetError) -> bool {
     match e {
@@ -99,7 +99,7 @@ pub struct Listed {
 }
 
 /// `com.atproto.repo.listRecords` with `limit=100&reverse=true` (ascending
-/// rkey, §5.2 step 6).
+/// rkey).
 pub async fn list_records(
     net: &Net,
     pds: &str,
@@ -285,7 +285,7 @@ pub async fn plc_export(
         q.push(("after", a));
     }
     // The export draws on the shared half of the PLC limiter; resolution
-    // keeps its reserved half (§5.3).
+    // keeps its reserved half.
     net.plc.acquire(crate::net::PlcUse::Export).await;
     let body = net.get_text(&url(plc, "/export", &q)?).await?;
     Ok(body
@@ -318,7 +318,7 @@ pub struct Backlink {
     pub rkey: String,
 }
 
-/// A backlink index `/links?target=&collection=&path=` page (§5.6).
+/// A backlink index `/links?target=&collection=&path=` page.
 pub async fn backlinks(
     net: &Net,
     base: &str,

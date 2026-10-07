@@ -1,5 +1,6 @@
-//! Normal-mode pages (design §8.6): admin sessions, dashboard, lookups,
-//! operations, settings and reset, with the access rules of §3.5.
+//! Normal-mode pages (see `docs/design/web-ui.md`): admin sessions,
+//! dashboard, lookups, operations, settings and reset, with their
+//! access rules.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -33,7 +34,7 @@ use crate::common::{self, NO_STORE, cookie, ct_eq, read_cookie, render_private};
 mod admin_did;
 mod admin_list;
 
-/// Admin session cookie (§8.6).
+/// Admin session cookie.
 pub const ADMIN_COOKIE: &str = "farsight_admin";
 /// Idle expiry.
 pub const SESSION_IDLE: Duration = Duration::from_secs(12 * 3600);
@@ -63,10 +64,10 @@ pub struct StatusInner {
     pub growth_warning: Option<String>,
     /// When the Cloudflare ranges were last refreshed.
     pub cf_refreshed_at: Option<DateTime<Utc>>,
-    /// Size of the three history tables with their indexes (§7.7).
+    /// Size of the three history tables with their indexes.
     pub history_bytes: Option<u64>,
     /// The UI sort indexes are not being built because the storage budget
-    /// has no room: the bytes the next one is estimated to need (§7.6).
+    /// has no room: the bytes the next one is estimated to need.
     pub sort_held_bytes: Option<u64>,
 }
 
@@ -87,10 +88,10 @@ impl ServerStatus {
 pub struct WebState {
     /// The API state (pool, config, snapshot, limits).
     pub api: Arc<ApiState>,
-    /// Safe outbound client (handle resolution, §11.3).
+    /// Safe outbound client (handle resolution).
     pub safe: SafeClient,
     /// IPs with a successful sign-in: exempt from the process-wide
-    /// sign-in bucket (§3.6).
+    /// sign-in bucket.
     pub recent_logins: Mutex<HashMap<IpAddr, Instant>>,
     /// The OAuth sign-in's state: flows in progress, discovery cache.
     pub oauth: crate::oauth::OAuthState,
@@ -103,8 +104,7 @@ pub struct WebState {
     /// The public UI's state (handle cache, warming queue, render bound,
     /// pending confirmations).
     pub public: crate::public::PublicState,
-    /// Which UI sections sort by shown time: one flag per sort index
-    /// (§7.6).
+    /// Which UI sections sort by shown time: one flag per sort index.
     pub sort: Arc<SortIndexes>,
 }
 
@@ -119,8 +119,8 @@ fn hex(b: &[u8]) -> String {
     farsight_api::auth::hex(b)
 }
 
-/// The stored key of an OAuth session (§7.1): SHA-256 of the cookie
-/// value, a zero byte and the admin DID it was created for. A session is
+/// The stored key of an OAuth session: SHA-256 of the cookie value, a
+/// zero byte and the admin DID it was created for. A session is
 /// therefore found only while that DID is the configured one.
 pub fn oauth_session_key(cookie: &str, did: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -161,11 +161,10 @@ fn is_htmx(headers: &HeaderMap) -> bool {
     headers.contains_key("hx-request")
 }
 
-/// The admin UI's access rule (§3.5, §8.6): every page under `/admin`
-/// needs a session. With the admin UI off the pages do not exist; without
-/// a session a navigation is sent to the sign-in page and a request made
-/// by htmx gets the bare 404, which leaves the page it came from as it
-/// is.
+/// The admin UI's access rule: every page under `/admin` needs a session.
+/// With the admin UI off the pages do not exist; without a session a
+/// navigation is sent to the sign-in page and a request made by htmx gets
+/// the bare 404, which leaves the page it came from as it is.
 pub(crate) async fn gate(st: &WebState, headers: &HeaderMap) -> Result<Admin, Response> {
     if st.api.config.current().admin_auth() == AdminAuth::Disabled {
         return Err(common::not_found());
@@ -191,8 +190,8 @@ pub(crate) fn check_form(
     }
 }
 
-/// The normal-mode UI router (§8.6). Every route is always mounted; a
-/// handler whose surface is switched off answers [`common::not_found`].
+/// The normal-mode UI router. Every route is always mounted; a handler
+/// whose surface is switched off answers [`common::not_found`].
 pub fn router(state: Arc<WebState>) -> Router {
     Router::new()
         .route("/admin", get(dashboard))
@@ -413,7 +412,7 @@ pub struct Warning {
 /// Everything the dashboard shows.
 #[derive(Debug, Clone, Default)]
 pub struct DashboardData {
-    /// Warnings (§9.3, budget, v1, gaps).
+    /// Warnings (Cloudflare share, budget, v1, gaps).
     pub warnings: Vec<Warning>,
     /// Work still catching up, in words; empty when there is none.
     pub catching: Vec<Stat>,
@@ -917,7 +916,7 @@ async fn dashboard(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Respo
 
 /// Tells the admin that the tables do not all sort by creation
 /// time yet: the sort indexes are still being built, or are held because
-/// the storage budget has no room for them (§7.6).
+/// the storage budget has no room for them.
 fn sort_warning(st: &WebState, d: &mut DashboardData) {
     let ready = st.sort.count();
     if ready == 4 {
@@ -954,7 +953,7 @@ async fn dashboard_fragment(State(st): State<Arc<WebState>>, headers: HeaderMap)
 #[derive(Template)]
 #[template(path = "alerts_fragment.html")]
 pub struct AlertsFragment {
-    /// Warnings (§9.3, budget, v1, gaps, sort indexes).
+    /// Warnings (Cloudflare share, budget, v1, gaps, sort indexes).
     pub warnings: Vec<Warning>,
     /// Coverage in words.
     pub coverage: String,
@@ -1008,8 +1007,7 @@ async fn logout(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response
 // Lookups
 
 /// Resolves a handle to a DID: DNS TXT `_atproto.<handle>`, then
-/// `https://<handle>/.well-known/atproto-did`, through the safe client
-/// (§8.6, §11.3).
+/// `https://<handle>/.well-known/atproto-did`, through the safe client.
 pub async fn resolve_handle(safe: &SafeClient, handle: &str) -> Result<Did, String> {
     let handle = handle.trim().trim_start_matches('@').to_ascii_lowercase();
     if !farsight_core::did::is_valid_hostname(&handle) {
@@ -1528,7 +1526,7 @@ async fn settings_save(
     let current = st.api.config.file_text().unwrap_or_default();
     let result = match unredact(&submitted, &current) {
         // Turning the public UI on needs the operator's confirmation,
-        // whichever editor asks for it (§8.6).
+        // whichever editor asks for it.
         Ok(text) => match crate::public_settings::confirmation(
             &st,
             &s,
@@ -1599,8 +1597,8 @@ async fn settings_token(
         return render_private(&page);
     }
     let _ = farsight_api::config_store::notify_config(&st.api.pool).await;
-    // Rotation revokes every session (§8.6); this page shows the token
-    // once, then the operator logs in again.
+    // Rotation revokes every session; this page shows the token once,
+    // then the operator logs in again.
     let _ = farsight_storage::auth::delete_all_sessions(&st.api.pool).await;
     page.text = st
         .api
@@ -1652,9 +1650,9 @@ async fn reset_page(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Resp
     })
 }
 
-/// Performs the reset (§8.6): revokes all admin sessions and API keys,
-/// deletes `config.toml`, writes a new setup token, notifies, and asks the
-/// server to switch to setup mode. Database contents are kept.
+/// Performs the reset: revokes all admin sessions and API keys, deletes
+/// `config.toml`, writes a new setup token, notifies, and asks the server
+/// to switch to setup mode. Database contents are kept.
 pub async fn perform_reset(st: &WebState) -> Result<(), String> {
     farsight_storage::auth::delete_all_sessions(&st.api.pool)
         .await

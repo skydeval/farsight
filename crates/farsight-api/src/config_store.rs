@@ -1,4 +1,5 @@
-//! The live configuration and its edits (design §8.6 settings, §16).
+//! The live configuration and its edits (the admin Settings page; see
+//! `docs/design/web-ui.md` and `docs/design/operations.md`).
 //!
 //! Handlers read [`ConfigStore::current`] per request, so hot-reloadable
 //! keys apply as soon as an edit is stored. Edits rewrite `config.toml`
@@ -12,16 +13,16 @@ use std::sync::{Arc, RwLock};
 
 use farsight_core::config::{self, LoadedConfig};
 
-/// Channel name for config-change notifications (§5.1).
+/// Channel name for config-change notifications.
 pub const CONFIG_CHANNEL: &str = "farsight_config";
 
 /// Keys (or key prefixes ending in `.`) that apply without a restart:
 /// everything the API and UI read per request, `[public_ui]` included.
 /// Anything else — bind addresses, the database, firehose and storage
-/// settings (`block_history_enabled` among them, §7.7), `[limits]` used
-/// by the running ingest — needs a restart of `farsight`.
+/// settings (`block_history_enabled` among them), `[limits]` used by
+/// the running ingest — needs a restart of `farsight`.
 /// `farsight-backfill` reloads `[backfill]` itself on `NOTIFY
-/// farsight_config` (§5.1).
+/// farsight_config`.
 pub const HOT_KEYS: &[&str] = &[
     "access.",
     "public_ui.",
@@ -55,9 +56,9 @@ pub const ADMIN_DID_READ_ONLY: &str =
     "the admin DID cannot be changed here; use `farsight set-admin-did` and restart farsight";
 
 /// Refusal: an edit whose result has another `access.admin_ui` than the
-/// config in force. The key is applied at start only (§8.6): an edit made
-/// in the admin UI would remove the page it was made from, and a change
-/// waiting in the file must not go live as a side effect of another edit.
+/// config in force. The key is applied at start only: an edit made in the
+/// admin UI would remove the page it was made from, and a change waiting
+/// in the file must not go live as a side effect of another edit.
 pub const ADMIN_UI_NEEDS_RESTART: &str = "`access.admin_ui` requires a restart to change: set it in config.toml and restart \
      farsight. If config.toml was already edited by hand, restart to apply that, or undo it; \
      until then no setting can be saved from the running server";
@@ -75,10 +76,10 @@ pub enum EditError {
     /// The result does not load.
     #[error("{0}")]
     Invalid(String),
-    /// The edit would change who may sign in to the admin UI (§8.6).
+    /// The edit would change who may sign in to the admin UI.
     #[error("{0}")]
     AdminDid(&'static str),
-    /// The edit would switch the admin UI on or off (§8.6).
+    /// The edit would switch the admin UI on or off.
     #[error("{0}")]
     AdminUi(&'static str),
     /// Reading or writing the file failed.

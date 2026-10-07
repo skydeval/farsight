@@ -1,9 +1,10 @@
-//! Where to resume, and which gap to record (design §6.3), as pure
-//! functions over the persisted state.
+//! Where to resume, and which gap to record (see
+//! `docs/design/firehose.md`), as pure functions over the persisted
+//! state.
 //!
 //! | Situation | Cursor | Gap rule |
 //! |---|---|---|
-//! | first start (nothing applied) | live tail | none (§6.3 "first start has no gap") |
+//! | first start (nothing applied) | live tail | none |
 //! | same instance, v2 → v2 | `seq + 1` (exact) | none; a `CursorTooOld` rejection ⇒ live tail + gap `[applied_through, first live event]` |
 //! | same instance, v1 (or v1 → v2) | `cursor_us − 120 s` | first event − cursor > `gap_threshold` ⇒ gap `[applied_through, first event]` (v1 clamps silently) |
 //! | other instance (failover), lag known and ≤ `failover_max_lag` | `applied − max(failover_rewind_min, lag + 5 min)` | B rejects the position (clamp / `OutdatedCursor`) ⇒ gap `[applied − 30 min, first event]` |
@@ -15,11 +16,11 @@ use farsight_storage::codes::GapCause;
 
 use crate::frame::Protocol;
 
-/// v1 same-instance replay margin (§6.3).
+/// v1 same-instance replay margin.
 pub const V1_REPLAY: Duration = Duration::from_secs(120);
-/// Fixed width of a failover gap's start (§6.3).
+/// Fixed width of a failover gap's start.
 pub const FAILOVER_GAP: Duration = Duration::from_secs(30 * 60);
-/// Added to the measured instance lag for the failover rewind (§6.3).
+/// Added to the measured instance lag for the failover rewind.
 pub const FAILOVER_LAG_MARGIN: Duration = Duration::from_secs(5 * 60);
 
 /// What was persisted by the last committed batch.

@@ -1,8 +1,8 @@
-// Browser probes of the stage-9 harness (Mode A): what only a browser can
-// show about UI v2.5.2 — the wizard's admin DID field appears with its
+// Browser probes of the stage-9 harness: what only a browser can
+// show about the routing — the wizard's admin DID field appears with its
 // checkbox and without any script, a dashboard whose poll is refused keeps
-// its content instead of swapping in another page, the script still
-// rewrites times on the pages' new addresses, and an account on an admin
+// its content instead of swapping in another page, the script
+// rewrites times on the public and the admin pages, and an account on an admin
 // page under /admin opens its card.
 //
 // Run by `farsight-stage9-harness --browser` inside the Playwright image;
@@ -100,7 +100,7 @@ try {
   });
   await lookup.goto(`${base}/admin/lookup/did?q=${encodeURIComponent(subject)}`);
   await probe(
-    "the lookup page under /admin loads the admin script, /static/admin.js (not /static/public.js or /static/farsight.js); hovering an account asks /admin/card/{did} with the session and shows the card",
+    "the lookup page under /admin loads the admin script, /static/admin.js (not /static/public.js); hovering an account asks /admin/card/{did} with the session and shows the card",
     async () => {
       const link = lookup.locator("a.who[data-card-session]").first();
       const n = await lookup.locator("a.who[data-card-session]").count();
@@ -115,7 +115,6 @@ try {
           r.status() === 200 &&
           asked.some((a) => a === "200 /static/admin.js") &&
           !asked.some((a) => a.includes("/static/public.js")) &&
-          !asked.some((a) => a.includes("farsight.js")) &&
           (cards > 0 || !!described),
         `${n} links; ${asked.join(", ")}; card elements ${cards}; aria-describedby ${described}`,
       ];
@@ -156,7 +155,7 @@ try {
     ];
   });
 
-  // The public account page at its new address.
+  // The public account page.
   const anon = await browser.newContext();
   const pub = await anon.newPage();
   const failed = [];

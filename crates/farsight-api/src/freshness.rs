@@ -1,5 +1,6 @@
-//! The `freshness` object (design §3.7): scopes of §3.7.5 composed on the
-//! global snapshot plus the per-response live reads, rendered as JSON.
+//! The `freshness` object (see `docs/design/coverage.md`): its scopes,
+//! composed on the global snapshot plus the per-response live reads,
+//! rendered as JSON.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -55,7 +56,7 @@ impl Cov {
         });
     }
 
-    /// The minimum of two scopes (§3.7.5 item 4 "minimum of").
+    /// The minimum of two scopes.
     pub fn combine(mut self, other: Cov) -> Cov {
         let level = self.level.min(other.level);
         self.complete_since = if level == Level::Partial {
@@ -80,7 +81,7 @@ pub const BLOCK: i16 = 1;
 /// Storage code of `listblock`.
 pub const LISTBLOCK: i16 = 2;
 
-/// Which discovery scope a subject-scope check uses (§3.7.5 item 2).
+/// Which discovery scope a subject-scope check uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubjectKind {
     /// Direct blocks (`subject_coverage(X, block)`).
@@ -109,7 +110,7 @@ fn uncovered_reason(s: &GlobalSnapshot, lag: Duration) -> &'static str {
     }
 }
 
-/// Reason for a list in a degraded state (§3.7.5 items 4 and 5).
+/// Reason for a list in a degraded state.
 pub fn list_state_reason(state: TrackState, readmits: bool) -> Option<&'static str> {
     match state {
         TrackState::Pending => Some("list_pending"),
@@ -127,7 +128,7 @@ impl View<'_> {
         self.snap.firehose.applied_through
     }
 
-    /// `covered(t)` (§3.7.1).
+    /// `covered(t)`.
     pub fn covered(&self, t: Option<DateTime<Utc>>) -> bool {
         self.snap.covered(t, self.lag)
     }
@@ -137,7 +138,7 @@ impl View<'_> {
         uncovered_reason(self.snap, self.lag)
     }
 
-    /// Network scope for collection `k` (§3.7.5 item 1).
+    /// Network scope for collection `k`.
     pub fn network(&self, k: i16) -> Cov {
         let s = network_scope(self.snap, k, self.lag);
         Cov {
@@ -149,8 +150,8 @@ impl View<'_> {
     }
 
     /// Network scope for `k`, or — when it is not complete — subject scope
-    /// for `(X, kind)` (§3.7.5 item 2). Returns the coverage and whether
-    /// it is at subject scope (`assisted`).
+    /// for `(X, kind)`. Returns the coverage and whether it is at subject
+    /// scope (`assisted`).
     pub fn network_or_subject(
         &self,
         k: i16,
@@ -185,7 +186,7 @@ impl View<'_> {
         (n, false)
     }
 
-    /// The §3.7.4 table at network scope: historical effective pending
+    /// The pending-list table at network scope: historical effective pending
     /// lists lower the level, live ones cap `indexedAt`.
     pub fn apply_pending_table(&self, c: &mut Cov) {
         let p = &self.snap.pending;
@@ -208,7 +209,7 @@ impl View<'_> {
         c
     }
 
-    /// `coverage.exceptions` (always present, §3.7.3).
+    /// `coverage.exceptions` (always present).
     pub fn exceptions(&self) -> Value {
         let s = self.snap;
         let debt = |r| s.debt_counts.get(&r).copied().unwrap_or(0);

@@ -1,5 +1,6 @@
-//! Bearer tokens (design §3.5): admin `fsa_<43 base64url>` and API keys
-//! `fsk_<43>`, 256-bit, stored as SHA-256 and compared in constant time.
+//! Bearer tokens (see `docs/design/api.md`): admin `fsa_<43 base64url>`
+//! and API keys `fsk_<43>`, 256-bit, stored as SHA-256 and compared in
+//! constant time.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, RwLock};
@@ -114,7 +115,7 @@ pub enum Caller {
 }
 
 impl Caller {
-    /// The requester key (`backfill_queue.requester`, intern cause, §5.3).
+    /// The requester key (`backfill_queue.requester`, intern cause).
     pub fn requester(&self) -> Option<String> {
         match self {
             Caller::Anonymous => None,
@@ -200,7 +201,7 @@ pub fn bearer(headers: &HeaderMap) -> Result<Option<&str>, XrpcError> {
 }
 
 /// Identifies the caller. A presented but invalid token is `401
-/// AuthRequired` (§3.5).
+/// AuthRequired`.
 pub fn authenticate(
     headers: &HeaderMap,
     cfg: &Config,

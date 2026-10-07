@@ -1,6 +1,6 @@
-//! `farsight-ingest-harness`: Phase B for stage 2 — real Jetstream into a
-//! real Postgres through `farsight-ingest` and `farsight-storage::apply`.
-//! Built only with `--features harness`.
+//! `farsight-ingest-harness`: integration tests of ingest — real
+//! Jetstream into a real Postgres through `farsight-ingest` and
+//! `farsight-storage::apply`. Built only with `--features harness`.
 //!
 //! ```text
 //! farsight-ingest-harness --mode a [--minutes 15]
@@ -9,8 +9,8 @@
 //! common: [--jetstream wss://…]… [--database-url URL] [--metrics 127.0.0.1:9464] [--keep]
 //! ```
 //!
-//! Mode A — bounded conformance run; Mode B — soak with failure
-//! injection. Both compare against an **independent** reference
+//! `--mode a` is a bounded conformance run; `--mode b` is a soak with
+//! failure injection. Both compare against an **independent** reference
 //! connection and an independent LWW model of the received events, and
 //! read every invariant from the stored rows.
 
@@ -445,7 +445,7 @@ fn check_metrics(c: &mut Checks, early: &Scrape, late: &Scrape, run_secs: f64) {
         })
         .collect();
     c.check(
-        "metrics: all stage-2 metrics exposed",
+        "metrics: all ingest metrics exposed",
         missing.is_empty(),
         format!("missing {missing:?}"),
     );
@@ -604,7 +604,7 @@ async fn mode_a(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
     let tapped = std::mem::take(&mut *run.tapped.lock().unwrap());
     let run_secs = run.started.elapsed().as_secs_f64();
 
-    println!("\n== Mode A checks ==");
+    println!("\n== conformance checks ==");
     // 1, 2: monotonic cursor and applied_through.
     let samples = run.watcher.samples.lock().unwrap().clone();
     check_monotonic(c, &samples, "1–2");
@@ -1091,14 +1091,14 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
     run.watcher.task.abort();
     let tapped = std::mem::take(&mut *run.tapped.lock().unwrap());
     let run_secs = run.started.elapsed().as_secs_f64();
-    println!("\n== Mode B final checks ==");
+    println!("\n== soak: final checks ==");
     let samples: Vec<StateSample> = run.watcher.samples.lock().unwrap().clone();
     if excluded_from_monotonic.is_empty() {
         check_monotonic(c, &samples, "whole run");
     } else {
         c.unverified(
             "whole run: cursor monotonic",
-            "the simulated outage deliberately rewinds the persisted cursor; checked in Mode A",
+            "the simulated outage deliberately rewinds the persisted cursor; checked in the conformance run",
         );
     }
     check_no_loss(c, "whole run", &tapped, &ref_events, &ref_intervals);

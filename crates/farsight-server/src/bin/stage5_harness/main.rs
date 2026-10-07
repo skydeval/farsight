@@ -1,9 +1,7 @@
-//! `farsight-stage5-harness`: Phase B Mode A — the history write path
-//! (design §7.7, §7.8), through the real apply path and janitor against a
-//! database of its own. Every assertion reads the rows the writers stored.
-//!
-//! The public UI sections this harness once held moved to
-//! `farsight-stage6-harness` with the stage-6 changes to that surface.
+//! `farsight-stage5-harness`: integration tests of the history write path
+//! (see `docs/design/history.md`), through the real apply path and janitor
+//! against a database of its own. Every assertion reads the rows the
+//! writers stored.
 //!
 //! `--keep` keeps the Postgres container.
 
@@ -22,7 +20,7 @@ use crate::support::{Checks, Pg};
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let keep = std::env::args().any(|a| a == "--keep");
-    println!("== farsight stage-5 harness: Mode A (history write path)");
+    println!("== farsight stage-5 harness: history write path");
     let pg = match Pg::start(keep) {
         Ok(p) => p,
         Err(e) => {

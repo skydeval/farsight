@@ -1,4 +1,5 @@
-//! Configuration schema and loading (design §16, §8.2, §9.2).
+//! Configuration schema and loading (see `docs/design/operations.md`,
+//! `docs/design/web-ui.md` and `docs/design/security.md`).
 //!
 //! Sources, in increasing precedence: built-in defaults, `config.toml`,
 //! then `FARSIGHT__<SECTION>__<KEY>` environment variables (one `__` per
@@ -7,14 +8,11 @@
 //! the same path, so an unknown key is an error rather than silently
 //! ignored.
 //!
-//! §16 is an example file. Where it shows a concrete value, that value is
-//! the default here. Where it shows a placeholder (`hostname =
-//! "farsight.example"`, `database_url = "postgres://farsight:…"`, the
-//! `auth` hashes), the key has no default and is required; see
-//! [`REQUIRED_KEYS`]. The one deliberate difference is `[proxy]`: §16 shows
-//! a Cloudflare example (`mode = "cloudflare"`, a truncated range list),
-//! but a fresh install trusts no proxy until the operator says so, so the
-//! defaults are `mode = "none"`, `trusted = []`.
+//! Every key has a default except those that differ per deployment
+//! (`hostname`, `database_url`, the `auth` hashes): these are required;
+//! see [`REQUIRED_KEYS`]. A fresh install trusts no proxy until the
+//! operator says so: the `[proxy]` defaults are `mode = "none"`,
+//! `trusted = []`.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -24,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::duration::ConfigDuration;
 
-/// Default config file location (design §8.2).
+/// Default config file location.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/farsight/config.toml";
 
 /// Environment variable prefix for overrides.
@@ -35,7 +33,7 @@ pub const ENV_PREFIX: &str = "FARSIGHT__";
 pub const SKIP_WIZARD_ENV: &str = "FARSIGHT_SKIP_WIZARD";
 
 /// Keys with no usable default. `access.admin_did` is not among them: a
-/// value used only at sign-in never stops the process (design §16).
+/// value used only at sign-in never stops the process.
 pub const REQUIRED_KEYS: [&str; 4] = [
     "server.hostname",
     "server.contact",
@@ -44,8 +42,7 @@ pub const REQUIRED_KEYS: [&str; 4] = [
 ];
 
 /// Configuration errors. Any of these makes the process exit non-zero
-/// (design §8.2: an invalid config never enters setup mode and is never
-/// rewritten).
+/// (an invalid config never enters setup mode and is never rewritten).
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// The file could not be read.
@@ -95,7 +92,7 @@ fn invalid(key: &str, reason: impl Into<String>) -> ConfigError {
     }
 }
 
-/// The complete configuration (design §16).
+/// The complete configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -153,16 +150,16 @@ impl Default for ServerConfig {
 pub struct StorageConfig {
     /// Postgres DSN. Required.
     pub database_url: String,
-    /// Storage budget in bytes (`pg_database_size`), §11.2.
+    /// Storage budget in bytes (`pg_database_size`).
     pub budget_bytes: u64,
     /// Hard ceiling in bytes; 0 means 115% of `budget_bytes`. Must exceed
     /// the budget after defaulting.
     pub hard_ceiling_bytes: u64,
-    /// Tombstone TTL (§7.3).
+    /// Tombstone TTL.
     pub tombstone_ttl: ConfigDuration,
-    /// Record removed blocks, listblocks and list memberships (§7.7, §7.8).
+    /// Record removed blocks, listblocks and list memberships.
     pub block_history_enabled: bool,
-    /// How long history rows are kept; `"0s"` keeps them forever (§7.7).
+    /// How long history rows are kept; `"0s"` keeps them forever.
     pub block_history_retention: ConfigDuration,
 }
 
@@ -217,24 +214,24 @@ impl Default for FirehoseConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FirehoseTuning {
-    /// v1 heuristic gap threshold (§6.3).
+    /// v1 heuristic gap threshold.
     pub gap_threshold: ConfigDuration,
-    /// Minimum failover rewind (§6.3).
+    /// Minimum failover rewind.
     pub failover_rewind_min: ConfigDuration,
-    /// Maximum instance lag for a gapless failover (§6.3).
+    /// Maximum instance lag for a gapless failover.
     pub failover_max_lag: ConfigDuration,
-    /// Lag beyond which the synthetic gap exists (§3.7.1).
+    /// Lag beyond which the synthetic gap exists.
     pub synthetic_gap_lag: ConfigDuration,
-    /// No-message stall timeout (§6.3).
+    /// No-message stall timeout.
     pub stall_timeout: ConfigDuration,
-    /// Seam repair window start, before the session's connect (§6.3).
+    /// Seam repair window start, before the session's connect.
     pub seam_repair_before: ConfigDuration,
-    /// Seam repair window end, after the session caught up (§6.3).
+    /// Seam repair window end, after the session caught up.
     pub seam_repair_after: ConfigDuration,
-    /// Delay between catching up and the seam repair (§6.3).
+    /// Delay between catching up and the seam repair.
     pub seam_repair_delay: ConfigDuration,
     /// A session has caught up once an event's witness time is within this
-    /// much of wall time (§6.3).
+    /// much of wall time.
     pub seam_repair_catchup_margin: ConfigDuration,
 }
 
@@ -258,7 +255,7 @@ impl Default for FirehoseTuning {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackfillConfig {
-    /// Worker pool size (§5.3).
+    /// Worker pool size.
     pub concurrency: u32,
     /// Per-host request rate.
     pub per_host_rps: u32,
@@ -266,35 +263,35 @@ pub struct BackfillConfig {
     pub plc_url: String,
     /// PLC request rate.
     pub plc_rps: u32,
-    /// Seed PDS resolution from the PLC export (§5.4).
+    /// Seed PDS resolution from the PLC export.
     pub plc_seed_from_export: bool,
-    /// Relay URL (verify at release, §18).
+    /// Relay URL.
     pub relay_url: String,
-    /// `requestBackfill` freshness window (§3.3).
+    /// `requestBackfill` freshness window.
     pub request_fresh_window: ConfigDuration,
-    /// Minimum interval between list fetch runs per owner (§5.5).
+    /// Minimum interval between list fetch runs per owner.
     pub owner_fetch_cooldown: ConfigDuration,
-    /// Repo job retry backoff; the last step repeats (§5.2).
+    /// Repo job retry backoff; the last step repeats.
     pub retry_schedule: Vec<ConfigDuration>,
-    /// Failing for this long makes a repo job terminal (§5.2).
+    /// Failing for this long makes a repo job terminal.
     pub terminal_after: ConfigDuration,
-    /// `missing` list re-check schedule (§5.5).
+    /// `missing` list re-check schedule.
     pub missing_retry: Vec<ConfigDuration>,
-    /// Failed fetch attempts before FT (§5.5).
+    /// Failed fetch attempts before FT.
     pub list_fetch_max_attempts: u32,
-    /// Phase-1 error retry schedule (§5.5).
+    /// Phase-1 error retry schedule.
     pub phase1_retry: Vec<ConfigDuration>,
-    /// Wall-clock cap on one list fetch run (§5.5).
+    /// Wall-clock cap on one list fetch run.
     pub list_fetch_max_duration: ConfigDuration,
-    /// Repair candidate slack (§7.5).
+    /// Repair candidate slack.
     pub repair_slack: ConfigDuration,
-    /// In-memory seen-set cap for out-of-order listings (§5.2).
+    /// In-memory seen-set cap for out-of-order listings.
     pub seen_set_cap: u64,
-    /// Queue entries per system requester (§5.3).
+    /// Queue entries per system requester.
     pub system_queue_cap: u64,
-    /// Concurrent requests per host (§5.3).
+    /// Concurrent requests per host.
     pub per_host_concurrency: u32,
-    /// Guaranteed shares of tiers 1, 2, 3 in percent (§5.3).
+    /// Guaranteed shares of tiers 1, 2, 3 in percent.
     pub tier_shares: Vec<u32>,
     /// `[backfill.sweep]`.
     pub sweep: SweepConfig,
@@ -346,7 +343,7 @@ impl Default for BackfillConfig {
     }
 }
 
-/// Sweep enumeration source (§5.4).
+/// Sweep enumeration source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SweepSource {
@@ -358,9 +355,9 @@ pub enum SweepSource {
     Plc,
 }
 
-/// `[backfill.repair]`: repairs of firehose gaps (§7.5). A repair
-/// re-reads every account whose repository changed during the gap, so
-/// after a long gap it runs for days.
+/// `[backfill.repair]`: repairs of firehose gaps. A repair re-reads
+/// every account whose repository changed during the gap, so after a
+/// long gap it runs for days.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RepairConfig {
@@ -413,11 +410,11 @@ impl Default for SweepConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BacklinksConfig {
-    /// Backlink index URL; empty = discovery disabled (§5.6).
+    /// Backlink index URL; empty = discovery disabled.
     pub url: String,
     /// Reference cap across discovery steps.
     pub max_refs: u64,
-    /// Allowance for backlink-index lag (§3.7.1).
+    /// Allowance for backlink-index lag.
     pub lag_allowance: ConfigDuration,
 }
 
@@ -431,7 +428,7 @@ impl Default for BacklinksConfig {
     }
 }
 
-/// `access.reads` (§3.5).
+/// `access.reads`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadsMode {
@@ -451,14 +448,14 @@ pub struct AccessConfig {
     pub reads: ReadsMode,
     /// Send `Access-Control-Allow-Origin: *` on reads.
     pub cors: bool,
-    /// Serve the public UI at the root (§8.6). Requires `reads =
-    /// "public"`; independent of `admin_ui`.
+    /// Serve the public UI at the root. Requires `reads = "public"`;
+    /// independent of `admin_ui`.
     pub public_ui: bool,
-    /// Serve the admin UI under `/admin`, with its sign-in at `/enter`
-    /// (§8.6). Applied at start only: no in-process edit may change it.
+    /// Serve the admin UI under `/admin`, with its sign-in at `/enter`.
+    /// Applied at start only: no in-process edit may change it.
     pub admin_ui: bool,
-    /// The DID of the one account that may sign in to the admin UI
-    /// (§8.6). Empty = not set (see [`AdminAuth`]).
+    /// The DID of the one account that may sign in to the admin UI.
+    /// Empty = not set (see [`AdminAuth`]).
     pub admin_did: String,
 }
 
@@ -506,8 +503,8 @@ pub const MAX_INSTANCE_DESCRIPTION: usize = 2_000;
 /// Longest `public_ui.contact`, in characters.
 pub const MAX_PUBLIC_CONTACT: usize = 200;
 
-/// `[public_ui]` (§16): what the public UI shows. Every key applies
-/// without a restart.
+/// `[public_ui]`: what the public UI shows. Every key applies without a
+/// restart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PublicUiConfig {
@@ -677,7 +674,7 @@ pub struct AuthConfig {
 pub const UNCONFIGURED_WARNING: &str = "admin sign-in is not configured: set access.admin_did (farsight set-admin-did, or \
      FARSIGHT__ACCESS__ADMIN_DID) and restart";
 
-/// How (and whether) anyone can sign in to the admin UI (design §8.6).
+/// How (and whether) anyone can sign in to the admin UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminAuth {
     /// `access.admin_ui = false`: no admin UI.
@@ -704,7 +701,7 @@ pub fn valid_admin_did(s: &str) -> bool {
     }
 }
 
-/// `proxy.mode` (§9.1).
+/// `proxy.mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyMode {
@@ -722,7 +719,7 @@ pub enum ProxyMode {
 pub struct ProxyConfig {
     /// Proxy mode.
     pub mode: ProxyMode,
-    /// Trusted proxy CIDRs (§9.2 validation applies).
+    /// Trusted proxy CIDRs (validated by [`validate_trusted_proxy`]).
     pub trusted: Vec<IpNet>,
     /// Opt-in daily refresh of Cloudflare ranges.
     pub cloudflare_refresh: bool,
@@ -738,35 +735,35 @@ impl Default for ProxyConfig {
     }
 }
 
-/// `[limits]` (§4, §11).
+/// `[limits]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
-    /// Grace for `retained` lists (§4.4 GE).
+    /// Grace for `retained` lists (then **GE** fires).
     pub list_grace: ConfigDuration,
-    /// Owner-caused re-admissions per UTC day (§4.4).
+    /// Owner-caused re-admissions per UTC day.
     pub owner_readmissions_per_day: u32,
-    /// Wall-clock bound on `pending` (§3.7.4).
+    /// Wall-clock bound on `pending`.
     pub pending_max_age: ConfigDuration,
-    /// Pending lists taking effect per owner key (§3.7.4).
+    /// Pending lists taking effect per owner key.
     pub pending_effects_per_owner_key: u32,
-    /// `unresolved` bucket block cap (§11.2).
+    /// `unresolved` bucket block cap.
     pub unresolved_blocks: u64,
     /// `unresolved` bucket list-item cap.
     pub unresolved_list_items: u64,
-    /// Daily admissions per bucket key (§11.1).
+    /// Daily admissions per bucket key.
     pub bucket_admissions_per_day: u64,
-    /// Daily admissions per DID key (§11.1).
+    /// Daily admissions per DID key.
     pub did_admissions_per_day: u64,
-    /// Extra shared CDN/anycast ranges excluded as address buckets (§11.2).
+    /// Extra shared CDN/anycast ranges excluded as address buckets.
     pub cdn_ranges_extra: Vec<IpNet>,
-    /// Items per list (§4.7).
+    /// Items per list.
     pub list_items_per_list: u64,
-    /// Items per owner (§4.7).
+    /// Items per owner.
     pub list_items_per_owner: u64,
-    /// Stored blocks per author (§11.1).
+    /// Stored blocks per author.
     pub blocks_per_author: u64,
-    /// Counted listblocks per author (trigger cap, §4.2).
+    /// Counted listblocks per author (trigger cap).
     pub listblock_fetch_triggers_per_author: u64,
     /// Hosts exempt from bucket caps (glob `*.` prefix allowed).
     pub large_hosts: Vec<String>,
@@ -784,18 +781,18 @@ pub struct LimitsConfig {
     pub lists_per_author: u64,
     /// `unresolved` bucket listblock cap.
     pub unresolved_listblocks: u64,
-    /// Daily interning per DID or requester cause key (§11.2).
+    /// Daily interning per DID or requester cause key.
     pub intern_per_did_per_day: u64,
-    /// Daily interning per bucket cause key (§11.2).
+    /// Daily interning per bucket cause key.
     pub intern_per_bucket_per_day: u64,
-    /// Lifetime interning per non-large bucket (§11.2).
+    /// Lifetime interning per non-large bucket.
     pub host_interned_lifetime: u64,
     /// `unresolved` bucket list cap.
     pub unresolved_lists: u64,
     /// Daily history rows per DID admission key, all three history tables
-    /// together (§7.7).
+    /// together.
     pub history_per_did_per_day: u64,
-    /// Daily history rows per bucket admission key (§7.7).
+    /// Daily history rows per bucket admission key.
     pub history_per_bucket_per_day: u64,
 }
 
@@ -858,7 +855,7 @@ pub struct NetConfig {
     pub allow_http_hosts: Vec<String>,
 }
 
-/// `[rate_limit]` (§3.6).
+/// `[rate_limit]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateLimitConfig {
@@ -898,7 +895,7 @@ impl Default for RateLimitConfig {
     }
 }
 
-/// `[metrics]` (§13).
+/// `[metrics]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -920,7 +917,7 @@ impl Default for MetricsConfig {
     }
 }
 
-/// How the process should start (design §8.2).
+/// How the process should start.
 #[derive(Debug)]
 pub enum StartMode {
     /// No config file and `FARSIGHT_SKIP_WIZARD` unset: run the wizard.
@@ -936,8 +933,7 @@ pub struct LoadedConfig {
     pub config: Config,
     /// Dotted keys set from the environment (locked in the settings UI).
     pub env_keys: Vec<String>,
-    /// Non-fatal findings (e.g. public proxy ranges; §9.2 "acknowledged
-    /// warning").
+    /// Non-fatal findings (e.g. public proxy ranges).
     pub warnings: Vec<String>,
     /// True when built from the environment without a file.
     pub from_env_only: bool,
@@ -1121,8 +1117,8 @@ pub fn apply_env_overrides(
     Ok(set.into_iter().collect())
 }
 
-/// Validates a proxy CIDR (design §9.2): refuses `0.0.0.0/0`, `::/0`, and
-/// prefixes shorter than /8 (IPv4) or /24 (IPv6).
+/// Validates a proxy CIDR: refuses `0.0.0.0/0`, `::/0`, and prefixes
+/// shorter than /8 (IPv4) or /24 (IPv6).
 pub fn validate_trusted_proxy(net: &IpNet) -> Result<(), String> {
     match net {
         IpNet::V4(n) if n.prefix_len() < 8 => Err(format!(
@@ -1267,9 +1263,9 @@ impl Config {
 }
 
 impl Config {
-    /// The public UI rules (§3.5, §16): the access combination, and the
-    /// bounds of `[public_ui]`. The same check runs at load and at every
-    /// settings save.
+    /// The public UI rules: the access combination, and the bounds of
+    /// `[public_ui]`. The same check runs at load and at every settings
+    /// save.
     fn validate_public_ui(&self) -> Result<(), ConfigError> {
         if self.access.public_ui && self.access.reads != ReadsMode::Public {
             return Err(invalid(
@@ -1336,9 +1332,9 @@ impl Config {
             validate_record_viewer_url(&p.record_viewer_url)
                 .map_err(|r| invalid("public_ui.record_viewer_url", r))?;
         }
-        // Checked only while the public UI is on: a config written before
-        // `[public_ui]` existed, with a lowered `rate_limit.query_concurrency`,
-        // must keep loading with the defaults of a feature it does not use.
+        // Checked only while the public UI is on: a config without
+        // `[public_ui]`, with a lowered `rate_limit.query_concurrency`,
+        // must load with the defaults of a feature it does not use.
         if self.access.public_ui && p.query_concurrency > self.rate_limit.query_concurrency {
             return Err(invalid(
                 "public_ui.query_concurrency",
@@ -1414,10 +1410,10 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     f.sync_all()
 }
 
-/// Writes `text` to `path` only if `path` does not exist yet (design
-/// §8.3 "first writer wins"): the content goes to a temp file (0600) that
-/// is then hard-linked into place, which fails if another writer got
-/// there first. Returns `Ok(false)` in that case.
+/// Writes `text` to `path` only if `path` does not exist yet (first
+/// writer wins): the content goes to a temp file (0600) that is then
+/// hard-linked into place, which fails if another writer got there
+/// first. Returns `Ok(false)` in that case.
 pub fn write_new(path: &Path, text: &str) -> std::io::Result<bool> {
     let tmp = temp_path(path);
     write_private(&tmp, text)?;
@@ -1431,7 +1427,7 @@ pub fn write_new(path: &Path, text: &str) -> std::io::Result<bool> {
 }
 
 /// Atomically replaces `path` with `text` (temp file, 0600, then rename;
-/// settings edits, §8.6).
+/// settings edits).
 pub fn write_replace(path: &Path, text: &str) -> std::io::Result<()> {
     let tmp = temp_path(path);
     write_private(&tmp, text)?;
@@ -1574,8 +1570,8 @@ gap_threshold = "300s"
         let loaded = load_from_parts(Some(text), &[]).unwrap();
         assert_eq!(loaded.config.proxy.mode, ProxyMode::Cloudflare);
         assert_eq!(loaded.config.proxy.trusted.len(), 1);
-        // A range inside the bundled Cloudflare set is not warned about
-        // (§9.2); other public space is a warning, not an error.
+        // A range inside the bundled Cloudflare set is not warned about;
+        // other public space is a warning, not an error.
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
         let other = text.replace("173.245.48.0/20", "203.0.113.0/24");
         let loaded = load_from_parts(Some(&other), &[]).unwrap();

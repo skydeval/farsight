@@ -1,5 +1,6 @@
-//! The admin history pages (design §7.7, §7.8, §8.6):
-//! `/admin/did/{did}/history` and `/admin/list/{did}/{rkey}/history`.
+//! The admin history pages (see `docs/design/history.md` and
+//! `docs/design/web-ui.md`): `/admin/did/{did}/history` and
+//! `/admin/list/{did}/{rkey}/history`.
 //!
 //! They show the records this instance stored and later removed. They
 //! need an admin session, whether or not the public UI
@@ -7,7 +8,7 @@
 //!
 //! Rules kept here:
 //!
-//! - **The display filters of §7.7 and §7.8 bind every surface**, this one
+//! - **The display filters of history bind every surface**, this one
 //!   included: a row whose author or list owner is hidden is not shown.
 //!   That, not the purge, is what keeps a deleted account's history from
 //!   being shown; an admin session does not lift it.
@@ -17,8 +18,9 @@
 //!   accounts shown as DIDs are handed to the warming worker.
 //! - **Record cells are text.** The records were removed; a viewer link
 //!   would open "not found".
-//! - History is outside the coverage contract (§3.7): the pages print no
-//!   coverage and state their own limits.
+//! - History is outside the coverage contract (see
+//!   `docs/design/coverage.md`): the pages print no coverage and state
+//!   their own limits.
 
 use std::collections::HashMap;
 use std::sync::Arc;

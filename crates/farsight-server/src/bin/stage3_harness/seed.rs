@@ -1,6 +1,6 @@
-//! Seeding real stored state for Mode A. Synthetic DIDs use a 3-letter
-//! prefix and a number spelled in base32 letters, so they are valid
-//! `did:plc` identifiers that never collide with the live network.
+//! Seeding real stored state for the harnesses. Synthetic DIDs use a 3-letter
+//! prefix and a number spelled in base32 letters, so they are valid `did:plc`
+//! identifiers that never collide with the live network.
 
 use sqlx::PgPool;
 

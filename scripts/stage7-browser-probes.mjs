@@ -1,4 +1,4 @@
-// Browser probes of the stage-7 harness (Mode A): what only a browser can
+// Browser probes of the stage-7 harness: what only a browser can
 // show about the admin sign-in. The OAuth callback is the end of a
 // cross-site redirect chain; it answers 200 with a page that sets the
 // SameSite=Strict session cookie and continues to /admin by meta refresh. The

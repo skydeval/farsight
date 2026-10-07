@@ -1,7 +1,7 @@
 //! TIDs (timestamp identifiers), used as repo revisions.
 //!
-//! Design §7.1: "`rev` is a decoded TID; events with a non-TID rev are
-//! rejected." A TID is a 64-bit integer with the top bit zero (53 bits of
+//! A stored `rev` is a decoded TID; events with a non-TID rev are
+//! rejected. A TID is a 64-bit integer with the top bit zero (53 bits of
 //! microseconds since the Unix epoch, 10 bits of clock id), written as 13
 //! characters of base32-sortable (`234567abcdefghijklmnopqrstuvwxyz`). The
 //! first character carries the top four bits; since the top bit must be

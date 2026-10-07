@@ -1,5 +1,5 @@
-//! `relist_debt` (design §3.7.3): the single source of actor-level
-//! coverage exceptions.
+//! `relist_debt` (see `docs/design/coverage.md`): the single source of
+//! actor-level coverage exceptions.
 
 use std::collections::HashMap;
 
@@ -50,8 +50,8 @@ pub async fn add_debt(
     Ok(())
 }
 
-/// A clean run (§5.2.1) with coverage point `point` deletes every debt of
-/// the actor whose `since_witness ≤ point`. Returns rows deleted.
+/// A clean run with coverage point `point` deletes every debt of the
+/// actor whose `since_witness ≤ point`. Returns rows deleted.
 pub async fn clear_for_clean_run(
     pool: &PgPool,
     actor_id: i64,
@@ -74,7 +74,7 @@ pub async fn clear_for_clean_run(
 }
 
 /// A `resync` debt that became terminal is replaced by `unreachable` (an
-/// actor never counts twice for one cause, §3.7.3).
+/// actor never counts twice for one cause).
 pub async fn replace_resync_with_unreachable(
     pool: &PgPool,
     actor_id: i64,
@@ -104,8 +104,8 @@ pub async fn replace_resync_with_unreachable(
 }
 
 /// Debts of the given actors (per-actor and per-reason reads used by
-/// `checkBlocks` per-result coverage, §3.7.5 item 5). Actors without
-/// debts are absent from the map.
+/// `checkBlocks` per-result coverage). Actors without debts are absent
+/// from the map.
 pub async fn debts_for<'e>(
     ex: impl PgExecutor<'e>,
     actor_ids: &[i64],
@@ -144,8 +144,8 @@ pub async fn counts_by_reason<'e>(ex: impl PgExecutor<'e>) -> Result<HashMap<Deb
 }
 
 /// `resync` debts older than `after` (by `created_at`, the first cause)
-/// become terminal: replaced by `unreachable` (§3.7.3, §6.2: 7 days).
-/// Returns how many were replaced.
+/// become terminal: replaced by `unreachable` (7 days). Returns how
+/// many were replaced.
 pub async fn expire_resyncs(
     pool: &PgPool,
     now: DateTime<Utc>,

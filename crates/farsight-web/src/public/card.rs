@@ -1,6 +1,7 @@
-//! Profile cards (design §3.6, §8.6): `GET /card/{did}`, the HTML
-//! fragment the script shows when the pointer rests on an account in a
-//! row, or the link takes keyboard focus.
+//! Profile cards (see `docs/design/api.md` and
+//! `docs/design/web-ui.md`): `GET /card/{did}`, the HTML fragment the
+//! script shows when the pointer rests on an account in a row, or the
+//! link takes keyboard focus.
 //!
 //! A card shows what the network publishes about the account and nothing
 //! Farsight stores: the avatar, the verified handle, the DID and when the
@@ -11,10 +12,11 @@
 //!    not show, gets the same 404 and nothing is fetched for it;
 //! 3. the process-wide budget (`public_ui.card_rps` / `card_burst`): with
 //!    none left the *short card* is returned and nothing is fetched;
-//! 4. the fetches, through the safe client (§11.3), with one deadline for
-//!    the whole card and no retry: the PLC audit log (or the did:web
-//!    document), then the handle's forward resolution and the profile
-//!    record side by side;
+//! 4. the fetches, through the safe client (see
+//!    `docs/design/security.md`), with one deadline for the whole card
+//!    and no retry: the PLC audit log (or the did:web document), then
+//!    the handle's forward resolution and the profile record side by
+//!    side;
 //! 5. the fragment. A part whose fetch failed is left out.
 //!
 //! **The avatar is never fetched by the server.** The fragment names the

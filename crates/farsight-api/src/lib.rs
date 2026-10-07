@@ -1,8 +1,8 @@
-//! The XRPC API of Farsight (design §3): handlers for the stable
-//! `app.nearhorizon.farsight.*` queries and procedures, auth and access
-//! modes, rate limits, the query semaphore and timeout, client-IP
-//! resolution, cache headers, the error shape, coverage (`freshness`) and
-//! API metrics.
+//! The XRPC API of Farsight (see `docs/design/api.md`): handlers for the
+//! stable `app.nearhorizon.farsight.*` queries and procedures, auth and
+//! access modes, rate limits, the query semaphore and timeout, client-IP
+//! resolution, cache headers, the error shape, coverage (`freshness`) and API
+//! metrics.
 
 #![warn(missing_docs)]
 
@@ -51,7 +51,7 @@ use crate::snapshot::SnapshotHolder;
 /// NSID prefix of every Farsight method.
 pub const NSID_PREFIX: &str = "app.nearhorizon.farsight.";
 
-/// Longest a read waits for a query slot before `503 Overloaded` (§3.6).
+/// Longest a read waits for a query slot before `503 Overloaded`.
 pub const PERMIT_WAIT: Duration = Duration::from_secs(2);
 
 /// The link to the running ingest.
@@ -76,7 +76,7 @@ pub struct ApiState {
     pub keys: Arc<KeyTable>,
     /// Rate limits.
     pub limiter: Arc<RateLimiter>,
-    /// The global read-query semaphore (§3.6).
+    /// The global read-query semaphore.
     pub query_permits: Arc<Semaphore>,
     /// Proxy trust.
     pub trust: Arc<ProxyTrust>,
@@ -163,13 +163,13 @@ impl Endpoint {
         self.name().rsplit('.').next().unwrap_or("unknown")
     }
 
-    /// Whether this is a read endpoint for CORS (§9.4).
+    /// Whether this is a read endpoint for CORS.
     pub fn is_read(self) -> bool {
         matches!(self.kind(), Kind::Read | Kind::Stats)
     }
 }
 
-/// How a successful response may be cached (§9.4).
+/// How a successful response may be cached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheClass {
     /// `public, max-age=<s>` (`private` when anonymous callers could not get
@@ -205,7 +205,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .with_state(state)
 }
 
-/// The setup-mode stand-in: every `/xrpc/*` is `503 SetupRequired` (§8.2).
+/// The setup-mode stand-in: every `/xrpc/*` is `503 SetupRequired`.
 pub fn setup_router() -> Router {
     Router::new().route(
         "/xrpc/{*rest}",
@@ -224,8 +224,8 @@ pub struct IpLayer {
     pub cf: Arc<CfTracker>,
 }
 
-/// Middleware: resolves the client IP (§9.1), strips forwarding headers
-/// of untrusted peers, counts Cloudflare-edge traffic (§9.3) and attaches
+/// Middleware: resolves the client IP, strips forwarding headers of
+/// untrusted peers, counts Cloudflare-edge traffic and attaches
 /// [`ClientIp`].
 pub async fn client_ip_middleware(
     State(layer): State<IpLayer>,
@@ -283,7 +283,7 @@ fn caller_limit(
     }
 }
 
-/// Access rules of §3.5.
+/// Whether `caller` may call an endpoint of `kind` under `access.reads`.
 pub fn authorize(kind: Kind, caller: &Caller, reads: ReadsMode) -> Result<(), XrpcError> {
     match kind {
         Kind::Read | Kind::Stats => match (reads, caller) {
@@ -319,7 +319,7 @@ pub fn authorize(kind: Kind, caller: &Caller, reads: ReadsMode) -> Result<(), Xr
 
 impl ApiState {
     /// Begins a read transaction with `statement_timeout =
-    /// rate_limit.query_timeout` (§3.6).
+    /// rate_limit.query_timeout`.
     pub async fn read_tx(&self) -> Result<Transaction<'static, Postgres>, XrpcError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("SET TRANSACTION READ ONLY")
@@ -448,7 +448,7 @@ async fn dispatch(
                 }
             };
             // Per-caller headers only on responses edge caches never
-            // replay (§3.6, r12 N11).
+            // replay.
             if !shared {
                 if let Some(r) = &rate {
                     put_rate_headers(h, r);
@@ -490,7 +490,7 @@ async fn run(
     rate: &mut Option<RateHeaders>,
 ) -> Result<Reply, XrpcError> {
     let cfg = st.config.current();
-    // `requestBackfill` also accepts the query-parameter form (D1); other
+    // `requestBackfill` also accepts the query-parameter form; other
     // methods take only their own verb.
     if *method != ep.method() {
         return Err(XrpcError::invalid(format!(

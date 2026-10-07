@@ -1,7 +1,8 @@
-//! Sweep and repair cycles (design §5.4, §7.5): enumerate a source into
-//! `cycle_outstanding` (bounded by `backfill.sweep.max_outstanding`), let
-//! the scheduler's tier 3 run the members, complete the cycle when
-//! enumeration finished and every remaining row is terminal.
+//! Sweep and repair cycles (see `docs/design/backfill.md` and
+//! `docs/design/storage.md`): enumerate a source into `cycle_outstanding`
+//! (bounded by `backfill.sweep.max_outstanding`), let the scheduler's
+//! tier 3 run the members, complete the cycle when enumeration finished
+//! and every remaining row is terminal.
 //!
 //! - Full cycles enumerate `backfill.sweep.source`; `relay_collections`
 //!   falls back to `relay_repos` when the relay lacks it.
@@ -38,7 +39,7 @@ pub const KNOWN_DIDS: &str = "known_dids";
 const TICK: Duration = Duration::from_secs(5);
 /// Largest enumeration page asked for (`listReposByCollection` limit).
 const PAGE: i64 = 2000;
-/// Collections a sweep enumerates with `relay_collections` (§5.4).
+/// Collections a sweep enumerates with `relay_collections`.
 const SWEPT: [Collection; 3] = [Collection::Block, Collection::ListBlock, Collection::List];
 
 /// An open cycle.
@@ -148,7 +149,7 @@ pub async fn tick(ctx: &Ctx, sweep: &Sweep) -> Res<()> {
             .map_err(e)?
             .flatten();
     let Some(first_applied) = first else {
-        return Ok(()); // §5.4: no cycle before the first committed batch
+        return Ok(()); // no cycle before the first committed batch
     };
     maybe_start(ctx, sweep, first_applied).await?;
     let open: Vec<Cycle> = sqlx::query_as(
@@ -354,7 +355,7 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Res<(Vec<Member>, Option<
     let cfg = ctx.cfg();
     let relay = cfg.backfill.relay_url.clone();
     let cp = c.checkpoint.clone();
-    // §7.5: repairs enumerate listRepos whatever the sweep source.
+    // Repairs enumerate listRepos whatever the sweep source.
     let source = if c.kind == REPAIR && c.source != KNOWN_DIDS {
         "relay_repos"
     } else {
@@ -468,8 +469,8 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Res<(Vec<Member>, Option<
     }
 }
 
-/// §7.5 item 2: repos changed since `from − slack − lag`, and repos the
-/// relay reports active that Farsight holds inactive.
+/// Repos changed since `from − slack − lag`, and repos the relay
+/// reports active that Farsight holds inactive.
 async fn repair_candidates(ctx: &Ctx, c: &Cycle, repos: Vec<xrpc::ListedRepo>) -> Res<Vec<Member>> {
     let cfg = ctx.cfg();
     let lag: i64 = sqlx::query_scalar(
@@ -516,7 +517,7 @@ async fn repair_candidates(ctx: &Ctx, c: &Cycle, repos: Vec<xrpc::ListedRepo>) -
 }
 
 /// Enumerates one page into `cycle_outstanding` and advances the
-/// checkpoint in the same transaction (§5.4).
+/// checkpoint in the same transaction.
 async fn enumerate_page(ctx: &Ctx, c: &Cycle, room: u32) -> Res<()> {
     let (members, next, done) = match next_page(ctx, c, room).await {
         Ok(p) => p,
@@ -566,7 +567,7 @@ async fn enumerate_page(ctx: &Ctx, c: &Cycle, room: u32) -> Res<()> {
 }
 
 /// A repo the relay reports active that Farsight holds inactive: a
-/// `resync` debt, and OA on its `unavailable` lists (§7.5 item 2).
+/// `resync` debt, and OA on its `unavailable` lists.
 async fn reactivation(ctx: &Ctx, did: &str) -> Res<()> {
     let Some(id) = crate::jobs::actor_id(&ctx.pool, did).await.map_err(e)? else {
         return Ok(());
@@ -603,7 +604,7 @@ async fn reactivation(ctx: &Ctx, did: &str) -> Res<()> {
 
 /// Completes a cycle whose enumeration finished and whose remaining rows
 /// are all terminal; a repair heals the gaps it claimed, a full cycle
-/// heals every gap that closed before its `S_C` (§7.5 item 3).
+/// heals every gap that closed before its `S_C`.
 async fn maybe_complete(ctx: &Ctx, c: &Cycle) -> Res<()> {
     let pool = &ctx.pool;
     let enumerated: Option<DateTime<Utc>> =

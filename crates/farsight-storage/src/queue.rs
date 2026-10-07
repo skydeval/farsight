@@ -1,8 +1,10 @@
-//! `backfill_queue` enqueueing with the collapse rule (design §5.3).
+//! `backfill_queue` enqueueing with the collapse rule (see
+//! `docs/design/backfill.md`).
 //!
 //! The backfill stage owns picking and running jobs; this module only
 //! adds or upgrades *waiting* entries, which ingest needs for `#sync`,
-//! poisoned events and newly active unknown DIDs (§6.2, §6.4).
+//! poisoned events and newly active unknown DIDs (see
+//! `docs/design/firehose.md`).
 
 use sqlx::PgConnection;
 
@@ -30,12 +32,12 @@ impl JobKind {
     }
 }
 
-/// Requester of `system:resync` re-lists (§5.3).
+/// Requester of `system:resync` re-lists.
 pub const SYSTEM_RESYNC: &str = "system:resync";
 /// Requester of tier-2 active-author jobs enqueued by ingest.
 pub const SYSTEM_FIREHOSE: &str = "system:firehose";
 
-/// Tier-2 cap (§5.3: overflow dropped; the sweep covers it).
+/// Tier-2 cap (overflow dropped; the sweep covers it).
 pub const TIER2_CAP: i64 = 1_000_000;
 
 /// What happened to an enqueue request.
@@ -48,7 +50,7 @@ pub enum Enqueued {
     CapReached,
 }
 
-/// Adds or upgrades the waiting entry for `(actor, kind)` (§5.3 collapse
+/// Adds or upgrades the waiting entry for `(actor, kind)` (the collapse
 /// rule): tier := most urgent, `not_before` := earliest (NULL = now),
 /// requester := that of the more urgent request, priority := higher.
 /// `cap` bounds the number of waiting entries of `requester` (system

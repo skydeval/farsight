@@ -1,4 +1,5 @@
-//! The stable read queries (design §3.2) with their coverage (§3.7.5).
+//! The stable read queries (see `docs/design/api.md`) with their coverage
+//! (see `docs/design/coverage.md`).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ pub(crate) fn view<'a>(st: &ApiState, snap: &'a GlobalSnapshot) -> View<'a> {
 }
 
 /// Harness hook: `_sleep=<seconds>` holds the query slot inside the read
-/// transaction (semaphore and `statement_timeout` checks of Phase B).
+/// transaction (semaphore and `statement_timeout` checks of the harness).
 #[cfg(feature = "harness")]
 async fn harness_sleep(conn: &mut PgConnection, p: &Params) -> Result<(), XrpcError> {
     if let Some(s) = p.get("_sleep").and_then(|s| s.parse::<f64>().ok()) {
@@ -127,7 +128,7 @@ pub async fn get_incoming_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply
     Ok(Reply::ok(Value::Object(body)))
 }
 
-/// Composite scope for X (§3.7.5 item 4) with the live rule of §3.7.1.
+/// Composite scope for X with the live rule of the snapshot.
 async fn composite(
     v: &View<'_>,
     conn: &mut PgConnection,
@@ -299,7 +300,7 @@ pub async fn get_lists_naming(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
     Ok(Reply::ok(Value::Object(body)))
 }
 
-/// Whether the session is on v2 without an open v1 interval (§6.5).
+/// Whether the session is on v2 without an open v1 interval.
 fn on_v2(s: &GlobalSnapshot) -> bool {
     s.firehose.protocol == Some(Protocol::V2)
         && !s.gaps.iter().any(|g| {
@@ -307,7 +308,7 @@ fn on_v2(s: &GlobalSnapshot) -> bool {
         })
 }
 
-/// List scope (§3.7.5 item 3).
+/// List scope.
 pub fn list_scope(v: &View<'_>, info: Option<&ListInfo>) -> Cov {
     let a = v.applied_through();
     let base = |level| Cov {
@@ -459,11 +460,11 @@ fn list_relevant(l: &queries::PartyList, inc: bool) -> bool {
     l.record_state != 2 && (inc || !actor_status::is_hidden(l.owner_status))
 }
 
-/// The X side of `checkBlocks` at response level (§3.7.5 item 5): network
-/// or subject scope for blocks and the list chain, X's last clean listing
-/// while the network is not complete, X's debts, and the state of every
-/// list X listblocks. `rows` must hold X's listblocks (`check_rows`).
-/// The public UI reads the same value for an account's outgoing blocks.
+/// The X side of `checkBlocks` at response level: network or subject
+/// scope for blocks and the list chain, X's last clean listing while the
+/// network is not complete, X's debts, and the state of every list X
+/// listblocks. `rows` must hold X's listblocks (`check_rows`). The public
+/// UI reads the same value for an account's outgoing blocks.
 pub(crate) fn actor_side_coverage(
     v: &View<'_>,
     ac: Option<&ActorCoverage>,
@@ -509,7 +510,7 @@ pub(crate) fn actor_side_coverage(
 /// Maximum `others` per `checkBlocks` call.
 pub const MAX_OTHERS: usize = 100;
 
-/// `query.checkBlocks` (§3.2, per-result coverage §3.7.5 item 5).
+/// `query.checkBlocks` (per-result coverage).
 pub async fn check_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcError> {
     let x = p.did("actor")?;
     let raw_others = p.all("others");

@@ -1,4 +1,4 @@
-# Farsight image: one image, two binaries (design §17, D8).
+# Farsight image: one image, two binaries.
 FROM rust:1.88-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rustfmt.toml ./

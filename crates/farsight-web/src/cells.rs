@@ -1,5 +1,5 @@
-//! Cells of the admin tables (design §8.6): accounts, records and times
-//! on the lookup and history pages.
+//! Cells of the admin tables (see `docs/design/web-ui.md`): accounts,
+//! records and times on the lookup and history pages.
 //!
 //! An account cell renders as on the public pages — `@handle` when the
 //! handle cache holds a verified one, the DID otherwise — as a link to the

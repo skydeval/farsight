@@ -1,5 +1,6 @@
-//! Storage budget and hard ceiling (design §11.2): measuring, the gate
-//! state machine with its hysteresis, and `storage_refusals` intervals.
+//! Storage budget and hard ceiling (see `docs/design/security.md`):
+//! measuring, the gate state machine with its hysteresis, and
+//! `storage_refusals` intervals.
 //!
 //! The budget monitor (a server task, every minute) calls
 //! [`measure_database_bytes`], feeds the result to [`next_gate_state`],
@@ -64,7 +65,7 @@ fn pct(bytes: u64, budget: u64, p: u64) -> bool {
     u128::from(bytes) * 100 >= u128::from(budget) * u128::from(p)
 }
 
-/// The next gate state for a measured size (§11.2):
+/// The next gate state for a measured size:
 /// - budget refusal starts at ≥ 100% and ends below 95% (hysteresis);
 /// - the ceiling refusal starts at ≥ the hard ceiling and ends below
 ///   105% of the budget;
@@ -99,7 +100,7 @@ pub async fn measure_database_bytes(pool: &PgPool) -> Result<u64> {
 }
 
 /// Opens or closes the global `storage_refusals` interval when the
-/// "any global refusal active" condition changes (§11.2: network scope is
+/// "any global refusal active" condition changes (network scope is
 /// `partial` + `storage_refusal` while one is open). `witness` is the
 /// current applied-through witness time.
 pub async fn record_refusal_transition(

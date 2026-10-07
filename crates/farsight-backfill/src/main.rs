@@ -1,6 +1,6 @@
-//! `farsight-backfill`: the background backfill process (design §5). Same
-//! image as the server, config volume read-only; idles until the server's
-//! setup wizard has written a config.
+//! `farsight-backfill`: the background backfill process (see
+//! `docs/design/backfill.md`). Same image as the server, config volume
+//! read-only; idles until the server's setup wizard has written a config.
 
 use std::process::ExitCode;
 
@@ -10,7 +10,7 @@ fn init_logging() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn,hyper=warn"));
-    // Structured JSON logs (§13).
+    // Structured JSON logs.
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(filter)

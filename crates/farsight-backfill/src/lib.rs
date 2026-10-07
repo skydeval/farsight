@@ -1,6 +1,6 @@
 //! Background backfill for Farsight: sweep sources, the tiered scheduler
 //! with per-host limits, repo listing, list jobs and optional subject
-//! discovery (design §5).
+//! discovery (see `docs/design/backfill.md`).
 //!
 //! The process idles while no config exists (setup mode, or after a
 //! config reset), waits for the server to migrate the schema, then runs one
@@ -77,7 +77,7 @@ pub fn install_metrics() -> Option<PrometheusHandle> {
     match b.install_recorder() {
         Ok(h) => {
             metrics::register();
-            // Reconciles write history rows in this process (§7.7).
+            // Reconciles write history rows in this process.
             farsight_storage::history::register_metrics();
             Some(h)
         }
@@ -457,9 +457,9 @@ fn restart_needed(old: &Config, new: &Config) -> bool {
         || old.limits.cdn_ranges_extra != new.limits.cdn_ranges_extra
 }
 
-/// Backfill's own budget monitor (§11.2): measures the database and
-/// publishes the gates to its writers and jobs. Refusal intervals and
-/// GF/GO on lists are the server's (one owner each).
+/// Backfill's own budget monitor: measures the database and publishes
+/// the gates to its writers and jobs. Refusal intervals and GF/GO on
+/// lists are the server's (one owner each).
 pub async fn budget_monitor(ctx: &Ctx) {
     let cfg = ctx.cfg();
     let budget = Budget {

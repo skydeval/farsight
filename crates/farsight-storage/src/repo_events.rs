@@ -1,11 +1,12 @@
-//! Non-commit firehose events (design §6.4): `identity`, `account` and
-//! `#sync`, applied inside the batch transaction so the persisted cursor
-//! never runs ahead of their effects (§6.2).
+//! Non-commit firehose events (see `docs/design/firehose.md`):
+//! `identity`, `account` and `#sync`, applied inside the batch
+//! transaction so the persisted cursor never runs ahead of their
+//! effects.
 //!
 //! | Event | Effect |
 //! |---|---|
 //! | `identity` | known DID ⇒ PDS cache cleared (`pds_resolved_at = NULL`) |
-//! | `account` | known DID ⇒ status per §7.4; `desynchronized` ⇒ `resync` debt; **any** DID becoming active: known with `inactive_at_listing` or a hidden status ⇒ `resync` debt + **OA** on its `unavailable` lists; unknown ⇒ no row, no job (counted in the report; r17, T4); `deleted` ⇒ purge after commit |
+//! | `account` | known DID ⇒ status set from the event; `desynchronized` ⇒ `resync` debt; **any** DID becoming active: known with `inactive_at_listing` or a hidden status ⇒ `resync` debt + **OA** on its `unavailable` lists; unknown ⇒ no row, no job (counted in the report); `deleted` ⇒ purge after commit |
 //! | `#sync` | any DID ⇒ `resync` debt + tier-1 `system:resync` re-list |
 
 use chrono::{DateTime, Utc};
@@ -154,10 +155,9 @@ impl Txn<'_> {
                 .await?;
                 self.report.repo_events += 1;
                 let Some((id, old, inactive_at_listing, status_at)) = known else {
-                    // §6.4 (r17, T4): an unknown DID becoming active gets no
-                    // row and no job, only a metric. Its first authored
-                    // indexed record interns it and enqueues the tier-2 job
-                    // (see `apply`).
+                    // An unknown DID becoming active gets no row and no
+                    // job, only a metric. Its first authored indexed record
+                    // interns it and enqueues the tier-2 job (see `apply`).
                     if *active {
                         self.report.unknown_activations += 1;
                     }
@@ -209,8 +209,8 @@ impl Txn<'_> {
     }
 }
 
-/// A poisoned event (§6.2): an event that failed 3 times on its own. Logs
-/// it to `op_errors`, raises a `resync` debt for its DID (counted in
+/// A poisoned event: an event that failed 3 times on its own. Logs it
+/// to `op_errors`, raises a `resync` debt for its DID (counted in
 /// `pendingResyncs`) and enqueues a tier-1 `system:resync` re-list. The
 /// debt turns into `unreachable` after 7 days without a clean run
 /// ([`crate::debts::expire_resyncs`]).

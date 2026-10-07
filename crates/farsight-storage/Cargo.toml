@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [features]
-# Builds the stage-1 Phase B harness binary. Off by default so release
+# Builds the stage-1 harness binary. Off by default so release
 # builds never contain it.
 harness = []
 

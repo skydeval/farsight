@@ -1,4 +1,5 @@
-//! Websocket connections to one Jetstream instance (§6.1).
+//! Websocket connections to one Jetstream instance (see
+//! `docs/design/firehose.md`).
 //!
 //! [`connect`] opens either protocol at a cursor. The v2 handshake is the
 //! detection probe: an instance that does not offer `subscribeEvents`
@@ -22,7 +23,7 @@ use crate::resume::Cursor;
 /// The four indexed collections (`wantedCollections` / `collections`).
 pub const COLLECTIONS: [&str; 4] = farsight_core::nsid::INDEXED_COLLECTIONS;
 
-/// v2 subprotocol (§6.1).
+/// v2 subprotocol.
 pub const V2_SUBPROTOCOL: &str = "xrpc.v1.json";
 
 /// Handshake timeout.

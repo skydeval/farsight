@@ -1,6 +1,6 @@
-//! Section 0: the history write path (design §7.7, §7.8), driven through
-//! the real apply path and janitor against a database of its own. Every
-//! assertion reads the rows the writers stored.
+//! Section 0: the history write path (see `docs/design/history.md`),
+//! driven through the real apply path and janitor against a database of
+//! its own. Every assertion reads the rows the writers stored.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use farsight_core::record::{BlockRecord, ListBlockRecord, ListItemRecord};
@@ -204,7 +204,7 @@ impl Env {
 
 /// Runs the section.
 pub async fn run(c: &mut Checks, pg: &Pg) -> Result<(), String> {
-    c.section("0. history write path (apply, janitor; design §7.7, §7.8)");
+    c.section("0. history write path (apply, janitor)");
     pg.create_db("stage5_store").await?;
     let pool = pg.pool("stage5_store", 4).await?;
     farsight_storage::migrate(&pool)

@@ -1,6 +1,7 @@
-//! The "Public UI" subsection of the admin Settings page (design §8.6):
-//! a control for every `[public_ui]` key, the master `access.public_ui`
-//! toggle, and the confirmation step in front of turning it on.
+//! The "Public UI" subsection of the admin Settings page (see
+//! `docs/design/web-ui.md`): a control for every `[public_ui]` key, the
+//! master `access.public_ui` toggle, and the confirmation step in front
+//! of turning it on.
 //!
 //! Turning the public UI on is the one settings change that publishes
 //! data to visitors without a login, so it never takes effect on the
@@ -186,7 +187,7 @@ impl View {
             card_rps: s("card_rps"),
             card_burst: s("card_burst"),
             handle_warming_enabled: b("handle_warming_enabled"),
-            // A form from before the field existed keeps the rate in force.
+            // A form without the field keeps the rate in force.
             handle_rps: form
                 .get("handle_rps")
                 .cloned()

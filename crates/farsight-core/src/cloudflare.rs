@@ -1,4 +1,4 @@
-//! The bundled, dated Cloudflare edge ranges (design §9.1, §9.3, §11.2).
+//! The bundled, dated Cloudflare edge ranges (see `docs/design/security.md`).
 //!
 //! Used by the wizard's "Cloudflare" proxy preset, by the dashboard's
 //! "behind Cloudflare but not trusting it" detection, and as shared

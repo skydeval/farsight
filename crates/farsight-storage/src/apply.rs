@@ -1,17 +1,19 @@
 //! `farsight-storage::apply` — the one write path for firehose batches,
-//! listing pages and discovery writes (design §2, §4, §7).
+//! listing pages and discovery writes (see `docs/design/README.md`,
+//! `docs/design/list-indexing.md` and `docs/design/storage.md`).
 //!
 //! One Postgres transaction per batch, at `READ COMMITTED`:
-//! 1. author locks for every author in the batch, ascending by key (§4.3);
+//! 1. author locks for every author in the batch, ascending by key;
 //! 2. stored rows of every listblock / listitem key and every reconcile
 //!    candidate are read (stable under the author locks), so the list keys
 //!    of deletes, subject-changing updates and reconciles are known;
 //! 3. list locks, ascending by key: exclusive for listblock and list
 //!    writes, shared for listitem writes;
-//! 4. writes in batch order, then reconciles, each with the LWW rule of
-//!    §7.2, counters and transitions of §4.2/§4.4 and caps of §11;
+//! 4. writes in batch order, then reconciles, each with the LWW rule,
+//!    the listblock counters, the list transitions and the caps;
 //! 5. firehose progress (cursor, `applied_through`, `firehose_clock`) in
-//!    the same transaction (§6.2, §3.7.1), and `NOTIFY farsight_coverage`.
+//!    the same transaction (see `docs/design/firehose.md` and
+//!    `docs/design/coverage.md`), and `NOTIFY farsight_coverage`.
 //!
 //! Deadlock aborts (`40P01`) are retried; they never count toward
 //! poisoned-event handling (the error type says so).
@@ -41,7 +43,7 @@ use crate::txn::{
 /// Maximum attempts of one batch transaction when deadlocks abort it.
 pub const MAX_DEADLOCK_ATTEMPTS: u32 = 8;
 
-/// A listing stamp may be applied only this long after it was read (§7.3).
+/// A listing stamp may be applied only this long after it was read.
 pub const STAMP_VALIDITY: Duration = Duration::from_secs(72 * 3600);
 
 /// Where a batch comes from; decides stamps, witnesses and charging.
@@ -49,16 +51,16 @@ pub const STAMP_VALIDITY: Duration = Duration::from_secs(72 * 3600);
 pub enum Origin {
     /// Firehose events: `W` = commit rev, `witnessed_at` = event witness.
     Firehose,
-    /// A listing page: `W = R`, `witnessed_at` NULL (§3.7.4).
+    /// A listing page: `W = R`, `witnessed_at` NULL.
     Listing {
         /// When `R` was read (database clock). Batches whose stamp is older
         /// than 72 h are rejected with [`StorageError::StaleStamp`].
         stamp_read_at: DateTime<Utc>,
         /// Budget gate on the job: inserts skipped with a `refused` debt,
-        /// deletes and reconcile applied (§5.3).
+        /// deletes and reconcile applied.
         deletes_only: bool,
     },
-    /// Discovery writes (`W = 0`), charged to the requester (§5.6, §11.2).
+    /// Discovery writes (`W = 0`), charged to the requester.
     Discovery {
         /// Requester cause key: `token:<id>` or `admin`.
         requester: String,
@@ -83,7 +85,7 @@ pub struct Write {
     pub collection: Collection,
     /// Record key.
     pub rkey: RecordKey,
-    /// Stamp `W` (§7.2): commit rev, listing stamp `R`, or 0 for discovery.
+    /// Stamp `W`: commit rev, listing stamp `R`, or 0 for discovery.
     pub stamp: i64,
     /// Firehose witness time of the event, if firehose.
     pub witness: Option<DateTime<Utc>>,
@@ -91,10 +93,10 @@ pub struct Write {
     pub action: WriteAction,
 }
 
-/// A range or whole-collection reconcile (§5.2 steps 5 and 6): delete the
-/// author's rows in `collection` with `rev < stamp` whose rkey lies in
-/// `(after, through]` (open ends = unbounded) and is not in `keep`. Never
-/// writes a tombstone (§7.2).
+/// A range or whole-collection reconcile: delete the author's rows in
+/// `collection` with `rev < stamp` whose rkey lies in `(after, through]`
+/// (open ends = unbounded) and is not in `keep`. Never writes a
+/// tombstone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reconcile {
     /// The repo.
@@ -120,7 +122,7 @@ pub struct Batch {
     pub writes: Vec<Write>,
     /// Reconciles, applied after the writes.
     pub reconciles: Vec<Reconcile>,
-    /// Non-commit firehose events, applied after the writes (§6.4).
+    /// Non-commit firehose events, applied after the writes.
     pub events: Vec<RepoEvent>,
     /// Firehose progress to persist atomically with the writes.
     pub firehose: Option<FirehoseProgress>,
@@ -340,9 +342,9 @@ async fn apply_once(
         for (r, c) in batch.reconciles.iter().zip(candidates) {
             apply_reconcile(&mut t, r, &c).await?;
         }
-        // §6.4 (r17, T4): a DID's first authored indexed record seen on the
-        // firehose interns it (above) and takes the active-DID branch here:
-        // a tier-2 repo job, so its pre-existing records get listed.
+        // A DID's first authored indexed record seen on the firehose
+        // interns it (above) and takes the active-DID branch here: a tier-2
+        // repo job, so its pre-existing records get listed.
         if batch.origin == Origin::Firehose && !batch.writes.is_empty() {
             let new: Vec<i64> = std::mem::take(&mut t.report.new_authors);
             for id in &new {
@@ -422,8 +424,8 @@ async fn stored_list_targets(
         .await?)
 }
 
-/// The removal a write causes (§7.7): a firehose event names its commit
-/// rev and its witness; a listing or discovery write knows neither.
+/// The removal a write causes: a firehose event names its commit rev
+/// and its witness; a listing or discovery write knows neither.
 fn removal_for(origin: &Origin, w: &Write, cause: Removed) -> Removal {
     match origin {
         Origin::Firehose => Removal {
@@ -435,7 +437,7 @@ fn removal_for(origin: &Origin, w: &Write, cause: Removed) -> Removal {
     }
 }
 
-/// The witness a write stamps on the row it stores (§7.7).
+/// The witness a write stamps on the row it stores.
 fn seen_for(t: &Txn<'_>, origin: &Origin, w: &Write) -> DateTime<Utc> {
     match origin {
         Origin::Firehose => t.seen_at(w.witness),
@@ -589,7 +591,7 @@ async fn block_upsert(
         if !same {
             // Subject change = removal of the old target + a fresh insert,
             // done in place: authored_blocks is unchanged, the old target
-            // goes to history and the witness bounds start again (§7.2).
+            // goes to history and the witness bounds start again.
             let gone = Gone {
                 rkey,
                 created_at: old_created,
@@ -718,8 +720,8 @@ type ItemGone = (
 
 /// Deletes one block row (with its counters). Returns whether a row went.
 /// Every path deleting `blocks` rows uses this function; it is also where
-/// `blocks_history` is written (§7.7): the caller names the removal, and
-/// the account and divergence purges name none.
+/// `blocks_history` is written: the caller names the removal, and the
+/// account and divergence purges name none.
 pub(crate) async fn block_delete_row(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
@@ -853,9 +855,9 @@ async fn listblock_upsert(
             t.report.applied += 1;
             return Ok(());
         }
-        // Subject change: delete of the old row plus a new insert (§4.2).
-        // The old target goes to history (§7.2); if the new version is
-        // then refused, the removal is a refused update.
+        // Subject change: delete of the old row plus a new insert. The
+        // old target goes to history; if the new version is then
+        // refused, the removal is a refused update.
         let removal = removal_for(origin, w, Removed::SubjectChange);
         t.clear_last_history();
         listblock_delete_row(t, author, rkey, Some(&removal)).await?;
@@ -886,9 +888,9 @@ async fn listblock_upsert(
     }
 }
 
-/// Whether counting a new listblock on this list would admit it (§4.2):
-/// count 0 and not tracked, excluding the cells where `+` does not admit
-/// (a deleted record goes to `dead`; a purge to `dead` stays).
+/// Whether counting a new listblock on this list would admit it: count 0
+/// and not tracked, excluding the cells where `+` does not admit (a
+/// deleted record goes to `dead`; a purge to `dead` stays).
 fn would_admit(
     state: TrackState,
     record_state: RecordState,
@@ -989,7 +991,7 @@ async fn listblock_insert(
                 .await?;
         }
         Err(cap) => {
-            // Stored uncounted: not a refusal, but a `capped` debt (§4.2).
+            // Stored uncounted: not a refusal, but a `capped` debt.
             t.add_debt(author.id, DebtReason::Capped, Some(cap), w.witness)
                 .await?;
             t.report.uncounted += 1;
@@ -998,13 +1000,13 @@ async fn listblock_insert(
     Ok(Ok(()))
 }
 
-/// The counter path (§4.2): deletes one listblock row and, if it was
-/// counted, decrements `listblock_count`, `fetch_triggers` and the lane
-/// of its stored `sched_key`, firing **−** on 1 → 0. Every path deleting
+/// The counter path: deletes one listblock row and, if it was counted,
+/// decrements `listblock_count`, `fetch_triggers` and the lane of its
+/// stored `sched_key`, firing **−** on 1 → 0. Every path deleting
 /// `list_blocks` rows uses this function. The caller holds author(A) and
-/// list(L) exclusive. It is also where `list_blocks_history` is written
-/// (§4.2, §7.7): the caller names the removal, and the two purges name
-/// none. Counted and uncounted rows are recorded alike.
+/// list(L) exclusive. It is also where `list_blocks_history` is written:
+/// the caller names the removal, and the two purges name none. Counted
+/// and uncounted rows are recorded alike.
 pub(crate) async fn listblock_delete_row(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
@@ -1091,8 +1093,8 @@ async fn item_row(t: &mut Txn<'_>, owner_id: i64, rkey: &str) -> Result<Option<I
     }))
 }
 
-/// Marks a list `capped` because one of its items was refused (§4.7,
-/// §11.2); `refresh` also requests a refresh run (intern-rate refusals).
+/// Marks a list `capped` because one of its items was refused;
+/// `refresh` also requests a refresh run (intern-rate refusals).
 async fn mark_list_capped(t: &mut Txn<'_>, list_id: i64, refresh: bool) -> Result<()> {
     sqlx::query(
         "UPDATE lists SET capped = true, refresh_requested = refresh_requested OR $2
@@ -1162,9 +1164,9 @@ async fn listitem_upsert(
         }
         // Changed (list or subject) or no longer tracked: delete the old
         // version, then try the new one as an insert. The removal goes to
-        // history under §7.8's condition: a subject change if the new
-        // version is stored, a refused update if it is not (which is also
-        // the case of an unchanged target whose new version is refused).
+        // history under the membership condition: a subject change if the new
+        // version is stored, a refused update if it is not (which is also the
+        // case of an unchanged target whose new version is refused).
         let removal = removal_for(origin, w, Removed::SubjectChange);
         t.clear_last_history();
         item_delete_row(t, author, rkey, Some(&removal)).await?;
@@ -1181,8 +1183,8 @@ async fn listitem_upsert(
             }
             Err(refusal) => {
                 t.relabel_last_history(Removed::RefusedUpdate).await?;
-                // §4.4 notes: refused new version with a stored row ⇒
-                // delete + refusal tombstone at E − 1.
+                // Refused new version with a stored row ⇒ delete +
+                // refusal tombstone at E − 1.
                 t.put_refusal_tombstone(Collection::ListItem, author.id, rkey, w.stamp)
                     .await?;
                 item_refused(t, author, rkey, w, refusal).await
@@ -1204,7 +1206,7 @@ async fn listitem_upsert(
 
 /// Why an item was not stored.
 enum ItemRefusal {
-    /// The list is not tracked: refused, no debt (costs nothing, §11.1).
+    /// The list is not tracked: refused, no debt (costs nothing).
     Untracked,
     /// A per-list or per-owner item cap: the list is marked `capped`.
     ListCap,
@@ -1307,10 +1309,10 @@ async fn item_insert(
 /// Deletes one listitem row and its counters. The caller holds author(O)
 /// and list(L) (shared suffices: all writers of L's items hold author(O)).
 /// Every path deleting `list_items` rows uses this function; it is also
-/// where `list_items_history` is written (§4.7, §7.8), when the caller
-/// names the removal **and** the owner is not `deleted` **and** the list
-/// is tracked or its record is deleted — so a change of tracking is never
-/// recorded as a change of membership.
+/// where `list_items_history` is written, when the caller names the
+/// removal **and** the owner is not `deleted` **and** the list is tracked
+/// or its record is deleted — so a change of tracking is never recorded as
+/// a change of membership.
 pub(crate) async fn item_delete_row(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
@@ -1449,7 +1451,7 @@ async fn list_upsert(
     .fetch_one(&mut *t.conn)
     .await?;
     t.report.applied += 1;
-    // "Any list record apply for L fires RP" (§5.5).
+    // Any list record apply for L fires RP.
     t.fire(list_id, Event::RecordPresent, FireArgs::default())
         .await?;
     Ok(())
@@ -1457,7 +1459,7 @@ async fn list_upsert(
 
 /// Marks a list record deleted at stamp `w` (firehose delete or
 /// reconcile) and fires **RD**. The row is kept: other authors'
-/// listblocks point at it (§7.4).
+/// listblocks point at it.
 pub(crate) async fn list_mark_deleted(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
@@ -1552,7 +1554,7 @@ async fn reconcile_candidates(
 async fn apply_reconcile(t: &mut Txn<'_>, r: &Reconcile, candidates: &[String]) -> Result<()> {
     let author = t.author(&r.author).await?;
     // A listing knows only its stamp, which is neither the removing
-    // commit's rev nor a bound on it: no rev, the listing clock (§7.7).
+    // commit's rev nor a bound on it: no rev, the listing clock.
     let found = Removal::listing(Removed::Reconcile);
     for rkey in candidates {
         // Re-check `rev < R` (a write earlier in this batch may have

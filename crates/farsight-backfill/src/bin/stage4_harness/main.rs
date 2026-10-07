@@ -1,10 +1,10 @@
-//! `farsight-stage4-harness`: Phase B Mode A — automated backfill
-//! conformance (stage-4 kickoff, 11 checks). Every assertion reads real
-//! stored rows written by the real backfill code paths (`repo::run`,
-//! `list_phase1::run`, `list_fetch::run`, the scheduler, the sweep, the
-//! feeder, the budget monitor) running against a fake PDS / PLC / relay on
-//! loopback; check 11 runs the real `farsight` and `farsight-backfill`
-//! binaries against a live v2 Jetstream.
+//! `farsight-stage4-harness`: integration tests of backfill (repo jobs,
+//! list jobs, the scheduler, the sweep, repairs and the feeder). Every
+//! assertion reads real stored rows written by the real backfill code
+//! paths (`repo::run`, `list_phase1::run`, `list_fetch::run`, the
+//! scheduler, the sweep, the feeder, the budget monitor) running against a
+//! fake PDS / PLC / relay on loopback; check 11 runs the real `farsight`
+//! and `farsight-backfill` binaries against a live v2 Jetstream.
 //!
 //! Time-dependent rules (retry ladders, `pending_max_age`, terminal
 //! failure) are driven by moving the stored timestamps back ("clock
@@ -220,8 +220,8 @@ impl H {
         Ok(r)
     }
 
-    /// The server's purge task (§4.4 purge→X, then PD), which the
-    /// harness runs in place of a server process.
+    /// The server's purge task (purge→X, then PD), which the harness
+    /// runs in place of a server process.
     async fn purges(&self) -> Res<()> {
         farsight_storage::janitor::process_purges(
             self.pool(),
@@ -418,7 +418,7 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
             "6. scheduler fairness (DRR across requesters, high:normal 4:1)",
             6,
         ),
-        ("1. repo job outcomes (§5.2.1)", 1),
+        ("1. repo job outcomes", 1),
         ("2. divergence check", 2),
         ("3. list phase 1", 3),
         ("4. list fetch run", 4),
@@ -427,7 +427,7 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
         ("8. sweep cycle", 8),
         ("9. repair cycle", 9),
         ("10. debt feeder", 10),
-        ("extra: subject discovery (§5.6)", 12),
+        ("extra: subject discovery", 12),
     ];
     for (name, n) in checks {
         c.section(name);
@@ -699,7 +699,7 @@ async fn check_divergence(h: &H, c: &mut Checks) -> Res<()> {
             (Collection::Block, b2.clone(), block_v(&did("sub", 43))),
         ],
     );
-    // Phase 1 and a fetch run make the list ready (the §4.4 row where DV
+    // Phase 1 and a fetch run make the list ready (the transition where DV
     // matters most: it must never be served empty as ready).
     jobs::list_phase1::run(&h.ctx, lid).await;
     let oid = h.id(&o).await?;
@@ -1538,7 +1538,7 @@ async fn check_repair(h: &H, c: &mut Checks) -> Res<()> {
     let recent_ok = recent.iter().all(listed);
     let old_skipped = !old.iter().any(listed);
     c.check(
-        "candidates per §7.5: rev time ≥ from − slack (5 recent) plus the reactivated repo; old revs skipped",
+        "repair candidates: rev time ≥ from − slack (5 recent) plus the reactivated repo; old revs skipped",
         source == "relay_repos" && total == Some(6) && recent_ok && old_skipped && listed(&back),
         format!("source {source}, enumerated {total:?}, recent listed {recent_ok}, old skipped {old_skipped}, reactivated listed {}", listed(&back)),
     );
@@ -2080,7 +2080,7 @@ enabled = false
         .filter(|n| m.contains(n))
         .collect();
     c.check(
-        "backfill metrics endpoint serves the §13 backfill series",
+        "backfill metrics endpoint serves the backfill series",
         m.contains("farsight_backfill_queue_depth") && m.contains("farsight_backfill_repos_total"),
         format!("present: {have:?}"),
     );

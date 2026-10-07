@@ -1,5 +1,6 @@
-//! Jetstream wire formats (§6.1): the v1 `/subscribe` JSON events and the
-//! v2 `network.bsky.jetstream.subscribeEvents` `xrpc.v1.json` frames,
+//! Jetstream wire formats (see `docs/design/firehose.md`): the v1
+//! `/subscribe` JSON events and the v2
+//! `network.bsky.jetstream.subscribeEvents` `xrpc.v1.json` frames,
 //! reduced to one [`InEvent`] shape.
 //!
 //! v1 event: `{"did", "time_us", "kind", "commit"|"identity"|"account"}`;
@@ -15,7 +16,7 @@ use farsight_core::record::{CommitOp, RecordError, parse_commit};
 use farsight_core::{Collection, Did};
 use serde_json::Value;
 
-/// The two protocols (§6.1).
+/// The two protocols.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Protocol {
     /// v1 `/subscribe`.
@@ -47,7 +48,7 @@ impl Protocol {
 pub enum DropReason {
     /// Failed validation (bad DID, non-TID rev, bad record, …).
     Invalid,
-    /// Authority rule: a listitem naming another repo's list (§1.1).
+    /// Authority rule: a listitem naming another repo's list.
     ForeignListItem,
 }
 

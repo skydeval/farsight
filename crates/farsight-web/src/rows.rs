@@ -1,5 +1,5 @@
-//! One page of a UI section that sorts by its rows' shown time (design
-//! §7.6, §8.6), for the public and the admin pages alike.
+//! One page of a UI section that sorts by its rows' shown time (see
+//! `docs/design/storage.md`), for the public and the admin pages alike.
 //!
 //! The admin pages page by cursor ([`page`]); the public tables by page
 //! number ([`numbered`], [`numbered_naming`]), in the same order.

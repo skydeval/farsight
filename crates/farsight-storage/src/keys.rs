@@ -17,19 +17,19 @@ pub fn hash64(s: &str) -> i64 {
     i64::from_be_bytes(b)
 }
 
-/// `hash64("a:" || did)` (design §4.3).
+/// `hash64("a:" || did)`.
 pub fn author_lock_key(did: &str) -> i64 {
     hash64(&format!("a:{did}"))
 }
 
-/// `hash64("l:" || owner_did || "/" || rkey)` (design §4.3).
+/// `hash64("l:" || owner_did || "/" || rkey)`.
 pub fn list_lock_key(owner_did: &str, rkey: &str) -> i64 {
     hash64(&format!("l:{owner_did}/{rkey}"))
 }
 
 /// `hash64("i:" || did)`: the intern lock for creating `actors` row `did`.
 /// Taken after the author and list locks, ascending (the third class of
-/// the §4.3 order; see `apply`).
+/// the lock order; see `apply`).
 pub fn intern_lock_key(did: &str) -> i64 {
     hash64(&format!("i:{did}"))
 }
@@ -45,7 +45,7 @@ pub struct Limits {
     pub tombstone_ttl: Duration,
     /// `backfill.system_queue_cap` (system requesters' waiting entries).
     pub system_queue_cap: i64,
-    /// `storage.block_history_enabled`: write history rows (§7.7, §7.8).
+    /// `storage.block_history_enabled`: write history rows.
     pub history_enabled: bool,
 }
 
@@ -61,12 +61,12 @@ impl Limits {
         }
     }
 
-    /// Limits with every default of design §16.
+    /// Limits with every default of the configuration.
     pub fn defaults() -> Limits {
         Limits::from_config(&Config::default())
     }
 
-    /// Daily admission limit for an admission key (§11.1).
+    /// Daily admission limit for an admission key.
     pub fn admission_limit(&self, key: &str) -> i64 {
         if key.starts_with(BUCKET_KEY_PREFIX) {
             clamp(self.cfg.bucket_admissions_per_day)
@@ -75,7 +75,7 @@ impl Limits {
         }
     }
 
-    /// Daily intern limit for a cause key (§11.2).
+    /// Daily intern limit for a cause key.
     pub fn intern_limit(&self, key: &str) -> i64 {
         if key.starts_with(BUCKET_KEY_PREFIX) {
             clamp(self.cfg.intern_per_bucket_per_day)
@@ -84,7 +84,7 @@ impl Limits {
         }
     }
 
-    /// Daily history-row limit for an admission key (§7.7).
+    /// Daily history-row limit for an admission key.
     pub fn history_limit(&self, key: &str) -> i64 {
         if key.starts_with(BUCKET_KEY_PREFIX) {
             clamp(self.cfg.history_per_bucket_per_day)
@@ -105,7 +105,7 @@ impl Limits {
                 CapKind::Interned => c.host_interned_lifetime,
             }
         } else if bucket.starts_with(DID_BUCKET_PREFIX) {
-            // A per-DID bucket uses the per-author caps (§11.2).
+            // A per-DID bucket uses the per-author caps.
             match kind {
                 CapKind::Blocks => c.blocks_per_author,
                 CapKind::Items => c.list_items_per_owner,
@@ -131,7 +131,7 @@ fn clamp(v: u64) -> i64 {
 }
 
 /// Record kinds with per-bucket caps; the bit is the `host_usage.capped_mask`
-/// bit (design §7.1: one bit per cap type, plus the lifetime intern bound).
+/// bit (one bit per cap type, plus the lifetime intern bound).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CapKind {
     /// `host_blocks`.
@@ -172,7 +172,7 @@ impl CapKind {
 pub const BUCKET_KEY_PREFIX: &str = "bucket:";
 /// Prefix of DID admission / cause keys (large hosts, per-DID buckets).
 pub const DID_KEY_PREFIX: &str = "did:";
-/// Prefix of not-yet-resolved did:plc keys (per-DID rate, §4.2).
+/// Prefix of not-yet-resolved did:plc keys (per-DID rate).
 pub const UNRESOLVED_KEY_PREFIX: &str = "unresolved:";
 
 /// Host-usage bucket for not-yet-resolved did:plc authors.
@@ -201,10 +201,10 @@ pub struct HostFacts {
     pub resolved: bool,
 }
 
-/// The author's admission key (§4.2, §5.5, §11.1): the stored key if the
-/// resolver set one; otherwise derived: resolved large host ⇒ `did:<did>`,
-/// resolved other host ⇒ `bucket:<cap_key>`, unresolved did:web ⇒
-/// `bucket:<registrable domain>`, unresolved did:plc ⇒ `unresolved:<did>`.
+/// The author's admission key: the stored key if the resolver set one;
+/// otherwise derived: resolved large host ⇒ `did:<did>`, resolved other
+/// host ⇒ `bucket:<cap_key>`, unresolved did:web ⇒ `bucket:<registrable
+/// domain>`, unresolved did:plc ⇒ `unresolved:<did>`.
 pub fn admission_key(did: &Did, facts: &HostFacts) -> String {
     if let Some(k) = &facts.admission_key {
         return k.clone();
@@ -223,7 +223,7 @@ pub fn admission_key(did: &Did, facts: &HostFacts) -> String {
     }
 }
 
-/// The author's cap buckets (§11.2). Empty for large hosts (exempt).
+/// The author's cap buckets. Empty for large hosts (exempt).
 pub fn buckets(did: &Did, facts: &HostFacts) -> Vec<String> {
     if facts.resolved {
         if facts.large {

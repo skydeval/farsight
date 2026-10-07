@@ -1,6 +1,7 @@
-//! On-demand backfill at the API layer (design §3.3, §5.3, §5.6):
-//! `requestBackfill` writes `backfill_queue` (the backfill process drains
-//! it) and `getBackfillStatus` reads job state without ever enqueueing.
+//! On-demand backfill at the API layer (see `docs/design/api.md` and
+//! `docs/design/backfill.md`): `requestBackfill` writes `backfill_queue`
+//! (the backfill process drains it) and `getBackfillStatus` reads job
+//! state without ever enqueueing.
 
 use chrono::{DateTime, Utc};
 use farsight_core::Did;
@@ -13,12 +14,12 @@ use crate::queue::{self, Enqueued, JobKind};
 use crate::repo_events::priority;
 use crate::txn::{Cause, Gates, Refusal, Txn};
 
-/// Waiting entries one requester may hold (§5.3; beyond it `QueueFull`).
+/// Waiting entries one requester may hold (beyond it `QueueFull`).
 pub const REQUESTER_QUEUE_CAP: i64 = 10_000;
-/// Waiting `high` entries one requester may hold (§5.3); beyond it a
-/// `high` request is downgraded.
+/// Waiting `high` entries one requester may hold; beyond it a `high`
+/// request is downgraded.
 pub const REQUESTER_HIGH_CAP: i64 = 100;
-/// Tier of on-demand jobs (§5.3).
+/// Tier of on-demand jobs.
 pub const TIER_ON_DEMAND: i16 = 1;
 
 /// `backfill_state.state` codes.
@@ -35,7 +36,7 @@ pub mod state {
     pub const FAILED: i16 = 4;
 }
 
-/// Repo job state as reported (§3.3, open enum).
+/// Repo job state as reported (open enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoState {
     /// `never`.
@@ -48,7 +49,7 @@ pub enum RepoState {
     Done,
     /// `failed`.
     Failed,
-    /// `covered_by_sweep`: no per-DID row (D4) but a completed baseline
+    /// `covered_by_sweep`: no per-DID row but a completed baseline
     /// covers the repo.
     CoveredBySweep,
 }
@@ -80,7 +81,7 @@ pub struct RepoStatus {
     pub last_error: Option<String>,
 }
 
-/// Discovery state as reported (§3.3, open enum).
+/// Discovery state as reported (open enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryState {
     /// No backlink source configured.
@@ -133,7 +134,7 @@ pub struct BackfillStatus {
     pub discovery: DiscoveryStatus,
 }
 
-/// Reads the status of `did` (pure read, §3.3). `discovery_enabled` is
+/// Reads the status of `did` (pure read). `discovery_enabled` is
 /// whether `backfill.backlinks.url` is set.
 pub async fn status(
     conn: &mut PgConnection,
@@ -261,8 +262,8 @@ pub async fn status(
     Ok(BackfillStatus { repo, discovery })
 }
 
-/// Who asked: charged as a cause (interning, §11.2) and as a requester
-/// (fairness and caps, §5.3).
+/// Who asked: charged as a cause (interning) and as a requester
+/// (fairness and caps).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requester {
     /// `token:<id>` or `admin` (`backfill_queue.requester` and the intern
@@ -303,16 +304,16 @@ pub enum RequestOutcome {
     /// The requester holds [`REQUESTER_QUEUE_CAP`] waiting entries.
     QueueFull,
     /// Interning the actor was refused by the requester's daily intern
-    /// rate (§11.2).
+    /// rate.
     InternRefused,
 }
 
-/// Applies the four rules of §3.3 in one transaction:
+/// Applies the four rules of `requestBackfill` in one transaction:
 /// already queued ⇒ no new work (the waiting entry is upgraded by the
 /// collapse rule); running ⇒ no new work unless `force`, which adds a
 /// waiting entry; done within the fresh window and not `force` ⇒ no new
 /// work; otherwise enqueue a tier-1 repo job (plus a discovery job when a
-/// backlink source is configured, §5.6).
+/// backlink source is configured).
 pub async fn request(
     pool: &PgPool,
     limits: &Limits,
@@ -393,7 +394,7 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
     }
     let new_work = if queued {
         // Rule 1: already queued. The collapse rule may still raise the
-        // waiting entry's tier or priority (§5.3).
+        // waiting entry's tier or priority.
         false
     } else if running {
         // Rule 2: a repo job holds the lease.
@@ -427,7 +428,7 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
             downgraded,
         });
     }
-    // D4: requested DIDs get a backfill_state row.
+    // Requested DIDs get a backfill_state row.
     sqlx::query(
         "INSERT INTO backfill_state (actor_id, state) VALUES ($1, 1)
          ON CONFLICT (actor_id) DO UPDATE SET state = 1 WHERE backfill_state.state <> 2",
@@ -465,7 +466,7 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
 }
 
 /// Waiting entries of the same tier served before `actor_id`'s repo entry
-/// under the scheduler's order (§5.3): within its requester, `high` before
+/// under the scheduler's order: within its requester, `high` before
 /// `normal` 4:1, each kind oldest first; across requesters, deficit
 /// round-robin, estimated with equal per-job cost (each other requester
 /// is served about as many entries as this one's rank). Entries not yet
@@ -512,7 +513,7 @@ async fn queue_position(conn: &mut PgConnection, actor_id: i64) -> Result<Option
 
 /// Entries of its own requester served before an entry with `same_ahead`
 /// entries of its priority ahead and `other_kind` of the other priority
-/// waiting (four `high` per `normal`, §5.3).
+/// waiting (four `high` per `normal`).
 fn rank_in_requester(high: bool, same_ahead: i64, other_kind: i64) -> i64 {
     let other_first = if high {
         same_ahead / 4

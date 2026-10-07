@@ -1,5 +1,5 @@
-//! Admin sign-in (design §8.6): `/enter`, the OAuth callback and the
-//! client metadata document.
+//! Admin sign-in (see `docs/design/web-ui.md`): `/enter`, the OAuth
+//! callback and the client metadata document.
 //!
 //! Sign-in authenticates one account, `access.admin_did`, at that
 //! account's own authorization server (see [`crate::oauth`]). What
@@ -160,7 +160,7 @@ fn remember_sign_in(st: &WebState, ip: IpAddr) {
 }
 
 /// The flow cookie: `Path=/enter`, `HttpOnly`, **`SameSite=Lax`** — the
-/// one exception to §8.5's `Strict`, because the callback is a cross-site
+/// one exception to `Strict`, because the callback is a cross-site
 /// top-level navigation and must carry it. `value = None` clears it.
 fn flow_cookie(value: Option<&str>, secure: bool) -> HeaderValue {
     let mut c = match value {
@@ -298,12 +298,12 @@ fn no_referrer(r: &mut Response) {
 }
 
 /// `GET /enter/callback`: where the authorization server sends the
-/// browser back. The checks run in this order (design §8.6): rate limit;
-/// flow cookie and `state` present; the flow exists and is young enough;
-/// the cookie is the one the flow was started with (otherwise the flow is
-/// kept); the flow is then removed — its `state` is spent whatever
-/// follows; `iss`; `error`/`code`; the token request; `sub`. Every refusal
-/// looks the same to the browser.
+/// browser back. The checks run in this order: rate limit; flow cookie and
+/// `state` present; the flow exists and is young enough; the cookie is the
+/// one the flow was started with (otherwise the flow is kept); the flow is
+/// then removed — its `state` is spent whatever follows; `iss`;
+/// `error`/`code`; the token request; `sub`. Every refusal looks the same
+/// to the browser.
 pub async fn callback(
     State(st): State<Arc<WebState>>,
     headers: HeaderMap,

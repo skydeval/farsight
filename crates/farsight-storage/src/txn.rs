@@ -13,7 +13,7 @@ use crate::counters::{Deltas, stat};
 use crate::error::Result;
 use crate::keys::{self, CapKind, HostFacts, Limits};
 
-/// Global write gates, supplied by the budget monitor (§11.2).
+/// Global write gates, supplied by the budget monitor.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Gates {
     /// Storage budget ≥ 100%: creates and updates from non-large or
@@ -77,7 +77,7 @@ pub struct AuthorInfo {
     pub large: bool,
     /// OR of the buckets' `capped_mask`.
     pub mask: i16,
-    /// `actors.status` (§7.4 codes), as read with the row.
+    /// `actors.status` code, as read with the row.
     pub status: i16,
 }
 
@@ -178,14 +178,14 @@ pub struct ApplyReport {
     pub repo_events: u64,
     /// Account events older than the stored `status_at` (replays), skipped.
     pub stale_repo_events: u64,
-    /// Unknown DIDs that became active: counted only (§6.4, r17).
+    /// Unknown DIDs that became active: counted only.
     pub unknown_activations: u64,
     /// Authors whose `actors` row this transaction created.
     pub new_authors: Vec<i64>,
     /// `resync` debts raised by `#sync` / account events.
     pub resyncs: u64,
     /// Accounts that became `deleted`: the caller purges them after commit
-    /// (§7.4; multi-transaction, see `janitor::purge_account`).
+    /// (multi-transaction, see `janitor::purge_account`).
     pub deleted_accounts: Vec<Did>,
     /// Whether `NOTIFY farsight_coverage` was sent.
     pub notified: bool,
@@ -204,7 +204,7 @@ pub struct Txn<'c> {
     /// `firehose_state.applied_through` at transaction start: the witness
     /// stamped on debts caused by non-firehose work.
     pub clock_witness: Option<DateTime<Utc>>,
-    /// The database's `now()` at transaction start (§7.7: the witness of a
+    /// The database's `now()` at transaction start (the witness of a
     /// listing write while the clock is still undefined).
     pub now: DateTime<Utc>,
     /// The history row written last (see `history`).
@@ -219,8 +219,8 @@ pub struct Txn<'c> {
 }
 
 impl<'c> Txn<'c> {
-    /// Starts the context: sets `READ COMMITTED` (design §7.2) and reads
-    /// the database's UTC day and the current applied-through witness.
+    /// Starts the context: sets `READ COMMITTED` and reads the
+    /// database's UTC day and the current applied-through witness.
     pub async fn start(
         conn: &'c mut PgConnection,
         limits: &'c Limits,
@@ -256,7 +256,7 @@ impl<'c> Txn<'c> {
         (self.report, self.deltas)
     }
 
-    /// Takes transaction-scoped author locks, ascending by key (§4.3).
+    /// Takes transaction-scoped author locks, ascending by key.
     pub async fn lock_authors(&mut self, keys: &BTreeSet<i64>) -> Result<()> {
         for k in keys {
             sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -267,7 +267,7 @@ impl<'c> Txn<'c> {
         Ok(())
     }
 
-    /// Takes list locks ascending by key; `true` = exclusive (§4.3).
+    /// Takes list locks ascending by key; `true` = exclusive.
     pub async fn lock_lists(&mut self, keys: &BTreeMap<i64, bool>) -> Result<()> {
         for (k, exclusive) in keys {
             let sql = if *exclusive {
@@ -319,8 +319,8 @@ impl<'c> Txn<'c> {
     }
 
     /// The author's row (created if absent, charged to its own key but
-    /// never refused: a debt needs it, §11.2), key, buckets and mask.
-    /// Cached for the transaction; the caller must hold author(did).
+    /// never refused: a debt needs it), key, buckets and mask. Cached
+    /// for the transaction; the caller must hold author(did).
     pub async fn author(&mut self, did: &Did) -> Result<AuthorInfo> {
         if let Some(a) = self.authors.get(did) {
             return Ok(a.clone());
@@ -453,8 +453,8 @@ impl<'c> Txn<'c> {
         }
     }
 
-    /// Charges one admission to `key` for today, if under its daily limit
-    /// (§4.2, §11.1). Exact: runs inside the apply transaction.
+    /// Charges one admission to `key` for today, if under its daily limit.
+    /// Exact: runs inside the apply transaction.
     pub async fn charge_admission(&mut self, key: &str) -> Result<bool> {
         let limit = self.limits.admission_limit(key);
         if limit <= 0 {
@@ -474,8 +474,8 @@ impl<'c> Txn<'c> {
         Ok(r.is_some())
     }
 
-    /// Interns a subject / member / owner DID, charged to `cause` (§11.2):
-    /// the lifetime bound of a non-large cause bucket, then the daily rate.
+    /// Interns a subject / member / owner DID, charged to `cause`: the
+    /// lifetime bound of a non-large cause bucket, then the daily rate.
     pub async fn intern_actor(&mut self, did: &Did, cause: &Cause) -> Result<Result<i64, Refusal>> {
         if let Some(a) = self.authors.get(did) {
             return Ok(Ok(a.id));
@@ -497,7 +497,8 @@ impl<'c> Txn<'c> {
 
     /// Interns the `lists` row for `(owner, rkey)`, creating a placeholder
     /// (`record_state = unknown`) charged to `cause` if absent. The caller
-    /// must hold list(L) exclusive (§11.2 cleanup protocol).
+    /// must hold list(L) exclusive (the placeholder cleanup takes the same
+    /// lock).
     pub async fn intern_list(
         &mut self,
         owner: &Did,
@@ -533,14 +534,14 @@ impl<'c> Txn<'c> {
         .bind(rkey)
         .fetch_one(&mut *self.conn)
         .await?;
-        // Placeholder rows are charged to the writer's bucket (§11.1, §7.1
-        // `stored_listblocks` "incl. placeholder rows").
+        // Placeholder rows are charged to the writer's bucket
+        // (`stored_listblocks` includes placeholder rows).
         self.deltas.host(&cause.buckets, CapKind::Listblocks, 1);
         self.deltas.host(&cause.buckets, CapKind::Interned, 1);
         Ok(Ok(id))
     }
 
-    /// Global and bucket gates for a create/update of `kind` (§11.2).
+    /// Global and bucket gates for a create/update of `kind`.
     pub fn gate(&self, cause: &Cause, kind: CapKind) -> Option<Refusal> {
         if self.gates.ceiling_refusing {
             return Some(Refusal::Refused(CapType::Ceiling));
@@ -564,7 +565,7 @@ impl<'c> Txn<'c> {
         None
     }
 
-    /// Inserts a debt or raises its `since_witness` (§3.7.3).
+    /// Inserts a debt or raises its `since_witness`.
     pub async fn add_debt(
         &mut self,
         actor_id: i64,
@@ -636,8 +637,8 @@ impl<'c> Txn<'c> {
         .await?)
     }
 
-    /// Upserts a tombstone with `rev = max(existing, rev)` (§7.2); the
-    /// TTL clock restarts only when the rev rises.
+    /// Upserts a tombstone with `rev = max(existing, rev)`; the TTL
+    /// clock restarts only when the rev rises.
     pub async fn put_tombstone(
         &mut self,
         collection: Collection,
@@ -661,8 +662,8 @@ impl<'c> Txn<'c> {
         Ok(())
     }
 
-    /// Writes a refusal tombstone for an update at rev `e`: rev `e − 1`
-    /// (§7.3), so listings stamped `R < e` are refused and `R ≥ e` apply.
+    /// Writes a refusal tombstone for an update at rev `e`: rev `e − 1`,
+    /// so listings stamped `R < e` are refused and `R ≥ e` apply.
     pub async fn put_refusal_tombstone(
         &mut self,
         collection: Collection,
@@ -698,8 +699,8 @@ type AuthorRow = (
     i16,
 );
 
-/// The LWW upsert rule (§7.2): apply iff `w` beats the stored row's rev
-/// and the tombstone's rev (absent ones pass). Equal ⇒ skip.
+/// The LWW upsert rule: apply iff `w` beats the stored row's rev and
+/// the tombstone's rev (absent ones pass). Equal ⇒ skip.
 pub fn lww_upsert_wins(w: i64, row_rev: Option<i64>, tombstone_rev: Option<i64>) -> bool {
     row_rev.is_none_or(|r| w > r) && tombstone_rev.is_none_or(|t| w > t)
 }

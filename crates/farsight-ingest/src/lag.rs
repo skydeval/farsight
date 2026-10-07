@@ -1,5 +1,5 @@
-//! Instance lag and source lag over the last 1000 commit events (§3.7.2,
-//! §6.3).
+//! Instance lag and source lag over the last 1000 commit events (see
+//! `docs/design/firehose.md` and `docs/design/coverage.md`).
 //!
 //! - **Instance lag** (`lag_A`, used for failover rewinds) = median of
 //!   `witness − rev commit time`.
@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-/// Events kept (§6.3: "over A's last 1000 events").
+/// Events kept: the lags are taken over an instance's last 1000 events.
 pub const WINDOW: usize = 1000;
 
 /// Trailing window of (witness µs, rev µs) pairs.

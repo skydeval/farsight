@@ -33,14 +33,14 @@ use tokio::task::JoinHandle;
 pub use reader::Control;
 pub use stats::{IngestStats, StatsSnapshot};
 
-/// Channel capacity between reader and writer (§6.2).
+/// Channel capacity between reader and writer.
 pub const CHANNEL_CAPACITY: usize = 10_000;
 
-/// Ingest connection pool size (§6.2: own pool, 4 connections).
+/// Ingest connection pool size (own pool, 4 connections).
 pub const POOL_SIZE: u32 = 4;
 
-/// Fault injection for the Phase B harness: events from these DIDs fail
-/// every apply attempt, exercising the poisoned-event path.
+/// Fault injection for the harness: events from these DIDs fail every
+/// apply attempt, exercising the poisoned-event path.
 #[cfg(feature = "harness")]
 #[derive(Debug, Default)]
 pub struct FaultHook {
@@ -55,7 +55,7 @@ pub struct IngestConfig {
     pub reader: reader::ReaderConfig,
     /// Limits for `apply`.
     pub limits: Limits,
-    /// Write gates, shared with the budget monitor (§11.2).
+    /// Write gates, shared with the budget monitor.
     pub gates: Arc<SharedGates>,
     /// Harness: receives a copy of every event read from the network.
     #[cfg(feature = "harness")]
@@ -108,11 +108,11 @@ pub struct IngestHandle {
     limits: Limits,
 }
 
-/// The dashboard / `getStats` firehose fields (§3.2, §8.6).
+/// The dashboard / `getStats` firehose fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FirehoseStatus {
-    /// `firehoseConnected` (the persisted flag; disconnection is the
-    /// synthetic gap of §3.7.1).
+    /// `firehoseConnected` (the persisted flag; disconnection is a
+    /// synthetic gap).
     pub connected: bool,
     /// Protocol of the last committed batch.
     pub protocol: Option<frame::Protocol>,
