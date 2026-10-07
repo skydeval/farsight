@@ -395,7 +395,7 @@ mod tests {
             if p.source_url.as_deref() == Some(url) {
                 return match (proto, p.protocol, p.cursor_seq) {
                     (Protocol::V2, Some(Protocol::V2), Some(seq)) => Plan {
-                        cursor: Cursor::Seq(seq.checked_add(1).unwrap_or(i64::MAX)),
+                        cursor: Cursor::Seq(seq.saturating_add(1)),
                         gap: GapRule::None,
                     },
                     _ => {
