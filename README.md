@@ -91,7 +91,10 @@ disk is supported with limits.
 | [Running behind Cloudflare](docs/guide/cloudflare.md) | DNS, cache rules, locking the origin |
 | [AppView integration](docs/guide/appview.md) | which endpoints to call and how to read coverage |
 
-Changes are in the [changelog](CHANGELOG.md).
+How Farsight works inside (the data model, coverage, the list state
+machine, backfill, the firehose, limits) is in the
+[design documentation](docs/design/README.md). Changes are in the
+[changelog](CHANGELOG.md).
 
 ## Workspace
 

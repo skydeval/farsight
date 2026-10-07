@@ -7,8 +7,8 @@ most of the storage.
 |---|---|
 | Day one | < 150 MB |
 | 30 days, firehose only | 2.5–10 GB |
-| First full backfill sweep complete | 28–52 GB |
-| Growth afterwards | 17–19 GB per year |
+| First full backfill sweep complete | 30–56 GB |
+| Growth afterwards | 18–20 GB per year |
 
 On top of these come the four indexes that sort the UI's tables by
 creation time: 9–20 GB for a complete index, roughly a third more. They
@@ -25,6 +25,7 @@ stops recording.
     disk you enter). The sweep pauses before the disk fills, and every
     refusal is reported.
 
-  Expect roughly 1–2.5 years of runway on a 100 GB disk.
+  Expect from under one to about two years of runway on a 100 GB
+  disk.
 - The Postgres data lives in the `farsight-pgdata` volume. That volume
   needs the disk space.
