@@ -13,59 +13,7 @@ commits it covers.
 
 ## [Unreleased]
 
-### Removed
-
-- The redirects from addresses the pages had before any release
-  (`/public/…`, and the admin pages at `/lookup/…`, `/ops`, `/settings`
-  and `/reset`). Those paths are unknown paths now.
-- What was kept for configs and links from before any release: the
-  password sign-in and its migration page (`auth.admin_password_bcrypt`,
-  `rate_limit.bcrypt_concurrency`), the keys `access.ui` and
-  `public_ui.show_history`, and the redirect of `?bc=…`-style cursor
-  parameters. A config file with one of these keys does not load.
-- The dashboard's "Oldest pending lists" block. The number of pending
-  lists is still under Exceptions.
-- Code that only a database from before any release could reach: the
-  background read of list descriptions for lists stored without one
-  (and the "List descriptions" line under "Catching up"), and the
-  wording for rows without a "first seen" time.
-- Unused code: cursor paging of the row tables, which all turn by page
-  number, history queries no page showed, and style rules and script
-  functions no page used.
-- The admin DID lookup no longer times out on an account that is on
-  hundreds of lists. Its "Incoming listblocks" table read every
-  listblock's author before cutting a page; it now cuts the page first.
-  A listblock of a deactivated or deleted account is left off its page
-  and still counted in the heading.
-- Home page top lists: "Show fewer" sits under the extra rows, not
-  between them and the first ten.
-- While a repair cycle is running, the gap alert says so, with how
-  many accounts it has re-read, where it used to keep telling you to
-  start one. Operations says a repair is already running when asked
-  again, and the dashboard's "Catching up" has a line for it (the
-  "History" line no longer shows the repair's figures as the sweep's).
-- The nightly rebuild of the approximate counters failed with
-  "deadlock detected" on a busy instance, every time it ran: it
-  rewrote every row of the host buckets while the writers were
-  updating them. It now takes a brief table lock, so the host buckets'
-  "Stored" figures and the totals are corrected nightly again.
-- Start-up no longer waits minutes on a large index. The check for
-  deleted accounts whose purge was interrupted walked every account
-  through the primary key; it now reads the deleted accounts in one
-  pass (13 seconds where it had not finished after six minutes, with
-  11.7 million accounts).
-- Admin alerts no longer tell you to start a repair for a gap that
-  cannot be repaired. The interval of a v1 firehose is one open gap
-  until a v2 Jetstream takes over; it is now part of the v1 alert, and
-  the gap alert counts only gaps a repair cycle can heal. The
-  dashboard's Firehose block shows the two counts separately.
-- Turning a page of a table no longer makes the page jump. A page
-  number or arrow used to load the whole page, after which the browser
-  scrolled to the table; now the table is replaced where it stands and
-  the window does not move, on the public pages and on the admin DID
-  lookup. The address still names the page, and Back returns to the
-  one before. Without the page's script the controls are the links
-  they were.
+## [0.6.0] - 2026-10-06
 
 ### Added
 
@@ -178,6 +126,63 @@ commits it covers.
   theme is unchanged.
 - The footer reads "An independent index of public block records.
   Farsight is not affiliated with Bluesky."
+
+### Fixed
+
+- The admin DID lookup no longer times out on an account that is on
+  hundreds of lists. Its "Incoming listblocks" table read every
+  listblock's author before cutting a page; it now cuts the page first.
+  A listblock of a deactivated or deleted account is left off its page
+  and still counted in the heading.
+- Home page top lists: "Show fewer" sits under the extra rows, not
+  between them and the first ten.
+- While a repair cycle is running, the gap alert says so, with how
+  many accounts it has re-read, where it used to keep telling you to
+  start one. Operations says a repair is already running when asked
+  again, and the dashboard's "Catching up" has a line for it (the
+  "History" line no longer shows the repair's figures as the sweep's).
+- The nightly rebuild of the approximate counters failed with
+  "deadlock detected" on a busy instance, every time it ran: it
+  rewrote every row of the host buckets while the writers were
+  updating them. It now takes a brief table lock, so the host buckets'
+  "Stored" figures and the totals are corrected nightly again.
+- Start-up no longer waits minutes on a large index. The check for
+  deleted accounts whose purge was interrupted walked every account
+  through the primary key; it now reads the deleted accounts in one
+  pass (13 seconds where it had not finished after six minutes, with
+  11.7 million accounts).
+- Admin alerts no longer tell you to start a repair for a gap that
+  cannot be repaired. The interval of a v1 firehose is one open gap
+  until a v2 Jetstream takes over; it is now part of the v1 alert, and
+  the gap alert counts only gaps a repair cycle can heal. The
+  dashboard's Firehose block shows the two counts separately.
+- Turning a page of a table no longer makes the page jump. A page
+  number or arrow used to load the whole page, after which the browser
+  scrolled to the table; now the table is replaced where it stands and
+  the window does not move, on the public pages and on the admin DID
+  lookup. The address still names the page, and Back returns to the
+  one before. Without the page's script the controls are the links
+  they were.
+
+### Removed
+
+- The redirects from addresses the pages had before any release
+  (`/public/…`, and the admin pages at `/lookup/…`, `/ops`, `/settings`
+  and `/reset`). Those paths are unknown paths now.
+- What was kept for configs and links from before any release: the
+  password sign-in and its migration page (`auth.admin_password_bcrypt`,
+  `rate_limit.bcrypt_concurrency`), the keys `access.ui` and
+  `public_ui.show_history`, and the redirect of `?bc=…`-style cursor
+  parameters. A config file with one of these keys does not load.
+- The dashboard's "Oldest pending lists" block. The number of pending
+  lists is still under Exceptions.
+- Code that only a database from before any release could reach: the
+  background read of list descriptions for lists stored without one
+  (and the "List descriptions" line under "Catching up"), and the
+  wording for rows without a "first seen" time.
+- Unused code: cursor paging of the row tables, which all turn by page
+  number, history queries no page showed, and style rules and script
+  functions no page used.
 
 ## [0.5.0] - 2026-10-04
 
@@ -400,7 +405,8 @@ Database schema version 9.
 - A Docker image and a compose file that runs the server, the backfill
   service and PostgreSQL.
 
-[Unreleased]: https://github.com/skydeval/farsight/compare/dd11be4...HEAD
+[Unreleased]: https://github.com/skydeval/farsight/compare/08be68d...HEAD
+[0.6.0]: https://github.com/skydeval/farsight/compare/dd11be4...08be68d
 [0.5.0]: https://github.com/skydeval/farsight/compare/380a503...dd11be4
 [0.4.0]: https://github.com/skydeval/farsight/compare/d69003d...380a503
 [0.3.0]: https://github.com/skydeval/farsight/compare/11408c3...d69003d
