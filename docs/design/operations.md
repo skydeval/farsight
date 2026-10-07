@@ -35,13 +35,11 @@ and `farsight-backfill`, and one Postgres database. The overview is in
 3. **History window.** `storage.block_history_enabled` is read here
    and only here; the recording window opens or closes accordingly
    ([history.md](history.md)).
-4. **Ingest.** Before the Jetstream reader and its writer start,
-   ingest looks for accounts with status `deleted` that still
-   have rows (a purge interrupted by a crash) and purges them, up to
-   1,000 accounts per start. The check first reads the deleted
-   accounts in a single scan of `actors` and only then looks for their
-   rows, so that it does not walk the whole table through its primary
-   key before the server serves.
+4. **Ingest.** The Jetstream reader and its writer start. Seam
+   windows a stopped process left open are closed first. No purge
+   stands before them: a purge that was interrupted has its request in
+   `account_purges`, and the purge task goes on with it once the
+   server serves.
 5. **Serving.** The first coverage snapshot is read, the API keys are
    loaded, and the listener on `server.bind` opens.
 6. **Background work** starts once the server is serving, so that none
@@ -50,7 +48,12 @@ and `farsight-backfill`, and one Postgres database. The overview is in
    UI sort indexes (see [Background tasks](#background-tasks)).
 
 On `SIGTERM` or `SIGINT` the server stops accepting requests, stops
-its tasks, shuts ingest down, flushes its counters and exits 0.
+its tasks, shuts ingest down, flushes its counters and exits 0. The
+backfill process stops its jobs, gives their work back to the queue
+and exits. Each takes up to 30 seconds; the compose file gives the
+containers 45 (`stop_grace_period`) before they are killed. A process
+that is killed loses nothing that was committed: what it held is
+taken up again ([backfill.md](backfill.md#what-a-stopped-process-leaves)).
 
 Database connections, for sizing Postgres `max_connections`:
 
@@ -65,6 +68,12 @@ Database connections, for sizing Postgres `max_connections`:
 With the defaults that is at most 89 connections, under Postgres'
 default `max_connections` of 100. Raising `query_concurrency` or
 `backfill.concurrency` raises the total by the same amount.
+
+Keep Postgres' `max_locks_per_transaction` at its default of 64 or
+above. Farsight's transactions take advisory locks, at most a few
+hundred each, and the room for them is `max_locks_per_transaction ×
+max_connections` over all sessions; the bounds are in
+[storage.md](storage.md#the-write-path).
 
 ### The backfill process
 
@@ -198,12 +207,14 @@ can be saved from the running server; restart, or undo the hand edit.
 A file edited by hand reaches the server at its next restart. The
 backfill process picks it up within a minute.
 
-The backfill process applies every change it can in place. For a
-change of `storage.database_url`, `[metrics]`, `[net]`,
-`backfill.per_host_rps`, `backfill.per_host_concurrency`,
-`backfill.plc_rps`, `backfill.plc_url`, `limits.large_hosts` or
-`limits.cdn_ranges_extra` it rebuilds itself in-process; the container
-is not restarted.
+The backfill process applies every change it can in place, the
+request limits (`backfill.per_host_*`, `backfill.per_domain_*`,
+`backfill.plc_rps`) among them. For a change of
+`storage.database_url`, `[metrics]`, `[net]`, `backfill.concurrency`,
+`backfill.plc_url`, `limits.large_hosts` or `limits.cdn_ranges_extra`
+it rebuilds its tasks in-process: running jobs are stopped, their work
+goes back to the queue and is taken up under the new settings. The
+container is not restarted.
 
 `storage.block_history_enabled` is read by both processes, and the
 server applies a change at restart only.
@@ -227,7 +238,7 @@ Defaults are the values a key takes when it is absent.
 | `database_url` | required | Postgres connection string. |
 | `budget_bytes` | `70_000_000_000` | Storage budget, compared with `pg_database_size`. At the budget the sweep and new list admissions are held back. Must be positive. See [security.md](security.md). |
 | `hard_ceiling_bytes` | `0` | Hard ceiling; `0` means 115% of `budget_bytes`. Must exceed the budget. |
-| `tombstone_ttl` | `"7d"` | How long a deletion's tombstone is kept ([storage.md](storage.md)). |
+| `tombstone_ttl` | `"7d"` | How long a deletion's tombstone is kept ([storage.md](storage.md)). At least `"72h"`, the time a listing may still be applied after it was read. |
 | `block_history_enabled` | `true` | Record removed blocks, listblocks and list memberships ([history.md](history.md)). |
 | `block_history_retention` | `"365d"` | How long history rows are kept, for all three history tables; `"0s"` keeps them forever. |
 
@@ -265,24 +276,28 @@ The resume plan, failover and seam repair are explained in
 
 | Key | Default | Meaning |
 |---|---|---|
-| `concurrency` | `32` | Worker pool size. Must be positive. |
-| `per_host_rps` | `10` | Request rate towards any one PDS host. |
-| `per_host_concurrency` | `4` | Concurrent requests towards any one host. |
-| `plc_url` | `"https://plc.directory"` | PLC directory. |
-| `plc_rps` | `10` | Request rate towards the PLC directory. |
-| `plc_seed_from_export` | `false` | Seed PDS resolution from the PLC export. |
-| `relay_url` | `"https://bsky.network"` | Relay used to enumerate repositories. |
+| `concurrency` | `32` | Worker pool size, 1 to 512. Each worker holds a database connection. |
+| `on_demand_reserved` | `4` | Workers kept for on-demand work and list jobs; the sweep and the firehose's new authors never use them. At most `concurrency − 1` are kept. |
+| `per_host_rps` | `10` | Request rate towards any one PDS host. Positive. |
+| `per_host_concurrency` | `4` | Concurrent requests towards any one host. Positive. |
+| `per_domain_rps` | `20` | Request rate towards all hosts of one registrable domain together. Never applied below `per_host_rps`. Large hosts are exempt. Positive. |
+| `per_domain_concurrency` | `8` | Concurrent requests towards all hosts of one registrable domain together. Never applied below `per_host_concurrency`. Large hosts are exempt. Positive. |
+| `plc_url` | `"https://plc.directory"` | PLC directory. An `http` or `https` URL. |
+| `plc_rps` | `10` | Request rate towards the PLC directory. Positive. |
+| `plc_seed_from_export` | `false` | Seed PDS resolution from the PLC export ([backfill.md](backfill.md#sources) says what that risks). |
+| `relay_url` | `"https://bsky.network"` | Relay used to enumerate repositories. An `http` or `https` URL. |
 | `request_fresh_window` | `"1h"` | A `requestBackfill` for an account done more recently than this adds no work unless forced ([api.md](api.md)). |
 | `owner_fetch_cooldown` | `"10m"` | Least interval between list fetch runs for one owner. |
-| `retry_schedule` | `["1h", "6h", "24h", "1d"]` | Backoff of a failing repository job; the last step repeats. Not empty. |
-| `terminal_after` | `"7d"` | A repository job failing for this long becomes terminal. |
-| `missing_retry` | `["1h", "24h", "7d"]` | Re-check schedule of a list whose record is missing. Not empty. |
-| `list_fetch_max_attempts` | `2` | Failed fetch attempts before a list fetch gives up. |
-| `phase1_retry` | `["5m", "20m", "1h"]` | Retry schedule for errors in the first phase of a list fetch. Not empty. |
-| `list_fetch_max_duration` | `"1h"` | Wall-clock cap on one list fetch run. |
+| `retry_schedule` | `["1h", "6h", "24h", "1d"]` | Backoff of a failing repository job; the last step repeats. Not empty, no step of `0s`. |
+| `terminal_after` | `"7d"` | A repository job failing for this long becomes terminal. Longer than `0s`. |
+| `missing_retry` | `["1h", "24h", "7d"]` | Re-check schedule of a list whose record is missing. Not empty, no step of `0s`. |
+| `list_fetch_max_attempts` | `2` | Failed fetch attempts before a list fetch gives up. Positive. |
+| `phase1_retry` | `["5m", "20m", "1h"]` | Retry schedule for errors in the first phase of a list fetch. Not empty, no step of `0s`. |
+| `list_fetch_max_duration` | `"1h"` | Wall-clock cap on one list fetch run. Longer than `0s`. |
+| `repo_job_max_duration` | `"1h"` | Wall-clock cap on one attempt of a repository job. An attempt that reaches it stops where it is and goes on later ([backfill.md](backfill.md#steps-of-a-repo-job)). Longer than `0s`. |
 | `repair_slack` | `"1h"` | Margin added around a gap when choosing the accounts to re-read. |
-| `seen_set_cap` | `2_000_000` | Cap of the in-memory set that tolerates out-of-order listings. |
-| `system_queue_cap` | `50_000` | Queue entries per system requester. |
+| `seen_set_cap` | `2_000_000` | Cap of the in-memory set that tolerates out-of-order listings; a key takes about 20 bytes. |
+| `system_queue_cap` | `50_000` | Queue entries per system requester. Positive. |
 | `tier_shares` | `[60, 25, 15]` | Guaranteed shares of the three scheduler tiers, in percent. Three values summing to 100. |
 
 ### `[backfill.sweep]`
@@ -458,8 +473,8 @@ refused write are explained in
 
 | Key | Default | Meaning |
 |---|---|---|
-| `bind` | `"0.0.0.0:9464"` | The server's metrics listener. |
-| `backfill_bind` | `"0.0.0.0:9465"` | The backfill process's metrics listener. |
+| `bind` | `"127.0.0.1:9464"` | The server's metrics listener. Loopback unless set; the compose file sets `0.0.0.0:9464`, which there is the compose network. |
+| `backfill_bind` | `"127.0.0.1:9465"` | The backfill process's metrics listener. Loopback unless set; the compose file sets `0.0.0.0:9465`. |
 | `bearer_token_sha256` | `""` | SHA-256 (64 hex characters) of a bearer token required on `/metrics`; empty means no authentication. |
 
 ### An example
@@ -519,21 +534,24 @@ at its next time.
 | `deferred_retry` | 1 day | 10 min | Re-admits `deferred` lists whose retry time has come (those deferred by the owner re-admission allowance). Lists deferred by a storage gate are re-admitted by the budget monitor. |
 | `placeholder_lists` | 1 day | 15 min | Deletes placeholder `lists` rows (record never seen, untracked) that nothing refers to any more, each under its list lock. |
 | `rate_tables` | 1 day | 16 min | Deletes `admission_rate`, `intern_rate` and `history_rate` rows older than two days. |
-| `account_purges` | 1 day | 25 min | Finishes the purge of accounts with status `deleted` that still author rows: one that was interrupted, or that ingest gave up on. A purge that fails is recorded with the account's DID and the others still run. |
+| `account_purges` | 10 s | 8 s | Purges the accounts asked for in `account_purges` (an account that became `deleted`): up to 20 accounts a run, each for up to 25 batches, so a large account goes on over several runs. No writer waits for a purge. One that fails is recorded with the account's DID, tried again an hour later, and the others still run. |
+| `account_purge_scan` | 1 day | 45 s | Looks for accounts with status `deleted` that still author rows and have no purge asked for, and asks for it. |
+| `table_pruning` | 1 day | 19 min | Deletes list fetch runs finished more than 7 days ago, operational errors older than 30 days (and the oldest beyond 100,000), and `subject_lists` rows of lists whose record is deleted. |
 | `orphaned_cursors` | 1 day | 17 min | Deletes listing-cursor rows of runs that are no longer current. |
 | `history_retention` | 1 day | 18 min | Deletes history rows older than `storage.block_history_retention`. Does not run with `"0s"`. |
 | `counter_recount` | 1 day | 20 min | Recounts the per-list and per-account counters exactly, in batches of 1,000, each list under its list lock. Drift is repaired; where a repair takes a list's listblock count across zero the tracking transition is run. Any drift is recorded as an operational error. |
 | `counter_rebuild` | 1 day | 30 min | Rebuilds the approximate counters behind `getStats` and the per-host usage. |
 
 The **counter rebuild** deserves a note, because it touches rows every
-writer touches. It first counts the tables, outside any lock; expect
-that to take a minute or more on a full index. Only then does it open a
-transaction, take `LOCK TABLE stats_counters IN SHARE ROW EXCLUSIVE
-MODE` and replace the rows; the same for `host_usage`. The table lock
-waits for counter flushes under way and holds new ones back for the
-moment the rows are replaced. Replacing the rows under row locks
-inside the counting transaction would deadlock with the writers'
-flushes on a busy instance.
+writer touches. It first counts the tables in one read-only snapshot,
+outside any lock a writer waits for; expect that to take a minute or
+more on a full index. Only then does it open a transaction, take `LOCK
+TABLE stats_counters IN SHARE ROW EXCLUSIVE MODE` and replace the
+rows, adding what the writers flushed since the snapshot; the same for
+`host_usage`. The table lock waits for counter flushes under way and
+holds new ones back for the moment the rows are replaced. Replacing
+the rows under row locks inside the counting transaction would
+deadlock with the writers' flushes on a busy instance.
 
 ### Other long-running work in the server
 
@@ -611,10 +629,13 @@ upstream outage into downtime. The compose file's health check uses
 
 Each process serves Prometheus text at `/metrics` on its own listener:
 the server on `metrics.bind` (port 9464), the backfill process on
-`metrics.backfill_bind` (port 9465). In the compose deployment neither
-port is published; a scraper joins the compose network. With
-`metrics.bearer_token_sha256` set, both require
-`Authorization: Bearer <token>`.
+`metrics.backfill_bind` (port 9465). Both listen on loopback unless
+set. The compose file sets them to every interface of the container
+and publishes neither port, so a scraper joins the compose network.
+Outside compose, set a bind another host can reach only together with
+`metrics.bearer_token_sha256`: with it, both listeners require
+`Authorization: Bearer <token>`; without it, anyone who reaches the
+port reads the metrics.
 
 Metric names are kept stable on a best-effort basis and are not part
 of the API contract.

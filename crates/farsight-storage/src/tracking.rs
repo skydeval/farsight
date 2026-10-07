@@ -92,6 +92,28 @@ impl Txn<'_> {
         Ok(used < limit)
     }
 
+    /// Charges one owner-caused re-admission to `owner_id` for today if
+    /// the owner has budget left; `false` if it has none.
+    async fn charge_owner_readmission(&mut self, owner_id: ActorId) -> Result<bool> {
+        let limit = i64::from(self.limits.cfg.owner_readmissions_per_day);
+        if limit <= 0 {
+            return Ok(false);
+        }
+        let charged: Option<i32> = sqlx::query_scalar(
+            "UPDATE actors SET
+               readmit_count = CASE WHEN readmit_day = $2 THEN readmit_count + 1 ELSE 1 END,
+               readmit_day = $2
+             WHERE id = $1 AND (readmit_day IS DISTINCT FROM $2 OR readmit_count < $3)
+             RETURNING readmit_count",
+        )
+        .bind(owner_id)
+        .bind(self.today)
+        .bind(limit)
+        .fetch_optional(&mut *self.conn)
+        .await?;
+        Ok(charged.is_some())
+    }
+
     /// Fires `event` on list `list_id` and applies the outcome. The caller
     /// holds list(L) exclusive.
     pub async fn fire(&mut self, list_id: ListId, event: Event, args: FireArgs) -> Result<Outcome> {
@@ -105,7 +127,22 @@ impl Txn<'_> {
         let ctx = Ctx {
             owner_readmit_available: self.owner_readmit_available(l.owner_id).await?,
         };
-        let o = transition(&facts, event, &ctx);
+        let mut o = transition(&facts, event, &ctx);
+        // The budget was read without a lock, and another of the owner's
+        // lists may have used the last of it since: the charge is one
+        // conditional statement, and a transition that finds the budget
+        // gone after all is decided again without it.
+        if o.effects.contains(&Effect::ChargeOwnerReadmission)
+            && !self.charge_owner_readmission(l.owner_id).await?
+        {
+            o = transition(
+                &facts,
+                event,
+                &Ctx {
+                    owner_readmit_available: false,
+                },
+            );
+        }
         if !o.changed {
             return Ok(o);
         }
@@ -127,19 +164,8 @@ impl Txn<'_> {
                     admitted = true;
                     self.admit(list_id, l.owner_id).await?;
                 }
-                Effect::ChargeOwnerReadmission => {
-                    sqlx::query(
-                        "UPDATE actors SET
-                           readmit_count = CASE WHEN readmit_day = $2 THEN readmit_count + 1
-                                                ELSE 1 END,
-                           readmit_day = $2
-                         WHERE id = $1",
-                    )
-                    .bind(l.owner_id)
-                    .bind(self.today)
-                    .execute(&mut *self.conn)
-                    .await?;
-                }
+                // Charged above, before the outcome was settled.
+                Effect::ChargeOwnerReadmission => {}
                 Effect::Defer(cause) => {
                     let retry = if cause == DeferCause::OwnerReadmissions {
                         self.today

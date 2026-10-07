@@ -25,6 +25,15 @@ read-only mount is enough) and the same database. It holds no state of
 its own that matters across a restart: every queue, lease, cursor and
 checkpoint is a row in Postgres.
 
+Work the scheduler has taken is never lost with the process. A queue
+entry is claimed, not deleted, while its job runs. A cycle member
+stays outstanding until a job settles it. A list fetch run stays open
+until it is finished. When the process stops in an orderly way it
+stops its jobs and gives back what they held. When it is killed, the
+claims and leases it held run out within 10 minutes, and the feeder
+takes the work up again ([what a stopped process
+leaves](#what-a-stopped-process-leaves)).
+
 Start-up and reload:
 
 - With no config (setup not finished, or a config reset) the process
@@ -35,13 +44,23 @@ Start-up and reload:
   fallback, every 60 seconds when the file's modification time has
   changed. An invalid edit keeps the running config. A change to
   `storage.database_url`, `[metrics]`, `[net]`,
-  `backfill.per_host_rps`, `backfill.per_host_concurrency`,
-  `backfill.plc_rps`, `backfill.plc_url`, `limits.large_hosts` or
-  `limits.cdn_ranges_extra` makes the process rebuild itself (jobs
-  stop at their next await, resumable state is already persisted);
-  every other key applies in place.
+  `backfill.concurrency`, `backfill.plc_url`, `limits.large_hosts` or
+  `limits.cdn_ranges_extra` makes the process rebuild its tasks: the
+  scheduler stops every running job at its next await, gives their
+  queue entries and leases back, and new tasks start on the new
+  config. Resumable state is already persisted, so the jobs go on
+  from their cursors. Every other key applies in place; the request
+  limits (`backfill.per_host_*`, `backfill.per_domain_*`,
+  `backfill.plc_rps`) apply to the next request.
+- One network layer serves the process across rebuilds. It keeps what
+  it knows of every host (cooldowns, circuit breaker, requests in
+  flight), and since the old jobs are stopped before the new ones
+  start, a host is never asked by two sets of jobs at once.
 - Its database pool is `backfill.concurrency + 8` connections,
-  separate from the server's pools.
+  separate from the server's pools. A change of
+  `backfill.concurrency` rebuilds the pool with the tasks.
+- On shutdown the scheduler stops its jobs the same way and the
+  process exits within 30 seconds.
 
 The two processes never talk to each other directly. They coordinate
 through these rows:
@@ -52,7 +71,8 @@ through these rows:
 | `firehose_state.first_applied_at` | server (first ingest batch) | backfill: no cycle starts before it |
 | `firehose_clock` | server (one row per ingest batch) | backfill: coverage points of jobs and cycles |
 | `firehose_gaps` | server (records gaps); backfill (claims and heals them) | both |
-| `backfill_queue` | server (`requestBackfill`, `#sync`, poisoned events, new firehose authors); backfill (retries, debts) | backfill scheduler |
+| `backfill_queue` | server (`requestBackfill`, `#sync`, poisoned events, new firehose authors); backfill (retries, debts, claims) | backfill scheduler; server (`getBackfillStatus`) |
+| `account_purges` | both (the transaction that records an account as `deleted`) | server (the purge task) |
 | `list_jobs`, `lists` | server and backfill (list admissions) | backfill scheduler |
 | `sweep_cycles` | backfill; server (`admin.startRepair`, `admin.cancelRepair`) | both |
 | `job_leases` | backfill | both (`getBackfillStatus` reports `running`) |
@@ -76,12 +96,16 @@ All kinds share one lease per DID in `job_leases(did, lease_owner,
 lease_until)`, so at most one job runs for a DID at a time. The table
 is keyed by the DID text, so a lease does not need an `actors` row. A
 lease lasts 10 minutes and is renewed after every page; a job that
-dies leaves a lease that expires. A lease can be taken when it has
-expired or already belongs to the same owner.
+dies leaves a lease that expires. Each job holds its leases under its
+own name (the process name and the job's number), so two jobs of one
+process exclude each other like jobs of two processes, and a job
+releases only its own lease.
 
-When a queued job finds the lease held, it is put back with a delay of
-60 seconds. A sweep member that finds the lease held is simply offered
-again on a later turn.
+The scheduler does not dispatch a queue entry whose DID has a live
+lease. A job that finds the lease held all the same leaves its entry
+in the queue for another 60 seconds. A sweep member that finds the
+lease held is offered again on a later turn. A phase-1 check that
+finds the owner's lease held is looked at again 30 seconds later.
 
 ### Steps of a `repo` job
 
@@ -140,9 +164,14 @@ For a DID `D`:
    A job never adopts another run's cursor. Each page is one
    transaction under the author lock of `D` (plus list locks; see
    [storage.md](storage.md) for the lock order):
-   - **Validate.** The URI authority must be `D`, the collection the
-     one asked for, and the record must parse. An invalid record is
-     dropped and counted against the host (`pds_hosts.errors_total`).
+   - **Validate.** A page holds at most the 100 records asked for;
+     one with more fails the job. The page's envelope is parsed, and
+     each record on its own: a record that cannot be parsed (one
+     nested deeper than the parser reads, for example) is dropped by
+     itself and the rest of the page is used. The URI authority must
+     be `D`, the collection the one asked for, and the record must be
+     valid. An invalid record is dropped and counted against the host
+     (`pds_hosts.errors_total`); its key still counts as listed.
    - **Apply** each record as an upsert with stamp `R` and no witness
      time. Last-write-wins decides against what is stored
      ([storage.md](storage.md)).
@@ -150,25 +179,56 @@ For a DID `D`:
      `rev < R` whose record key lies in `(prev_last, this_last]` and
      that are not on the page; on the last page the range is open
      upwards. Late stamps reconcile too: a row with `rev < R` that is
-     absent from a page read *after* `R` is gone.
+     absent from a page read *after* `R` is gone. A reconcile removes
+     at most 5,000 rows and locks at most 250 lists in one
+     transaction; one with more to remove goes on in further
+     transactions before the page is done
+     ([storage.md](storage.md#the-write-path)).
    - **Persist** `(cursor, prev_last, R, stamp_read_at)` and renew the
      lease.
    - Record keys must increase strictly, compared bytewise. On a
-     violation the collection is restarted with an in-memory set of
-     the keys seen, and reconciled once over the whole range at the
-     end. If the set outgrows `backfill.seen_set_cap` (2,000,000)
-     the reconcile is skipped for that collection and `D` gets an
-     `unreachable` debt, which stays until a clean listing succeeds.
+     violation the collection is restarted, once, with an in-memory
+     set of the keys seen (a 64-bit hash of each, keyed anew for every
+     listing). At the end the stored keys are read 2,000 at a time and
+     each chunk is reconciled over its own range, keeping the keys
+     that are in the set. If the set outgrows `backfill.seen_set_cap`
+     (2,000,000, about 40 MB) the listing goes on to the end without
+     it and without starting again, the reconcile is skipped for that
+     collection and `D` gets an `unreachable` debt, which stays until
+     a clean listing succeeds.
 10. **Finish** with one of the outcomes below.
 
 Bounds on every outbound request: a 30 second timeout, a 2 MB response
-cap, no redirects followed. The `listRecords` cursor must change on
-every page. A job lists at most 50,000 pages per collection per
-attempt; reaching that bound is not a failure: the job yields, is
-queued again in its tier, and continues from its cursor. A job whose
-stamp has reached 72 hours does not resume: its next attempt is a new
-run with a new stamp, listing from the first page. Nothing makes that
-a terminal failure.
+cap, no redirects followed.
+
+Bounds on a job, so that no host can keep a worker:
+
+| Bound | Value | When it is reached |
+|---|---|---|
+| Time of one attempt | `backfill.repo_job_max_duration` (1 hour) | the attempt **yields** |
+| Pages of one attempt, over all collections | 25,000 | the attempt **yields** |
+| A `listRecords` cursor the listing has already followed | none allowed | the job **fails** |
+| Attempts of one run that yielded, in a row | 10 | the job **fails** |
+
+A cursor is remembered by its hash for the length of a listing, so a
+cursor that repeats and a cycle of cursors of any length are both
+found. An account at every per-author cap is about 31,000 pages, so a
+real repository can need more than one attempt.
+
+A job that **yields** has stored what it listed, with its cursor. It
+is queued again in its tier and goes on from the cursor: at once the
+first two times, then after 30 seconds, doubling up to an hour. Each
+yield is counted in `backfill_state.yields`. The eleventh in a row is
+a failure like any other: it is retried on `backfill.retry_schedule`
+with its cursor kept, and it becomes terminal after
+`backfill.terminal_after`. A run that ends, in any outcome, starts
+the count again.
+
+An attempt that goes on with a run keeps that run's coverage point
+and start time: the pages an earlier attempt read are no newer than
+the first attempt's start. A job whose stamp has reached 72 hours does
+not resume: its next attempt is a new run with a new stamp, listing
+from the first page.
 
 Cursor rows of runs that are no longer current are deleted once a day
 by the server.
@@ -207,11 +267,24 @@ never with revs applied from the firehose, which may legitimately
 exceed `R` when a commit lands between the stamp and the apply.
 
 If `R < backfill_rev` the repository went backwards (for example a
-PDS restored from a backup). The job then fires the divergence event
-on each of `D`'s tracked lists (see
-[list-indexing.md](list-indexing.md)), purges `D`'s authored rows in
-batches of 10,000 through the counter path, adds a `resync` debt, and
-lists from scratch.
+PDS restored from a backup). A host that came out of a cache proves
+nothing here: an account that moved leaves an old copy behind, and
+that copy's rev is behind too. So the job first resolves `D` again
+at the directory and reads the stamp at the host it names. Only a
+host confirmed this way starts the purge.
+
+The job then, in this order:
+
+1. adds a `resync` debt, so coverage reports the account for as long
+   as its rows are going;
+2. fires the divergence event on each of `D`'s tracked lists (see
+   [list-indexing.md](list-indexing.md));
+3. purges `D`'s authored rows through the counter path, in batches of
+   at most 10,000 rows and 500 list locks. The purge takes rows,
+   tombstones and list revs whose rev is below the stamp of the
+   moment the divergence was found. What the firehose writes for `D`
+   while the purge runs carries a later rev and stays;
+4. lists from scratch.
 
 ### Repo-level errors, retries and terminal failure
 
@@ -233,7 +306,10 @@ directory, never from what a PDS says about itself.
 A failed job records `last_error`, increments `attempts`, and is put
 back in the queue in its tier with a delay from
 `backfill.retry_schedule` (default `1h`, `6h`, `24h`, `1d`; the last
-step repeats). When a DID has been failing for
+step repeats). The delay is that of the retry alone: if an entry
+already waits for the DID, such as a newer on-demand request, the
+collapse rule keeps the earlier of the two times. When a DID has been
+failing for
 `backfill.terminal_after` (7 days, counted from its first failure in a
 row) the failure is terminal: the DID gets an `unreachable` debt,
 counted in `unreachableRepos`, its cycle membership is marked
@@ -256,32 +332,50 @@ The shares are `backfill.tier_shares` (three percentages that sum to
 - **Shares are minimums.** Among the tiers that have work, the next
   free worker goes to the tier whose running count is lowest relative
   to its share. A share nobody uses flows to the others.
+- **Workers kept for tier 1.** A lent worker comes back only when its
+  job ends, so `backfill.on_demand_reserved` workers (default 4, and
+  never more than `concurrency − 1`) are not lent: tiers 2 and 3
+  together use at most `concurrency − on_demand_reserved`. An
+  on-demand request finds a worker however long the sweep's jobs run.
 - **Fairness inside tier 1** is cost-based deficit round-robin across
   requesters: each API token, the admin token, `system:lists`,
   `system:resync`. A requester is charged the outbound requests its
-  jobs made; the least-charged requester with work goes next, and one
+  jobs make; the least-charged requester with work goes next, and one
   that joins starts at the current minimum. A job is charged one
-  request when it is dispatched and the rest of its cost when it
-  ends, so the jobs already running count: several free workers are
-  shared between the requesters that have work, not all given to
+  request when it is dispatched, each further request as it makes it,
+  and at its end whatever its cost says beyond that. So the jobs
+  already running count, a long job included: several free workers
+  are shared between the requesters that have work, not all given to
   the one that looked cheapest a moment ago.
+- **Claims.** Dispatching a queue entry claims it
+  (`backfill_queue.claimed_by`, `claimed_until`) for 10 minutes; the
+  claim is renewed every minute while the job runs, and the entry is
+  deleted when the job has ended. A job that did not run because the
+  DID's lease was held gives its entry back to wait.
 - **A job that panics** is logged and counted in
-  `farsight_task_panics_total{task="backfill_job"}`. Its worker and
-  the mark that its DID is being worked on are given back when its
-  task ends, however it ends, so no failure of a job shrinks the pool.
+  `farsight_task_panics_total{task="backfill_job"}`, and recorded as
+  a failed job of its kind: a repo job is retried on
+  `backfill.retry_schedule` and becomes an `unreachable` debt if it
+  keeps failing, a list fetch run counts a failed attempt, a phase-1
+  check is put off by an hour. Its worker and the mark that its DID
+  is being worked on are given back when its task ends, however it
+  ends, so no failure of a job shrinks the pool.
 - **Priority inside a requester**: `high` before `normal`, four to
   one. Within a priority, oldest first.
 - **Caps.** At most 10,000 waiting entries per API requester
   (`QueueFull` beyond), of which at most 100 `high` (further ones are
-  downgraded). Tier 2 holds at most 1,000,000 entries; overflow is
-  dropped, because the sweep covers those repositories anyway.
+  downgraded). Tier 2 stops taking entries when the queue holds
+  about 1,000,000 (the planner's estimate of the table is read, the
+  queue is not counted for every new author); overflow is dropped,
+  because the sweep covers those repositories anyway.
 - **System requesters** (`system:lists`, `system:resync`) keep at
   most `backfill.system_queue_cap` (50,000) queue entries. The durable
   source of truth is the debt table and the list state; a feeder, run
   every 10 seconds, enqueues from them as capacity frees and only when
   a re-list can clear the debt. Nothing is refused for queue space.
-- **Collapse rule.** There is one *waiting* entry per `(actor, kind)`.
-  A new request for a DID that already has one upgrades it: the tier
+- **Collapse rule.** There is one *waiting* entry per `(actor, kind)`;
+  the entry of a running job is claimed and apart from it. A new
+  request for a DID that already has a waiting one upgrades it: the tier
   becomes the more urgent of the two, `not_before` the earlier (a new
   request means now), the priority the higher, and the requester that
   of the more urgent request, who is charged. So an on-demand request
@@ -303,6 +397,23 @@ The shares are `backfill.tier_shares` (three percentages that sum to
 - **Pacing of tier 3**: `backfill.sweep.max_repos_per_hour` (0, the
   default, leaves it bounded only by the hosts).
 
+### What a stopped process leaves
+
+A process that is stopped gives its work back: the scheduler stops
+its jobs, releases the claims on their queue entries (they wait
+again) and deletes their leases. A process that is killed cannot. What
+it held is told by a claim or a lease that ran out, and the feeder
+takes it up every 10 seconds:
+
+| Left behind | Told by | What happens |
+|---|---|---|
+| A claimed queue entry | `claimed_until` has passed | The claim is taken off and the entry waits again. If a newer waiting entry exists for the same account and kind, that one stands for both. |
+| A repo job marked `running` with no entry | no live lease, no queue entry, not an outstanding member of an open cycle | `backfill_state.state` becomes `queued` and a tier-2 `system:resync` entry is added. |
+| A cycle member | its `cycle_outstanding` row, and no live lease | The scheduler dispatches it again in its turn. |
+| A list fetch run | `finished_at` is NULL, no live lease on the owner, no `list_fetch` entry | The owner is queued, and its job resumes the run with the lists it had claimed. |
+
+Until then `getBackfillStatus` reports the job as `queued`.
+
 ### Politeness per host
 
 Every outbound request waits for a slot on its host:
@@ -311,7 +422,17 @@ Every outbound request waits for a slot on its host:
 |---|---|---|
 | Token bucket, requests per second per host | `backfill.per_host_rps` | 10 |
 | Concurrent requests per host | `backfill.per_host_concurrency` | 4 |
+| Token bucket, requests per second over all hosts of one registrable domain | `backfill.per_domain_rps` | 20 |
+| Concurrent requests over all hosts of one registrable domain | `backfill.per_domain_concurrency` | 8 |
 | PLC directory, requests per second in total | `backfill.plc_rps` | 10 |
+
+- A host is its name and port. The registrable domain is the one the
+  cap buckets use (eTLD+1 by the public suffix list), so an operator
+  who gives every account a host name of its own under one domain
+  gets one domain's worth of requests, not one host's worth for each
+  name. A domain is never held below what one of its hosts is
+  allowed. The hosts in `limits.large_hosts` are exempt from the
+  per-domain limits: each is limited by itself.
 
 - A `429`, or a response with `RateLimit-Remaining: 0`, cools the host
   for the seconds its `Retry-After` names, at most 1 hour (60 seconds
@@ -321,6 +442,9 @@ Every outbound request waits for a slot on its host:
   1 minute; a second trip within an hour of the last lasts 1 hour.
 - A request waits at most 2 minutes for a slot. A slot is given back
   when its request ends, also when the request is abandoned midway.
+- The limiter remembers a host while it has a request in flight, a
+  cooldown, a recent breaker trip, or was asked in the last 10
+  minutes; beyond 10,000 hosts the others are forgotten.
 - Half of `plc_rps` is reserved for DID resolution; enumeration of the
   PLC export uses the other half only.
 - The User-Agent is `farsight/<version> (+https://<hostname>;
@@ -369,7 +493,15 @@ sweep; the number of DIDs divided by `plc_rps` is its lower bound. A
 PLC mirror with a
 higher limit (`backfill.plc_url`, `backfill.plc_rps`) shortens that.
 With the `plc` source, `backfill.plc_seed_from_export = true` takes
-each account's PDS from the export itself.
+each account's PDS from the export itself. The export is a history:
+the endpoint of an operation may have been replaced by a later one
+that the cycle has not read yet. A seeded endpoint is used like any
+cached resolution. A repo-level error at it, or a repository that
+looks diverged there, makes the job resolve the account at the
+directory before it acts. An account that moved and whose old host
+still serves its old copy without error is listed from that copy
+until its resolution is refreshed, so with this option the first
+listing of such an account can be stale.
 
 ### Cycle start
 
@@ -404,6 +536,10 @@ member needs no `actors` row.
   entries) while its outstanding rows are fewer than
   `backfill.sweep.max_outstanding` (10,000). A page asks for no more
   than the room left, so the bound holds.
+- An entry of the page that is not a valid DID is left out and
+  logged: it names no repository. A member that is not a valid DID
+  all the same is set to `terminal` when it is dispatched, so it does
+  not keep its cycle open.
 - The page's DIDs are inserted in the same transaction that advances
   `sweep_cycles.checkpoint`. A DID whose last job ended clean,
   complete-with-debts or inactive at or after the cycle's effective
@@ -455,7 +591,14 @@ every repository that could have changed in it.
   yet claimed when it starts, from the earliest `from_at` among them
   (`sweep_cycles.repair_from`). It claims them by setting
   `firehose_gaps.repair_cycle_id`. Gaps that close while it runs wait
-  for the next repair; there is never one repair per gap.
+  for the next repair; there is never one repair per gap. The cause
+  of a gap plays no part: a gap recorded because seam windows could
+  not be read again (`seam_unrepaired`) is claimed and healed like
+  one recorded at a reconnect.
+- At most one repair cycle is open at a time (a unique index says
+  so). The process and `admin.startRepair` start a repair under the
+  same lock and look for an open one first, so whichever comes second
+  finds the first one's cycle.
 - An open gap, one whose stream is still down or still on a v1
   Jetstream, waits until it has closed.
 
@@ -625,19 +768,20 @@ One run serves every claimable list of an owner.
   `deleted` and the run ends; any other failure: retry in 5 minutes).
   Insert a `list_fetch_runs` row with the coverage point, the witness
   clock at that moment. Read the stamp `R` with `getLatestCommit`.
-  Then, in one transaction holding the locks of all the owner's lists,
-  claim:
+  Then, in one transaction holding the locks of the lists it takes,
+  claim the claimable lists, at most 500 of them, lowest id first:
 
   ```sql
   UPDATE lists SET fetch_run_id = $run, fetch_run_epoch = admit_epoch
-  WHERE owner_id = $owner
+  WHERE id = ANY($claimable)
     AND ((track_state IN (pending, unavailable)
           AND phase1_epoch = admit_epoch)
       OR (track_state IN (ready, retained) AND refresh_requested))
   RETURNING id
   ```
 
-  A run that claims nothing ends there. Every page is read after this
+  Lists beyond the 500 are claimed by the owner's next run. A run
+  that claims nothing ends there. Every page is read after this
   commit, through the run's own cursor, so every claimed list saw
   every page.
 - **Listing** is step 9 of the per-repo job for the `listitem`
@@ -664,12 +808,17 @@ One run serves every claimable list of an owner.
   attempts; `unavailable` lists stay claimable and are retried weekly
   without end. Waiting in the queue, the cooldown and a failure
   before the claim do not count as attempts.
-- **Yield.** A run that reaches the page bound is queued again at
-  once and continues.
-- **Resume.** A run left unfinished by a crash is resumed with its
-  run id, cursor, claimed set and coverage point. It keeps its stamp
-  if that was read less than 72 hours ago and otherwise reads a new
-  one.
+- **Page bound.** A run that lists 25,000 pages without reaching the
+  end is a failed attempt like one that runs out of time.
+- **Any other error** (the database, the resolver) closes the run all
+  the same: the claim is released, the run is finished as failed, and
+  the owner is queued again in 5 minutes. No attempt is counted for
+  it. No path leaves a run open with lists claimed.
+- **Resume.** A run left unfinished because the process was killed is
+  taken up by the feeder: it queues the owner again, and the run is
+  resumed with its run id, cursor, claimed set and coverage point. It
+  keeps its stamp if that was read less than 72 hours ago and
+  otherwise reads a new one.
 
 **Wall-clock bound.** Once a minute, every list `pending` for longer
 than `limits.pending_max_age` (3 hours) since its admission fires
@@ -753,8 +902,8 @@ Parameter `actor`. A pure read that never enqueues.
 | State | Meaning |
 |---|---|
 | `never` | Nothing known and no baseline yet. |
-| `queued` | A repo job waits; `position` estimates the entries of its tier served before it. |
-| `running` | A repo job holds the lease. |
+| `queued` | A repo job waits; `position` estimates the entries of its tier served before it. Also reported for a job that a stopped process left behind, until it is taken up again. |
+| `running` | The scheduler holds the job's queue entry, or (a cycle member) a repo job holds the lease. |
 | `done` | The last job ended clean, complete-with-debts or inactive. |
 | `failed` | The last job failed; `lastError` says why. |
 | `covered_by_sweep` | No row exists for the DID, but a completed full cycle covers its repository. `lastBackfilledAt` is that cycle's completion. |
@@ -790,9 +939,16 @@ normal way.
 - `backfill.backlinks.max_refs` (200,000) caps the references taken
   across the three steps. A run that hits it keeps its verified
   records and is marked `truncated`.
+- A reference is settled when its record was read, or when there is
+  an answer that it does not exist: the author's PDS says
+  `RecordNotFound`, or the directory says the author does not exist
+  or is tombstoned. A reference that could not be checked (the author
+  did not resolve for a reason that may pass, or the PDS did not
+  answer the read) may be real, so the run is marked `truncated` too.
 - Every list found in step 2 is recorded in `subject_lists(X, L)`
   whatever its state; coverage uses it to know which pending lists
-  could still add a block on `X`.
+  could still add a block on `X`. An untruncated run replaces the
+  set: lists an earlier run found and this one did not are removed.
 - State is in `discovery_state`: `state`, `started_at`,
   `discovered_witness`, `completed_at`, `truncated`, `refs_found`,
   `source`, `last_error`.

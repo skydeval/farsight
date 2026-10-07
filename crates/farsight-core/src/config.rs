@@ -288,6 +288,9 @@ pub struct BackfillConfig {
     pub phase1_retry: Vec<ConfigDuration>,
     /// Wall-clock cap on one list fetch run.
     pub list_fetch_max_duration: ConfigDuration,
+    /// Wall-clock cap on one attempt of a repo job. An attempt that
+    /// reaches it stops where it is and goes on later.
+    pub repo_job_max_duration: ConfigDuration,
     /// Margin before a gap's start when a repair chooses the accounts to
     /// re-read: those whose rev is at or after `from − repair_slack − lag`.
     pub repair_slack: ConfigDuration,
@@ -297,6 +300,15 @@ pub struct BackfillConfig {
     pub system_queue_cap: u64,
     /// Concurrent requests per host.
     pub per_host_concurrency: u32,
+    /// Requests per second towards all hosts of one registrable domain
+    /// together. Large hosts are exempt.
+    pub per_domain_rps: u32,
+    /// Concurrent requests towards all hosts of one registrable domain
+    /// together. Large hosts are exempt.
+    pub per_domain_concurrency: u32,
+    /// Workers kept for tier 1 (on-demand work and list jobs): tiers 2
+    /// and 3 never use them. At most `concurrency − 1` are kept.
+    pub on_demand_reserved: u32,
     /// Guaranteed shares of tiers 1, 2, 3 in percent.
     pub tier_shares: Vec<u32>,
     /// `[backfill.sweep]`.
@@ -337,10 +349,14 @@ impl Default for BackfillConfig {
                 ConfigDuration::hours(1),
             ],
             list_fetch_max_duration: ConfigDuration::hours(1),
+            repo_job_max_duration: ConfigDuration::hours(1),
             repair_slack: ConfigDuration::hours(1),
             seen_set_cap: 2_000_000,
             system_queue_cap: 50_000,
             per_host_concurrency: 4,
+            per_domain_rps: 20,
+            per_domain_concurrency: 8,
+            on_demand_reserved: 4,
             tier_shares: vec![60, 25, 15],
             sweep: SweepConfig::default(),
             repair: RepairConfig::default(),
@@ -838,20 +854,24 @@ impl Default for LimitsConfig {
     }
 }
 
+/// Whether `host` matches one of `patterns`: exactly, or `*.suffix`
+/// matching any subdomain of `suffix`. Case does not matter.
+pub fn host_matches(patterns: &[String], host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    patterns.iter().any(|pat| {
+        let pat = pat.to_ascii_lowercase();
+        match pat.strip_prefix("*.") {
+            Some(suffix) => host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}")),
+            None => host == pat,
+        }
+    })
+}
+
 impl LimitsConfig {
     /// Whether `host` matches `large_hosts` (exact, or `*.suffix` matching
     /// any subdomain of `suffix`).
     pub fn is_large_host(&self, host: &str) -> bool {
-        let host = host.to_ascii_lowercase();
-        self.large_hosts.iter().any(|pat| {
-            let pat = pat.to_ascii_lowercase();
-            match pat.strip_prefix("*.") {
-                Some(suffix) => {
-                    host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}"))
-                }
-                None => host == pat,
-            }
-        })
+        host_matches(&self.large_hosts, host)
     }
 }
 
@@ -909,9 +929,12 @@ impl Default for RateLimitConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsConfig {
-    /// The server's metrics listener, as `host:port`.
+    /// The server's metrics listener, as `host:port`. Loopback unless
+    /// set: the compose file sets it to all interfaces, which there are
+    /// the compose network's.
     pub bind: String,
-    /// The backfill process's metrics listener, as `host:port`.
+    /// The backfill process's metrics listener, as `host:port`; loopback
+    /// unless set, like `bind`.
     pub backfill_bind: String,
     /// Optional bearer token hash; empty = no auth.
     pub bearer_token_sha256: String,
@@ -920,8 +943,8 @@ pub struct MetricsConfig {
 impl Default for MetricsConfig {
     fn default() -> Self {
         MetricsConfig {
-            bind: "0.0.0.0:9464".to_owned(),
-            backfill_bind: "0.0.0.0:9465".to_owned(),
+            bind: "127.0.0.1:9464".to_owned(),
+            backfill_bind: "127.0.0.1:9465".to_owned(),
             bearer_token_sha256: String::new(),
         }
     }
@@ -1141,6 +1164,28 @@ fn is_public_net(net: &IpNet) -> bool {
     }
 }
 
+/// The most workers `backfill.concurrency` accepts: each holds a
+/// database connection.
+pub const MAX_BACKFILL_CONCURRENCY: u32 = 512;
+
+/// How long after it was read a listing stamp may still be applied (see
+/// `docs/design/backfill.md`). `storage.tombstone_ttl` is at least this.
+pub const LISTING_STAMP_VALIDITY: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
+
+/// Whether `s` is an absolute `http` or `https` URL with a host and no
+/// credentials.
+fn is_http_url(s: &str) -> bool {
+    match url::Url::parse(s) {
+        Ok(u) => {
+            matches!(u.scheme(), "http" | "https")
+                && u.host_str().is_some_and(|h| !h.is_empty())
+                && u.username().is_empty()
+                && u.password().is_none()
+        }
+        Err(_) => false,
+    }
+}
+
 fn is_hex_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -1229,8 +1274,74 @@ impl Config {
                 "expected three shares summing to 100",
             ));
         }
-        if self.backfill.concurrency == 0 {
-            return Err(invalid("backfill.concurrency", "must be positive"));
+        let b = &self.backfill;
+        if b.concurrency == 0 || b.concurrency > MAX_BACKFILL_CONCURRENCY {
+            return Err(invalid(
+                "backfill.concurrency",
+                format!("must be between 1 and {MAX_BACKFILL_CONCURRENCY}"),
+            ));
+        }
+        // A zero wait would have a failing job, or a list that is not
+        // there, tried again without pause.
+        for (key, list) in [
+            ("backfill.retry_schedule", &b.retry_schedule),
+            ("backfill.missing_retry", &b.missing_retry),
+            ("backfill.phase1_retry", &b.phase1_retry),
+        ] {
+            if list.iter().any(|d| d.get().is_zero()) {
+                return Err(invalid(key, "every step must be longer than 0s"));
+            }
+        }
+        for (key, value) in [
+            ("backfill.per_host_rps", b.per_host_rps),
+            ("backfill.per_host_concurrency", b.per_host_concurrency),
+            ("backfill.per_domain_rps", b.per_domain_rps),
+            ("backfill.per_domain_concurrency", b.per_domain_concurrency),
+            ("backfill.plc_rps", b.plc_rps),
+            (
+                "backfill.list_fetch_max_attempts",
+                b.list_fetch_max_attempts,
+            ),
+        ] {
+            if value == 0 {
+                return Err(invalid(key, "must be positive"));
+            }
+        }
+        if b.system_queue_cap == 0 {
+            return Err(invalid("backfill.system_queue_cap", "must be positive"));
+        }
+        for (key, value) in [
+            ("backfill.terminal_after", b.terminal_after),
+            (
+                "backfill.list_fetch_max_duration",
+                b.list_fetch_max_duration,
+            ),
+            ("backfill.repo_job_max_duration", b.repo_job_max_duration),
+        ] {
+            if value.get().is_zero() {
+                return Err(invalid(key, "must be longer than 0s"));
+            }
+        }
+        for (key, value, required) in [
+            ("backfill.relay_url", b.relay_url.as_str(), true),
+            ("backfill.plc_url", b.plc_url.as_str(), true),
+            ("backfill.backlinks.url", b.backlinks.url.as_str(), false),
+        ] {
+            if (required || !value.is_empty()) && !is_http_url(value) {
+                return Err(invalid(
+                    key,
+                    "expected an http:// or https:// URL with a host and no credentials",
+                ));
+            }
+        }
+        // A tombstone has to outlive every listing stamp that could still
+        // be applied: a listing read before a delete would otherwise put
+        // the record back once the tombstone is gone.
+        if self.storage.tombstone_ttl.get() < LISTING_STAMP_VALIDITY {
+            return Err(invalid(
+                "storage.tombstone_ttl",
+                "must be at least 72h, the time a listing may still be applied after it was read",
+            ));
         }
         self.validate_public_ui()?;
         let mut warnings = Vec::new();
@@ -1495,7 +1606,7 @@ mod tests {
         assert_eq!(c.limits.did_admissions_per_day, 200);
         assert_eq!(c.limits.large_hosts, ["*.host.bsky.network"]);
         assert_eq!(c.rate_limit.query_timeout, ConfigDuration::secs(5));
-        assert_eq!(c.metrics.backfill_bind, "0.0.0.0:9465");
+        assert_eq!(c.metrics.backfill_bind, "127.0.0.1:9465");
         assert_eq!(c.firehose.tuning.synthetic_gap_lag, ConfigDuration::mins(5));
         assert_eq!(
             c.firehose.tuning.seam_repair_before,
@@ -1751,6 +1862,77 @@ gap_threshold = "300s"
         let mut c = complete();
         c.proxy.trusted = vec!["10.0.0.0/8".parse().unwrap()];
         assert!(c.validate().unwrap().is_empty());
+    }
+
+    #[test]
+    fn backfill_keys_that_would_loop_or_stall_are_refused() {
+        type Edit = fn(&mut Config);
+        let refused: [(&str, Edit); 15] = [
+            ("backfill.retry_schedule", |c| {
+                c.backfill.retry_schedule = vec![ConfigDuration::secs(0)]
+            }),
+            ("backfill.missing_retry", |c| {
+                c.backfill.missing_retry[1] = ConfigDuration::secs(0)
+            }),
+            ("backfill.phase1_retry", |c| {
+                c.backfill.phase1_retry = vec![ConfigDuration::secs(0)]
+            }),
+            ("backfill.system_queue_cap", |c| {
+                c.backfill.system_queue_cap = 0
+            }),
+            ("backfill.concurrency", |c| c.backfill.concurrency = 0),
+            ("backfill.concurrency", |c| {
+                c.backfill.concurrency = MAX_BACKFILL_CONCURRENCY + 1
+            }),
+            ("backfill.per_host_rps", |c| c.backfill.per_host_rps = 0),
+            ("backfill.per_domain_concurrency", |c| {
+                c.backfill.per_domain_concurrency = 0
+            }),
+            ("backfill.repo_job_max_duration", |c| {
+                c.backfill.repo_job_max_duration = ConfigDuration::secs(0)
+            }),
+            ("backfill.relay_url", |c| {
+                c.backfill.relay_url = "ftp://relay.example".into()
+            }),
+            ("backfill.relay_url", |c| {
+                c.backfill.relay_url = String::new()
+            }),
+            ("backfill.plc_url", |c| {
+                c.backfill.plc_url = "plc.directory".into()
+            }),
+            ("backfill.plc_url", |c| {
+                c.backfill.plc_url = "https://user:pw@plc.example".into()
+            }),
+            ("backfill.backlinks.url", |c| {
+                c.backfill.backlinks.url = "file:///etc/passwd".into()
+            }),
+            ("storage.tombstone_ttl", |c| {
+                c.storage.tombstone_ttl = ConfigDuration::hours(71)
+            }),
+        ];
+        for (key, edit) in refused {
+            let mut c = complete();
+            edit(&mut c);
+            let e = c.validate().unwrap_err().to_string();
+            assert!(e.contains(key), "{key}: {e}");
+        }
+        let accepted: [Edit; 5] = [
+            |c| c.backfill.concurrency = MAX_BACKFILL_CONCURRENCY,
+            |c| c.backfill.relay_url = "http://127.0.0.1:2470".into(),
+            |c| c.backfill.backlinks.url = "https://links.example/".into(),
+            |c| c.storage.tombstone_ttl = ConfigDuration::hours(72),
+            // More workers kept than there are: all but one are kept.
+            |c| c.backfill.on_demand_reserved = 10_000,
+        ];
+        for edit in accepted {
+            let mut c = complete();
+            edit(&mut c);
+            assert!(c.validate().is_ok());
+        }
+        // The metrics listeners are loopback unless set.
+        let c = Config::default();
+        assert!(c.metrics.bind.starts_with("127.0.0.1:"));
+        assert!(c.metrics.backfill_bind.starts_with("127.0.0.1:"));
     }
 
     #[test]

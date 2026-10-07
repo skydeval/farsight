@@ -10,10 +10,11 @@ use crate::codes::sql::{
     FETCH_CANCELLED, JOB_LIST_FETCH, JOB_REPO, RECORD_DELETED, RECORD_UNKNOWN, TRACK_RETAINED,
     TRACK_UNTRACKED,
 };
-use crate::ids::{ListId, RunId};
+use crate::ids::{ActorId, ListId, RunId, Stamp};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use farsight_core::Did;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
+use std::collections::BTreeMap;
 
 use crate::apply::{block_delete_rows, item_delete_rows, listblock_delete_rows};
 use crate::codes::TrackState;
@@ -23,10 +24,97 @@ use crate::history::{self, Cause, Removal};
 use crate::keys::{self, CapKind, Limits};
 use crate::tracking::FireArgs;
 use crate::transition::Event;
-use crate::txn::{ApplyReport, Gates, Txn};
+use crate::txn::{ApplyReport, Gates, MAX_LOCKS, Txn, retry_deadlocks};
 
 /// Items deleted per purge transaction.
 pub const PURGE_BATCH: i64 = 10_000;
+
+/// Lists of its own that one account-purge transaction marks deleted.
+pub const PURGE_OWN_LISTS: usize = MAX_LOCKS / 4;
+
+/// Finished `list_fetch_runs` rows are kept this long.
+pub const FETCH_RUN_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+/// `op_errors` rows are kept this long.
+pub const OP_ERROR_RETENTION: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
+/// The most `op_errors` rows kept, whatever their age.
+pub const OP_ERROR_ROWS: i64 = 100_000;
+/// How long a purge that failed waits before it is tried again.
+pub const PURGE_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The head of `rows` whose list locks fit: a row goes in while its key
+/// is already in `locks` or fewer than `cap` keys are. The first row that
+/// does not fit ends the head. Returns the head and whether rows were
+/// left out.
+pub(crate) fn head_within<T>(
+    rows: Vec<T>,
+    key: impl Fn(&T) -> (i64, bool),
+    locks: &mut BTreeMap<i64, bool>,
+    cap: usize,
+) -> (Vec<T>, bool) {
+    let total = rows.len();
+    let mut head = Vec::with_capacity(total);
+    for row in rows {
+        let (k, exclusive) = key(&row);
+        if !locks.contains_key(&k) && locks.len() >= cap {
+            break;
+        }
+        *locks.entry(k).or_insert(false) |= exclusive;
+        head.push(row);
+    }
+    let cut = head.len() < total;
+    (head, cut)
+}
+
+/// Deletes finished `list_fetch_runs` rows older than
+/// [`FETCH_RUN_RETENTION`] (nightly). A run still claimed by a list, or
+/// not finished, stays.
+pub async fn prune_fetch_runs(pool: &PgPool, now: DateTime<Utc>) -> Result<u64> {
+    let cutoff = now
+        - ChronoDuration::from_std(FETCH_RUN_RETENTION)
+            .map_err(|e| StorageError::Invariant(e.to_string()))?;
+    Ok(sqlx::query(
+        "DELETE FROM list_fetch_runs r WHERE r.finished_at < $1
+           AND NOT EXISTS (SELECT 1 FROM lists l WHERE l.fetch_run_id = r.id)",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+/// Deletes `op_errors` rows older than [`OP_ERROR_RETENTION`], and the
+/// oldest beyond [`OP_ERROR_ROWS`] (nightly).
+pub async fn prune_op_errors(pool: &PgPool, now: DateTime<Utc>) -> Result<u64> {
+    let cutoff = now
+        - ChronoDuration::from_std(OP_ERROR_RETENTION)
+            .map_err(|e| StorageError::Invariant(e.to_string()))?;
+    let old = sqlx::query("DELETE FROM op_errors WHERE at < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    let over = sqlx::query(
+        "DELETE FROM op_errors WHERE id <= (
+           SELECT id FROM op_errors ORDER BY id DESC OFFSET $1 LIMIT 1)",
+    )
+    .bind(OP_ERROR_ROWS)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(old + over)
+}
+
+/// Deletes `subject_lists` rows whose list's record is deleted: such a
+/// list names nobody (nightly).
+pub async fn prune_subject_lists(pool: &PgPool) -> Result<u64> {
+    Ok(sqlx::query(&format!(
+        "DELETE FROM subject_lists s USING lists l
+         WHERE l.id = s.list_id AND l.record_state = {RECORD_DELETED}"
+    ))
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
 
 /// Deletes tombstones older than the TTL (hourly). The TTL is measured
 /// from `deleted_at`, the time the delete was processed.
@@ -288,15 +376,37 @@ async fn fire_event_guarded(
     let Some((owner, rkey)) = list_owner_key(pool, list_id).await? else {
         return Ok(ApplyReport::default());
     };
+    let key = keys::list_lock_key(&owner, &rkey);
+    retry_deadlocks(|| {
+        fire_event_once(pool, limits, counters, list_id, key, event, args, grace_now)
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fire_event_once(
+    pool: &PgPool,
+    limits: &Limits,
+    counters: &CounterSink,
+    list_id: ListId,
+    key: i64,
+    event: Event,
+    args: FireArgs,
+    grace_now: Option<DateTime<Utc>>,
+) -> Result<ApplyReport> {
     let mut tx = pool.begin().await?;
     let (report, deltas) = {
         let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
-        t.lock_lists(
-            &[(keys::list_lock_key(&owner, &rkey), true)]
-                .into_iter()
-                .collect(),
-        )
-        .await?;
+        t.lock_lists(&[(key, true)].into_iter().collect()).await?;
+        // The list may have been deleted (a placeholder nothing refers
+        // to) since it was picked.
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM lists WHERE id = $1)")
+            .bind(list_id)
+            .fetch_one(&mut *t.conn)
+            .await?;
+        if !exists {
+            return Ok(ApplyReport::default());
+        }
         let proceed = match grace_now {
             Some(now) => {
                 sqlx::query_scalar::<_, bool>(
@@ -326,11 +436,60 @@ async fn fire_event_guarded(
 /// Account purge of `did`, one batch: deletes up to `batch` of the DID's
 /// authored `blocks`, `list_blocks` (counter path) and `list_items` under
 /// author(D) plus the list locks the batch touches, and fires **RD** on
-/// the DID's lists (their items are then purged by
-/// [`process_purges`]). Returns `true` when nothing authored remains.
-/// Rows where the DID is the *subject* stay; the `lists` rows stay with
-/// `record_state = deleted`.
+/// up to [`PURGE_OWN_LISTS`] of the DID's lists (their items are then
+/// purged by [`process_purges`]). A batch ends where its rows would need
+/// more than [`MAX_LOCKS`] list locks. Returns `true` when nothing
+/// authored remains, and at once for an account whose status is not
+/// `deleted`: a purge asked for an account that has since been
+/// reactivated removes nothing. Rows where the DID is the *subject*
+/// stay; the `lists` rows stay with `record_state = deleted`.
 pub async fn purge_account_batch(
+    pool: &PgPool,
+    limits: &Limits,
+    counters: &CounterSink,
+    did: &Did,
+    batch: i64,
+) -> Result<bool> {
+    retry_deadlocks(|| purge_account_batch_once(pool, limits, counters, did, batch)).await
+}
+
+/// `(listblock rkey, list owner DID, list rkey)`.
+type ListBlockTarget = (String, String, String);
+
+/// Up to `batch` of the author's listblocks (with their lists) and
+/// listitems (with their lists' rkeys), each ascending by rkey; with
+/// `below`, only rows whose rev is lower.
+async fn authored_list_rows(
+    conn: &mut PgConnection,
+    author_id: ActorId,
+    batch: i64,
+    below: Option<Stamp>,
+) -> Result<(Vec<ListBlockTarget>, Vec<(String, String)>)> {
+    let lbs: Vec<ListBlockTarget> = sqlx::query_as(
+        "SELECT r.rkey, a.did, l.rkey FROM list_blocks r
+         JOIN lists l ON l.id = r.list_id JOIN actors a ON a.id = l.owner_id
+         WHERE r.author_id = $1 AND ($3::BIGINT IS NULL OR r.rev < $3)
+         ORDER BY r.rkey LIMIT $2",
+    )
+    .bind(author_id)
+    .bind(batch)
+    .bind(below)
+    .fetch_all(&mut *conn)
+    .await?;
+    let items: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.rkey, l.rkey FROM list_items r JOIN lists l ON l.id = r.list_id
+         WHERE r.owner_id = $1 AND ($3::BIGINT IS NULL OR r.rev < $3)
+         ORDER BY r.rkey LIMIT $2",
+    )
+    .bind(author_id)
+    .bind(batch)
+    .bind(below)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok((lbs, items))
+}
+
+async fn purge_account_batch_once(
     pool: &PgPool,
     limits: &Limits,
     counters: &CounterSink,
@@ -346,6 +505,12 @@ pub async fn purge_account_batch(
             return Ok(true);
         };
         let author = t.author(did).await?;
+        // Read under the author lock, which every change of the status
+        // holds: an account that is not `deleted` (any more) keeps its
+        // rows. A reactivation re-lists the repository instead.
+        if author.status != crate::codes::ActorStatus::Deleted {
+            return Ok(true);
+        }
         let blocks: Vec<String> = sqlx::query_scalar(
             "SELECT rkey FROM blocks WHERE author_id = $1 ORDER BY rkey LIMIT $2",
         )
@@ -353,41 +518,32 @@ pub async fn purge_account_batch(
         .bind(batch)
         .fetch_all(&mut *t.conn)
         .await?;
-        let lbs: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT r.rkey, a.did, l.rkey FROM list_blocks r
-             JOIN lists l ON l.id = r.list_id JOIN actors a ON a.id = l.owner_id
-             WHERE r.author_id = $1 ORDER BY r.rkey LIMIT $2",
-        )
-        .bind(author_id)
-        .bind(batch)
-        .fetch_all(&mut *t.conn)
-        .await?;
-        let items: Vec<(String, String)> = sqlx::query_as(
-            "SELECT r.rkey, l.rkey FROM list_items r JOIN lists l ON l.id = r.list_id
-             WHERE r.owner_id = $1 ORDER BY r.rkey LIMIT $2",
-        )
-        .bind(author_id)
-        .bind(batch)
-        .fetch_all(&mut *t.conn)
-        .await?;
+        let (lbs, items) = authored_list_rows(&mut *t.conn, author_id, batch, None).await?;
         let own_lists: Vec<(ListId, String, i16)> = sqlx::query_as(
-            &format!("SELECT id, rkey, record_state FROM lists WHERE owner_id = $1 AND record_state <> {RECORD_DELETED}"),
+            &format!("SELECT id, rkey, record_state FROM lists WHERE owner_id = $1 AND record_state <> {RECORD_DELETED}
+                      ORDER BY id LIMIT $2"),
         )
         .bind(author_id)
+        .bind(PURGE_OWN_LISTS as i64)
         .fetch_all(&mut *t.conn)
         .await?;
-        let mut locks = std::collections::BTreeMap::new();
-        for (_, owner, lrkey) in &lbs {
-            locks.insert(keys::list_lock_key(owner, lrkey), true);
-        }
-        for (_, lrkey) in &items {
-            locks
-                .entry(keys::list_lock_key(did.as_str(), lrkey))
-                .or_insert(false);
-        }
+        let mut locks = BTreeMap::new();
         for (_, lrkey, _) in &own_lists {
             locks.insert(keys::list_lock_key(did.as_str(), lrkey), true);
         }
+        let (lbs_read, items_read) = (lbs.len() as i64, items.len() as i64);
+        let (lbs, lbs_cut) = head_within(
+            lbs,
+            |(_, owner, lrkey)| (keys::list_lock_key(owner, lrkey), true),
+            &mut locks,
+            MAX_LOCKS,
+        );
+        let (items, items_cut) = head_within(
+            items,
+            |(_, lrkey)| (keys::list_lock_key(did.as_str(), lrkey), false),
+            &mut locks,
+            MAX_LOCKS,
+        );
         t.lock_lists(&locks).await?;
         let lb_keys: Vec<String> = lbs.iter().map(|(rk, _, _)| rk.clone()).collect();
         let item_keys: Vec<String> = items.iter().map(|(rk, _)| rk.clone()).collect();
@@ -423,8 +579,11 @@ pub async fn purge_account_batch(
         .execute(&mut *t.conn)
         .await?;
         let mut done = (blocks.len() as i64) < batch
-            && (lbs.len() as i64) < batch
-            && (items.len() as i64) < batch;
+            && lbs_read < batch
+            && items_read < batch
+            && !lbs_cut
+            && !items_cut
+            && own_lists.len() < PURGE_OWN_LISTS;
         if done {
             // The purge writes no history, and deletes the history the DID
             // authored, in batches, after the live rows.
@@ -456,15 +615,24 @@ pub async fn promote_claimed(
     let Some((owner, rkey)) = list_owner_key(pool, list_id).await? else {
         return Ok(false);
     };
+    let key = keys::list_lock_key(&owner, &rkey);
+    retry_deadlocks(|| promote_claimed_once(pool, limits, counters, list_id, key, run_id, args))
+        .await
+}
+
+async fn promote_claimed_once(
+    pool: &PgPool,
+    limits: &Limits,
+    counters: &CounterSink,
+    list_id: ListId,
+    key: i64,
+    run_id: RunId,
+    args: FireArgs,
+) -> Result<bool> {
     let mut tx = pool.begin().await?;
     let (fired, deltas) = {
         let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
-        t.lock_lists(
-            &[(keys::list_lock_key(&owner, &rkey), true)]
-                .into_iter()
-                .collect(),
-        )
-        .await?;
+        t.lock_lists(&[(key, true)].into_iter().collect()).await?;
         let claimed: bool = sqlx::query_scalar(
             "SELECT fetch_run_id = $2 AND fetch_run_epoch = admit_epoch FROM lists WHERE id = $1",
         )
@@ -493,15 +661,31 @@ pub async fn promote_claimed(
 /// — blocks, listblocks (counter path), listitems and tombstones — and the
 /// DID's `lists` rows lose their stored rev (the record fields stay; the
 /// fresh listing re-applies them, which a stored rev from the discarded
-/// history would refuse as newer). Unlike an account purge no **RD** fires:
-/// the caller fires **DV** on the DID's tracked lists *before* this.
-/// Returns `true` when nothing authored remains.
+/// history would refuse as newer). Only rows, tombstones and list revs
+/// below `below` go: the caller passes the stamp of the moment it found
+/// the divergence, so what the firehose writes while the purge runs,
+/// whose revs are later, is kept. Unlike an account purge no **RD**
+/// fires: the caller fires **DV** on the DID's tracked lists *before*
+/// this. A batch ends where its rows would need more than [`MAX_LOCKS`]
+/// list locks. Returns `true` when nothing below `below` remains.
 pub async fn purge_for_divergence_batch(
     pool: &PgPool,
     limits: &Limits,
     counters: &CounterSink,
     did: &Did,
     batch: i64,
+    below: Stamp,
+) -> Result<bool> {
+    retry_deadlocks(|| purge_for_divergence_once(pool, limits, counters, did, batch, below)).await
+}
+
+async fn purge_for_divergence_once(
+    pool: &PgPool,
+    limits: &Limits,
+    counters: &CounterSink,
+    did: &Did,
+    batch: i64,
+    below: Stamp,
 ) -> Result<bool> {
     let mut tx = pool.begin().await?;
     let (done, deltas) = {
@@ -513,54 +697,48 @@ pub async fn purge_for_divergence_batch(
         };
         let author = t.author(did).await?;
         let blocks: Vec<String> = sqlx::query_scalar(
-            "SELECT rkey FROM blocks WHERE author_id = $1 ORDER BY rkey LIMIT $2",
+            "SELECT rkey FROM blocks WHERE author_id = $1 AND rev < $3 ORDER BY rkey LIMIT $2",
         )
         .bind(author_id)
         .bind(batch)
+        .bind(below)
         .fetch_all(&mut *t.conn)
         .await?;
-        let lbs: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT r.rkey, a.did, l.rkey FROM list_blocks r
-             JOIN lists l ON l.id = r.list_id JOIN actors a ON a.id = l.owner_id
-             WHERE r.author_id = $1 ORDER BY r.rkey LIMIT $2",
-        )
-        .bind(author_id)
-        .bind(batch)
-        .fetch_all(&mut *t.conn)
-        .await?;
-        let items: Vec<(String, String)> = sqlx::query_as(
-            "SELECT r.rkey, l.rkey FROM list_items r JOIN lists l ON l.id = r.list_id
-             WHERE r.owner_id = $1 ORDER BY r.rkey LIMIT $2",
-        )
-        .bind(author_id)
-        .bind(batch)
-        .fetch_all(&mut *t.conn)
-        .await?;
-        let mut locks = std::collections::BTreeMap::new();
-        for (_, owner, lrkey) in &lbs {
-            locks.insert(keys::list_lock_key(owner, lrkey), true);
-        }
-        for (_, lrkey) in &items {
-            locks
-                .entry(keys::list_lock_key(did.as_str(), lrkey))
-                .or_insert(false);
-        }
+        let (lbs, items) = authored_list_rows(&mut *t.conn, author_id, batch, Some(below)).await?;
+        let mut locks = BTreeMap::new();
+        let (lbs_read, items_read) = (lbs.len() as i64, items.len() as i64);
+        let (lbs, lbs_cut) = head_within(
+            lbs,
+            |(_, owner, lrkey)| (keys::list_lock_key(owner, lrkey), true),
+            &mut locks,
+            MAX_LOCKS,
+        );
+        let (items, items_cut) = head_within(
+            items,
+            |(_, lrkey)| (keys::list_lock_key(did.as_str(), lrkey), false),
+            &mut locks,
+            MAX_LOCKS,
+        );
         t.lock_lists(&locks).await?;
         let lb_keys: Vec<String> = lbs.iter().map(|(rk, _, _)| rk.clone()).collect();
         let item_keys: Vec<String> = items.iter().map(|(rk, _)| rk.clone()).collect();
-        block_delete_rows(&mut t, &author, &blocks, None, None).await?;
-        listblock_delete_rows(&mut t, &author, &lb_keys, None, None).await?;
-        item_delete_rows(&mut t, &author, &item_keys, None, None).await?;
+        block_delete_rows(&mut t, &author, &blocks, Some(below), None).await?;
+        listblock_delete_rows(&mut t, &author, &lb_keys, Some(below), None).await?;
+        item_delete_rows(&mut t, &author, &item_keys, Some(below), None).await?;
         let done = (blocks.len() as i64) < batch
-            && (lbs.len() as i64) < batch
-            && (items.len() as i64) < batch;
+            && lbs_read < batch
+            && items_read < batch
+            && !lbs_cut
+            && !items_cut;
         if done {
-            sqlx::query("DELETE FROM tombstones WHERE author_id = $1")
+            sqlx::query("DELETE FROM tombstones WHERE author_id = $1 AND rev < $2")
                 .bind(author_id)
+                .bind(below)
                 .execute(&mut *t.conn)
                 .await?;
-            sqlx::query("UPDATE lists SET rev = NULL WHERE owner_id = $1")
+            sqlx::query("UPDATE lists SET rev = NULL WHERE owner_id = $1 AND rev < $2")
                 .bind(author_id)
+                .bind(below)
                 .execute(&mut *t.conn)
                 .await?;
         }
@@ -619,10 +797,111 @@ pub async fn purge_account(
     Ok(())
 }
 
+/// Asks for the purge of account `actor_id` (`account_purges`). Called in
+/// the transaction that records the account as `deleted`.
+pub async fn request_account_purge(conn: &mut PgConnection, actor_id: ActorId) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO account_purges (actor_id) VALUES ($1)
+         ON CONFLICT (actor_id) DO UPDATE SET not_before = NULL",
+    )
+    .bind(actor_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// What one call of [`run_account_purges`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountPurges {
+    /// Accounts of which nothing is left.
+    pub purged: u32,
+    /// Accounts whose purge goes on in the next call.
+    pub unfinished: u32,
+    /// Accounts whose purge failed, with the failure; each is tried again
+    /// after [`PURGE_RETRY`].
+    pub failed: Vec<(Did, String)>,
+}
+
+/// Runs the purges asked for in `account_purges`, oldest request first:
+/// up to `accounts` accounts, each for up to `batches` batches. An
+/// account of which nothing is left loses its row; one with more to
+/// remove keeps it for the next call.
+pub async fn run_account_purges(
+    pool: &PgPool,
+    limits: &Limits,
+    counters: &CounterSink,
+    accounts: i64,
+    batches: u32,
+) -> Result<AccountPurges> {
+    let due: Vec<(ActorId, String)> = sqlx::query_as(
+        "SELECT p.actor_id, a.did FROM account_purges p JOIN actors a ON a.id = p.actor_id
+         WHERE p.not_before IS NULL OR p.not_before <= now()
+         ORDER BY p.requested_at, p.actor_id LIMIT $1",
+    )
+    .bind(accounts)
+    .fetch_all(pool)
+    .await?;
+    let mut out = AccountPurges::default();
+    for (actor_id, did) in due {
+        let did = Did::parse(&did).map_err(|e| StorageError::Invariant(e.to_string()))?;
+        let mut done = false;
+        let mut failure = None;
+        for _ in 0..batches {
+            match purge_account_batch(pool, limits, counters, &did, PURGE_BATCH).await {
+                Ok(true) => {
+                    done = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(e) = failure {
+            sqlx::query(
+                "UPDATE account_purges SET not_before = now() + make_interval(secs => $2)
+                 WHERE actor_id = $1",
+            )
+            .bind(actor_id)
+            .bind(PURGE_RETRY.as_secs_f64())
+            .execute(pool)
+            .await?;
+            out.failed.push((did, e));
+        } else if done {
+            sqlx::query("DELETE FROM account_purges WHERE actor_id = $1")
+                .bind(actor_id)
+                .execute(pool)
+                .await?;
+            out.purged += 1;
+        } else {
+            out.unfinished += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Asks for the purge of every account [`accounts_pending_purge`] finds
+/// (up to `limit`): a purge whose request was lost, or an account that
+/// got a row again after its purge. Returns how many it found.
+pub async fn request_pending_purges(pool: &PgPool, limit: i64) -> Result<usize> {
+    let pending = accounts_pending_purge(pool, limit).await?;
+    let dids: Vec<String> = pending.iter().map(|d| d.as_str().to_owned()).collect();
+    sqlx::query(
+        "INSERT INTO account_purges (actor_id)
+         SELECT id FROM actors WHERE did = ANY($1)
+         ON CONFLICT (actor_id) DO NOTHING",
+    )
+    .bind(&dids)
+    .execute(pool)
+    .await?;
+    Ok(pending.len())
+}
+
 /// Accounts with status `deleted` that still author rows, live or in
-/// history (a purge was interrupted, e.g. by a crash after the status
-/// commit; or a replayed event wrote a history row later). Ingest runs
-/// these at start-up.
+/// history (a purge whose request was lost, or a replayed event wrote a
+/// history row later).
 pub async fn accounts_pending_purge(pool: &PgPool, limit: i64) -> Result<Vec<Did>> {
     let dids: Vec<String> = sqlx::query_scalar(
         // The deleted accounts are read first, in one pass over `actors`.
@@ -648,4 +927,33 @@ pub async fn accounts_pending_purge(pool: &PgPool, limit: i64) -> Result<Vec<Did
     dids.iter()
         .map(|d| Did::parse(d).map_err(|e| StorageError::Invariant(e.to_string())))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_purge_batch_ends_where_its_locks_would_exceed_the_bound() {
+        // Rows on lists 0, 0, 1, 2, 2, 3: with room for three keys the
+        // head is the first five rows.
+        let rows: Vec<i64> = vec![0, 0, 1, 2, 2, 3, 0];
+        let mut locks = BTreeMap::new();
+        let (head, cut) = head_within(rows.clone(), |k| (*k, true), &mut locks, 3);
+        assert_eq!((head, cut), (vec![0, 0, 1, 2, 2], true));
+        assert_eq!(locks.len(), 3);
+        // Keys already held cost nothing; a shared lock does not weaken
+        // an exclusive one, and an exclusive one upgrades a shared one.
+        let mut locks: BTreeMap<i64, bool> = [(0, true), (1, false)].into_iter().collect();
+        let (head, cut) = head_within(vec![0, 1, 0], |k| (*k, false), &mut locks, 2);
+        assert_eq!((head.len(), cut), (3, false));
+        assert_eq!(locks, [(0, true), (1, false)].into_iter().collect());
+        let (_, cut) = head_within(vec![1], |k| (*k, true), &mut locks, 2);
+        assert!(!cut && locks[&1]);
+        // No room and a new key: nothing fits.
+        let (head, cut) = head_within(vec![9, 0], |k| (*k, true), &mut locks, 2);
+        assert!(head.is_empty() && cut);
+        let (head, cut) = head_within(Vec::<i64>::new(), |k| (*k, true), &mut locks, 0);
+        assert!(head.is_empty() && !cut);
+    }
 }

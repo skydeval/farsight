@@ -1,13 +1,21 @@
 //! Outbound requests (see `docs/design/backfill.md` and
 //! `docs/design/security.md`): every request to a network-learned address
 //! goes through the safe client, a per-host token bucket with a
-//! concurrency limit, `429` / `RateLimit-Remaining: 0` / `Retry-After`
-//! handling and a circuit breaker; the PLC directory has its own limiter
-//! with half reserved for the resolver.
+//! concurrency limit, a second bucket and limit shared by every host of
+//! one registrable domain, `429` / `RateLimit-Remaining: 0` /
+//! `Retry-After` handling and a circuit breaker; the PLC directory has
+//! its own limiter with half reserved for the resolver.
+//!
+//! One [`Net`] serves the process for its lifetime: a rebuild after a
+//! config change gives it the new client and limits and keeps what it
+//! knows of every host (cooldowns, breaker trips, requests in flight).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+use farsight_core::Config;
 
 use farsight_core::bucket::{Bucket, Rate};
 use farsight_core::net::{OutboundClient, OutboundError, OutboundResponse, SafeClient};
@@ -145,6 +153,15 @@ struct HostState {
     consecutive_failures: u32,
     trips: u32,
     last_trip: Option<Instant>,
+    last_used: Instant,
+}
+
+/// What the hosts of one registrable domain share.
+#[derive(Debug)]
+struct DomainState {
+    bucket: Bucket,
+    inflight: u32,
+    last_used: Instant,
 }
 
 /// Circuit-breaker threshold: consecutive failures that trip it.
@@ -161,6 +178,11 @@ pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 /// Longest a request waits for a per-host slot before giving up.
 pub const MAX_SLOT_WAIT: Duration = Duration::from_secs(120);
+/// Hosts (and domains) remembered before the idle ones are forgotten.
+pub const REMEMBERED: usize = 10_000;
+/// A host or domain not asked for this long, with nothing in flight and
+/// no cooldown or recent breaker trip, is idle.
+pub const IDLE_AFTER: Duration = Duration::from_secs(600);
 
 /// How a request that held a slot ended, for the breaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +203,7 @@ pub enum SlotOutcome {
 pub struct Slot<'a> {
     limiter: &'a HostLimiter,
     host: String,
+    domain: Option<String>,
     released: bool,
 }
 
@@ -188,14 +211,16 @@ impl Slot<'_> {
     /// Frees the slot and records the result for the breaker.
     pub fn release(mut self, outcome: SlotOutcome) {
         self.released = true;
-        self.limiter.release(&self.host, Some(outcome));
+        self.limiter
+            .release(&self.host, self.domain.as_deref(), Some(outcome));
     }
 }
 
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
         if !self.released {
-            self.limiter.release(&self.host, None);
+            self.limiter
+                .release(&self.host, self.domain.as_deref(), None);
         }
     }
 }
@@ -216,89 +241,227 @@ fn slot_wait(bucket: &Bucket, rate: Rate) -> Duration {
     }
 }
 
-/// Per-host limits: token bucket, concurrency, cooldown, breaker.
+/// The limits a [`HostLimiter`] applies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HostLimits {
+    /// Requests a second towards one host, with room for one second of
+    /// it.
+    pub host: Rate,
+    /// Requests in flight towards one host.
+    pub host_concurrency: u32,
+    /// Requests a second towards all hosts of one registrable domain.
+    pub domain: Rate,
+    /// Requests in flight towards all hosts of one registrable domain.
+    pub domain_concurrency: u32,
+}
+
+impl HostLimits {
+    /// The limits of `backfill.per_host_*` and `backfill.per_domain_*`.
+    /// A domain is never held below what one of its hosts is allowed.
+    pub fn from_config(cfg: &Config) -> HostLimits {
+        let b = &cfg.backfill;
+        HostLimits::new(
+            b.per_host_rps,
+            b.per_host_concurrency,
+            b.per_domain_rps,
+            b.per_domain_concurrency,
+        )
+    }
+
+    /// Limits of `rps` and `concurrency` per host and `domain_rps` and
+    /// `domain_concurrency` per domain.
+    pub fn new(rps: u32, concurrency: u32, domain_rps: u32, domain_concurrency: u32) -> HostLimits {
+        let rps = rps.max(1);
+        let concurrency = concurrency.max(1);
+        HostLimits {
+            host: Rate::one_second(f64::from(rps)),
+            host_concurrency: concurrency,
+            domain: Rate::one_second(f64::from(domain_rps.max(rps))),
+            domain_concurrency: domain_concurrency.max(concurrency),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Limited {
+    limits: HostLimits,
+    hosts: HashMap<String, HostState>,
+    domains: HashMap<String, DomainState>,
+}
+
+impl Limited {
+    fn host(&mut self, host: &str, now: Instant) -> &mut HostState {
+        if !self.hosts.contains_key(host) && self.hosts.len() >= REMEMBERED {
+            self.hosts.retain(|_, s| {
+                s.inflight > 0
+                    || s.cooldown_until.is_some_and(|u| u > now)
+                    || s.last_trip
+                        .is_some_and(|t| now.saturating_duration_since(t) < BREAKER_REPEAT)
+                    || now.saturating_duration_since(s.last_used) < IDLE_AFTER
+            });
+        }
+        let rate = self.limits.host;
+        let s = self
+            .hosts
+            .entry(host.to_owned())
+            .or_insert_with(|| HostState {
+                bucket: Bucket::full(rate, now),
+                inflight: 0,
+                cooldown_until: None,
+                consecutive_failures: 0,
+                trips: 0,
+                last_trip: None,
+                last_used: now,
+            });
+        s.last_used = now;
+        s
+    }
+
+    fn domain(&mut self, domain: &str, now: Instant) -> &mut DomainState {
+        if !self.domains.contains_key(domain) && self.domains.len() >= REMEMBERED {
+            self.domains.retain(|_, s| {
+                s.inflight > 0 || now.saturating_duration_since(s.last_used) < IDLE_AFTER
+            });
+        }
+        let rate = self.limits.domain;
+        let s = self
+            .domains
+            .entry(domain.to_owned())
+            .or_insert_with(|| DomainState {
+                bucket: Bucket::full(rate, now),
+                inflight: 0,
+                last_used: now,
+            });
+        s.last_used = now;
+        s
+    }
+}
+
+/// Per-host limits (token bucket, concurrency, cooldown, breaker) and,
+/// over all hosts of one registrable domain, a second token bucket and
+/// concurrency limit: an operator who puts every account on a host name
+/// of its own under one domain gets one domain's worth of requests, not
+/// one host's worth each.
 #[derive(Debug)]
 pub struct HostLimiter {
-    /// `rps` a second, and room for one second of it.
-    rate: Rate,
-    concurrency: u32,
-    hosts: Mutex<HashMap<String, HostState>>,
+    state: Mutex<Limited>,
     freed: Notify,
 }
 
 impl HostLimiter {
-    /// A limiter with `rps` and `concurrency` per host.
+    /// A limiter with `rps` and `concurrency` per host, and the same per
+    /// domain.
     pub fn new(rps: u32, concurrency: u32) -> HostLimiter {
+        HostLimiter::with(HostLimits::new(rps, concurrency, rps, concurrency))
+    }
+
+    /// A limiter with `limits`.
+    pub fn with(limits: HostLimits) -> HostLimiter {
         HostLimiter {
-            rate: Rate::one_second(f64::from(rps.max(1))),
-            concurrency: concurrency.max(1),
-            hosts: Mutex::new(HashMap::new()),
+            state: Mutex::new(Limited {
+                limits,
+                hosts: HashMap::new(),
+                domains: HashMap::new(),
+            }),
             freed: Notify::new(),
         }
     }
 
-    fn state<'a>(
-        map: &'a mut HashMap<String, HostState>,
-        host: &str,
-        rate: Rate,
-    ) -> &'a mut HostState {
-        map.entry(host.to_owned()).or_insert_with(|| HostState {
-            bucket: Bucket::full(rate, Instant::now()),
-            inflight: 0,
-            cooldown_until: None,
-            consecutive_failures: 0,
-            trips: 0,
-            last_trip: None,
-        })
+    fn lock(&self) -> std::sync::MutexGuard<'_, Limited> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Replaces the limits. What is known of each host stays.
+    pub fn set_limits(&self, limits: HostLimits) {
+        self.lock().limits = limits;
+        self.freed.notify_waiters();
+    }
+
+    /// How many hosts and domains are remembered.
+    pub fn remembered(&self) -> (usize, usize) {
+        let s = self.lock();
+        (s.hosts.len(), s.domains.len())
     }
 
     /// Whether a request to `host` could start now (blocked-head skip of
-    /// the list-job lanes).
-    pub fn has_capacity(&self, host: &str) -> bool {
-        let mut map = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
-        let s = Self::state(&mut map, host, self.rate);
+    /// the list-job lanes): the host is not cooling down, and it and
+    /// `domain` have a request slot free.
+    pub fn has_capacity(&self, host: &str, domain: Option<&str>) -> bool {
+        let mut s = self.lock();
         let now = Instant::now();
-        if s.cooldown_until.is_some_and(|u| u > now) {
+        let limits = s.limits;
+        let h = s.host(host, now);
+        if h.cooldown_until.is_some_and(|u| u > now) || h.inflight >= limits.host_concurrency {
             return false;
         }
-        s.inflight < self.concurrency
+        domain.is_none_or(|d| s.domain(d, now).inflight < limits.domain_concurrency)
     }
 
     /// Seconds `host` is still cooling down, if it is.
     pub fn cooling(&self, host: &str) -> Option<u64> {
-        let map = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+        let s = self.lock();
         let now = Instant::now();
-        map.get(host)
+        s.hosts
+            .get(host)
             .and_then(|s| s.cooldown_until)
             .filter(|u| *u > now)
             .map(|u| u.duration_since(now).as_secs().max(1))
     }
 
-    /// Waits for a slot on `host` (bucket token + concurrency).
-    pub async fn acquire(&self, host: &str) -> Result<Slot<'_>, NetError> {
+    /// Waits for a slot on `host`: a token and a free request slot of the
+    /// host and, with a `domain`, of the domain too.
+    pub async fn acquire(&self, host: &str, domain: Option<&str>) -> Result<Slot<'_>, NetError> {
         let start = Instant::now();
         loop {
             let wait = {
-                let mut map = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
-                let (rate, conc) = (self.rate, self.concurrency);
-                let s = Self::state(&mut map, host, rate);
+                let mut s = self.lock();
+                let limits = s.limits;
                 let now = Instant::now();
-                if let Some(u) = s.cooldown_until.filter(|u| *u > now) {
+                // The domain first: what it allows is read before the
+                // host is looked at, and taken only with the host's.
+                let (domain_free, domain_wait) = match domain {
+                    Some(d) => {
+                        let ds = s.domain(d, now);
+                        ds.bucket.refill(now, limits.domain);
+                        (
+                            ds.inflight < limits.domain_concurrency && ds.bucket.tokens() >= 1.0,
+                            slot_wait(&ds.bucket, limits.domain),
+                        )
+                    }
+                    None => (true, Duration::ZERO),
+                };
+                let h = s.host(host, now);
+                if let Some(u) = h.cooldown_until.filter(|u| *u > now) {
                     return Err(NetError::Cooling {
                         host: host.to_owned(),
                         secs: u.duration_since(now).as_secs().max(1),
                     });
                 }
-                s.bucket.refill(now, rate);
-                if s.inflight < conc && s.bucket.try_take() {
-                    s.inflight += 1;
+                h.bucket.refill(now, limits.host);
+                let took =
+                    domain_free && h.inflight < limits.host_concurrency && h.bucket.try_take();
+                if took {
+                    h.inflight += 1;
+                }
+                let host_wait = slot_wait(&h.bucket, limits.host);
+                if took {
+                    if let Some(d) = domain {
+                        let ds = s.domain(d, now);
+                        ds.bucket.try_take();
+                        ds.inflight += 1;
+                    }
                     return Ok(Slot {
                         limiter: self,
                         host: host.to_owned(),
+                        domain: domain.map(str::to_owned),
                         released: false,
                     });
                 }
-                slot_wait(&s.bucket, rate)
+                if domain_free {
+                    host_wait
+                } else {
+                    host_wait.max(domain_wait)
+                }
             };
             if start.elapsed() > MAX_SLOT_WAIT {
                 return Err(NetError::Cooling {
@@ -314,11 +477,15 @@ impl HostLimiter {
     }
 
     /// Frees a slot; with an outcome, records it for the breaker.
-    fn release(&self, host: &str, outcome: Option<SlotOutcome>) {
-        let mut map = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
-        let s = Self::state(&mut map, host, self.rate);
-        s.inflight = s.inflight.saturating_sub(1);
+    fn release(&self, host: &str, domain: Option<&str>, outcome: Option<SlotOutcome>) {
+        let mut state = self.lock();
         let now = Instant::now();
+        if let Some(d) = domain {
+            let ds = state.domain(d, now);
+            ds.inflight = ds.inflight.saturating_sub(1);
+        }
+        let s = state.host(host, now);
+        s.inflight = s.inflight.saturating_sub(1);
         match outcome {
             None => {}
             Some(SlotOutcome::Healthy) => s.consecutive_failures = 0,
@@ -350,7 +517,7 @@ impl HostLimiter {
                 }
             }
         }
-        drop(map);
+        drop(state);
         self.freed.notify_waiters();
     }
 }
@@ -362,7 +529,7 @@ pub struct PlcLimiter {
     reserved: Mutex<Bucket>,
     shared: Mutex<Bucket>,
     /// Each half's rate, with room for one second of it.
-    half: Rate,
+    half: Mutex<Rate>,
 }
 
 /// Who is calling the PLC directory.
@@ -375,14 +542,27 @@ pub enum PlcUse {
 }
 
 impl PlcLimiter {
+    fn half_of(rps: u32) -> Rate {
+        Rate::one_second((f64::from(rps.max(2))) / 2.0)
+    }
+
     /// A limiter for `rps` requests per second.
     pub fn new(rps: u32) -> PlcLimiter {
-        let half = Rate::one_second((f64::from(rps.max(2))) / 2.0);
+        let half = Self::half_of(rps);
         PlcLimiter {
             reserved: Mutex::new(Bucket::full(half, Instant::now())),
             shared: Mutex::new(Bucket::full(half, Instant::now())),
-            half,
+            half: Mutex::new(half),
         }
+    }
+
+    /// Changes the rate to `rps` requests per second.
+    pub fn set_rps(&self, rps: u32) {
+        *self.half.lock().unwrap_or_else(|e| e.into_inner()) = Self::half_of(rps);
+    }
+
+    fn half(&self) -> Rate {
+        *self.half.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Takes a token, or says how long until there is one.
@@ -403,16 +583,17 @@ impl PlcLimiter {
     /// the shared half; the export waits on the shared half alone.
     pub async fn acquire(&self, use_: PlcUse) {
         loop {
+            let half = self.half();
             if use_ == PlcUse::Resolver {
-                match Self::take(&self.reserved, self.half) {
+                match Self::take(&self.reserved, half) {
                     None => return,
-                    Some(w) => match Self::take(&self.shared, self.half) {
+                    Some(w) => match Self::take(&self.shared, half) {
                         None => return,
                         Some(w2) => tokio::time::sleep(w.min(w2)).await,
                     },
                 }
             } else {
-                match Self::take(&self.shared, self.half) {
+                match Self::take(&self.shared, half) {
                     None => return,
                     Some(w) => tokio::time::sleep(w).await,
                 }
@@ -421,18 +602,34 @@ impl PlcLimiter {
     }
 }
 
+tokio::task_local! {
+    /// The outbound requests of the job running in this task, counted as
+    /// they are made: the scheduler charges a job's requester from it
+    /// while the job runs.
+    pub static METER: Arc<AtomicU64>;
+}
+
+/// What a [`Net`] takes from the config, replaced together at a rebuild.
+struct Settings {
+    client: Client,
+    /// `host[:port]` of the PLC directory.
+    plc_host: String,
+    /// `limits.large_hosts`: hosts exempt from the per-domain limits.
+    large_hosts: Vec<String>,
+}
+
 /// The network layer shared by every job.
 pub struct Net {
-    client: Client,
-    /// Limits of every host but the PLC directory, keyed by
-    /// `host[:port]`: `backfill.per_host_rps` and
-    /// `backfill.per_host_concurrency`, cooldowns and the breaker.
+    settings: RwLock<Settings>,
+    /// Limits of every host but the PLC directory: per `host[:port]`
+    /// (`backfill.per_host_rps`, `backfill.per_host_concurrency`,
+    /// cooldowns and the breaker) and per registrable domain
+    /// (`backfill.per_domain_rps`, `backfill.per_domain_concurrency`).
     pub hosts: HostLimiter,
     /// The PLC directory's own limiter. A caller takes a token from it
     /// before a request to the directory; requests to that host skip
     /// `hosts`.
     pub plc: PlcLimiter,
-    plc_host: String,
 }
 
 /// The host part of a URL used as the limiter key (`host[:port]`).
@@ -442,6 +639,15 @@ pub fn host_key(url: &Url) -> String {
         Some(p) => format!("{h}:{p}"),
         None => h,
     }
+}
+
+/// The name in a limiter key, without its port: `pds.example` of
+/// `pds.example:2583`, `[2001:db8::1]` of `[2001:db8::1]:443`.
+pub fn bare_host(host: &str) -> &str {
+    if host.starts_with('[') {
+        return host.find(']').map_or(host, |i| &host[..=i]);
+    }
+    host.split(':').next().unwrap_or(host)
 }
 
 fn retry_after(r: &OutboundResponse) -> Option<Duration> {
@@ -480,24 +686,60 @@ pub fn error_name(body: &[u8]) -> String {
 }
 
 impl Net {
-    /// A network layer over `client`. `plc_url` names the host that is
-    /// exempt from the per-host limits and timed as the PLC directory.
-    pub fn new(
-        client: Client,
-        per_host_rps: u32,
-        per_host_concurrency: u32,
-        plc_rps: u32,
-        plc_url: &str,
-    ) -> Net {
-        let plc_host = Url::parse(plc_url)
-            .map(|u| host_key(&u))
-            .unwrap_or_default();
+    /// A network layer over `client` with the limits of `cfg`:
+    /// `backfill.plc_url` names the host that is exempt from the per-host
+    /// limits and timed as the PLC directory, and `limits.large_hosts`
+    /// the hosts exempt from the per-domain limits.
+    pub fn new(client: Client, cfg: &Config) -> Net {
         Net {
-            client,
-            hosts: HostLimiter::new(per_host_rps, per_host_concurrency),
-            plc: PlcLimiter::new(plc_rps),
-            plc_host,
+            settings: RwLock::new(Self::settings(client, cfg)),
+            hosts: HostLimiter::with(HostLimits::from_config(cfg)),
+            plc: PlcLimiter::new(cfg.backfill.plc_rps),
         }
+    }
+
+    fn settings(client: Client, cfg: &Config) -> Settings {
+        Settings {
+            client,
+            plc_host: Url::parse(&cfg.backfill.plc_url)
+                .map(|u| host_key(&u))
+                .unwrap_or_default(),
+            large_hosts: cfg.limits.large_hosts.clone(),
+        }
+    }
+
+    /// Takes a new client and the limits of `cfg` (a rebuild after a
+    /// config change). Cooldowns, breaker state and requests in flight
+    /// stay as they are.
+    pub fn reconfigure(&self, client: Client, cfg: &Config) {
+        *self.settings.write().unwrap_or_else(|e| e.into_inner()) = Self::settings(client, cfg);
+        self.set_limits(cfg);
+    }
+
+    /// Applies the request limits of `cfg` (`backfill.per_host_*`,
+    /// `backfill.per_domain_*`, `backfill.plc_rps`) to the requests that
+    /// follow.
+    pub fn set_limits(&self, cfg: &Config) {
+        self.hosts.set_limits(HostLimits::from_config(cfg));
+        self.plc.set_rps(cfg.backfill.plc_rps);
+    }
+
+    /// The registrable domain `host` is limited under with the other
+    /// hosts of that domain; `None` for a large host, which is limited
+    /// by itself.
+    pub fn domain_of(&self, host: &str) -> Option<String> {
+        let bare = bare_host(host);
+        let s = self.settings.read().unwrap_or_else(|e| e.into_inner());
+        if farsight_core::config::host_matches(&s.large_hosts, bare) {
+            return None;
+        }
+        Some(farsight_core::registrable_domain(bare))
+    }
+
+    /// Whether a request to `host` could start now.
+    pub fn has_capacity(&self, host: &str) -> bool {
+        self.hosts
+            .has_capacity(host, self.domain_of(host).as_deref())
     }
 
     /// `GET url` as JSON through the per-host limiter. `method` labels the
@@ -513,18 +755,24 @@ impl Net {
         String::from_utf8(body).map_err(|e| NetError::Decode(e.to_string()))
     }
 
-    async fn get_body(&self, url: &Url, method: &'static str) -> Result<Vec<u8>, NetError> {
+    /// `GET url` through the per-host limiter: the body of a `200`.
+    pub async fn get_body(&self, url: &Url, method: &'static str) -> Result<Vec<u8>, NetError> {
         let host = host_key(url);
-        let is_plc = host == self.plc_host;
+        let (client, is_plc) = {
+            let s = self.settings.read().unwrap_or_else(|e| e.into_inner());
+            (s.client.clone(), host == s.plc_host)
+        };
         // Held across the request: if this future is dropped at the await
         // below, the slot is freed with it.
         let slot = if is_plc {
             None
         } else {
-            Some(self.hosts.acquire(&host).await?)
+            let domain = self.domain_of(&host);
+            Some(self.hosts.acquire(&host, domain.as_deref()).await?)
         };
+        let _ = METER.try_with(|m| m.fetch_add(1, Ordering::Relaxed));
         let started = Instant::now();
-        let r = self.client.get(url).await;
+        let r = client.get(url).await;
         let elapsed = started.elapsed().as_secs_f64();
         let label = m::host_label(&host);
         if is_plc {
@@ -591,18 +839,21 @@ mod tests {
     #[tokio::test]
     async fn concurrency_and_breaker() {
         let l = HostLimiter::new(100, 2);
-        let a = l.acquire("h").await.unwrap();
-        let b = l.acquire("h").await.unwrap();
-        assert!(!l.has_capacity("h"));
+        let a = l.acquire("h", None).await.unwrap();
+        let b = l.acquire("h", None).await.unwrap();
+        assert!(!l.has_capacity("h", None));
         a.release(SlotOutcome::Healthy);
-        assert!(l.has_capacity("h"));
+        assert!(l.has_capacity("h", None));
         b.release(SlotOutcome::Healthy);
         for _ in 0..BREAKER_FAILURES {
-            l.acquire("h").await.unwrap().release(SlotOutcome::Failed);
+            l.acquire("h", None)
+                .await
+                .unwrap()
+                .release(SlotOutcome::Failed);
         }
         assert!(l.cooling("h").is_some_and(|s| s <= 60));
         assert!(matches!(
-            l.acquire("h").await,
+            l.acquire("h", None).await,
             Err(NetError::Cooling { .. })
         ));
     }
@@ -610,11 +861,121 @@ mod tests {
     #[tokio::test]
     async fn retry_after_cools_host() {
         let l = HostLimiter::new(100, 2);
-        l.acquire("x")
+        l.acquire("x", None)
             .await
             .unwrap()
             .release(SlotOutcome::RateLimited(Duration::from_secs(30)));
         assert!(l.cooling("x").is_some_and(|s| s > 20));
+    }
+
+    #[tokio::test]
+    async fn hosts_of_one_domain_share_its_slots_and_its_rate() {
+        // Two requests at a time per host, three per domain.
+        let l = HostLimiter::with(HostLimits::new(100, 2, 100, 3));
+        let d = Some("evil.example");
+        let a1 = l.acquire("a.evil.example", d).await.unwrap();
+        let a2 = l.acquire("a.evil.example", d).await.unwrap();
+        // The host is full; a second host of the domain still gets one.
+        assert!(!l.has_capacity("a.evil.example", d));
+        assert!(l.has_capacity("b.evil.example", d));
+        let b1 = l.acquire("b.evil.example", d).await.unwrap();
+        // The domain is full now: no host of it has room, a fresh one
+        // included; a host of another domain does.
+        assert!(!l.has_capacity("b.evil.example", d));
+        assert!(!l.has_capacity("c.evil.example", d));
+        assert!(l.has_capacity("pds.other.example", Some("other.example")));
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(60), l.acquire("c.evil.example", d)).await;
+        assert!(
+            waiting.is_err(),
+            "a fourth request of the domain got a slot"
+        );
+        // A freed slot of any host of the domain lets it in.
+        a1.release(SlotOutcome::Healthy);
+        let c1 = tokio::time::timeout(Duration::from_secs(2), l.acquire("c.evil.example", d))
+            .await
+            .expect("a slot once one is free")
+            .unwrap();
+        drop((a2, b1, c1));
+        assert!(l.has_capacity("c.evil.example", d));
+
+        // The rate: one a second for the domain, however many hosts.
+        let l = HostLimiter::with(HostLimits::new(1, 1, 1, 50));
+        l.acquire("h0.evil.example", d)
+            .await
+            .unwrap()
+            .release(SlotOutcome::Healthy);
+        // The second host has its own token left; the domain has none.
+        let second =
+            tokio::time::timeout(Duration::from_millis(100), l.acquire("h1.evil.example", d)).await;
+        assert!(
+            second.is_err(),
+            "a second request within the second got a token"
+        );
+        // Without a domain (a large host) only the host's limits apply.
+        l.acquire("h1.evil.example", None)
+            .await
+            .unwrap()
+            .release(SlotOutcome::Healthy);
+    }
+
+    #[test]
+    fn a_domain_is_never_held_below_one_host() {
+        let l = HostLimits::new(10, 4, 2, 1);
+        assert_eq!((l.domain.per_sec, l.domain_concurrency), (10.0, 4));
+        let l = HostLimits::new(10, 4, 20, 8);
+        assert_eq!((l.host.per_sec, l.host_concurrency), (10.0, 4));
+        assert_eq!((l.domain.per_sec, l.domain_concurrency), (20.0, 8));
+    }
+
+    #[tokio::test]
+    async fn new_limits_apply_and_cooldowns_stay() {
+        let l = HostLimiter::new(100, 1);
+        l.acquire("h", None)
+            .await
+            .unwrap()
+            .release(SlotOutcome::RateLimited(Duration::from_secs(30)));
+        let held = l.acquire("g", None).await.unwrap();
+        assert!(!l.has_capacity("g", None));
+        l.set_limits(HostLimits::new(100, 2, 100, 2));
+        // The cooldown is the host's, not the limiter's settings'.
+        assert!(l.cooling("h").is_some());
+        assert!(l.has_capacity("g", None));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn idle_hosts_are_forgotten_and_busy_ones_kept() {
+        let l = HostLimiter::new(1000, 4);
+        let held = l.acquire("busy", None).await.unwrap();
+        l.acquire("cooling", None)
+            .await
+            .unwrap()
+            .release(SlotOutcome::RateLimited(MAX_RETRY_AFTER));
+        let now = Instant::now();
+        {
+            let mut s = l.lock();
+            for i in 0..REMEMBERED {
+                s.host(&format!("h{i}"), now);
+            }
+        }
+        assert!(l.remembered().0 >= REMEMBERED);
+        // Twice the idle time later, the next new host makes room: the
+        // host with a request in flight and the one cooling down stay.
+        let later = now + IDLE_AFTER * 2;
+        l.lock().host("new", later);
+        assert_eq!(l.remembered().0, 3, "busy, cooling and the new one");
+        assert!(!l.has_capacity("cooling", None));
+        drop(held);
+    }
+
+    #[test]
+    fn bare_hosts() {
+        assert_eq!(bare_host("pds.example"), "pds.example");
+        assert_eq!(bare_host("pds.example:2583"), "pds.example");
+        assert_eq!(bare_host("[2001:db8::1]:443"), "[2001:db8::1]");
+        assert_eq!(bare_host("[2001:db8::1]"), "[2001:db8::1]");
+        assert_eq!(bare_host("127.0.0.1:8080"), "127.0.0.1");
     }
 
     fn response(status: u16, headers: &[(&str, &str)]) -> OutboundResponse {
@@ -654,7 +1015,7 @@ mod tests {
         let l = HostLimiter::new(100, 2);
         // What `Retry-After: 18446744073709551615` would ask for, handed
         // to the limiter unclamped.
-        l.acquire("x")
+        l.acquire("x", None)
             .await
             .unwrap()
             .release(SlotOutcome::RateLimited(Duration::from_secs(u64::MAX)));
@@ -662,7 +1023,7 @@ mod tests {
             l.cooling("x")
                 .is_some_and(|s| s <= MAX_RETRY_AFTER.as_secs())
         );
-        assert!(l.has_capacity("y"));
+        assert!(l.has_capacity("y", None));
     }
 
     #[tokio::test]
@@ -670,22 +1031,22 @@ mod tests {
         let l = HostLimiter::new(100, 1);
         for _ in 0..(BREAKER_FAILURES * 2) {
             // A request whose future is dropped while it holds the slot.
-            let slot = l.acquire("h").await.unwrap();
-            assert!(!l.has_capacity("h"));
+            let slot = l.acquire("h", None).await.unwrap();
+            assert!(!l.has_capacity("h", None));
             drop(slot);
-            assert!(l.has_capacity("h"));
+            assert!(l.has_capacity("h", None));
         }
         assert_eq!(l.cooling("h"), None);
         // The same when the holder panics.
         let r = farsight_core::task::catch(async {
-            let _slot = l.acquire("h").await.unwrap();
+            let _slot = l.acquire("h", None).await.unwrap();
             if std::hint::black_box(true) {
                 panic!("job failed");
             }
         })
         .await;
         assert!(r.is_err());
-        assert!(l.has_capacity("h"));
+        assert!(l.has_capacity("h", None));
     }
 
     #[test]
@@ -784,14 +1145,14 @@ mod tests {
                 let now = Instant::now();
                 prop_assert!(after(now, d) >= now);
                 let l = HostLimiter::new(100, 2);
-                l.release("h", Some(SlotOutcome::RateLimited(d)));
+                l.release("h", None, Some(SlotOutcome::RateLimited(d)));
                 let left = l.cooling("h");
                 prop_assert!(left.is_none_or(|s| (1..=MAX_RETRY_AFTER.as_secs()).contains(&s)));
                 prop_assert!(left.is_none_or(|s| s <= d.as_secs().max(1)));
                 if d >= Duration::from_secs(2) {
-                    prop_assert!(left.is_some() && !l.has_capacity("h"));
+                    prop_assert!(left.is_some() && !l.has_capacity("h", None));
                 }
-                prop_assert!(l.has_capacity("other"));
+                prop_assert!(l.has_capacity("other", None));
             }
 
             /// The wait of a request without a slot is between 5 ms and

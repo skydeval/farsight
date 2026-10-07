@@ -291,8 +291,8 @@ pub struct Ingest;
 impl Ingest {
     /// Starts the reader, the writer, the seam repair task, the gauge task
     /// and the counter flusher. `pool` should be the dedicated
-    /// 4-connection ingest pool. Accounts left half-purged by a crash are
-    /// purged first, and seam windows left open by one are closed.
+    /// 4-connection ingest pool. Seam windows left open by a crash are
+    /// closed first.
     pub async fn start(cfg: IngestConfig, pool: PgPool) -> Result<IngestHandle, String> {
         if cfg.reader.urls.is_empty() {
             return Err("firehose.urls is empty".into());
@@ -306,29 +306,6 @@ impl Ingest {
             .store(-1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "harness")]
         let faults = Arc::new(FaultHook::default());
-
-        let pending = farsight_storage::janitor::accounts_pending_purge(&pool, 1000)
-            .await
-            .map_err(|e| e.to_string())?;
-        // One account whose purge fails does not keep the process from
-        // starting: the failure is recorded and the purge is taken up
-        // again by the daily task.
-        for did in &pending {
-            if let Err(e) =
-                farsight_storage::janitor::purge_account(&pool, &cfg.limits, &counters, did).await
-            {
-                tracing::error!(%did, error = %e, "purging a deleted account failed");
-                ::metrics::counter!(crate::metrics::STORAGE_ERRORS, "op" => "purge_account")
-                    .increment(1);
-                let _ = farsight_storage::auth::record_op_error(
-                    &pool,
-                    "ingest",
-                    Some(did.as_str()),
-                    &format!("purge_account failed: {e}"),
-                )
-                .await;
-            }
-        }
 
         // A seam window still open belongs to a session that did not live
         // to close it: it ends where the stream got to.

@@ -356,8 +356,11 @@ CREATE TABLE backfill_state (
   last_error          TEXT,
   current_run_id      BIGINT,
   current_run_point   TIMESTAMPTZ,
-  inactive_at_listing BOOLEAN NOT NULL DEFAULT false
+  current_run_started_at TIMESTAMPTZ,
+  inactive_at_listing BOOLEAN NOT NULL DEFAULT false,
+  yields              INT NOT NULL DEFAULT 0
 );
+CREATE INDEX backfill_state_running ON backfill_state (actor_id) WHERE state = 2;
 
 CREATE TABLE job_leases (
   did         TEXT COLLATE "C" PRIMARY KEY,
@@ -387,11 +390,17 @@ CREATE TABLE backfill_queue (
   requester   TEXT NOT NULL,
   cycle_id    BIGINT,
   enqueued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  not_before  TIMESTAMPTZ
+  not_before  TIMESTAMPTZ,
+  claimed_by  TEXT,
+  claimed_until TIMESTAMPTZ
 );
-CREATE UNIQUE INDEX backfill_queue_one_waiting ON backfill_queue (actor_id, kind);
+CREATE UNIQUE INDEX backfill_queue_one_waiting ON backfill_queue (actor_id, kind)
+  WHERE claimed_by IS NULL;
 CREATE INDEX backfill_queue_pick
   ON backfill_queue (tier, requester, priority DESC, enqueued_at);
+CREATE INDEX backfill_queue_by_requester ON backfill_queue (requester, priority);
+CREATE INDEX backfill_queue_claimed ON backfill_queue (claimed_until)
+  WHERE claimed_by IS NOT NULL;
 
 CREATE TABLE list_jobs (
   list_id     BIGINT PRIMARY KEY,
@@ -410,6 +419,9 @@ CREATE TABLE list_fetch_runs (
   finished_at    TIMESTAMPTZ,
   outcome        SMALLINT
 );
+CREATE INDEX list_fetch_runs_by_owner ON list_fetch_runs (owner_id, started_at);
+CREATE INDEX list_fetch_runs_unfinished ON list_fetch_runs (owner_id)
+  WHERE finished_at IS NULL;
 
 CREATE TABLE discovery_state (
   actor_id           BIGINT PRIMARY KEY,
@@ -440,6 +452,8 @@ CREATE TABLE sweep_cycles (
   failed_terminal         BIGINT NOT NULL DEFAULT 0,
   repair_from             TIMESTAMPTZ
 );
+CREATE UNIQUE INDEX sweep_cycles_one_open ON sweep_cycles (kind)
+  WHERE completed_at IS NULL;
 
 CREATE TABLE cycle_outstanding (
   cycle_id BIGINT NOT NULL,
@@ -454,13 +468,24 @@ CREATE TABLE cycle_outstanding (
   4 failed; `last_outcome` is 1 clean, 2 complete with debts,
   3 inactive, 4 failed. `backfilled_witness` and `clean_witness` are
   the coverage points of the last complete and the last clean run.
-- `job_leases`: which worker holds the job for a DID, and until when.
+  `current_run_point` and `current_run_started_at` are the coverage
+  point and the start of the run under way, set by its first attempt
+  and kept by the attempts that go on with it. `yields` counts the
+  attempts of that run that stopped at a bound, in a row. The partial
+  index finds the rows marked `running`, among which the feeder looks
+  for jobs a stopped process left behind.
+- `job_leases`: which job holds a DID, and until when. `lease_owner`
+  is the name of the process and the number of its job.
 - `backfill_cursors`: the paging position and the listing stamp of one
   running job (`job_kind` 1 repository, 2 list fetch). A cursor belongs
   to its run and is never adopted by another.
-- `backfill_queue`: waiting jobs only; a picked entry is deleted.
-  `kind` is 1 repository, 2 list fetch, 3 discovery. The unique index
-  allows one waiting entry per account and kind. `requester` names who
+- `backfill_queue`: jobs that wait or run. The scheduler claims an
+  entry when it starts the job (`claimed_by` names the process,
+  `claimed_until` the time the claim runs out unless it is renewed)
+  and deletes it when the job has ended. An entry whose claim ran out
+  waits again. `kind` is 1 repository, 2 list fetch, 3 discovery. The
+  unique index allows one waiting entry per account and kind; a
+  claimed entry is apart from it. `requester` names who
   asked: `token:<id>`, `admin`, or a system requester such as
   `system:sweep`, `system:repair`, `system:resync`, `system:firehose`,
   `system:lists`.
@@ -468,11 +493,13 @@ CREATE TABLE cycle_outstanding (
   applied only if `admit_epoch` is still the list's.
 - `list_fetch_runs`: one row per run that fetches an owner's list
   items. `outcome` is NULL while running, then 1 ok, 2 failed,
-  3 owner inactive, 4 cancelled.
+  3 owner inactive, 4 cancelled. A finished run is deleted after 7
+  days.
 - `discovery_state`: the per-account state of a discovery run (1
   queued, 2 running, 3 done, 4 failed) and its coverage point.
 - `sweep_cycles`: one row per full sweep (`kind` 1) or gap repair
-  (`kind` 2), with its enumeration checkpoint and progress.
+  (`kind` 2), with its enumeration checkpoint and progress. The unique
+  index allows one open cycle of each kind.
 - `cycle_outstanding`: the members of a cycle that are still in flight
   or being retried (`state` 1 outstanding, 2 terminal).
 
@@ -494,6 +521,7 @@ CREATE TABLE subject_lists (
   list_id  BIGINT NOT NULL,
   PRIMARY KEY (actor_id, list_id)
 );
+CREATE INDEX subject_lists_by_list ON subject_lists (list_id);
 
 CREATE TABLE relist_debt (
   actor_id      BIGINT   NOT NULL,
@@ -544,6 +572,9 @@ CREATE INDEX list_sched_keys_by_key ON list_sched_keys (key);
   as a subject (`scope` 1 direct blocks, 2 the listitem → list →
   listblock chain).
 - `subject_lists`: every list a discovery run found naming the account.
+  A run that checked every reference replaces the account's set, and
+  rows whose list's record is deleted are removed once a day. The
+  index serves the placeholder cleanup, which asks by list.
 - `relist_debt`: the single source of per-account exceptions to
   coverage. `reason` is 1 unreachable, 2 resync, 3 capped, 4 refused;
   `cap_type` names the cap, rate or gate behind a capped or refused
@@ -591,6 +622,13 @@ CREATE TABLE op_errors (
   host      TEXT,
   message   TEXT NOT NULL
 );
+CREATE INDEX op_errors_at ON op_errors (at);
+
+CREATE TABLE account_purges (
+  actor_id     BIGINT PRIMARY KEY,
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  not_before   TIMESTAMPTZ
+);
 
 CREATE TABLE stats_counters (
   name       TEXT NOT NULL,
@@ -605,7 +643,13 @@ CREATE TABLE stats_counters (
   itself is not stored.
 - `admin_sessions`: admin sessions by a SHA-256 derived from the
   session cookie, with the session's CSRF secret.
-- `op_errors`: the operational error log the dashboard shows.
+- `op_errors`: the operational error log the dashboard shows. Rows
+  older than 30 days are deleted once a day, and the oldest beyond
+  100,000 rows.
+- `account_purges`: the deleted accounts whose stored rows still have
+  to be removed; see
+  [the purge of a deleted account](#the-purge-of-a-deleted-account).
+  `not_before` is set after a failed purge.
 - `stats_counters`: the approximate totals behind `getStats` and the
   dashboard; see [counters](#counters).
 
@@ -832,7 +876,11 @@ firehose progress to persist. The transaction does, in this order:
 2. **Reads** of the stored rows of every listblock and listitem key in
    the batch and of every reconcile candidate. They are stable under
    the author locks, and they tell which lists a delete, a
-   target-changing update or a reconcile will touch.
+   target-changing update or a reconcile will touch. The reconciles
+   of one batch take at most 5,000 candidates and at most 250 list
+   locks between them, lowest record keys first. A batch that leaves
+   candidates says so, and its caller applies the same reconciles
+   again until none is left.
 3. **List locks**, ascending by key: exclusive for listblock and list
    writes, shared for listitem writes.
 4. **Intern locks** for every DID the batch may create an `actors` row
@@ -857,9 +905,43 @@ list, `"i:" + did` for an intern. The hash is stable across processes
 and builds, which the protocol requires, since both binaries must
 derive the same key.
 
+Each class of locks is taken with one statement, in ascending key
+order.
+
+**Lock bounds.** Postgres keeps every lock of every session in one
+shared table of `max_locks_per_transaction × max_connections` entries
+(6,400 with the defaults of 64 and 100), and a transaction that finds
+it full fails with "out of shared memory". No transaction of Farsight
+takes a number of advisory locks that grows with the data:
+
+| Transaction | Locks it takes at most |
+|---|---|
+| A firehose batch (500 events) | one author lock per event, two list locks per listblock or listitem event, one intern lock per DID it names |
+| A listing page (100 records) | 1 author lock, 2 list locks per record, and 250 list locks for its reconciles |
+| One batch of an account purge or a divergence purge | 1 author lock and 500 list locks; a batch ends where its rows would need more |
+| The re-evaluation of uncounted listblocks | 1 author lock and 500 list locks per transaction |
+| The claim of a list fetch run | 500 list locks |
+| A reactivation (**OA** on the account's `unavailable` lists) | 500 list locks; lists beyond them keep their own retry |
+| One batch of the nightly recount of per-account counters | 500 author locks |
+
+Work that needs more is split over several transactions. Keep
+`max_locks_per_transaction` at 64 or above; the defaults leave room
+for every backfill worker and the firehose writer at once.
+
 A transaction aborted by a deadlock (`40P01`) is retried, up to 8
 attempts, with an exponential backoff from 10 ms capped at 1 s plus
-jitter. A deadlock retry never counts toward poisoned-event handling.
+jitter. This holds for `apply` and for the transactions around it
+that take the same locks: the purges, a list transition fired by a
+job or a task, the promotion at the end of a fetch run. A deadlock
+retry never counts toward poisoned-event handling.
+
+In deletes-only mode (the storage gate) a listing page's upserts are
+skipped with a `refused` debt. One case still writes: a skipped
+version that would have pointed a stored row at another target (a
+block's subject, a listblock's list, a listitem's list or subject)
+removes that row, with a refusal tombstone, like any refused update.
+The row would otherwise go on reporting a target its record no longer
+names.
 
 A listing batch whose stamp `R` was read 72 hours ago or more is
 rejected (`StaleStamp`); the job reads a fresh stamp and starts again.
@@ -1022,12 +1104,23 @@ When an applied event
 - makes an account active that was hidden, or that was inactive when
   last listed, the account gets a `resync` debt, and each of its lists
   in state `unavailable` is told that its owner is active again;
-- sets `deleted`, the account is purged after the batch commits.
+- sets `deleted`, a purge of the account is asked for in the same
+  transaction (a row in `account_purges`).
 
 ### The purge of a deleted account
 
-The purge runs in batches of 10,000 rows, each batch under the
-account's author lock and the list locks it touches. The rows of a
+No writer purges. The transaction that records an account as
+`deleted`, in either process, adds the account to `account_purges`,
+and the server's `account_purges` task, which looks every 10 seconds,
+does the work. The firehose writer and the backfill jobs go on at
+once, however much the account stored. The task purges up to 20
+accounts a pass, each for up to 25 batches, so one large account does
+not hold up the others; an account with more to remove goes on in the
+next pass.
+
+A batch is at most 10,000 rows per table and at most 500 list locks,
+under the account's author lock and the list locks it touches. It
+marks at most 125 of the account's own lists deleted. The rows of a
 batch are deleted with one statement per table, which also adjusts the
 counters they were counted in:
 
@@ -1050,16 +1143,25 @@ counters they were counted in:
   account as a subject, or as the owner of a listblocked list, stay.
 - no tombstones are needed and the `actors` row is never deleted.
 
+A batch reads the account's status under its author lock and removes
+nothing unless it is `deleted`: a purge asked for an account that has
+since been reactivated ends there, and the reactivation's `resync`
+debt has the repository listed again.
+
+An account's row in `account_purges` is deleted when a batch finds
+nothing left. The request survives a restart, so an interrupted purge
+goes on where it was. A purge that fails is recorded among the
+operational errors with the account's DID and tried again an hour
+later; the other accounts do not wait for it.
+
 An account counts as pending purge while it has status `deleted` and
 still authors any live row, any list not yet marked deleted, or any
-history row. The server looks for such accounts at start and once a
-day (the `account_purges` task) and finishes their purge, so an
-interrupted purge is completed, and a history row written later by a
-replayed event is removed within a day or when it ages out. A purge
-that fails is recorded among the operational errors with the
-account's DID, and neither the start nor the other accounts wait for
-it. Until then it is never shown, because `deleted` is a
-hidden status.
+history row. Shortly after start and once a day the server looks for
+such accounts that have no request (the `account_purge_scan` task)
+and asks for their purge, so a history row written later by a replayed
+event is removed within a day or when it ages out. Until an account
+is purged its rows are never shown, because `deleted` is a hidden
+status.
 
 ## Counters
 
@@ -1071,8 +1173,14 @@ updated inside the apply transaction: `actors.authored_blocks`,
 `fetch_triggers` under the author lock; `lists.listblock_count` and
 `lists.item_count` under the list lock. The caps that must be exact
 read these. So are the three daily rate tables (`admission_rate`,
-`intern_rate`, `history_rate`): they are keyed per bucket or DID, so
-contention is negligible.
+`intern_rate`, `history_rate`): they are keyed per bucket or DID, and
+a row is locked from the batch's first charge to it until the batch
+commits. A charge is conditional (it decides whether the write is
+refused), so it is made where the write is applied, in batch order,
+not in key order at commit. Two batches that charge the same two keys
+in opposite orders can therefore deadlock; one of them is aborted and
+[retried](#the-write-path). The keys are per bucket or DID, so this
+needs two batches working on the same two hosts at the same moment.
 
 **Approximate counts** are `stats_counters` (the totals `blocks`,
 `list_blocks`, `lists` with a present record, `list_items`, `actors`)
@@ -1090,23 +1198,48 @@ The consequences:
   which is acceptable for a bound on abuse;
 - a crash loses at most 5 seconds of deltas.
 
+**Usage follows the account's host.** A row is counted in the buckets
+its author has when it is stored, and taken out of the buckets the
+author has when it is deleted. An author's buckets change when its
+host becomes known (from `unresolved` to the host's domain and address
+block), when it moves, and at its third failed resolution (from
+`unresolved` to a bucket of its own). The resolver makes each of these
+changes under the author lock and, in the same step, moves the
+account's usage: its exact per-author counts are taken out of the old
+buckets and added to the new. Without that the rows of every new
+author would stay in `unresolved`, which only the nightly rebuild
+would empty. The lifetime intern charge is not moved. A change to a
+host's own facts (its address block, or whether it is a large host)
+moves nothing; the nightly rebuild accounts for it.
+
 ### The nightly rebuild
 
 A nightly task makes both tables exact again.
 
-- `stats_counters`: the five tables are counted first, outside any
-  transaction that writes the result (counting about 150 million rows
-  takes on the order of a minute). Then, in one short transaction under
-  `LOCK TABLE stats_counters IN SHARE ROW EXCLUSIVE MODE`, the rows of
-  each name are deleted and one row with the total is inserted at shard
-  0.
-- `host_usage`: `actors` is read in batches of 100,000 by id, and each
-  account's exact counts are added to the account's current buckets.
-  Then, under `LOCK TABLE host_usage IN SHARE ROW EXCLUSIVE MODE`, the
-  four columns `stored_blocks`, `stored_items`, `stored_listblocks` and
-  `stored_lists` are set to zero and the computed values written.
-  `stored_interned` is a lifetime charge with no per-row record and is
-  left as it is.
+Counting takes minutes (about 150 million rows), and the writers go
+on flushing deltas meanwhile. So the rebuild works from one snapshot
+and keeps what is flushed after it:
+
+1. In one read-only `REPEATABLE READ` transaction, which takes no lock
+   a writer waits for, it reads the stored values of both tables,
+   counts the five record tables, and reads `actors` in batches of
+   100,000 by id, adding each account's exact counts to the account's
+   current buckets.
+2. `stats_counters`: in one short transaction under `LOCK TABLE
+   stats_counters IN SHARE ROW EXCLUSIVE MODE`, the stored value of
+   each name is read again, the rows of the name are deleted, and one
+   row is inserted at shard 0 with the count plus what was flushed
+   since the snapshot (the value now minus the value then).
+3. `host_usage`: under `LOCK TABLE host_usage IN SHARE ROW EXCLUSIVE
+   MODE`, each of the four columns `stored_blocks`, `stored_items`,
+   `stored_listblocks` and `stored_lists` of each bucket is set to its
+   computed value plus what was flushed since the snapshot.
+   `stored_interned` is a lifetime charge with no per-row record and
+   is left as it is.
+
+A delta for a row that the snapshot already counted, flushed after
+the snapshot, is counted twice: at most one flush interval (5 seconds)
+of changes, until the next rebuild.
 
 The table lock is required. The writers' flushes update these rows one
 at a time, in their own order; replacing all the rows at once under row

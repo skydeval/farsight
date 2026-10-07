@@ -25,6 +25,14 @@ pub struct Repo {
     pub repo_error: Option<String>,
     /// `listRecords` of this collection answers 500.
     pub fail_collection: Option<String>,
+    /// Every PDS call for this repo is answered this many milliseconds
+    /// late.
+    pub delay_ms: u64,
+    /// `listRecords` answers every page with a cursor, going round
+    /// `a → b → a`: a listing that never ends.
+    pub cursor_loop: bool,
+    /// `listRecords` lists the record keys in descending order.
+    pub descending: bool,
 }
 
 /// The scripted world.
@@ -75,7 +83,6 @@ fn no_repo(did: &str) -> Response {
 type Q = Query<HashMap<String, String>>;
 
 async fn xrpc(State(s): State<Shared>, Path(method): Path<String>, Query(q): Q) -> Response {
-    let mut world = w(&s);
     let did = q
         .get("repo")
         .or_else(|| q.get("did"))
@@ -83,7 +90,17 @@ async fn xrpc(State(s): State<Shared>, Path(method): Path<String>, Query(q): Q) 
         .unwrap_or_default();
     let coll = q.get("collection").cloned().unwrap_or_default();
     let short = method.rsplit('.').next().unwrap_or("").to_owned();
-    world.hits.push((short.clone(), did.clone(), coll.clone()));
+    // The request is logged when it arrives. A slow host answers late;
+    // the world is not held meanwhile.
+    let delay = {
+        let mut world = w(&s);
+        world.hits.push((short.clone(), did.clone(), coll.clone()));
+        world.repos.get(&did).map_or(0, |r| r.delay_ms)
+    };
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+    let world = w(&s);
     match short.as_str() {
         "getRepoStatus" => {
             if world.status_down.contains(&did) {
@@ -174,12 +191,19 @@ async fn xrpc(State(s): State<Shared>, Path(method): Path<String>, Query(q): Q) 
                     }
                     let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
                     let cursor = q.get("cursor").cloned().unwrap_or_default();
-                    let recs: Vec<(&String, &Value)> = repo
+                    if repo.cursor_loop {
+                        let next = if cursor == "a" { "b" } else { "a" };
+                        return Json(json!({"records": [], "cursor": next})).into_response();
+                    }
+                    let mut recs: Vec<(&String, &Value)> = repo
                         .records
                         .iter()
-                        .filter(|((c, r), _)| *c == coll && *r > cursor)
+                        .filter(|((c, r), _)| *c == coll && (repo.descending || *r > cursor))
                         .map(|((_, r), v)| (r, v))
                         .collect();
+                    if repo.descending {
+                        recs.reverse();
+                    }
                     let page: Vec<Value> = recs
                         .iter()
                         .take(limit)

@@ -52,10 +52,20 @@ The `farsight-backfill` container starts with the others. It idles
 until the wizard has written the config and the server has migrated the
 database, then works through on-demand requests, recently active
 accounts, list fetches and (if enabled in the wizard) the systematic
-sweep. It talks to PDS hosts at a polite per-host rate, to the PLC
-directory and to the relay set in `backfill.relay_url`; progress, ETA
-and queue depths are on the dashboard and on its metrics port (9465,
-not published).
+sweep. It talks to PDS hosts at a polite rate per host and per domain,
+to the PLC directory and to the relay set in `backfill.relay_url`;
+progress, ETA and queue depths are on the dashboard and on its metrics
+port (9465, not published).
+
+Both containers can be stopped and updated at any time. They take up
+to 30 seconds to stop, and the compose file gives them 45
+(`stop_grace_period`). Work that was under way goes back to the queue
+and is taken up after the start, also when a container was killed.
+
+Outside the compose file, the metrics listeners are on loopback
+(`127.0.0.1:9464` and `127.0.0.1:9465`). To scrape them from another
+host, set `metrics.bind` and `metrics.backfill_bind`, and set
+`metrics.bearer_token_sha256` with them.
 
 ## Unattended deployment
 

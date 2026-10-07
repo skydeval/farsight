@@ -269,6 +269,23 @@ async fn start_cycle(
     repair_from: Option<DateTime<Utc>>,
 ) -> Res<CycleId> {
     let mut tx = ctx.pool.begin().await?;
+    if kind == CycleKind::Repair {
+        // `admin.startRepair` starts repairs too. Both take this lock and
+        // look for an open repair under it, so one of them starts it and
+        // the other finds it.
+        sqlx::query(farsight_storage::firehose::START_REPAIR_LOCK)
+            .execute(&mut *tx)
+            .await?;
+        let open: Option<CycleId> = sqlx::query_scalar(&format!(
+            "SELECT id FROM sweep_cycles WHERE kind = {CYCLE_REPAIR} AND completed_at IS NULL
+             ORDER BY id LIMIT 1"
+        ))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(id) = open {
+            return Ok(id);
+        }
+    }
     let collections: Vec<i16> = Collection::ALL.iter().map(|c| c.code()).collect();
     let id: CycleId = sqlx::query_scalar(
         "INSERT INTO sweep_cycles (kind, source, collections, started_at, effective_start, repair_from)
@@ -560,6 +577,19 @@ async fn repair_candidates(ctx: &Ctx, c: &Cycle, repos: Vec<xrpc::ListedRepo>) -
     Ok(out)
 }
 
+/// The members whose DID is one, and how many were not. An entry that is
+/// not a DID names no repository: as a member it could never be listed,
+/// and its cycle would never complete.
+pub fn valid_members(members: Vec<Member>) -> (Vec<Member>, usize) {
+    let listed = members.len();
+    let valid: Vec<Member> = members
+        .into_iter()
+        .filter(|m| farsight_core::Did::parse(&m.did).is_ok())
+        .collect();
+    let invalid = listed - valid.len();
+    (valid, invalid)
+}
+
 /// Enumerates one page into `cycle_outstanding` and advances the
 /// checkpoint in the same transaction.
 async fn enumerate_page(ctx: &Ctx, sweep: &Sweep, c: &Cycle, room: u32) -> Res<()> {
@@ -590,6 +620,14 @@ async fn enumerate_page(ctx: &Ctx, sweep: &Sweep, c: &Cycle, room: u32) -> Res<(
             return Ok(());
         }
     };
+    let (members, invalid) = valid_members(members);
+    if invalid > 0 {
+        tracing::warn!(
+            cycle = c.id.get(),
+            invalid,
+            "the source listed entries that are not DIDs; they are left out"
+        );
+    }
     for m in members.iter().filter(|m| m.reactivated) {
         reactivation(ctx, &m.did).await?;
     }
@@ -777,5 +815,35 @@ async fn publish_progress(ctx: &Ctx) {
                 metrics::gauge!(m::SWEEP_ETA).set(outstanding as f64 / rate as f64 * 3600.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entries_that_are_not_dids_are_left_out_of_a_cycle() {
+        let member = |did: &str| Member {
+            did: did.to_owned(),
+            reactivated: false,
+        };
+        let listed = vec![
+            member("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
+            member(""),
+            member("not a did"),
+            member("did:plc:"),
+            member("did:web:example.com"),
+            member("DID:PLC:aaaaaaaaaaaaaaaaaaaaaaaa"),
+            member("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa\u{0}"),
+        ];
+        let (valid, invalid) = valid_members(listed);
+        let dids: Vec<&str> = valid.iter().map(|m| m.did.as_str()).collect();
+        assert_eq!(
+            dids,
+            ["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "did:web:example.com"]
+        );
+        assert_eq!(invalid, 5);
+        assert_eq!(valid_members(Vec::new()), (Vec::new(), 0));
     }
 }

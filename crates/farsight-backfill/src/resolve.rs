@@ -5,6 +5,8 @@
 //! Results are cached on `actors.pds_host_id` (TTL 7 days; `identity`
 //! events invalidate) for interned DIDs and in memory for the rest (sweep
 //! members hold no row); nonexistent DIDs are negatively cached for 24 h.
+//! Both in-memory caches are bounded: at their cap the entries past their
+//! TTL go, and all of them if none is.
 //! Resolving records the host in `pds_hosts` with its cap buckets
 //! (registrable domain, /24 or /48 address block unless a shared CDN
 //! range) and the author's admission key.
@@ -15,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use farsight_core::{Did, DidMethod};
+use farsight_storage::counters::{self, CounterSink, HostChange};
 use ipnet::IpNet;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -29,6 +32,20 @@ pub const NEGATIVE_TTL: Duration = Duration::from_secs(24 * 3600);
 /// In-memory TTL for DIDs without an `actors` row.
 pub const MEMORY_TTL: Duration = Duration::from_secs(3600);
 const MEMORY_CAP: usize = 200_000;
+/// Nonexistent DIDs remembered at most.
+pub const NEGATIVE_CAP: usize = 200_000;
+
+/// Makes room in a cache that has reached `cap`: the entries for which
+/// `expired` says so go, and every entry if that leaves it full.
+fn make_room<V>(cache: &mut HashMap<String, V>, cap: usize, expired: impl Fn(&V) -> bool) {
+    if cache.len() < cap {
+        return;
+    }
+    cache.retain(|_, v| !expired(v));
+    if cache.len() >= cap {
+        cache.clear();
+    }
+}
 
 /// A resolved PDS: where a DID's repo is read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +81,7 @@ pub struct Resolver {
     large_hosts: Vec<String>,
     cdn_ranges: Vec<IpNet>,
     dns: Option<farsight_core::net::SafeClient>,
+    counters: Arc<CounterSink>,
     memory: Mutex<HashMap<String, (Pds, Instant)>>,
     negative: Mutex<HashMap<String, Instant>>,
 }
@@ -102,12 +120,14 @@ impl Resolver {
     /// directory's URL, the hosts allowed over plain HTTP, the large
     /// hosts and the extra CDN ranges, and keeps them for its lifetime: a
     /// change to any of them restarts the run. `dns` looks up a host's
-    /// address for its cap bucket.
+    /// address for its cap bucket. `counters` takes the usage that moves
+    /// between cap buckets when an account's host becomes known.
     pub fn new(
         net: Arc<Net>,
         pool: PgPool,
         config: &farsight_core::Config,
         dns: Option<farsight_core::net::SafeClient>,
+        counters: Arc<CounterSink>,
     ) -> Resolver {
         let mut cdn = farsight_core::cloudflare::bundled();
         cdn.extend(config.limits.cdn_ranges_extra.iter().copied());
@@ -124,6 +144,7 @@ impl Resolver {
             large_hosts: config.limits.large_hosts.clone(),
             cdn_ranges: cdn,
             dns,
+            counters,
             memory: Mutex::new(HashMap::new()),
             negative: Mutex::new(HashMap::new()),
         }
@@ -179,12 +200,14 @@ impl Resolver {
     }
 
     /// Seeds the in-memory cache (PLC export with `plc_seed_from_export`).
+    /// The endpoint is the one the operation set, which a later operation
+    /// of the export may have replaced: like every cached resolution it
+    /// is confirmed with the directory before a repo is purged on its
+    /// word (see `jobs::repo`).
     pub fn seed(&self, did: &str, endpoint: &str) {
         if let Ok(u) = Url::parse(endpoint) {
             let mut m = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-            if m.len() >= MEMORY_CAP {
-                m.clear();
-            }
+            make_room(&mut m, MEMORY_CAP, |(_, at)| at.elapsed() >= MEMORY_TTL);
             m.insert(
                 did.to_owned(),
                 (
@@ -200,9 +223,20 @@ impl Resolver {
 
     /// Resolves `did`; `bypass` skips every cache (repo-level errors).
     pub async fn resolve(&self, did: &Did, bypass: bool) -> Result<Pds, ResolveError> {
+        self.resolve_noting(did, bypass).await.map(|(pds, _)| pds)
+    }
+
+    /// [`Resolver::resolve`], also saying whether the answer came out of
+    /// a cache (`true`) or was read from the directory or the `did:web`
+    /// host just now.
+    pub async fn resolve_noting(
+        &self,
+        did: &Did,
+        bypass: bool,
+    ) -> Result<(Pds, bool), ResolveError> {
         if !bypass {
             if let Some(p) = self.cached(did).await {
-                return Ok(p);
+                return Ok((p, true));
             }
             let neg = self.negative.lock().unwrap_or_else(|e| e.into_inner());
             if neg
@@ -220,22 +254,24 @@ impl Resolver {
                 }
             }
             Err(ResolveError::NotFound) => {
-                self.negative
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(did.as_str().to_owned(), Instant::now());
+                let mut neg = self.negative.lock().unwrap_or_else(|e| e.into_inner());
+                make_room(&mut neg, NEGATIVE_CAP, |at| at.elapsed() >= NEGATIVE_TTL);
+                neg.insert(did.as_str().to_owned(), Instant::now());
             }
             Err(ResolveError::Transient(_)) => {
-                let _ = sqlx::query(
-                    "UPDATE actors SET resolve_failures = resolve_failures + 1 WHERE did = $1",
+                // The third failure moves an unresolved did:plc author to
+                // a bucket of its own: its usage moves with it.
+                let _ = counters::record_host_change(
+                    &self.pool,
+                    &self.counters,
+                    did,
+                    &HostChange::Failed,
                 )
-                .bind(did.as_str())
-                .execute(&self.pool)
                 .await;
             }
             Err(ResolveError::Tombstoned) => {}
         }
-        r
+        r.map(|pds| (pds, false))
     }
 
     async fn resolve_uncached(&self, did: &Did) -> Result<Pds, ResolveError> {
@@ -296,16 +332,14 @@ impl Resolver {
         Some(ip_block(ip))
     }
 
-    async fn record(&self, did: &Did, pds: &Pds) -> Result<(), sqlx::Error> {
+    async fn record(&self, did: &Did, pds: &Pds) -> Result<(), farsight_storage::StorageError> {
         // In memory for DIDs without a row.
         {
             let mut m = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-            if m.len() >= MEMORY_CAP {
-                m.clear();
-            }
+            make_room(&mut m, MEMORY_CAP, |(_, at)| at.elapsed() >= MEMORY_TTL);
             m.insert(did.as_str().to_owned(), (pds.clone(), Instant::now()));
         }
-        let bare = pds.host.split(':').next().unwrap_or(&pds.host);
+        let bare = crate::net::bare_host(&pds.host);
         let cap_key = farsight_core::registrable_domain(bare);
         let large = self.is_large(&pds.host);
         let ip_bucket = if large {
@@ -330,17 +364,18 @@ impl Resolver {
         } else {
             format!("bucket:{cap_key}")
         };
-        sqlx::query(
-            "UPDATE actors SET pds_host_id = $2, pds_resolved_at = now(), resolve_failures = 0,
-               admission_key = $3
-             WHERE did = $1",
+        // The account's stored rows are counted under its buckets, and
+        // those follow its host: the usage moves with the change.
+        counters::record_host_change(
+            &self.pool,
+            &self.counters,
+            did,
+            &HostChange::Resolved {
+                host: host_id,
+                admission_key: key,
+            },
         )
-        .bind(did.as_str())
-        .bind(host_id)
-        .bind(key)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await
     }
 }
 
@@ -348,6 +383,32 @@ impl Resolver {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_full_cache_drops_what_expired_and_everything_if_nothing_did() {
+        let entries = |n: usize| -> HashMap<String, u32> {
+            (0..n).map(|i| (format!("did:plc:{i}"), i as u32)).collect()
+        };
+        // Below the cap: untouched.
+        let mut c = entries(9);
+        make_room(&mut c, 10, |_| true);
+        assert_eq!(c.len(), 9);
+        // At the cap: the expired half goes.
+        let mut c = entries(10);
+        make_room(&mut c, 10, |v| v % 2 == 0);
+        assert_eq!(c.len(), 5);
+        assert!(c.values().all(|v| v % 2 == 1));
+        // At the cap with nothing expired: emptied, so it never grows
+        // past the cap.
+        let mut c = entries(10);
+        make_room(&mut c, 10, |_| false);
+        assert!(c.is_empty());
+        for i in 0..1_000 {
+            make_room(&mut c, 10, |_| false);
+            c.insert(format!("did:plc:n{i}"), 0);
+            assert!(c.len() <= 10);
+        }
+    }
 
     #[test]
     fn endpoint_from_doc() {

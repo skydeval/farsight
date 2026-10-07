@@ -91,7 +91,8 @@ pub async fn load(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
                 h.host
          FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
          LEFT JOIN pds_hosts h ON h.id = a.pds_host_id
-         WHERE q.kind = {JOB_LIST_FETCH} AND (q.not_before IS NULL OR q.not_before <= now())
+         WHERE q.kind = {JOB_LIST_FETCH} AND q.claimed_by IS NULL
+           AND (q.not_before IS NULL OR q.not_before <= now())
          ORDER BY q.enqueued_at, q.id LIMIT $1"
     ))
     .bind(LOAD_LIMIT)

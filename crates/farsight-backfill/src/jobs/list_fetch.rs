@@ -2,6 +2,12 @@
 //! `docs/design/backfill.md`): claim the owner's claimable lists, list the
 //! owner's `listitem` collection through the run's own cursor, then
 //! promote every list still claimed for its epoch.
+//!
+//! A run row is open from its start to its end, and lists are claimed by
+//! it in between. Whatever ends the job, the run is closed and its claim
+//! released: by the job itself on every path, an error included, and for
+//! a job that was killed by the feeder, which queues the owner again so
+//! that the run is taken up ([`crate::feeder`]).
 
 use farsight_storage::codes::sql::{JOB_LIST_FETCH, TRACK_SERVED, TRACK_UNFETCHED};
 use std::time::Duration;
@@ -12,10 +18,11 @@ use farsight_storage::codes::{FetchOutcome, JobKind, Priority, RequesterKey, Tie
 use farsight_storage::ids::{ActorId, ListId, RunId, Stamp};
 use farsight_storage::tracking::FireArgs;
 use farsight_storage::transition::Event;
+use farsight_storage::txn::MAX_LOCKS;
 
 use crate::ctx::Ctx;
 use crate::jobs::list_phase1::WEEKLY;
-use crate::jobs::repo::{self, CursorRun, ListingStamp, Stop};
+use crate::jobs::repo::{self, CursorRun, ListingStamp, PageBudget, Stop};
 use crate::jobs::{self, JobError, JobReq, JobResult, Outcome};
 use crate::resolve::ResolveError;
 use crate::xrpc;
@@ -26,7 +33,7 @@ pub const RUN_RETRY: Duration = Duration::from_secs(300);
 async fn requeue(ctx: &Ctx, owner_id: ActorId, delay: Duration) {
     let cap = ctx.limits().system_queue_cap;
     if let Ok(mut conn) = ctx.pool.acquire().await {
-        let r = farsight_storage::queue::enqueue(
+        let _ = farsight_storage::queue::enqueue(
             &mut conn,
             owner_id,
             JobKind::ListFetch,
@@ -34,18 +41,9 @@ async fn requeue(ctx: &Ctx, owner_id: ActorId, delay: Duration) {
             Priority::Normal,
             RequesterKey::Lists,
             Some(cap),
+            (!delay.is_zero()).then_some(delay),
         )
         .await;
-        if r.is_ok() && !delay.is_zero() {
-            let _ = sqlx::query(&format!(
-                "UPDATE backfill_queue SET not_before = now() + make_interval(secs => $2)
-                 WHERE actor_id = $1 AND kind = {JOB_LIST_FETCH}"
-            ))
-            .bind(owner_id)
-            .bind(delay.as_secs_f64())
-            .execute(&mut *conn)
-            .await;
-        }
     }
 }
 
@@ -95,40 +93,42 @@ async fn claimed(ctx: &Ctx, run_id: RunId) -> Result<Vec<(ListId, TrackState)>, 
         .await
 }
 
-/// The claim: under the list locks of O's lists, every list that passed
-/// phase 1 in its epoch (pending/unavailable) or asked for a refresh
-/// (ready/retained).
+/// The claim: under the list locks of the lists it takes, every list of
+/// O that passed phase 1 in its epoch (pending/unavailable) or asked for
+/// a refresh (ready/retained), up to [`MAX_LOCKS`] of them, lowest id
+/// first. What is left over is claimed by the owner's next run.
 async fn claim(
     ctx: &Ctx,
     owner_id: ActorId,
     owner: &Did,
     run_id: RunId,
-) -> Result<Vec<ListId>, sqlx::Error> {
+) -> Result<Vec<ListId>, farsight_storage::StorageError> {
+    let claimable = format!(
+        "((track_state IN {TRACK_UNFETCHED} AND phase1_epoch = admit_epoch)
+          OR (track_state IN {TRACK_SERVED} AND refresh_requested))"
+    );
     let mut tx = ctx.pool.begin().await?;
-    let keys: Vec<String> = sqlx::query_scalar("SELECT rkey FROM lists WHERE owner_id = $1")
-        .bind(owner_id)
-        .fetch_all(&mut *tx)
-        .await?;
-    let mut lock_keys: Vec<i64> = keys
-        .iter()
-        .map(|rk| farsight_storage::keys::list_lock_key(owner.as_str(), rk))
-        .collect();
-    lock_keys.sort_unstable();
-    lock_keys.dedup();
-    for k in lock_keys {
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(k)
-            .execute(&mut *tx)
-            .await?;
-    }
-    let ids: Vec<ListId> = sqlx::query_scalar(&format!(
-        "UPDATE lists SET fetch_run_id = $2, fetch_run_epoch = admit_epoch
-         WHERE owner_id = $1
-           AND ((track_state IN {TRACK_UNFETCHED} AND phase1_epoch = admit_epoch)
-                OR (track_state IN {TRACK_SERVED} AND refresh_requested))
-         RETURNING id"
+    let wanted: Vec<(ListId, String)> = sqlx::query_as(&format!(
+        "SELECT id, rkey FROM lists WHERE owner_id = $1 AND {claimable} ORDER BY id LIMIT $2"
     ))
     .bind(owner_id)
+    .bind(MAX_LOCKS as i64)
+    .fetch_all(&mut *tx)
+    .await?;
+    let lock_keys: std::collections::BTreeSet<i64> = wanted
+        .iter()
+        .map(|(_, rk)| farsight_storage::keys::list_lock_key(owner.as_str(), rk))
+        .collect();
+    farsight_storage::txn::lock_ascending(&mut tx, &lock_keys).await?;
+    // Checked again under the locks: a list may have left the claimable
+    // states since it was read.
+    let ids: Vec<ListId> = wanted.iter().map(|(id, _)| *id).collect();
+    let ids: Vec<ListId> = sqlx::query_scalar(&format!(
+        "UPDATE lists SET fetch_run_id = $2, fetch_run_epoch = admit_epoch
+         WHERE id = ANY($1) AND {claimable}
+         RETURNING id"
+    ))
+    .bind(&ids)
     .bind(run_id)
     .fetch_all(&mut *tx)
     .await?;
@@ -169,13 +169,99 @@ async fn run_inner(
             }
         }
     }
-    if !jobs::acquire_lease(pool, owner.as_str(), &ctx.lease_owner).await? {
+    let lease = ctx.lease_owner();
+    if !jobs::acquire_lease(pool, owner.as_str(), &lease).await? {
         requeue(ctx, owner_id, Duration::from_secs(60)).await;
         return Ok(Outcome::Busy);
     }
-    let r = fetch(ctx, owner_id, owner, resume, cost).await;
-    jobs::release_lease(pool, owner.as_str(), &ctx.lease_owner).await;
+    let mut run_id = resume.map(|(id, _)| id);
+    let r = match fetch(ctx, owner_id, owner, resume, &mut run_id, cost).await {
+        Ok(o) => Ok(o),
+        Err(e) => {
+            // Whatever stopped the job, its run does not stay open with
+            // lists claimed: nothing else would take them up.
+            if let Some(id) = run_id
+                && let Err(x) = abort_run(ctx, id).await
+            {
+                tracing::warn!(owner = %owner, error = %x, "closing a failed list fetch run failed");
+            }
+            requeue(ctx, owner_id, RUN_RETRY).await;
+            Err(e)
+        }
+    };
+    jobs::release_lease(pool, owner.as_str(), &lease).await;
     r
+}
+
+/// Closes a run that an error ended: its claim is released and the run
+/// finished as failed. No attempt is counted on its lists: the failure
+/// was not the fetch's.
+async fn abort_run(ctx: &Ctx, run_id: RunId) -> Result<(), sqlx::Error> {
+    release_claim(ctx, run_id).await?;
+    finish_run(ctx, run_id, FetchOutcome::Failed).await
+}
+
+/// A real failure of the fetch: counts an attempt on every claimed list
+/// (claimed pending lists out of attempts fire FT → unavailable),
+/// releases the claim, finishes the run as failed and queues the owner
+/// again: in [`RUN_RETRY`], or in a week once every claimed list is out
+/// of attempts (unavailable lists retry weekly, indefinitely, and stay
+/// claimable).
+async fn fail_run(ctx: &Ctx, owner_id: ActorId, run_id: RunId) -> Result<(), JobError> {
+    let pool = &ctx.pool;
+    let max_attempts = i32::try_from(ctx.cfg().backfill.list_fetch_max_attempts).unwrap_or(2);
+    let limits = ctx.limits();
+    let rows: Vec<(ListId, TrackState, i32)> = sqlx::query_as(
+        "UPDATE lists SET fetch_attempts = fetch_attempts + 1 WHERE fetch_run_id = $1
+         RETURNING id, track_state, fetch_attempts",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    let mut all_exhausted = true;
+    for (id, state, attempts) in &rows {
+        if *attempts >= max_attempts {
+            if *state == TrackState::Pending {
+                farsight_storage::janitor::fire_event(
+                    pool,
+                    &limits,
+                    &ctx.counters,
+                    *id,
+                    Event::FailTerminal,
+                    FireArgs::default(),
+                )
+                .await?;
+            }
+        } else {
+            all_exhausted = false;
+        }
+    }
+    release_claim(ctx, run_id).await?;
+    finish_run(ctx, run_id, FetchOutcome::Failed).await?;
+    requeue(
+        ctx,
+        owner_id,
+        if all_exhausted { WEEKLY } else { RUN_RETRY },
+    )
+    .await;
+    Ok(())
+}
+
+/// The owner's job ended without returning (it panicked): its open run,
+/// if it left one, is failed like a fetch that failed, so the lists it
+/// claimed are not left claimed and the owner is tried again within the
+/// attempts its lists have.
+pub async fn abandon(ctx: &Ctx, owner_id: ActorId) -> Result<(), JobError> {
+    let open: Vec<RunId> = sqlx::query_scalar(
+        "SELECT id FROM list_fetch_runs WHERE owner_id = $1 AND finished_at IS NULL ORDER BY id",
+    )
+    .bind(owner_id)
+    .fetch_all(&ctx.pool)
+    .await?;
+    for run_id in open {
+        fail_run(ctx, owner_id, run_id).await?;
+    }
+    Ok(())
 }
 
 async fn fetch(
@@ -183,6 +269,7 @@ async fn fetch(
     owner_id: ActorId,
     owner: &Did,
     resume: Option<(RunId, Option<DateTime<Utc>>)>,
+    open: &mut Option<RunId>,
     cost: &mut u64,
 ) -> Result<Outcome, JobError> {
     let cfg = ctx.cfg();
@@ -194,12 +281,13 @@ async fn fetch(
             repo::apply_status(ctx, owner, false, Some("deleted".into()))
                 .await
                 .map_err(JobError::Status)?;
+            if let Some((run_id, _)) = resume {
+                release_claim(ctx, run_id).await?;
+                finish_run(ctx, run_id, FetchOutcome::OwnerInactive).await?;
+            }
             return Ok(Outcome::Inactive);
         }
-        Err(x) => {
-            requeue(ctx, owner_id, RUN_RETRY).await;
-            return Err(x.into());
-        }
+        Err(x) => return Err(x.into()),
     };
     *cost += 1;
     let (run_id, point, stamp) = match resume {
@@ -242,14 +330,8 @@ async fn fetch(
             .bind(point)
             .fetch_one(pool)
             .await?;
-            let rev = match xrpc::latest_rev(&ctx.net, &pds.endpoint, owner).await {
-                Ok(r) => r,
-                Err(x) => {
-                    finish_run(ctx, run_id, FetchOutcome::Failed).await?;
-                    requeue(ctx, owner_id, RUN_RETRY).await;
-                    return Err(x.into());
-                }
-            };
+            *open = Some(run_id);
+            let rev = xrpc::latest_rev(&ctx.net, &pds.endpoint, owner).await?;
             *cost += 1;
             let read_at = jobs::db_now(pool).await?;
             let ids = claim(ctx, owner_id, owner, run_id).await?;
@@ -277,6 +359,7 @@ async fn fetch(
     };
     let policy = repo::GatePolicy::new(&req, repo::host_is_large(ctx, &pds));
     let max = cfg.backfill.list_fetch_max_duration.get();
+    let mut budget = PageBudget::new();
     let listing = tokio::time::timeout(
         max.saturating_sub(started.elapsed()),
         repo::list_collection(
@@ -287,6 +370,7 @@ async fn fetch(
             stamp,
             CursorRun::ListFetch(run_id),
             policy,
+            &mut budget,
         ),
     )
     .await;
@@ -323,10 +407,9 @@ async fn fetch(
                 Outcome::Clean
             });
         }
-        Ok(Err(Stop::Yield)) => {
-            requeue(ctx, owner_id, Duration::ZERO).await;
-            return Ok(Outcome::Yielded);
-        }
+        // More pages than one run lists: a failure like the time bound,
+        // so an owner whose listing never ends runs out of attempts.
+        Ok(Err(Stop::Yield)) => format!("the listing did not end within {} pages", repo::MAX_PAGES),
         Ok(Err(Stop::RepoLevel(x))) => {
             // Owner inactive (relay-confirmed) ⇒ OI on claimed pending lists.
             let relay = cfg.backfill.relay_url.clone();
@@ -358,46 +441,10 @@ async fn fetch(
             x.to_string()
         }
         Ok(Err(Stop::Failed(x))) => x,
+        Ok(Err(Stop::Unconfirmed)) => "the owner's host could not be confirmed".into(),
         Err(_) => "list fetch run exceeded backfill.list_fetch_max_duration".into(),
     };
-    // A real failure: count an attempt on every claimed list; claimed
-    // pending lists out of attempts fire FT (→ unavailable).
-    let max_attempts = i32::try_from(cfg.backfill.list_fetch_max_attempts).unwrap_or(2);
-    let limits = ctx.limits();
-    let rows: Vec<(ListId, TrackState, i32)> = sqlx::query_as(
-        "UPDATE lists SET fetch_attempts = fetch_attempts + 1 WHERE fetch_run_id = $1
-         RETURNING id, track_state, fetch_attempts",
-    )
-    .bind(run_id)
-    .fetch_all(pool)
-    .await?;
-    let mut all_exhausted = true;
-    for (id, state, attempts) in &rows {
-        if *attempts >= max_attempts {
-            if *state == TrackState::Pending {
-                farsight_storage::janitor::fire_event(
-                    pool,
-                    &limits,
-                    &ctx.counters,
-                    *id,
-                    Event::FailTerminal,
-                    FireArgs::default(),
-                )
-                .await?;
-            }
-        } else {
-            all_exhausted = false;
-        }
-    }
-    release_claim(ctx, run_id).await?;
-    finish_run(ctx, run_id, FetchOutcome::Failed).await?;
-    // Unavailable lists retry weekly, indefinitely, and stay claimable.
-    requeue(
-        ctx,
-        owner_id,
-        if all_exhausted { WEEKLY } else { RUN_RETRY },
-    )
-    .await;
+    fail_run(ctx, owner_id, run_id).await?;
     Ok(Outcome::Failed {
         error: failure,
         terminal: false,

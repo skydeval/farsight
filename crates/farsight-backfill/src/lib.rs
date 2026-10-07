@@ -8,6 +8,13 @@
 //! own pool. Config reloads on `NOTIFY farsight_config` and every 60 s by
 //! mtime.
 //!
+//! A change that the running tasks cannot take in place rebuilds them:
+//! the scheduler stops its jobs and gives their work back to the queue,
+//! and new tasks start on the new config. One network layer serves every
+//! rebuild, so what it knows of each host (cooldowns, the breaker,
+//! requests in flight) is kept, and no host is ever asked by two sets of
+//! jobs at once.
+//!
 //! Every task is supervised (`farsight_core::task`): a panic in the
 //! scheduler loop, the sweep or the metrics listener is logged, counted
 //! and the task started again; a panic in one pass of a periodic task
@@ -215,6 +222,8 @@ pub async fn run(
     shutdown: watch::Receiver<bool>,
     metrics: Option<PrometheusHandle>,
 ) -> Result<(), BackfillError> {
+    // The network layer outlives every rebuild.
+    let mut net: Option<Arc<Net>> = None;
     loop {
         if *shutdown.borrow() {
             return Ok(());
@@ -236,6 +245,7 @@ pub async fn run(
                     &path,
                     shutdown.clone(),
                     metrics.clone(),
+                    &mut net,
                 )
                 .await
                 {
@@ -294,6 +304,7 @@ async fn run_normal(
     path: &Path,
     mut shutdown: watch::Receiver<bool>,
     metrics_handle: Option<PrometheusHandle>,
+    shared_net: &mut Option<Arc<Net>>,
 ) -> Result<End, BackfillError> {
     let max_conn = cfg.backfill.concurrency.saturating_add(8);
     let pool = farsight_storage::connect(&cfg.storage.database_url, max_conn).await?;
@@ -305,20 +316,32 @@ async fn run_normal(
         r = farsight_storage::wait_for_schema(&pool) => r?,
         _ = shutdown.changed() => return Ok(End::Shutdown),
     }
-    let net = Arc::new(Net::new(
-        client(&cfg),
-        cfg.backfill.per_host_rps,
-        cfg.backfill.per_host_concurrency,
-        cfg.backfill.plc_rps,
-        &cfg.backfill.plc_url,
-    ));
+    let net = match shared_net {
+        // A rebuild: the new client and limits, and everything the layer
+        // has learned of the hosts it talked to.
+        Some(net) => {
+            net.reconfigure(client(&cfg), &cfg);
+            net.clone()
+        }
+        None => shared_net
+            .insert(Arc::new(Net::new(client(&cfg), &cfg)))
+            .clone(),
+    };
     let dns = match client(&cfg) {
         Client::Safe(c) => Some(c),
         #[cfg(feature = "harness")]
         Client::Plain(_) => None,
     };
-    let resolver = Resolver::new(net.clone(), pool.clone(), &cfg, dns);
-    let ctx = Arc::new(Ctx::new(pool.clone(), cfg.clone(), net, resolver, VERSION));
+    let counters = Ctx::counter_sink();
+    let resolver = Resolver::new(net.clone(), pool.clone(), &cfg, dns, counters.clone());
+    let ctx = Arc::new(Ctx::new(
+        pool.clone(),
+        cfg.clone(),
+        net,
+        resolver,
+        counters,
+        VERSION,
+    ));
     let (stop_tx, stop) = watch::channel(false);
     let mut tasks = tokio::task::JoinSet::new();
     if let Some(h) = metrics_handle {
@@ -349,6 +372,18 @@ async fn run_normal(
         move || {
             let ctx = ctx.clone();
             async move {
+                // First what a stopped process left behind, then the
+                // debts.
+                match feeder::recover(&ctx).await {
+                    Ok(r) if r.total() > 0 => tracing::info!(
+                        entries = r.entries,
+                        repo_jobs = r.repo_jobs,
+                        fetch_runs = r.fetch_runs,
+                        "work left by a stopped process taken up"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "taking up left work failed"),
+                }
                 match feeder::pass(&ctx).await {
                     Ok(n) if n > 0 => tracing::debug!(fed = n, "feeder pass"),
                     Ok(_) => {}
@@ -413,8 +448,10 @@ async fn run_normal(
     tracing::info!(concurrency = cfg.backfill.concurrency, "backfill running");
     let end = watch_config(&ctx, path, &mut shutdown).await;
     let _ = stop_tx.send(true);
-    // Jobs stop at their next await; leases expire if one is cut short and
-    // resumable state (cursors, runs) is persisted as it goes.
+    // The scheduler stops its jobs at their next await and gives back the
+    // queue entries and leases they held; resumable state (cursors, runs)
+    // is persisted as it goes. What a task cut short here still holds
+    // runs out and is taken up by the feeder.
     let drain = async { while tasks.join_next().await.is_some() {} };
     if tokio::time::timeout(Duration::from_secs(30), drain)
         .await
@@ -503,6 +540,8 @@ async fn watch_config(ctx: &Ctx, path: &Path, shutdown: &mut watch::Receiver<boo
                 }
                 if *old != new {
                     tracing::info!("configuration reloaded");
+                    // The request limits apply to the next request.
+                    ctx.net.set_limits(&new);
                     ctx.set_cfg(Arc::new(new));
                 }
             }
@@ -515,13 +554,13 @@ async fn watch_config(ctx: &Ctx, path: &Path, shutdown: &mut watch::Receiver<boo
     }
 }
 
-/// Keys the running process cannot apply in place.
-fn restart_needed(old: &Config, new: &Config) -> bool {
+/// Keys the running tasks cannot apply in place: the database, the
+/// listeners, the outbound client, what the resolver was built with, and
+/// `backfill.concurrency`, which sizes the database pool.
+pub fn restart_needed(old: &Config, new: &Config) -> bool {
     old.storage.database_url != new.storage.database_url
         || old.metrics != new.metrics
-        || old.backfill.per_host_rps != new.backfill.per_host_rps
-        || old.backfill.per_host_concurrency != new.backfill.per_host_concurrency
-        || old.backfill.plc_rps != new.backfill.plc_rps
+        || old.backfill.concurrency != new.backfill.concurrency
         || old.backfill.plc_url != new.backfill.plc_url
         || old.net != new.net
         || old.limits.large_hosts != new.limits.large_hosts
@@ -548,5 +587,46 @@ pub async fn budget_monitor(ctx: &Ctx) {
             }
         }
         Err(e) => tracing::warn!(error = %e, "measuring the database failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_what_cannot_change_in_place_rebuilds() {
+        let base = Config::default();
+        let with = |f: fn(&mut Config)| {
+            let mut c = Config::default();
+            f(&mut c);
+            c
+        };
+        // The pool is sized by the worker count: a change rebuilds, so
+        // the pool always has a connection for every worker.
+        assert!(restart_needed(
+            &base,
+            &with(|c| c.backfill.concurrency = 64)
+        ));
+        assert!(restart_needed(
+            &base,
+            &with(|c| c.backfill.plc_url = "https://plc.example".into())
+        ));
+        assert!(restart_needed(
+            &base,
+            &with(|c| c.storage.database_url = "postgres://other".into())
+        ));
+        // Request limits are taken by the next request.
+        for change in [
+            (|c| c.backfill.per_host_rps = 1) as fn(&mut Config),
+            |c| c.backfill.per_host_concurrency = 1,
+            |c| c.backfill.per_domain_rps = 2,
+            |c| c.backfill.per_domain_concurrency = 2,
+            |c| c.backfill.plc_rps = 3,
+            |c| c.backfill.on_demand_reserved = 0,
+            |c| c.backfill.sweep.enabled = !c.backfill.sweep.enabled,
+        ] {
+            assert!(!restart_needed(&base, &with(change)));
+        }
     }
 }

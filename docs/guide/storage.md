@@ -35,3 +35,7 @@ stops recording.
   of its own if you can. Otherwise lower `backfill.concurrency`, or
   turn the sweep off while the other services need the disk
   (`backfill.sweep.enabled`; it resumes where it stopped).
+- **Postgres settings.** The compose file's Postgres needs no change.
+  With a Postgres of your own, keep `max_locks_per_transaction` at its
+  default of 64 or above, and `max_connections` at 100 or above for
+  the default pools.

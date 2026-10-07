@@ -172,8 +172,10 @@ and what it would have changed is recovered by reading the repository.
 ### Storage calls outside a batch
 
 The writer also writes what is not an event: the connected flag, gaps,
-seam windows, the purge of an account that became `deleted`, the
-record of a poisoned event. These follow the same rule about errors. A transient
+seam windows, the record of a poisoned event. (The purge of an
+account that became `deleted` is not among them: the batch that
+records the deletion asks the server's purge task for it, and the
+writer goes on.) These follow the same rule about errors. A transient
 one is retried until it passes. Any other error is tried 3 times;
 then the call is given up, logged, recorded in `op_errors` (with the
 DID, when it concerns one account) and counted in
@@ -184,7 +186,6 @@ What going on leaves behind:
 
 | Call (`op`) | Left behind |
 |---|---|
-| `purge_account` | The account is `deleted` and its rows are still stored. They are withheld by the status; the purge is taken up again by the daily `account_purges` task and at the next start. |
 | `record_poisoned` | The event has no `resync` debt. The operational error names its DID; `admin.requestBackfill` re-reads the repository. |
 | `record_gap`, `open_sync_unavailable`, `close_sync_unavailable`, `open_seam` | Nothing: these are not passed over. Coverage is claimed from the recorded gaps, and a seam window is what is known to need a second read, so one that cannot be written stops the writer, which ends the process (see below); the next start resumes from the stored cursor and meets the gap or the seam again. |
 | `close_seams` | The seam window stays open. The next session that catches up or ends closes it, and so does the next start. |
@@ -533,9 +534,11 @@ For a DID Farsight holds:
    `inactive_at_listing` set (the last backfill found the account
    inactive), adds a `resync` debt and re-admits the account's
    `unavailable` lists.
-5. Becoming `deleted` purges the account's authored rows after the
-   batch commits, in several transactions; an interrupted purge is
-   finished at the next start. The purge removes the account's
+5. Becoming `deleted` asks for the purge of the account's authored
+   rows in the same transaction; the server's purge task does it, in
+   several transactions, and an interrupted purge goes on where it
+   was ([storage.md](storage.md#the-purge-of-a-deleted-account)). The
+   writer does not wait for it. The purge removes the account's
    tombstones too, so nothing stored would turn a replay away: a
    commit of a `deleted` account that was witnessed no later than its
    `status_at` is therefore stale and stores nothing.

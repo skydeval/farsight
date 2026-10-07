@@ -284,6 +284,137 @@ async fn flush_deltas(
     Ok(report)
 }
 
+/// A change to where an account is hosted, as the resolver learns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostChange {
+    /// The account resolved to this `pds_hosts` row; its admissions are
+    /// charged to this key from now on.
+    Resolved {
+        /// `pds_hosts.id`.
+        host: crate::ids::HostId,
+        /// The new `actors.admission_key`.
+        admission_key: String,
+    },
+    /// Resolution failed (not authoritatively): one more
+    /// `resolve_failures`.
+    Failed,
+}
+
+/// The deltas that move an account's stored rows from the buckets it
+/// was counted in to those it is counted in now: `counts` are its exact
+/// `authored_blocks`, `owned_items`, `authored_listblocks` and
+/// `authored_lists`. Nothing when the buckets are the same. The lifetime
+/// intern charge stays where it was made.
+pub fn moved(old: &[String], new: &[String], counts: [i64; 4]) -> Deltas {
+    let mut d = Deltas::default();
+    if old == new {
+        return d;
+    }
+    let kinds = [
+        CapKind::Blocks,
+        CapKind::Items,
+        CapKind::Listblocks,
+        CapKind::Lists,
+    ];
+    for (kind, n) in kinds.into_iter().zip(counts) {
+        if n != 0 {
+            d.host(old, kind, -n);
+            d.host(new, kind, n);
+        }
+    }
+    d
+}
+
+/// Records `change` on the `actors` row of `did` and moves the account's
+/// usage between cap buckets when the change gives it other buckets (the
+/// row's own counters say how much). Without it the rows an unresolved
+/// author stored would stay counted under `unresolved` after its host is
+/// known, while their deletes were taken from the host's bucket. Runs
+/// under author(D), so the counters it reads are those of committed
+/// batches. An account without a row is left alone.
+pub async fn record_host_change(
+    pool: &PgPool,
+    counters: &CounterSink,
+    did: &farsight_core::Did,
+    change: &HostChange,
+) -> Result<()> {
+    use crate::keys::{self, HostFacts};
+    type Row = (
+        crate::ids::ActorId,
+        Option<String>,
+        i32,
+        bool,
+        Option<String>,
+        Option<String>,
+        bool,
+        i32,
+        i32,
+        i32,
+        i32,
+    );
+    const READ: &str =
+        "SELECT a.id, a.admission_key, a.resolve_failures, a.pds_host_id IS NOT NULL,
+                h.cap_key, h.ip_bucket, COALESCE(h.large, false),
+                a.authored_blocks, a.owned_items, a.authored_listblocks, a.authored_lists
+         FROM actors a LEFT JOIN pds_hosts h ON h.id = a.pds_host_id WHERE a.did = $1";
+    let facts = |r: &Row| HostFacts {
+        admission_key: r.1.clone(),
+        resolve_failures: r.2,
+        resolved: r.3,
+        cap_key: r.4.clone(),
+        ip_bucket: r.5.clone(),
+        large: r.6,
+    };
+    let mut tx = pool.begin().await?;
+    crate::txn::lock_ascending(
+        &mut tx,
+        &[keys::author_lock_key(did.as_str())].into_iter().collect(),
+    )
+    .await?;
+    let Some(before) = sqlx::query_as::<_, Row>(READ)
+        .bind(did.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Ok(());
+    };
+    match change {
+        HostChange::Resolved {
+            host,
+            admission_key,
+        } => {
+            sqlx::query(
+                "UPDATE actors SET pds_host_id = $2, pds_resolved_at = now(),
+                   resolve_failures = 0, admission_key = $3
+                 WHERE id = $1",
+            )
+            .bind(before.0)
+            .bind(*host)
+            .bind(admission_key)
+            .execute(&mut *tx)
+            .await?;
+        }
+        HostChange::Failed => {
+            sqlx::query("UPDATE actors SET resolve_failures = resolve_failures + 1 WHERE id = $1")
+                .bind(before.0)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    let after: Row = sqlx::query_as(READ)
+        .bind(did.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+    let deltas = moved(
+        &keys::buckets(did, &facts(&before)),
+        &keys::buckets(did, &facts(&after)),
+        [before.7, before.8, before.9, before.10].map(i64::from),
+    );
+    tx.commit().await?;
+    counters.add(deltas);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +433,52 @@ mod tests {
         assert_eq!(a.hosts["d:x"].blocks, 0);
         assert_eq!(a.hosts["ip:y"].blocks, 1);
         assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn a_host_change_moves_usage_between_buckets() {
+        let b = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        // Unresolved, then resolved on a small host: the stored rows
+        // leave `unresolved` and are counted under the host's buckets.
+        let d = moved(
+            &b(&["unresolved"]),
+            &b(&["d:example.com", "ip:203.0.113.0/24"]),
+            [7, 0, 3, 1],
+        );
+        assert_eq!(
+            d.hosts["unresolved"],
+            HostDelta {
+                blocks: -7,
+                listblocks: -3,
+                lists: -1,
+                ..HostDelta::default()
+            }
+        );
+        for bucket in ["d:example.com", "ip:203.0.113.0/24"] {
+            assert_eq!(
+                d.hosts[bucket],
+                HostDelta {
+                    blocks: 7,
+                    listblocks: 3,
+                    lists: 1,
+                    ..HostDelta::default()
+                }
+            );
+        }
+        // The sum over all buckets of a kind changes only by the number
+        // of buckets the rows are counted in.
+        let total: i64 = d.hosts.values().map(|h| h.blocks).sum();
+        assert_eq!(total, 7);
+        // A large host has no buckets: the rows are only taken out.
+        let d = moved(&b(&["unresolved"]), &[], [2, 5, 0, 0]);
+        assert_eq!(d.hosts.len(), 1);
+        assert_eq!(
+            (d.hosts["unresolved"].blocks, d.hosts["unresolved"].items),
+            (-2, -5)
+        );
+        // The same buckets, or nothing stored: nothing moves.
+        assert!(moved(&b(&["d:x"]), &b(&["d:x"]), [9, 9, 9, 9]).is_empty());
+        assert!(moved(&b(&["unresolved"]), &b(&["d:x"]), [0; 4]).is_empty());
     }
 
     #[test]

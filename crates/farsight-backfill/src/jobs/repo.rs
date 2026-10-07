@@ -3,12 +3,17 @@
 //! (early stamp only) → list each present collection with range reconcile
 //! → done.
 
-use farsight_storage::codes::sql::{DEBT_CAPPED, JOB_REPO, RECORD_UNKNOWN, REPO_RUNNING, TRACKED};
+use farsight_storage::codes::sql::{
+    DEBT_CAPPED, JOB_REPO, RECORD_PRESENT, RECORD_UNKNOWN, REPO_RUNNING, TRACKED,
+};
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeSet, HashSet};
+use std::hash::BuildHasher;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use farsight_core::record::parse_record;
-use farsight_core::{AtUri, Collection, Did, RecordKey};
+use farsight_core::{AtUri, Collection, Did, RecordKey, Tid};
 use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Reconcile, Write, WriteAction};
 use farsight_storage::codes::{ActorStatus, DebtReason, JobKind, Priority, RequesterKey, Tier};
 use farsight_storage::ids::{ListId, RepoRunId, RunId, Stamp};
@@ -23,10 +28,93 @@ use crate::net::NetError;
 use crate::resolve::{Pds, ResolveError};
 use crate::xrpc;
 
-/// Pages per collection per attempt (reaching it yields).
-pub const MAX_PAGES: u32 = 50_000;
+/// Pages one attempt of a job lists, over all its collections (reaching
+/// it yields). An account at every per-author cap is about 31,000 pages.
+pub const MAX_PAGES: u32 = 25_000;
+/// Attempts of one run that may end at a bound (pages or time) before
+/// the run counts as failed.
+pub const MAX_YIELDS: i32 = 10;
 /// Rows purged per divergence-purge transaction.
 pub const PURGE_BATCH: i64 = 10_000;
+/// Stored keys compared with a seen-set per reconcile.
+pub const SEEN_CHUNK: i64 = 2_000;
+
+/// How long a job that stopped at a bound for the `n`-th time in a row
+/// waits before it goes on: not at all the first two times, then 30 s
+/// doubling up to an hour.
+pub fn yield_delay(n: i32) -> Duration {
+    if n <= 2 {
+        return Duration::ZERO;
+    }
+    let doublings = u32::try_from(n - 3).unwrap_or(0).min(16);
+    Duration::from_secs((30u64 << doublings).min(3600))
+}
+
+/// The pages an attempt may still list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageBudget(pub u32);
+
+impl PageBudget {
+    /// The budget of a fresh attempt: [`MAX_PAGES`].
+    pub fn new() -> PageBudget {
+        PageBudget(MAX_PAGES)
+    }
+
+    /// Takes one page; `false` when none is left.
+    pub fn take(&mut self) -> bool {
+        if self.0 == 0 {
+            return false;
+        }
+        self.0 -= 1;
+        true
+    }
+}
+
+impl Default for PageBudget {
+    fn default() -> PageBudget {
+        PageBudget::new()
+    }
+}
+
+/// The cursors a listing has followed, to tell one that comes back. A
+/// PDS that answers every page with a cursor it gave before (the same
+/// one, or one of a cycle) would be listed without end.
+#[derive(Debug, Default)]
+pub struct Cursors {
+    hasher: RandomState,
+    seen: HashSet<u64>,
+}
+
+impl Cursors {
+    /// Notes `next` as the cursor of the page after the one read with
+    /// `current`; `false` if the listing has been there before.
+    pub fn follow(&mut self, current: Option<&str>, next: &str) -> bool {
+        if let Some(c) = current {
+            self.seen.insert(self.hasher.hash_one(c));
+        }
+        self.seen.insert(self.hasher.hash_one(next))
+    }
+
+    /// Forgets every cursor (the listing starts again from its first
+    /// page).
+    pub fn clear(&mut self) {
+        self.seen.clear();
+    }
+}
+
+/// How a listing tells which stored rows the repo no longer has.
+#[derive(Debug)]
+enum Mode {
+    /// Record keys ascend: each page reconciles its own range.
+    Ordered,
+    /// The PDS lists out of order: the listing started again and
+    /// remembers every key it sees (as a hash), and the stored rows are
+    /// compared with the set at the end.
+    Seen(HashSet<u64>),
+    /// More keys than `backfill.seen_set_cap`: the listing goes on to the
+    /// end and reconciles nothing.
+    Unreconciled,
+}
 
 /// The collections a `repo` job lists.
 pub const REPO_COLLECTIONS: [Collection; 4] = [
@@ -43,8 +131,12 @@ pub enum Stop {
     RepoLevel(NetError),
     /// Any other failure.
     Failed(String),
-    /// Page bound reached.
+    /// A bound of the attempt (pages) was reached.
     Yield,
+    /// The repo looks diverged, as read from a host that came out of a
+    /// cache: the host is confirmed with the directory before anything is
+    /// purged on its word.
+    Unconfirmed,
 }
 
 impl From<farsight_storage::StorageError> for Stop {
@@ -180,8 +272,36 @@ pub fn host_is_large(ctx: &Ctx, pds: &Pds) -> bool {
     ctx.cfg().limits.is_large_host(bare)
 }
 
+/// Applies `batch`, then its reconciles alone for as long as they have
+/// more rows to remove than one transaction takes. Returns the report of
+/// the first application (the one with the writes).
+async fn apply_through(
+    pool: &PgPool,
+    actx: &ApplyCtx<'_>,
+    batch: &Batch,
+) -> Result<farsight_storage::txn::ApplyReport, Stop> {
+    let first = apply::apply(pool, actx, batch).await?;
+    if first.reconcile_pending {
+        let mut rest = Batch::new(batch.origin.clone());
+        rest.reconciles = batch.reconciles.clone();
+        loop {
+            let r = apply::apply(pool, actx, &rest).await?;
+            if !r.reconcile_pending {
+                break;
+            }
+            if r.reconciled == 0 {
+                return Err(Stop::Failed(
+                    "a reconcile had rows left to remove and removed none".into(),
+                ));
+            }
+        }
+    }
+    Ok(first)
+}
+
 /// Lists one collection of `did` with stamp `R` through its own cursor rows
-/// and applies each page with range reconcile.
+/// and applies each page with range reconcile. Every page is taken from
+/// `budget`; when none is left the listing stops with [`Stop::Yield`].
 #[allow(clippy::too_many_arguments)]
 pub async fn list_collection(
     ctx: &Ctx,
@@ -191,6 +311,7 @@ pub async fn list_collection(
     stamp: ListingStamp,
     run: CursorRun,
     policy: GatePolicy,
+    budget: &mut PageBudget,
 ) -> Result<Listing, Stop> {
     let pool = &ctx.pool;
     let limits = ctx.limits();
@@ -219,11 +340,11 @@ pub async fn list_collection(
             prev_last = p;
         }
     }
-    let mut seen: Option<HashSet<String>> = None;
-    let mut pages = 0u32;
+    let mut mode = Mode::Ordered;
+    let hasher = RandomState::new();
+    let mut cursors = Cursors::default();
     loop {
-        pages += 1;
-        if pages > MAX_PAGES {
+        if !budget.take() {
             return Err(Stop::Yield);
         }
         let (records, next) =
@@ -231,8 +352,12 @@ pub async fn list_collection(
                 .await
                 .map_err(net_stop)?;
         out.cost += 1;
-        if next.is_some() && next == cursor {
-            return Err(Stop::Failed("listRecords cursor did not change".into()));
+        if let Some(n) = &next
+            && !cursors.follow(cursor.as_deref(), n)
+        {
+            return Err(Stop::Failed(
+                "listRecords gave a cursor it had given before".into(),
+            ));
         }
         let mut writes = Vec::new();
         let mut keys: Vec<RecordKey> = Vec::new();
@@ -249,17 +374,20 @@ pub async fn list_collection(
                 continue;
             }
             let rk = uri.rkey.as_str().to_owned();
-            if last.as_deref().is_some_and(|l| rk.as_str() <= l) && seen.is_none() {
+            if matches!(mode, Mode::Ordered) && last.as_deref().is_some_and(|l| rk.as_str() <= l) {
                 order_broken = true;
                 break;
             }
-            last = Some(rk.clone());
-            if let Some(s) = seen.as_mut() {
-                s.insert(rk.clone());
+            if let Mode::Seen(s) = &mut mode {
+                s.insert(hasher.hash_one(rk.as_str()));
             }
+            last = Some(rk);
             keys.push(uri.rkey.clone());
-            match parse_record(did, k, &r.value) {
-                Ok(rec) => writes.push(Write {
+            // A record whose text could not be parsed has a key and no
+            // value: the key is listed, so a stored version stays.
+            let parsed = r.value.as_ref().map(|v| parse_record(did, k, v));
+            match parsed {
+                Some(Ok(rec)) => writes.push(Write {
                     author: did.clone(),
                     collection: k,
                     rkey: uri.rkey.clone(),
@@ -267,7 +395,7 @@ pub async fn list_collection(
                     witness: None,
                     action: WriteAction::Upsert(rec),
                 }),
-                Err(_) => invalid += 1,
+                Some(Err(_)) | None => invalid += 1,
             }
         }
         if invalid > 0 {
@@ -280,12 +408,20 @@ pub async fn list_collection(
             .await;
         }
         if order_broken {
-            // Restart this collection with an in-memory seen-set.
+            // Restart this collection with an in-memory seen-set. Only an
+            // ordered listing does: one that outgrew its set stays
+            // unreconciled, however the pages are ordered.
             tracing::warn!(did = %did, collection = %k, "rkeys not increasing; restarting with a seen-set");
-            seen = Some(HashSet::new());
+            mode = Mode::Seen(HashSet::new());
             cursor = None;
             prev_last = None;
+            cursors.clear();
             continue;
+        }
+        if matches!(&mode, Mode::Seen(s) if s.len() > seen_cap) {
+            tracing::warn!(did = %did, collection = %k, "more keys than the seen-set holds; listing on without reconcile");
+            mode = Mode::Unreconciled;
+            out.reconcile_skipped = true;
         }
         let through = if next.is_some() {
             last.clone().and_then(|l| RecordKey::parse(&l).ok())
@@ -305,7 +441,7 @@ pub async fn list_collection(
             deletes_only,
         });
         batch.writes = writes;
-        if seen.is_none() {
+        if matches!(mode, Mode::Ordered) {
             batch.reconciles.push(Reconcile {
                 author: did.clone(),
                 collection: k,
@@ -315,33 +451,14 @@ pub async fn list_collection(
                 keep: keys,
             });
         }
-        let report = apply::apply(pool, &actx, &batch).await?;
+        let report = apply_through(pool, &actx, &batch).await?;
         crate::metrics::count_refusals(&report);
         out.refused += report.refused;
-        if next.is_none() {
-            if let Some(s) = seen.take() {
-                // The seen-set listing reconciles the whole range at the end.
-                if s.len() > seen_cap {
-                    out.reconcile_skipped = true;
-                } else {
-                    let mut b = Batch::new(Origin::Listing {
-                        stamp_read_at: stamp.read_at,
-                        deletes_only,
-                    });
-                    b.reconciles.push(Reconcile {
-                        author: did.clone(),
-                        collection: k,
-                        stamp: stamp.rev,
-                        after: None,
-                        through: None,
-                        keep: s.iter().filter_map(|x| RecordKey::parse(x).ok()).collect(),
-                    });
-                    apply::apply(pool, &actx, &b).await?;
-                }
-            }
-        } else if seen.as_ref().is_some_and(|s| s.len() > seen_cap) {
-            out.reconcile_skipped = true;
-            seen = None;
+        if next.is_none()
+            && let Mode::Seen(seen) = &mode
+        {
+            // The seen-set listing reconciles the whole range at the end.
+            reconcile_unseen(ctx, policy, did, k, stamp, seen, &hasher).await?;
         }
         // Persist (cursor, prev_last, R, stamp_read_at) for this run.
         if let Some(id) = jobs::actor_id(pool, did.as_str()).await? {
@@ -367,7 +484,7 @@ pub async fn list_collection(
             )
             .execute(pool)
             .await?;
-            jobs::renew_lease(pool, did.as_str(), &ctx.lease_owner).await?;
+            jobs::renew_lease(pool, did.as_str(), &ctx.lease_owner()).await?;
         }
         match next {
             Some(n) => {
@@ -379,14 +496,109 @@ pub async fn list_collection(
     }
 }
 
-/// Fires **DV** on the DID's tracked lists, purges its authored rows and
-/// adds a `resync` debt (the divergence check).
+/// The end of a seen-set listing: removes the author's stored rows of
+/// `k` (those below the stamp) whose key the listing did not see. The
+/// stored keys are read [`SEEN_CHUNK`] at a time and each chunk is
+/// reconciled over its own key range, keeping the keys that are in the
+/// set. Two keys with one hash would keep a row the repo no longer has;
+/// the hash is keyed anew for every listing.
+async fn reconcile_unseen(
+    ctx: &Ctx,
+    policy: GatePolicy,
+    did: &Did,
+    k: Collection,
+    stamp: ListingStamp,
+    seen: &HashSet<u64>,
+    hasher: &RandomState,
+) -> Result<(), Stop> {
+    let pool = &ctx.pool;
+    let Some(id) = jobs::actor_id(pool, did.as_str()).await? else {
+        return Ok(());
+    };
+    let sql = match k {
+        Collection::Block => {
+            "SELECT rkey FROM blocks WHERE author_id = $1 AND rkey > $2 ORDER BY rkey LIMIT $3"
+                .to_owned()
+        }
+        Collection::ListBlock => {
+            "SELECT rkey FROM list_blocks WHERE author_id = $1 AND rkey > $2 ORDER BY rkey LIMIT $3"
+                .to_owned()
+        }
+        Collection::ListItem => {
+            "SELECT rkey FROM list_items WHERE owner_id = $1 AND rkey > $2 ORDER BY rkey LIMIT $3"
+                .to_owned()
+        }
+        Collection::List => format!(
+            "SELECT rkey FROM lists WHERE owner_id = $1 AND record_state = {RECORD_PRESENT}
+               AND rkey > $2 ORDER BY rkey LIMIT $3"
+        ),
+    };
+    let limits = ctx.limits();
+    let mut after = String::new();
+    loop {
+        let stored: Vec<String> = sqlx::query_scalar(&sql)
+            .bind(id)
+            .bind(&after)
+            .bind(SEEN_CHUNK)
+            .fetch_all(pool)
+            .await?;
+        let Some(last) = stored.last().cloned() else {
+            return Ok(());
+        };
+        let done = (stored.len() as i64) < SEEN_CHUNK;
+        let gates = ctx.gates.load();
+        let actx = ApplyCtx {
+            limits: &limits,
+            gates: policy.apply_gates(gates),
+            counters: &ctx.counters,
+        };
+        let mut b = Batch::new(Origin::Listing {
+            stamp_read_at: stamp.read_at,
+            deletes_only: policy.deletes_only(gates),
+        });
+        b.reconciles.push(Reconcile {
+            author: did.clone(),
+            collection: k,
+            stamp: stamp.rev,
+            after: RecordKey::parse(&after).ok(),
+            through: if done {
+                None
+            } else {
+                RecordKey::parse(&last).ok()
+            },
+            keep: stored
+                .iter()
+                .filter(|rk| seen.contains(&hasher.hash_one(rk.as_str())))
+                .filter_map(|rk| RecordKey::parse(rk).ok())
+                .collect(),
+        });
+        apply_through(pool, &actx, &b).await?;
+        if done {
+            return Ok(());
+        }
+        after = last;
+    }
+}
+
+/// Records the divergence of `did` (the divergence check): a `resync`
+/// debt first, so that coverage says so for as long as rows are going;
+/// then **DV** on the DID's tracked lists and the purge of what it
+/// authored under the discarded history. The purge takes rows whose rev
+/// is below the stamp of this moment: what the firehose writes while it
+/// runs carries later revs and stays.
 pub async fn diverged(ctx: &Ctx, did: &Did, witness: DateTime<Utc>) -> Result<(), Stop> {
     let pool = &ctx.pool;
     let limits = ctx.limits();
     let Some(id) = jobs::actor_id(pool, did.as_str()).await? else {
         return Ok(());
     };
+    farsight_storage::debts::add_debt(pool, id, DebtReason::Resync, None, witness).await?;
+    let now = jobs::db_now(pool).await?;
+    let below = u64::try_from(now.timestamp_micros())
+        .ok()
+        .and_then(|us| Tid::from_parts(us, 0))
+        .map(Stamp::from_tid)
+        .ok_or_else(|| Stop::Failed("the clock is outside the range of a rev".into()))?;
     let lists: Vec<ListId> = sqlx::query_scalar(&format!(
         "SELECT id FROM lists WHERE owner_id = $1 AND track_state IN {TRACKED} ORDER BY id"
     ))
@@ -410,10 +622,10 @@ pub async fn diverged(ctx: &Ctx, did: &Did, witness: DateTime<Utc>) -> Result<()
         &ctx.counters,
         did,
         PURGE_BATCH,
+        below,
     )
     .await?
     {}
-    farsight_storage::debts::add_debt(pool, id, DebtReason::Resync, None, witness).await?;
     Ok(())
 }
 
@@ -473,10 +685,9 @@ pub async fn apply_status(
         active,
         status,
     });
-    let report = apply::apply(&ctx.pool, &actx, &b).await?;
-    for d in &report.deleted_accounts {
-        farsight_storage::janitor::purge_account(&ctx.pool, &limits, &ctx.counters, d).await?;
-    }
+    // An account that became `deleted` is purged by the server: the
+    // transaction that records the status asks for it.
+    apply::apply(&ctx.pool, &actx, &b).await?;
     Ok(())
 }
 
@@ -533,34 +744,152 @@ async fn record_hidden(ctx: &Ctx, did: &Did, status: Option<String>) {
     }
 }
 
+/// The run an attempt belongs to: a new one, or the DID's unfinished run
+/// taken up again.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    /// `backfill_state.current_run_id`: the key of the run's cursor rows.
+    id: RepoRunId,
+    /// The listing stamp of the run, when it is resumed.
+    stamp: Option<ListingStamp>,
+    /// The run's coverage point: `clock` of its first attempt's start. A
+    /// later attempt keeps it, since the pages the earlier ones read are
+    /// no newer than that.
+    point: Option<DateTime<Utc>>,
+    /// Server time of the first attempt's start (cycle membership).
+    started: DateTime<Utc>,
+}
+
+/// The DID's own run, if it has one whose stamp is fresh (< 72 h) and
+/// whose coverage point is known; a new run otherwise, starting at `now`
+/// with the point `point`.
+async fn pick_run(
+    pool: &PgPool,
+    did: &Did,
+    now: DateTime<Utc>,
+    point: Option<DateTime<Utc>>,
+) -> Result<Run, sqlx::Error> {
+    type Resumed = (
+        RepoRunId,
+        Stamp,
+        DateTime<Utc>,
+        bool,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    );
+    let resume: Option<Resumed> = sqlx::query_as(&format!(
+        "SELECT s.current_run_id, c.stamp_rev, c.stamp_read_at, c.late_stamp,
+                s.current_run_point, s.current_run_started_at
+         FROM backfill_state s JOIN actors a ON a.id = s.actor_id
+         JOIN backfill_cursors c ON c.actor_id = s.actor_id AND c.job_kind = {JOB_REPO}
+              AND c.run_id = s.current_run_id
+         WHERE a.did = $1 AND c.stamp_read_at > now() - interval '72 hours'
+           AND s.current_run_point IS NOT NULL AND s.current_run_started_at IS NOT NULL
+         LIMIT 1"
+    ))
+    .bind(did.as_str())
+    .fetch_optional(pool)
+    .await?;
+    Ok(match resume {
+        Some((id, rev, read_at, late, run_point, started)) => Run {
+            id,
+            stamp: Some(ListingStamp { rev, read_at, late }),
+            point: Some(run_point),
+            started,
+        },
+        None => {
+            let mut b = [0u8; 8];
+            let _ = getrandom::getrandom(&mut b);
+            Run {
+                id: RepoRunId::new(i64::from_le_bytes(b) & i64::MAX),
+                stamp: None,
+                point,
+                started: now,
+            }
+        }
+    })
+}
+
+/// Notes on the DID's state row which run is under way, so that its next
+/// attempt takes it up again.
+async fn note_run(
+    pool: &PgPool,
+    id: farsight_storage::ids::ActorId,
+    run: &Run,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "INSERT INTO backfill_state (actor_id, state, current_run_id, current_run_point,
+                                     current_run_started_at)
+         VALUES ($1, {REPO_RUNNING}, $2, $3, $4)
+         ON CONFLICT (actor_id) DO UPDATE SET state = {REPO_RUNNING}, current_run_id = $2,
+           current_run_point = $3, current_run_started_at = $4"
+    ))
+    .bind(id)
+    .bind(run.id)
+    .bind(run.point)
+    .bind(run.started)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Runs a `repo` job for `req.did`. The caller holds the lease.
+///
+/// One attempt runs for at most `backfill.repo_job_max_duration` and
+/// lists at most [`MAX_PAGES`] pages; at either bound it stops where it
+/// is and is queued to go on ([`Outcome::Yielded`]). A run that stops at
+/// a bound more than [`MAX_YIELDS`] times in a row has failed.
 pub async fn run(ctx: &Ctx, req: &JobReq) -> JobResult {
     let mut cost = 0u64;
+    let failed = |error: String, cost: u64| JobResult {
+        outcome: Outcome::Failed {
+            error,
+            terminal: false,
+        },
+        cost,
+    };
     let job_start = match jobs::db_now(&ctx.pool).await {
         Ok(t) => t,
-        Err(e) => {
-            return JobResult {
-                outcome: Outcome::Failed {
-                    error: e.to_string(),
-                    terminal: false,
-                },
-                cost,
-            };
-        }
+        Err(e) => return failed(e.to_string(), cost),
     };
-    let point = farsight_storage::firehose::clock(&ctx.pool, job_start)
+    let now_point = farsight_storage::firehose::clock(&ctx.pool, job_start)
         .await
         .ok()
         .flatten();
-    let (outcome, stamp) = match attempt(ctx, req, point, &mut cost).await {
+    let run = match pick_run(&ctx.pool, &req.did, job_start, now_point).await {
+        Ok(r) => r,
+        Err(e) => return failed(e.to_string(), cost),
+    };
+    let max = ctx.cfg().backfill.repo_job_max_duration.get();
+    let attempted = match tokio::time::timeout(max, attempt(ctx, req, &run, &mut cost)).await {
+        Ok(r) => r,
+        // Out of time: what was listed is stored and its cursor with it.
+        Err(_) => Err((Stop::Yield, None)),
+    };
+    let (outcome, stamp) = match attempted {
         Ok((o, s)) => (o, s),
-        Err((Stop::Yield, _)) => {
-            requeue_yielded(ctx, req).await;
-            return JobResult {
-                outcome: Outcome::Yielded,
-                cost,
-            };
-        }
+        Err((Stop::Yield, s)) => match yielded(ctx, req, &run).await {
+            Ok(None) => {
+                return JobResult {
+                    outcome: Outcome::Yielded,
+                    cost,
+                };
+            }
+            Ok(Some(n)) => (
+                Outcome::Failed {
+                    error: format!("stopped at a bound {n} times in a row without finishing"),
+                    terminal: false,
+                },
+                s,
+            ),
+            Err(e) => (
+                Outcome::Failed {
+                    error: format!("queueing the rest of the job: {e}"),
+                    terminal: false,
+                },
+                s,
+            ),
+        },
         // The repo-level error rule after re-resolution failed to help:
         // the relay decides between **inactive** and **failed**.
         Err((Stop::RepoLevel(e), s)) => {
@@ -583,11 +912,18 @@ pub async fn run(ctx: &Ctx, req: &JobReq) -> JobResult {
             },
             s,
         ),
+        Err((Stop::Unconfirmed, s)) => (
+            Outcome::Failed {
+                error: "the account's host could not be confirmed".into(),
+                terminal: false,
+            },
+            s,
+        ),
     };
     let f = Finish {
         req,
-        point,
-        job_start,
+        point: run.point,
+        job_start: run.started,
         stamp,
         outcome: &outcome,
     };
@@ -601,21 +937,39 @@ pub async fn run(ctx: &Ctx, req: &JobReq) -> JobResult {
     JobResult { outcome, cost }
 }
 
-async fn requeue_yielded(ctx: &Ctx, req: &JobReq) {
-    if let Ok(id) = jobs::intern(ctx, &req.did).await
-        && let Ok(mut conn) = ctx.pool.acquire().await
-    {
-        let _ = farsight_storage::queue::enqueue(
-            &mut conn,
-            id,
-            JobKind::Repo,
-            req.tier,
-            Priority::Normal,
-            req.requester,
-            None,
-        )
-        .await;
+/// An attempt stopped at a bound: counts it on the run and queues the
+/// job to go on, after [`yield_delay`]. `Ok(Some(n))` when this was the
+/// `n`-th in a row and `n` is past [`MAX_YIELDS`]: nothing is queued and
+/// the caller records a failure.
+async fn yielded(
+    ctx: &Ctx,
+    req: &JobReq,
+    run: &Run,
+) -> Result<Option<i32>, farsight_storage::StorageError> {
+    let id = jobs::intern(ctx, &req.did).await?;
+    note_run(&ctx.pool, id, run).await?;
+    let n: i32 = sqlx::query_scalar(
+        "UPDATE backfill_state SET yields = yields + 1 WHERE actor_id = $1 RETURNING yields",
+    )
+    .bind(id)
+    .fetch_one(&ctx.pool)
+    .await?;
+    if n > MAX_YIELDS {
+        return Ok(Some(n));
     }
+    let mut conn = ctx.pool.acquire().await?;
+    farsight_storage::queue::enqueue(
+        &mut conn,
+        id,
+        JobKind::Repo,
+        req.tier,
+        Priority::Normal,
+        req.requester,
+        None,
+        Some(yield_delay(n)),
+    )
+    .await?;
+    Ok(None)
 }
 
 type AttemptErr = (Stop, Option<Stamp>);
@@ -623,7 +977,7 @@ type AttemptErr = (Stop, Option<Stamp>);
 async fn attempt(
     ctx: &Ctx,
     req: &JobReq,
-    point: Option<DateTime<Utc>>,
+    run: &Run,
     cost: &mut u64,
 ) -> Result<(Outcome, Option<Stamp>), AttemptErr> {
     let pool = &ctx.pool;
@@ -656,56 +1010,20 @@ async fn attempt(
             }
         }
     }
-    // Resume this DID's own run if it is fresh (< 72 h).
-    let resume: Option<(RepoRunId, Stamp, DateTime<Utc>, bool)> = sqlx::query_as(&format!(
-        "SELECT s.current_run_id, c.stamp_rev, c.stamp_read_at, c.late_stamp
-         FROM backfill_state s JOIN actors a ON a.id = s.actor_id
-         JOIN backfill_cursors c ON c.actor_id = s.actor_id AND c.job_kind = {JOB_REPO}
-              AND c.run_id = s.current_run_id
-         WHERE a.did = $1 AND c.stamp_read_at > now() - interval '72 hours'
-         LIMIT 1"
-    ))
-    .bind(did.as_str())
-    .fetch_optional(pool)
-    .await
-    .map_err(|x| e(x.into()))?;
-    let (run_id, mut stamp) = match resume {
-        Some((run, rev, at, late)) => (
-            run,
-            Some(ListingStamp {
-                rev,
-                read_at: at,
-                late,
-            }),
-        ),
-        None => {
-            let mut b = [0u8; 8];
-            let _ = getrandom::getrandom(&mut b);
-            (RepoRunId::new(i64::from_le_bytes(b) & i64::MAX), None)
-        }
-    };
+    let mut stamp = run.stamp;
     let resumed = stamp.is_some();
     if let Some(id) = jobs::actor_id(pool, did.as_str())
         .await
         .map_err(|x| e(x.into()))?
     {
-        sqlx::query(&format!(
-            "INSERT INTO backfill_state (actor_id, state, current_run_id, current_run_point)
-             VALUES ($1, {REPO_RUNNING}, $2, $3)
-             ON CONFLICT (actor_id) DO UPDATE SET state = {REPO_RUNNING}, current_run_id = $2,
-               current_run_point = $3"
-        ))
-        .bind(id)
-        .bind(run_id)
-        .bind(point)
-        .execute(pool)
-        .await
-        .map_err(|x| e(x.into()))?;
+        note_run(pool, id, run).await.map_err(|x| e(x.into()))?;
     }
-    // 1. Resolve (re-resolve bypassing the cache on a repo-level error).
+    let mut budget = PageBudget::new();
+    // 1. Resolve (re-resolve bypassing the cache on a repo-level error,
+    // and before a divergence is acted on).
     let mut bypass = false;
     loop {
-        let pds = match ctx.resolver.resolve(did, bypass).await {
+        let (pds, cached) = match ctx.resolver.resolve_noting(did, bypass).await {
             Ok(p) => p,
             Err(ResolveError::NotFound) => {
                 return Err(e(Stop::Failed("DID does not resolve".into())));
@@ -719,20 +1037,58 @@ async fn attempt(
             Err(ResolveError::Transient(m)) => return Err(e(Stop::Failed(m))),
         };
         *cost += 1;
-        match list_repo(ctx, req, &pds, &mut stamp, resumed, point, run_id, cost).await {
+        let listed = list_repo(
+            ctx,
+            req,
+            &pds,
+            &mut stamp,
+            Attempt {
+                resumed,
+                confirmed: !cached,
+                run,
+            },
+            &mut budget,
+            cost,
+        )
+        .await;
+        match listed {
             Ok(o) => return Ok((o, stamp.map(|s| s.rev))),
             Err(Stop::RepoLevel(err)) if !bypass => {
                 // Re-resolve bypassing the cache; if the PDS changed,
                 // retry there.
                 bypass = true;
                 match ctx.resolver.resolve(did, true).await {
-                    Ok(p2) if p2 != pds => continue,
+                    Ok(p2) if p2 != pds => {
+                        // A stamp read at the old host says nothing of
+                        // the repo at the new one.
+                        if !resumed {
+                            stamp = None;
+                        }
+                        continue;
+                    }
                     _ => return Err((Stop::RepoLevel(err), stamp.map(|s| s.rev))),
+                }
+            }
+            Err(Stop::Unconfirmed) if !bypass => {
+                bypass = true;
+                if !resumed {
+                    stamp = None;
                 }
             }
             Err(s) => return Err((s, stamp.map(|s| s.rev))),
         }
     }
+}
+
+/// What `list_repo` needs to know of the attempt it runs in.
+#[derive(Clone, Copy)]
+struct Attempt<'a> {
+    /// The run is taken up again with its stamp.
+    resumed: bool,
+    /// The host was read from the directory for this attempt, not from a
+    /// cache.
+    confirmed: bool,
+    run: &'a Run,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -741,11 +1097,11 @@ async fn list_repo(
     req: &JobReq,
     pds: &Pds,
     stamp: &mut Option<ListingStamp>,
-    resumed: bool,
-    point: Option<DateTime<Utc>>,
-    run_id: RepoRunId,
+    at: Attempt<'_>,
+    budget: &mut PageBudget,
     cost: &mut u64,
 ) -> Result<Outcome, Stop> {
+    let (resumed, point, run_id) = (at.resumed, at.run.point, at.run.id);
     let pool = &ctx.pool;
     let did = &req.did;
     let policy = GatePolicy::new(req, host_is_large(ctx, pds));
@@ -788,6 +1144,11 @@ async fn list_repo(
         .await?
         .flatten();
         if prev.is_some_and(|p| s.rev < p) {
+            // A host out of a cache may be one the account has left, and
+            // what it still serves is then the past, not a divergence.
+            if !at.confirmed {
+                return Err(Stop::Unconfirmed);
+            }
             tracing::warn!(did = %did, "repo went backwards (divergence); purging and re-listing");
             let witness = point.unwrap_or(s.read_at);
             diverged(ctx, did, witness).await?;
@@ -821,13 +1182,23 @@ async fn list_repo(
                 keep: Vec::new(),
             });
         }
-        apply::apply(pool, &actx, &b).await?;
+        apply_through(pool, &actx, &b).await?;
     }
     // 6. List each present collection.
     let mut refused = 0u64;
     let mut skipped = false;
     for k in &present {
-        let l = list_collection(ctx, pds, did, *k, stamp, CursorRun::Repo(run_id), policy).await?;
+        let l = list_collection(
+            ctx,
+            pds,
+            did,
+            *k,
+            stamp,
+            CursorRun::Repo(run_id),
+            policy,
+            budget,
+        )
+        .await?;
         *cost += l.cost;
         deletes_only |= l.deletes_only;
         refused += l.refused;
@@ -875,6 +1246,76 @@ mod tests {
             stated,
             status: status.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn a_job_that_keeps_stopping_at_a_bound_waits_longer_each_time() {
+        assert_eq!(yield_delay(1), Duration::ZERO);
+        assert_eq!(yield_delay(2), Duration::ZERO);
+        assert_eq!(yield_delay(3), Duration::from_secs(30));
+        assert_eq!(yield_delay(4), Duration::from_secs(60));
+        assert_eq!(yield_delay(9), Duration::from_secs(1920));
+        // Never more than an hour, whatever the count.
+        for n in [10, MAX_YIELDS, 50, i32::MAX] {
+            assert_eq!(yield_delay(n), Duration::from_secs(3600), "{n}");
+        }
+        for n in 1..=MAX_YIELDS {
+            assert!(yield_delay(n) <= yield_delay(n + 1));
+        }
+        assert_eq!(yield_delay(0), Duration::ZERO);
+        assert_eq!(yield_delay(-3), Duration::ZERO);
+    }
+
+    #[test]
+    fn an_attempt_lists_no_more_pages_than_its_budget() {
+        let mut b = PageBudget(3);
+        assert!(b.take() && b.take() && b.take());
+        assert!(!b.take());
+        assert!(!b.take());
+        assert_eq!(PageBudget::new().0, MAX_PAGES);
+    }
+
+    #[test]
+    fn a_cursor_that_comes_back_is_told_whatever_the_cycle() {
+        // The same cursor again.
+        let mut c = Cursors::default();
+        assert!(c.follow(None, "a"));
+        assert!(!c.follow(Some("a"), "a"));
+        // A → B → A.
+        let mut c = Cursors::default();
+        assert!(c.follow(None, "a"));
+        assert!(c.follow(Some("a"), "b"));
+        assert!(!c.follow(Some("b"), "a"));
+        // A cycle of any length, entered after a lead-in.
+        for len in [2usize, 3, 7, 100] {
+            let mut c = Cursors::default();
+            let mut current: Option<String> = None;
+            let mut pages = 0;
+            let next_of = |page: usize| -> String {
+                if page < 5 {
+                    format!("lead{page}")
+                } else {
+                    format!("cycle{}", (page - 5) % len)
+                }
+            };
+            loop {
+                let next = next_of(pages);
+                pages += 1;
+                if !c.follow(current.as_deref(), &next) {
+                    break;
+                }
+                current = Some(next);
+                assert!(pages < 1_000, "a cycle of {len} was followed without end");
+            }
+            assert_eq!(pages, 5 + len + 1, "cycle of {len}");
+        }
+        // A resumed listing knows the cursor it starts from.
+        let mut c = Cursors::default();
+        assert!(c.follow(Some("resume"), "x"));
+        assert!(!c.follow(Some("x"), "resume"));
+        // After a restart from the first page the same cursors are new.
+        c.clear();
+        assert!(c.follow(None, "x"));
     }
 
     #[test]

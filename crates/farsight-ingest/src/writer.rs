@@ -29,7 +29,6 @@ use farsight_storage::error::StorageError;
 use farsight_storage::firehose::{self, FirehoseProgress};
 use farsight_storage::gates::SharedGates;
 use farsight_storage::ids::SeamId;
-use farsight_storage::janitor;
 use farsight_storage::keys::Limits;
 use farsight_storage::repo_events::{RepoEvent, record_poisoned};
 use farsight_storage::txn::ApplyReport;
@@ -682,26 +681,15 @@ impl Writer {
         if live {
             metrics::gauge!(m::LAG).set(lag.max(0.0));
         }
-        // Purge accounts that became `deleted` (multi-transaction,
-        // after the status commit; resumed at start-up if interrupted).
-        let purge_started = Instant::now();
-        // A purge given up leaves the account `deleted` with rows still
-        // stored: its rows are already withheld by its status, and the
-        // purge is taken up again by the daily task and at the next start
-        // (`janitor::accounts_pending_purge`).
-        for did in &report.deleted_accounts {
-            self.call_or_record("purge_account", Some(did), || {
-                janitor::purge_account(&self.pool, &self.limits, &self.counters, did)
-            })
-            .await;
-        }
+        // An account that became `deleted` is not purged here: the batch
+        // that recorded the deletion asked the server's purge task for it
+        // (`account_purges`), and the status already withholds its rows.
         let total = started.elapsed().as_secs_f64();
         if total > 5.0 {
             tracing::warn!(
                 total_secs = total,
                 apply_secs,
-                purge_secs = purge_started.elapsed().as_secs_f64(),
-                purged_accounts = report.deleted_accounts.len(),
+                deleted_accounts = report.deleted_accounts.len(),
                 writes = n_writes,
                 repo_events = n_events,
                 deadlock_retries = report.deadlock_retries,

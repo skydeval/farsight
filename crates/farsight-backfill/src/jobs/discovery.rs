@@ -4,7 +4,11 @@
 //! their list owner's repo, (c) listblocks on every list from (b) — verify
 //! every reference with `getRecord` at its author's PDS and apply it with
 //! `W = 0`, charged to the requester. Only an untruncated completion
-//! confirms subject coverage.
+//! confirms subject coverage, and a run is truncated by the reference
+//! cap and by every reference it could not check: one whose author did
+//! not resolve for a reason that may pass, or whose record could not be
+//! read. A reference is settled when its record was read, or when its
+//! author's PDS or the directory says there is none.
 
 use chrono::{DateTime, Utc};
 use farsight_core::record::parse_record;
@@ -87,16 +91,31 @@ impl Run<'_> {
     }
 
     /// Fetches and parses one referenced record at its author's PDS.
+    /// `None` when there is no such record to store; when that could not
+    /// be found out, the run is marked truncated as well.
     async fn verify(&mut self, l: &Backlink, k: Collection) -> Option<(Did, RecordKey, Record)> {
+        // A reference that names no DID or no record key names no record.
         let did = Did::parse(&l.did).ok()?;
         let rkey = RecordKey::parse(&l.rkey).ok()?;
-        let pds = self.ctx.resolver.resolve(&did, false).await.ok()?;
+        let resolved = self.ctx.resolver.resolve(&did, false).await;
         self.cost += 1;
-        let value = xrpc::get_record(&self.ctx.net, &pds.endpoint, &did, k.nsid(), rkey.as_str())
-            .await
-            .ok()??;
-        let rec = parse_record(&did, k, &value).ok()?;
-        Some((did, rkey, rec))
+        let fetched = match &resolved {
+            Ok(pds) => Some(
+                xrpc::get_record(&self.ctx.net, &pds.endpoint, &did, k.nsid(), rkey.as_str()).await,
+            ),
+            Err(_) => None,
+        };
+        match checked(resolved.as_ref().err(), fetched) {
+            Checked::Record(value) => {
+                let rec = parse_record(&did, k, &value).ok()?;
+                Some((did, rkey, rec))
+            }
+            Checked::Gone => None,
+            Checked::Unknown => {
+                self.truncated = true;
+                None
+            }
+        }
     }
 
     async fn push(
@@ -142,6 +161,37 @@ impl Run<'_> {
         let report = apply::apply(&self.ctx.pool, &actx, &b).await?;
         crate::metrics::count_refusals(&report);
         Ok(())
+    }
+}
+
+/// What checking one reference found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Checked {
+    /// The record, as its author's PDS returned it.
+    Record(serde_json::Value),
+    /// There is no such record: the author does not exist or is
+    /// tombstoned, or its PDS says the record is not there.
+    Gone,
+    /// Not found out: the author did not resolve for a reason that may
+    /// pass, or the record could not be read. The reference may be real,
+    /// so the run cannot confirm that it found everything.
+    Unknown,
+}
+
+/// What the resolution of a reference's author (`unresolved` is why it
+/// failed) and the read of its record (`fetched`, when the author
+/// resolved) say of the reference.
+pub fn checked(
+    unresolved: Option<&crate::resolve::ResolveError>,
+    fetched: Option<Result<Option<serde_json::Value>, crate::net::NetError>>,
+) -> Checked {
+    use crate::resolve::ResolveError;
+    match (unresolved, fetched) {
+        (Some(ResolveError::NotFound | ResolveError::Tombstoned), _) => Checked::Gone,
+        (Some(ResolveError::Transient(_)), _) => Checked::Unknown,
+        (None, Some(Ok(Some(value)))) => Checked::Record(value),
+        (None, Some(Ok(None))) => Checked::Gone,
+        (None, Some(Err(_)) | None) => Checked::Unknown,
     }
 }
 
@@ -238,8 +288,11 @@ async fn run_inner(
     run.flush().await?;
     // Every list found naming X, whatever its state; a list without a
     // row is interned as a placeholder charged to the requester.
+    let mut named = Vec::with_capacity(lists.len());
     for list in &lists {
-        record_subject_list(ctx, x_id, list, requester).await?;
+        if let Some(id) = record_subject_list(ctx, x_id, list, requester).await? {
+            named.push(id);
+        }
     }
     // (c) Listblocks on those lists (verified listblocks admit lists the
     // normal way).
@@ -267,6 +320,13 @@ async fn run_inner(
     .execute(pool)
     .await?;
     if !run.truncated {
+        // The run saw every list that names X: the lists an earlier run
+        // found and this one did not no longer do.
+        sqlx::query("DELETE FROM subject_lists WHERE actor_id = $1 AND NOT (list_id = ANY($2))")
+            .bind(x_id)
+            .bind(&named)
+            .execute(pool)
+            .await?;
         sqlx::query(&format!(
             "INSERT INTO subject_coverage (actor_id, scope, confirmed_at, refs_found)
              VALUES ($1, {SCOPE_BLOCK}, now(), $2), ($1, {SCOPE_LIST_CHAIN}, now(), $2)
@@ -293,10 +353,10 @@ async fn record_subject_list(
     x_id: ActorId,
     list: &AtUri,
     requester: RequesterKey,
-) -> Result<(), JobError> {
+) -> Result<Option<farsight_storage::ids::ListId>, JobError> {
     let limits = ctx.limits();
     let mut tx = ctx.pool.begin().await?;
-    let deltas = {
+    let (deltas, stored) = {
         let mut t = Txn::start(&mut tx, &limits, ctx.gates.load()).await?;
         let key =
             farsight_storage::keys::list_lock_key(list.authority.as_str(), list.rkey.as_str());
@@ -308,7 +368,11 @@ async fn record_subject_list(
             large: true,
             mask: 0,
         };
-        if let Ok(list_id) = t.intern_list(&list.authority, &list.rkey, &cause).await? {
+        let stored = t
+            .intern_list(&list.authority, &list.rkey, &cause)
+            .await?
+            .ok();
+        if let Some(list_id) = stored {
             sqlx::query("INSERT INTO subject_lists (actor_id, list_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
                 .bind(x_id)
                 .bind(list_id)
@@ -316,9 +380,63 @@ async fn record_subject_list(
                 .await?;
         }
         let (_, d) = t.finish();
-        d
+        (d, stored)
     };
     tx.commit().await?;
     ctx.counters.add(deltas);
-    Ok(())
+    Ok(stored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::NetError;
+    use crate::resolve::ResolveError;
+    use serde_json::json;
+
+    #[test]
+    fn only_an_answer_settles_a_reference() {
+        let record = json!({"subject": "did:plc:x"});
+        // The record was read.
+        assert_eq!(
+            checked(None, Some(Ok(Some(record.clone())))),
+            Checked::Record(record)
+        );
+        // An answer that there is none: nothing was missed.
+        assert_eq!(checked(None, Some(Ok(None))), Checked::Gone);
+        assert_eq!(checked(Some(&ResolveError::NotFound), None), Checked::Gone);
+        assert_eq!(
+            checked(Some(&ResolveError::Tombstoned), None),
+            Checked::Gone
+        );
+        // No answer: the reference may be real.
+        assert_eq!(
+            checked(Some(&ResolveError::Transient("timed out".into())), None),
+            Checked::Unknown
+        );
+        let failures = [
+            NetError::Http {
+                status: 500,
+                name: String::new(),
+            },
+            NetError::Http {
+                status: 429,
+                name: "RateLimitExceeded".into(),
+            },
+            NetError::Http {
+                status: 400,
+                name: "RepoNotFound".into(),
+            },
+            NetError::Cooling {
+                host: "pds.example".into(),
+                secs: 30,
+            },
+            NetError::Transport("timed out".into()),
+            NetError::Decode("not JSON".into()),
+        ];
+        for e in failures {
+            assert_eq!(checked(None, Some(Err(e.clone()))), Checked::Unknown, "{e}");
+        }
+        assert_eq!(checked(None, None), Checked::Unknown);
+    }
 }

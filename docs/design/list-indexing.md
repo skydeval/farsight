@@ -235,8 +235,9 @@ the batch and keeps its own retry.
 | `list` record write by O for L | author(O); list(L) exclusive |
 | list-job record check or promotion | author(O); list(L) exclusive |
 | purge batch of L | author(O); list(L) exclusive |
-| reactivation of O (`account` event, active) | author(O); list(L) exclusive for every `unavailable` list of O |
-| account purge of D | author(D); then, per batch, the list locks it touches |
+| reactivation of O (`account` event, active) | author(O); list(L) exclusive for the `unavailable` lists of O, the 500 with the lowest ids (the others keep their own retry) |
+| account purge of D | author(D); then, per batch, the list locks it touches, at most 500 |
+| claim of a fetch run for O | list(L) exclusive for the lists it claims, at most 500 |
 | discovery write of `subject_lists` for (X, L) | list(L) shared |
 | placeholder-list cleanup of L | list(L) exclusive |
 | creating the `actors` row of D | intern(D), after all author and list locks |
@@ -296,7 +297,10 @@ are touched.
   budget left (`limits.owner_readmissions_per_day`, 4 per UTC day):
   charge one, then **admit**. Over budget: `state = deferred`,
   `deferred_by = 5`, `next_retry_at` = the start of the next UTC day;
-  a daily retry task fires **GO** on such lists.
+  a daily retry task fires **GO** on such lists. The charge is one
+  conditional statement on the owner's row, so two of an owner's
+  lists that are re-admitted at the same moment cannot both take the
+  last of the budget: the one that finds it gone is deferred.
 - **purge→X**: `state = purging`; `purge_then = X`;
   `fetch_run_id = NULL`. The janitor deletes the list's items in
   batches of 10,000 rows, each batch under author(owner) and list(L)
@@ -361,7 +365,10 @@ item clears `capped`.
 discarded history. The re-admission is charged when **DV** fires. With
 budget left: charge one, purge→`untracked`, and **PD** re-admits the
 list (count > 0) uncharged for a fresh fetch. Over budget: set
-`deferred_by = 5` and `next_retry_at`, purge→`deferred`. **DV** is
+`deferred_by = 5` and `next_retry_at`, purge→`deferred`. A list
+nothing counts on (count = 0, which is what `retained` means) is not
+re-admitted when its purge ends, so for it **DV** is purge→`untracked`
+with no charge and no deferral, whatever the budget. **DV** is
 fired *before* the owner's authored rows are purged, so the list is
 already `purging` — treated like `pending` for coverage — and is never
 served empty as `ready`.

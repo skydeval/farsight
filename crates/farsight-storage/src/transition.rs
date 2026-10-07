@@ -250,7 +250,7 @@ pub fn transition(f: &ListFacts, event: Event, ctx: &Ctx) -> Outcome {
             changed: true,
         },
         (S::Ready, E::FailTerminal) | (S::Ready, E::OwnerInactive) => stay(f),
-        (S::Ready, E::Diverged) => diverged_fetched(ctx),
+        (S::Ready, E::Diverged) => diverged_fetched(ctx, count_pos),
         (S::Ready, _) => stay(f),
 
         // retained
@@ -263,7 +263,7 @@ pub fn transition(f: &ListFacts, event: Event, ctx: &Ctx) -> Outcome {
             changed: true,
         },
         (S::Retained, E::FailTerminal) | (S::Retained, E::OwnerInactive) => stay(f),
-        (S::Retained, E::Diverged) => diverged_fetched(ctx),
+        (S::Retained, E::Diverged) => diverged_fetched(ctx, count_pos),
         (S::Retained, E::GraceExpired) => purge(S::Untracked),
         (S::Retained, _) => stay(f),
 
@@ -358,8 +358,13 @@ pub fn transition(f: &ListFacts, event: Event, ctx: &Ctx) -> Outcome {
 
 /// DV on `ready`/`retained`: purge→`untracked` (PD re-admits, count > 0),
 /// with the owner-caused re-admission charged now; over budget the purge
-/// ends in `deferred` instead.
-fn diverged_fetched(ctx: &Ctx) -> Outcome {
+/// ends in `deferred` instead. A list nothing counts on is not
+/// re-admitted when its purge ends, so it is purged to `untracked`
+/// without a charge whatever the budget.
+fn diverged_fetched(ctx: &Ctx, count_pos: bool) -> Outcome {
+    if !count_pos {
+        return purge(TrackState::Untracked);
+    }
     if ctx.owner_readmit_available {
         let mut o = purge(TrackState::Untracked);
         o.effects.insert(0, Effect::ChargeOwnerReadmission);
@@ -574,9 +579,22 @@ mod tests {
         );
         assert!(unchanged(&transition(&f, E::FailTerminal, &OK_CTX), &f));
         assert!(unchanged(&transition(&f, E::OwnerInactive, &OK_CTX), &f));
+        // Nothing counts on a retained list, so no re-admission follows
+        // its purge: DV charges nothing and defers nothing, with budget
+        // or without.
+        for ctx in [&OK_CTX, &NO_BUDGET] {
+            let dv = transition(&f, E::Diverged, ctx);
+            assert!(is_purge(&dv, S::Untracked));
+            assert!(!dv.effects.contains(&Effect::ChargeOwnerReadmission));
+            assert!(!dv.effects.iter().any(|e| matches!(e, Effect::Defer(_))));
+        }
+        // One that is counted on again is re-admitted, and charged.
+        let dv = transition(&facts(S::Retained, 1), E::Diverged, &OK_CTX);
+        assert!(is_purge(&dv, S::Untracked));
+        assert!(dv.effects.contains(&Effect::ChargeOwnerReadmission));
         assert!(is_purge(
-            &transition(&f, E::Diverged, &OK_CTX),
-            S::Untracked
+            &transition(&facts(S::Retained, 1), E::Diverged, &NO_BUDGET),
+            S::Deferred
         ));
         assert!(is_purge(
             &transition(&f, E::GraceExpired, &OK_CTX),

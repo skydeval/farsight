@@ -194,7 +194,7 @@ names what a `complete` scope leaves out. The last use matters: a
 | `list_missing` | A list is in state `missing`; on `getListMembers`, also `dead`. | The record is found, or the listblocks on it go away. |
 | `list_deferred` | A list is in state `deferred`. | The gate reopens and the list is admitted. |
 | `list_not_tracked` | `getListMembers` on a list that no counted listblock targets. Farsight holds no items for it by design. | A listblock on the list admits it. |
-| `discovery_truncated` | The network-wide claim cannot be made and the discovery run for the subject was cut short. Level `partial`. | A later discovery run completes, or the first full sweep completes. |
+| `discovery_truncated` | The network-wide claim cannot be made and the discovery run for the subject did not check every reference: it stopped at its reference cap, or a reference could not be read. Level `partial`. | A later discovery run completes, or the first full sweep completes. |
 | `party_debt` | `checkBlocks`: the actor or one of the `others` has an open re-list debt. | A clean listing of that account. |
 
 ## Exceptions

@@ -5,6 +5,7 @@
 use farsight_core::{Did, Tid};
 use farsight_storage::ids::Stamp;
 use serde_json::Value;
+use serde_json::value::RawValue;
 use url::Url;
 
 use crate::net::{Net, NetError, RECORD_NOT_FOUND, REPO_NOT_FOUND};
@@ -111,13 +112,73 @@ pub async fn latest_rev(net: &Net, pds: &str, did: &Did) -> Result<Stamp, NetErr
     rev_stamp(&s(&v, "rev").ok_or_else(|| NetError::Decode("no rev".into()))?)
 }
 
+/// Records asked for per `listRecords` page, and the most a page may
+/// hold.
+pub const PAGE_RECORDS: usize = 100;
+
 /// One listed record: its URI and value.
 #[derive(Debug, Clone)]
 pub struct Listed {
     /// `uri`: the record's `at://` URI, as the PDS returned it.
     pub uri: String,
-    /// `value`: the record itself, not yet parsed.
-    pub value: Value,
+    /// `value`: the record itself, not yet checked. `None` when its text
+    /// cannot be parsed as JSON (nested deeper than the parser allows,
+    /// for one): the key is listed, the record is not usable.
+    pub value: Option<Value>,
+}
+
+/// A `listRecords` page as it is written: the envelope is parsed, each
+/// record's `value` is left as text and parsed on its own.
+#[derive(serde::Deserialize)]
+struct RawPage<'a> {
+    #[serde(borrow)]
+    records: Option<Vec<RawRecord<'a>>>,
+    #[serde(borrow, default)]
+    cursor: Option<&'a RawValue>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawRecord<'a> {
+    #[serde(borrow, default)]
+    uri: Option<&'a RawValue>,
+    #[serde(borrow, default)]
+    value: Option<&'a RawValue>,
+}
+
+/// The JSON string written as `raw`, if it is one.
+fn raw_string(raw: Option<&RawValue>) -> Option<String> {
+    serde_json::from_str::<String>(raw?.get()).ok()
+}
+
+/// Parses a `listRecords` body. One record that cannot be parsed costs
+/// that record ([`Listed::value`] is `None`), not the page: the page's
+/// other records and its cursor are read all the same. A page with more
+/// than [`PAGE_RECORDS`] records is refused; an entry without a `uri` or a
+/// `value` is dropped.
+pub fn parse_page(body: &[u8]) -> Result<(Vec<Listed>, Option<String>), NetError> {
+    let page: RawPage<'_> =
+        serde_json::from_slice(body).map_err(|e| NetError::Decode(e.to_string()))?;
+    let records = page
+        .records
+        .ok_or_else(|| NetError::Decode("no records".into()))?;
+    if records.len() > PAGE_RECORDS {
+        return Err(NetError::Decode(format!(
+            "{} records in a page of at most {PAGE_RECORDS}",
+            records.len()
+        )));
+    }
+    let listed = records
+        .into_iter()
+        .filter_map(|r| {
+            let uri = raw_string(r.uri)?;
+            let raw = r.value?;
+            Some(Listed {
+                uri,
+                value: serde_json::from_str::<Value>(raw.get()).ok(),
+            })
+        })
+        .collect();
+    Ok((listed, raw_string(page.cursor)))
 }
 
 /// `com.atproto.repo.listRecords` with `limit=100&reverse=true` (ascending
@@ -129,34 +190,23 @@ pub async fn list_records(
     collection: &str,
     cursor: Option<&str>,
 ) -> Result<(Vec<Listed>, Option<String>), NetError> {
+    let limit = PAGE_RECORDS.to_string();
     let mut q = vec![
         ("repo", did.as_str()),
         ("collection", collection),
-        ("limit", "100"),
+        ("limit", limit.as_str()),
         ("reverse", "true"),
     ];
     if let Some(c) = cursor {
         q.push(("cursor", c));
     }
-    let v = net
-        .get_json(
+    let body = net
+        .get_body(
             &xrpc(pds, "com.atproto.repo.listRecords", &q)?,
             "listRecords",
         )
         .await?;
-    let records = v
-        .get("records")
-        .and_then(Value::as_array)
-        .ok_or_else(|| NetError::Decode("no records".into()))?
-        .iter()
-        .filter_map(|r| {
-            Some(Listed {
-                uri: s(r, "uri")?,
-                value: r.get("value")?.clone(),
-            })
-        })
-        .collect();
-    Ok((records, s(&v, "cursor")))
+    parse_page(&body)
 }
 
 /// `com.atproto.repo.getRecord`; `Ok(None)` on `RecordNotFound`.
@@ -414,6 +464,67 @@ mod tests {
             status: 500,
             name: String::new()
         }));
+    }
+
+    #[test]
+    fn one_record_that_cannot_be_parsed_costs_that_record_not_the_page() {
+        let deep = format!("{}{}", "[".repeat(4_000), "]".repeat(4_000));
+        let body = format!(
+            r#"{{"records":[
+                 {{"uri":"at://did:plc:a/app.bsky.graph.block/1","cid":"x","value":{{"subject":"did:plc:b"}}}},
+                 {{"uri":"at://did:plc:a/app.bsky.graph.block/2","cid":"x","value":{{"subject":{deep}}}}},
+                 {{"uri":"at://did:plc:a/app.bsky.graph.block/3","cid":"x","value":{{"subject":"did:plc:c"}}}},
+                 {{"cid":"no uri","value":{{}}}},
+                 {{"uri":"at://did:plc:a/app.bsky.graph.block/5"}}
+               ],"cursor":"next"}}"#
+        );
+        // Parsed whole, the page is lost with the one record.
+        assert!(serde_json::from_str::<Value>(&body).is_err());
+        let (records, cursor) = parse_page(body.as_bytes()).unwrap();
+        assert_eq!(cursor.as_deref(), Some("next"));
+        let uris: Vec<&str> = records.iter().map(|r| r.uri.as_str()).collect();
+        assert_eq!(
+            uris,
+            [
+                "at://did:plc:a/app.bsky.graph.block/1",
+                "at://did:plc:a/app.bsky.graph.block/2",
+                "at://did:plc:a/app.bsky.graph.block/3"
+            ]
+        );
+        assert!(records[0].value.is_some() && records[2].value.is_some());
+        assert!(
+            records[1].value.is_none(),
+            "the nested record is listed without a value"
+        );
+        // The last page has no cursor, written or null.
+        for tail in [r#"{"records":[]}"#, r#"{"records":[],"cursor":null}"#] {
+            assert_eq!(parse_page(tail.as_bytes()).unwrap().1, None);
+        }
+        // Not a page at all.
+        for bad in ["", "[]", r#"{"cursor":"x"}"#, r#"{"records":7}"#, "{"] {
+            assert!(
+                matches!(parse_page(bad.as_bytes()), Err(NetError::Decode(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_with_more_records_than_asked_for_is_refused() {
+        let page = |n: usize| {
+            let records: Vec<String> = (0..n)
+                .map(|i| format!(r#"{{"uri":"at://did:plc:a/c/{i}","value":{{}}}}"#))
+                .collect();
+            format!(r#"{{"records":[{}]}}"#, records.join(","))
+        };
+        assert_eq!(
+            parse_page(page(PAGE_RECORDS).as_bytes()).unwrap().0.len(),
+            PAGE_RECORDS
+        );
+        assert!(matches!(
+            parse_page(page(PAGE_RECORDS + 1).as_bytes()),
+            Err(NetError::Decode(_))
+        ));
     }
 
     #[test]

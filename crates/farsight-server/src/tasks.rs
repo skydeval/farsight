@@ -199,9 +199,21 @@ fn jobs() -> Vec<Job> {
         job!("rate_tables", DAY, Duration::from_secs(960), rate_tables),
         job!(
             "account_purges",
-            DAY,
-            Duration::from_secs(1500),
+            Duration::from_secs(10),
+            Duration::from_secs(8),
             account_purges
+        ),
+        job!(
+            "account_purge_scan",
+            DAY,
+            Duration::from_secs(45),
+            account_purge_scan
+        ),
+        job!(
+            "table_pruning",
+            DAY,
+            Duration::from_secs(1140),
+            table_pruning
         ),
         job!(
             "history_retention",
@@ -571,34 +583,70 @@ async fn placeholder_lists(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
     Ok(format!("{total} placeholder lists deleted"))
 }
 
-/// Purges of `deleted` accounts that are not finished: one that was
-/// interrupted, or that the ingest writer gave up on. An account whose
+/// Accounts purged per pass of [`account_purges`].
+const PURGE_ACCOUNTS: i64 = 20;
+/// Batches per account and pass: an account with more to remove goes on
+/// in the next pass, so one large account does not hold up the others.
+const PURGE_BATCHES: u32 = 25;
+
+/// The purges of `deleted` accounts asked for in `account_purges`: the
+/// transaction that recorded a deletion asked for its purge, so neither
+/// the firehose writer nor a backfill job waits for one. An account whose
 /// purge fails is recorded and the others still run.
 async fn account_purges(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
-    let pending = janitor::accounts_pending_purge(&ctx.pool, 1000).await?;
     let limits = ctx.limits();
-    let (mut purged, mut failed) = (0u32, 0u32);
-    for did in &pending {
-        match janitor::purge_account(&ctx.pool, &limits, &ctx.counters, did).await {
-            Ok(()) => purged += 1,
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(%did, error = %e, "purging a deleted account failed");
-                let _ = farsight_storage::auth::record_op_error(
-                    &ctx.pool,
-                    "task:account_purges",
-                    Some(did.as_str()),
-                    &e.to_string(),
-                )
-                .await;
-            }
-        }
+    let r = janitor::run_account_purges(
+        &ctx.pool,
+        &limits,
+        &ctx.counters,
+        PURGE_ACCOUNTS,
+        PURGE_BATCHES,
+    )
+    .await?;
+    for (did, e) in &r.failed {
+        tracing::warn!(%did, error = %e, "purging a deleted account failed");
+        let _ = farsight_storage::auth::record_op_error(
+            &ctx.pool,
+            "task:account_purges",
+            Some(did.as_str()),
+            e,
+        )
+        .await;
     }
-    Ok(if pending.is_empty() {
+    Ok(if r.purged == 0 && r.failed.is_empty() {
         String::new()
     } else {
-        format!("{purged} deleted accounts purged, {failed} failed")
+        format!(
+            "{} deleted accounts purged, {} failed, {} going on",
+            r.purged,
+            r.failed.len(),
+            r.unfinished
+        )
     })
+}
+
+/// Looks for `deleted` accounts that still hold rows and have no purge
+/// asked for (shortly after start, then daily), and asks for it.
+async fn account_purge_scan(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    let n = janitor::request_pending_purges(&ctx.pool, 10_000).await?;
+    Ok(if n == 0 {
+        String::new()
+    } else {
+        format!("{n} deleted accounts with rows left: purge asked for")
+    })
+}
+
+/// Nightly: rows of tables that only ever grow are deleted past their
+/// use.
+async fn table_pruning(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
+    let now = Utc::now();
+    let runs = janitor::prune_fetch_runs(&ctx.pool, now).await?;
+    let errors = janitor::prune_op_errors(&ctx.pool, now).await?;
+    let subject_lists = janitor::prune_subject_lists(&ctx.pool).await?;
+    Ok(format!(
+        "pruned {runs} finished list fetch runs, {errors} logged errors, {subject_lists} \
+         references to deleted lists"
+    ))
 }
 
 async fn rate_tables(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {

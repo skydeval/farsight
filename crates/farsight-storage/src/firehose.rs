@@ -309,6 +309,13 @@ pub async fn maintain_clock(pool: &PgPool, now: DateTime<Utc>) -> Result<u64> {
     Ok(thinned + expired)
 }
 
+/// The statement that takes the transaction-scoped lock under which a
+/// repair cycle is started. The API (`admin.startRepair`) and the
+/// backfill process (auto-start) both take it and look for an open
+/// repair under it.
+pub const START_REPAIR_LOCK: &str =
+    "SELECT pg_advisory_xact_lock(hashtext('farsight:start_repair'))";
+
 /// A `firehose_gaps` row: an interval of the witness clock in which events
 /// may have been lost.
 #[derive(Debug, Clone, PartialEq, Eq)]

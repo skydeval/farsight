@@ -19,6 +19,13 @@ x-farsight-common: &farsight-common
       required: false
   environment:
     FARSIGHT__STORAGE__DATABASE_URL: postgres://farsight:${POSTGRES_PASSWORD:-farsight}@postgres:5432/farsight
+    # Metrics listen on loopback unless told otherwise. Here the ports are
+    # not published, so every interface means the compose network.
+    FARSIGHT__METRICS__BIND: 0.0.0.0:9464
+    FARSIGHT__METRICS__BACKFILL_BIND: 0.0.0.0:9465
+  # Both processes take up to 30 s to stop: they finish the batch in hand
+  # and give back the work they hold.
+  stop_grace_period: 45s
   depends_on:
     postgres:
       condition: service_healthy

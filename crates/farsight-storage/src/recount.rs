@@ -18,7 +18,7 @@ use crate::error::{Result, StorageError};
 use crate::keys::{self, HostFacts, Limits};
 use crate::tracking::FireArgs;
 use crate::transition::Event;
-use crate::txn::{Gates, Txn};
+use crate::txn::{Gates, MAX_LOCKS, Txn, lock_ascending, retry_deadlocks};
 
 /// The row a repaired counter is on: the list counters are columns of
 /// `lists`, the per-author counters columns of `actors`.
@@ -94,16 +94,20 @@ pub async fn recount_lists(
                     .collect(),
             )
             .await?;
-            let (stored_lb, stored_items, actual_lb, actual_items): (i32, i32, i64, i64) =
-                sqlx::query_as(
-                    "SELECT l.listblock_count, l.item_count,
+            let counts: Option<(i32, i32, i64, i64)> = sqlx::query_as(
+                "SELECT l.listblock_count, l.item_count,
                             (SELECT count(*) FROM list_blocks b WHERE b.list_id = l.id AND b.counted),
                             (SELECT count(*) FROM list_items i WHERE i.list_id = l.id)
                      FROM lists l WHERE l.id = $1",
-                )
-                .bind(id)
-                .fetch_one(&mut *t.conn)
-                .await?;
+            )
+            .bind(id)
+            .fetch_optional(&mut *t.conn)
+            .await?;
+            // A placeholder the cleanup deleted since the batch was read:
+            // there is nothing to recount, and the pass goes on.
+            let Some((stored_lb, stored_items, actual_lb, actual_items)) = counts else {
+                continue;
+            };
             report.checked += 1;
             if i64::from(stored_items) != actual_items {
                 report.drift.push(Drift {
@@ -152,8 +156,9 @@ pub async fn recount_lists(
 
 /// Recounts the exact per-actor counters (`authored_blocks`,
 /// `authored_listblocks`, `authored_lists`, `owned_items`,
-/// `fetch_triggers`) for actors with `id > after`, `batch` at a time, under
-/// their author locks. Returns the report and the last id checked.
+/// `fetch_triggers`) for actors with `id > after`, `batch` at a time (at
+/// most [`MAX_LOCKS`]), under their author locks. Returns the report and
+/// the last id checked.
 pub async fn recount_actors(
     pool: &PgPool,
     after: ActorId,
@@ -162,7 +167,7 @@ pub async fn recount_actors(
     let actors: Vec<(ActorId, String)> =
         sqlx::query_as("SELECT id, did FROM actors WHERE id > $1 ORDER BY id LIMIT $2")
             .bind(after)
-            .bind(batch)
+            .bind(batch.min(MAX_LOCKS as i64))
             .fetch_all(pool)
             .await?;
     let mut report = RecountReport::default();
@@ -175,12 +180,7 @@ pub async fn recount_actors(
         .iter()
         .map(|(_, d)| keys::author_lock_key(d))
         .collect();
-    for k in &locks {
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(*k)
-            .execute(&mut *tx)
-            .await?;
-    }
+    lock_ascending(&mut tx, &locks).await?;
     type Row = (ActorId, i32, i32, i32, i32, i32, i64, i64, i64, i64, i64);
     let rows: Vec<Row> = sqlx::query_as(
         &format!("SELECT a.id, a.authored_blocks, a.authored_listblocks, a.authored_lists,
@@ -226,12 +226,28 @@ pub async fn recount_actors(
     Ok((report, Some(last)))
 }
 
-/// Rebuilds `stats_counters` exactly (shard 0 holds the total; other
-/// shards are reset) and the `stored_blocks/items/listblocks/lists`
-/// columns of `host_usage` from the exact per-author counters, grouped by
-/// each author's current buckets. `stored_interned` is a lifetime charge
-/// with no per-row record and is left as is; placeholder-list charges in
+/// What a rebuilt counter is set to: the exact count `counted`, plus what
+/// the writers flushed while the rebuild ran (`now − then`, the stored
+/// value read when the rebuild writes and when it counted). Never below
+/// zero.
+pub fn rebuilt(counted: i64, then: i64, now: i64) -> i64 {
+    counted.saturating_add(now.saturating_sub(then)).max(0)
+}
+
+/// Rebuilds `stats_counters` (shard 0 holds the total; other shards are
+/// reset) and the `stored_blocks/items/listblocks/lists` columns of
+/// `host_usage` from the exact per-author counters, grouped by each
+/// author's current buckets. `stored_interned` is a lifetime charge with
+/// no per-row record and is left as is; placeholder-list charges in
 /// `stored_listblocks` are not reconstructed.
+///
+/// Counting takes minutes, and the writers go on flushing deltas
+/// meanwhile. The rows are counted, and the stored values read, in one
+/// snapshot; under the table lock the stored values are read again and
+/// what was flushed in between is added to the counts ([`rebuilt`]). A
+/// delta for a row that was already counted, flushed after the snapshot,
+/// is counted twice: at most one flush interval of changes, until the
+/// next rebuild.
 pub async fn rebuild_approximate_counters(pool: &PgPool, batch: i64) -> Result<()> {
     let lists = format!("SELECT count(*) FROM lists WHERE record_state = {RECORD_PRESENT}");
     let exact: [(&str, &str); 5] = [
@@ -241,34 +257,29 @@ pub async fn rebuild_approximate_counters(pool: &PgPool, batch: i64) -> Result<(
         (stat::LIST_ITEMS, "SELECT count(*) FROM list_items"),
         (stat::ACTORS, "SELECT count(*) FROM actors"),
     ];
-    // Counted first, outside the transaction that writes them: counting
-    // the large tables takes a minute, and the lock below is not held
-    // that long.
+    // One snapshot for the counts and for the stored values they are
+    // compared with. It takes no lock a writer waits for.
+    let mut snap = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *snap)
+        .await?;
+    let then: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT name, COALESCE(sum(value), 0)::BIGINT FROM stats_counters GROUP BY name",
+    )
+    .fetch_all(&mut *snap)
+    .await?;
+    let then: BTreeMap<String, i64> = then.into_iter().collect();
     let mut counts = Vec::with_capacity(exact.len());
     for (name, sql) in exact {
-        let n: i64 = sqlx::query_scalar(sql).fetch_one(pool).await?;
+        let n: i64 = sqlx::query_scalar(sql).fetch_one(&mut *snap).await?;
         counts.push((name, n));
     }
-    let mut tx = pool.begin().await?;
-    // The writers' flushes update these rows one at a time, in their own
-    // order, and replacing them all at once under row locks deadlocks
-    // with a flush in progress. The table lock waits for flushes under
-    // way and holds back new ones for the moment the rows are replaced.
-    sqlx::query("LOCK TABLE stats_counters IN SHARE ROW EXCLUSIVE MODE")
-        .execute(&mut *tx)
-        .await?;
-    for (name, n) in counts {
-        sqlx::query("DELETE FROM stats_counters WHERE name = $1")
-            .bind(name)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("INSERT INTO stats_counters (name, shard, value) VALUES ($1, 0, $2)")
-            .bind(name)
-            .bind(n)
-            .execute(&mut *tx)
-            .await?;
-    }
-    tx.commit().await?;
+    let usage_then: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT bucket, stored_blocks, stored_items, stored_listblocks, stored_lists
+         FROM host_usage",
+    )
+    .fetch_all(&mut *snap)
+    .await?;
 
     let mut usage: BTreeMap<String, [i64; 4]> = BTreeMap::new();
     let mut after = ActorId::new(0);
@@ -296,7 +307,7 @@ pub async fn rebuild_approximate_counters(pool: &PgPool, batch: i64) -> Result<(
         )
         .bind(after)
         .bind(batch)
-        .fetch_all(pool)
+        .fetch_all(&mut *snap)
         .await?;
         let Some(last) = rows.last().map(|r| r.0) else {
             break;
@@ -324,34 +335,97 @@ pub async fn rebuild_approximate_counters(pool: &PgPool, batch: i64) -> Result<(
             }
         }
     }
+    snap.commit().await?;
+
+    let mut tx = pool.begin().await?;
+    // The writers' flushes update these rows one at a time, in their own
+    // order, and replacing them all at once under row locks deadlocks
+    // with a flush in progress. The table lock waits for flushes under
+    // way and holds back new ones for the moment the rows are replaced.
+    sqlx::query("LOCK TABLE stats_counters IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    let now: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT name, COALESCE(sum(value), 0)::BIGINT FROM stats_counters GROUP BY name",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let now: BTreeMap<String, i64> = now.into_iter().collect();
+    for (name, n) in counts {
+        let total = rebuilt(
+            n,
+            then.get(name).copied().unwrap_or(0),
+            now.get(name).copied().unwrap_or(0),
+        );
+        sqlx::query("DELETE FROM stats_counters WHERE name = $1")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO stats_counters (name, shard, value) VALUES ($1, 0, $2)")
+            .bind(name)
+            .bind(total)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+
+    // Every bucket that has a stored value or a count: what it held at
+    // the snapshot, and what was counted for it.
+    let mut buckets: BTreeMap<String, ([i64; 4], [i64; 4])> = usage_then
+        .into_iter()
+        .map(|(b, x0, x1, x2, x3)| (b, ([x0, x1, x2, x3], [0; 4])))
+        .collect();
+    for (b, v) in usage {
+        buckets.entry(b).or_insert(([0; 4], [0; 4])).1 = v;
+    }
+    let names: Vec<&str> = buckets.keys().map(String::as_str).collect();
+    let col = |held: bool, i: usize| -> Vec<i64> {
+        buckets
+            .values()
+            .map(|(then, counted)| if held { then[i] } else { counted[i] })
+            .collect()
+    };
     let mut tx = pool.begin().await?;
     // As above: every row is rewritten, so flushes wait for the moment.
     sqlx::query("LOCK TABLE host_usage IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut *tx)
         .await?;
-    sqlx::query(
-        "UPDATE host_usage SET stored_blocks = 0, stored_items = 0, stored_listblocks = 0,
-                               stored_lists = 0",
-    )
-    .execute(&mut *tx)
-    .await?;
-    for (bucket, v) in &usage {
-        sqlx::query(
+    // A bucket created since the snapshot is in neither list and keeps
+    // what the flushes gave it. The arithmetic is that of [`rebuilt`].
+    const VALUES: &str = "unnest($1::TEXT[], $2::BIGINT[], $3::BIGINT[], $4::BIGINT[],
+                $5::BIGINT[], $6::BIGINT[], $7::BIGINT[], $8::BIGINT[], $9::BIGINT[])
+         AS v(bucket, t0, t1, t2, t3, c0, c1, c2, c3)";
+    let statements = [
+        format!(
+            "UPDATE host_usage h SET
+               stored_blocks = GREATEST(v.c0 + h.stored_blocks - v.t0, 0),
+               stored_items = GREATEST(v.c1 + h.stored_items - v.t1, 0),
+               stored_listblocks = GREATEST(v.c2 + h.stored_listblocks - v.t2, 0),
+               stored_lists = GREATEST(v.c3 + h.stored_lists - v.t3, 0)
+             FROM {VALUES} WHERE h.bucket = v.bucket"
+        ),
+        format!(
             "INSERT INTO host_usage (bucket, stored_blocks, stored_items, stored_listblocks,
                                      stored_lists)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (bucket) DO UPDATE SET stored_blocks = EXCLUDED.stored_blocks,
-               stored_items = EXCLUDED.stored_items,
-               stored_listblocks = EXCLUDED.stored_listblocks,
-               stored_lists = EXCLUDED.stored_lists",
-        )
-        .bind(bucket.as_str())
-        .bind(v[0])
-        .bind(v[1])
-        .bind(v[2])
-        .bind(v[3])
-        .execute(&mut *tx)
-        .await?;
+             SELECT v.bucket, GREATEST(v.c0 - v.t0, 0), GREATEST(v.c1 - v.t1, 0),
+                    GREATEST(v.c2 - v.t2, 0), GREATEST(v.c3 - v.t3, 0)
+             FROM {VALUES}
+             WHERE NOT EXISTS (SELECT 1 FROM host_usage h WHERE h.bucket = v.bucket)"
+        ),
+    ];
+    for sql in &statements {
+        sqlx::query(sql)
+            .bind(&names)
+            .bind(col(true, 0))
+            .bind(col(true, 1))
+            .bind(col(true, 2))
+            .bind(col(true, 3))
+            .bind(col(false, 0))
+            .bind(col(false, 1))
+            .bind(col(false, 2))
+            .bind(col(false, 3))
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(())
@@ -381,8 +455,42 @@ pub async fn reevaluate_uncounted(
     counters: &CounterSink,
     did: &Did,
 ) -> Result<ReevalReport> {
+    let mut out = ReevalReport::default();
+    let mut after = String::new();
+    // One transaction per [`MAX_LOCKS`] rows: each row's list is locked,
+    // and an author may hold uncounted listblocks on any number of lists.
+    loop {
+        let chunk =
+            retry_deadlocks(|| reevaluate_chunk(pool, limits, counters, did, &after)).await?;
+        out.flipped += chunk.flipped;
+        out.remaining = chunk.remaining;
+        out.stopped_by = chunk.stopped_by.or(out.stopped_by);
+        match chunk.last {
+            Some(last) if chunk.stopped_by != Some(CapType::TriggerCap) => after = last,
+            _ => return Ok(out),
+        }
+    }
+}
+
+/// What one transaction of [`reevaluate_uncounted`] did.
+struct ReevalChunk {
+    flipped: u64,
+    remaining: u64,
+    stopped_by: Option<CapType>,
+    /// The last rkey looked at; `None` when no uncounted row was left
+    /// after the chunk's start.
+    last: Option<String>,
+}
+
+async fn reevaluate_chunk(
+    pool: &PgPool,
+    limits: &Limits,
+    counters: &CounterSink,
+    did: &Did,
+    after: &str,
+) -> Result<ReevalChunk> {
     let mut tx = pool.begin().await?;
-    let (report, deltas) = {
+    let (chunk, deltas) = {
         let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
         t.lock_authors(&[keys::author_lock_key(did.as_str())].into_iter().collect())
             .await?;
@@ -390,9 +498,12 @@ pub async fn reevaluate_uncounted(
         let rows: Vec<(String, ListId, String, String)> = sqlx::query_as(
             "SELECT r.rkey, r.list_id, a.did, l.rkey FROM list_blocks r
              JOIN lists l ON l.id = r.list_id JOIN actors a ON a.id = l.owner_id
-             WHERE r.author_id = $1 AND NOT r.counted ORDER BY r.rkey",
+             WHERE r.author_id = $1 AND NOT r.counted AND r.rkey > $2
+             ORDER BY r.rkey LIMIT $3",
         )
         .bind(author.id)
+        .bind(after)
+        .bind(MAX_LOCKS as i64)
         .fetch_all(&mut *t.conn)
         .await?;
         let locks: BTreeMap<i64, bool> = rows
@@ -400,7 +511,12 @@ pub async fn reevaluate_uncounted(
             .map(|(_, _, owner, lrkey)| (keys::list_lock_key(owner, lrkey), true))
             .collect();
         t.lock_lists(&locks).await?;
-        let mut out = ReevalReport::default();
+        let mut out = ReevalChunk {
+            flipped: 0,
+            remaining: 0,
+            stopped_by: None,
+            last: rows.last().map(|r| r.0.clone()),
+        };
         for (rkey, list_id, _, _) in &rows {
             match decide_counted(&mut t, &author, *list_id).await? {
                 Ok(()) => {
@@ -445,5 +561,25 @@ pub async fn reevaluate_uncounted(
     };
     tx.commit().await?;
     counters.add(deltas);
-    Ok(report)
+    Ok(chunk)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rebuilt_counter_keeps_what_was_flushed_while_it_was_counted() {
+        // Nothing flushed during the count: the count.
+        assert_eq!(rebuilt(1_000, 990, 990), 1_000);
+        // 25 more rows were flushed after the snapshot: they are not in
+        // the count, and are not lost.
+        assert_eq!(rebuilt(1_000, 990, 1_015), 1_025);
+        // Deletes flushed meanwhile.
+        assert_eq!(rebuilt(1_000, 990, 950), 960);
+        // A counter that had drifted far is replaced by the count.
+        assert_eq!(rebuilt(1_000, 5_000_000, 5_000_000), 1_000);
+        assert_eq!(rebuilt(0, 10, 0), 0);
+        assert_eq!(rebuilt(i64::MAX, 0, i64::MAX), i64::MAX);
+    }
 }

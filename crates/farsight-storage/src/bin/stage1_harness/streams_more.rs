@@ -1258,6 +1258,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         farsight_storage::codes::Priority::Normal,
         farsight_storage::codes::RequesterKey::Sweep,
         None,
+        None,
     )
     .await?;
     drop(conn);

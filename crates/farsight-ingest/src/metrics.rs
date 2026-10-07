@@ -109,14 +109,13 @@ pub fn describe() {
 
 /// The storage calls the writer makes outside a batch (the `op` label of
 /// [`STORAGE_ERRORS`]).
-pub const STORAGE_OPS: [&str; 12] = [
+pub const STORAGE_OPS: [&str; 11] = [
     "mark_connected",
     "set_connected",
     "record_gap",
     "read_state",
     "open_sync_unavailable",
     "close_sync_unavailable",
-    "purge_account",
     "record_poisoned",
     "open_seam",
     "close_seams",

@@ -290,7 +290,7 @@ pub async fn pause_repair(st: &Arc<ApiState>, body: &Bytes) -> Result<Reply, Xrp
 pub async fn cancel_repair_cycle(st: &ApiState) -> Result<Option<CycleId>, XrpcError> {
     set_repair_auto_start(st, false).await?;
     let mut tx = st.pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('farsight:start_repair'))")
+    sqlx::query(farsight_storage::firehose::START_REPAIR_LOCK)
         .execute(&mut *tx)
         .await?;
     let cycle: Option<CycleId> = sqlx::query_scalar(&format!(
@@ -358,7 +358,7 @@ pub struct RepairStart {
 /// unfinished repair cycle is reused. The backfill process runs it.
 pub async fn start_repair_cycle(st: &ApiState) -> Result<RepairStart, XrpcError> {
     let mut tx = st.pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('farsight:start_repair'))")
+    sqlx::query(farsight_storage::firehose::START_REPAIR_LOCK)
         .execute(&mut *tx)
         .await?;
     let (gaps, from): (i64, Option<DateTime<Utc>>) = sqlx::query_as(

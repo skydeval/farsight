@@ -176,8 +176,8 @@ Farsight ships as one container image with both binaries and a
 
 | Service | Container | Command | Volumes | Ports |
 |---|---|---|---|---|
-| `farsight` | `farsight` | `farsight` | `farsight-config` at `/etc/farsight` | `8080` published (API and web UI); `9464` metrics, inside the compose network only |
-| `farsight-backfill` | `farsight-backfill` | `farsight-backfill` | `farsight-config` at `/etc/farsight`, read-only | `9465` metrics, inside the compose network only |
+| `farsight` | `farsight` | `farsight` | `farsight-config` at `/etc/farsight` | `8080` published (API and web UI); `9464` metrics, inside the compose network only (the compose file sets `metrics.bind`) |
+| `farsight-backfill` | `farsight-backfill` | `farsight-backfill` | `farsight-config` at `/etc/farsight`, read-only | `9465` metrics, inside the compose network only (the compose file sets `metrics.backfill_bind`) |
 | `postgres` | `farsight-postgres` | `postgres:16` with tuned settings | `farsight-pgdata` | `5432`, inside the compose network only |
 
 - Only the web port is published. `FARSIGHT_PORT` changes its host

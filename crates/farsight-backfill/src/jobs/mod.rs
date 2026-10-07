@@ -91,8 +91,8 @@ pub enum Outcome {
         /// or longer. Jobs return `false`; [`finish_repo`] sets it.
         terminal: bool,
     },
-    /// The page bound was reached: continue from the cursor later (not a
-    /// failure).
+    /// A bound of the attempt (pages or time) was reached: the job is
+    /// queued to continue from its cursor (not a failure).
     Yielded,
     /// Another job holds the DID's lease: retried later.
     Busy,
@@ -163,6 +163,41 @@ pub async fn release_lease(pool: &PgPool, did: &str, owner: &str) {
         .bind(owner)
         .execute(pool)
         .await;
+}
+
+/// Deletes every lease held by a job of `process` (the process is
+/// stopping its jobs).
+pub async fn release_process_leases(pool: &PgPool, process: &str) -> Result<u64, sqlx::Error> {
+    let jobs_of = format!("{process}{}", crate::ctx::LEASE_JOB_SEP);
+    Ok(
+        sqlx::query(
+            "DELETE FROM job_leases WHERE lease_owner = $1 OR starts_with(lease_owner, $2)",
+        )
+        .bind(process)
+        .bind(jobs_of)
+        .execute(pool)
+        .await?
+        .rows_affected(),
+    )
+}
+
+/// A cycle member whose DID is not one: there is no repo to list. Its
+/// outstanding row becomes terminal and the cycle counts it as failed, so
+/// the cycle can complete.
+pub async fn settle_invalid_member(pool: &PgPool, did: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "WITH settled AS (
+           UPDATE cycle_outstanding o SET state = {MEMBER_TERMINAL} FROM sweep_cycles c
+           WHERE o.did = $1 AND o.state = {MEMBER_OUTSTANDING} AND c.id = o.cycle_id
+             AND c.completed_at IS NULL
+           RETURNING o.cycle_id)
+         UPDATE sweep_cycles SET failed_terminal = failed_terminal + 1
+         WHERE id IN (SELECT cycle_id FROM settled)"
+    ))
+    .bind(did)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// The DID's `actors.id`, creating the row (under its intern lock, charged
@@ -258,9 +293,10 @@ pub async fn settle_membership(
 pub struct Finish<'a> {
     /// The job that ran: its DID, tier and requester.
     pub req: &'a JobReq,
-    /// Its coverage point `clock(job start)`.
+    /// The coverage point of its run: `clock` of the start of the run's
+    /// first attempt.
     pub point: Option<DateTime<Utc>>,
-    /// Server time of the job start (cycle membership).
+    /// Server time of that start (cycle membership).
     pub job_start: DateTime<Utc>,
     /// The listing stamp `R`, if one was read.
     pub stamp: Option<Stamp>,
@@ -298,6 +334,7 @@ pub async fn finish_repo(
                        last_outcome = $4, backfill_rev = COALESCE($5, backfill_state.backfill_rev),
                        attempts = 0, next_attempt_at = NULL, first_failed_at = NULL,
                        last_error = NULL, current_run_id = NULL, current_run_point = NULL,
+                       current_run_started_at = NULL, yields = 0,
                        inactive_at_listing = false"),
                 )
                 .bind(id)
@@ -328,7 +365,8 @@ pub async fn finish_repo(
                  ON CONFLICT (actor_id) DO UPDATE SET state = {REPO_DONE}, backfilled_at = now(),
                    backfilled_witness = $2, last_outcome = {RUN_INACTIVE}, attempts = 0,
                    next_attempt_at = NULL, first_failed_at = NULL, last_error = NULL,
-                   current_run_id = NULL, current_run_point = NULL, inactive_at_listing = true"
+                   current_run_id = NULL, current_run_point = NULL,
+                   current_run_started_at = NULL, yields = 0, inactive_at_listing = true"
             ))
             .bind(id)
             .bind(f.point)
@@ -346,7 +384,7 @@ pub async fn finish_repo(
                  ON CONFLICT (actor_id) DO UPDATE SET state = {REPO_FAILED},
                    attempts = backfill_state.attempts + 1,
                    first_failed_at = COALESCE(backfill_state.first_failed_at, now()),
-                   last_error = $2, last_outcome = {RUN_FAILED}, current_run_point = NULL
+                   last_error = $2, last_outcome = {RUN_FAILED}, yields = 0
                  RETURNING attempts, first_failed_at"),
             )
             .bind(id)
@@ -372,7 +410,10 @@ pub async fn finish_repo(
                 settle_membership(pool, &f.req.did, f.job_start, true).await?;
             } else {
                 // Retried with backoff through the queue (failed cycle
-                // members are queued, which interns them).
+                // members are queued, which interns them). The wait is
+                // this request's: an entry already waiting for the DID,
+                // such as a newer on-demand request, keeps its own
+                // earlier time.
                 let mut conn = pool.acquire().await?;
                 farsight_storage::queue::enqueue(
                     &mut conn,
@@ -382,15 +423,8 @@ pub async fn finish_repo(
                     Priority::Normal,
                     f.req.requester,
                     None,
+                    Some(delay),
                 )
-                .await?;
-                sqlx::query(&format!(
-                    "UPDATE backfill_queue SET not_before = now() + make_interval(secs => $2)
-                     WHERE actor_id = $1 AND kind = {JOB_REPO}"
-                ))
-                .bind(id)
-                .bind(delay.as_secs_f64())
-                .execute(&mut *conn)
                 .await?;
             }
         }

@@ -144,12 +144,16 @@ pub async fn status(
         Option<String>,
         bool,
         bool,
+        bool,
     );
     let row: Option<Row> =
         sqlx::query_as(
             &format!("SELECT a.id, s.state, s.backfilled_at, s.last_error,
-                    EXISTS (SELECT 1 FROM backfill_queue q WHERE q.actor_id = a.id AND q.kind = {JOB_REPO}),
-                    EXISTS (SELECT 1 FROM job_leases j WHERE j.did = a.did AND j.lease_until > now())
+                    EXISTS (SELECT 1 FROM backfill_queue q WHERE q.actor_id = a.id AND q.kind = {JOB_REPO}
+                              AND q.claimed_by IS NULL),
+                    EXISTS (SELECT 1 FROM job_leases j WHERE j.did = a.did AND j.lease_until > now()),
+                    EXISTS (SELECT 1 FROM backfill_queue q WHERE q.actor_id = a.id AND q.kind = {JOB_REPO}
+                              AND q.claimed_until > now())
              FROM actors a LEFT JOIN backfill_state s ON s.actor_id = a.id
              WHERE a.did = $1"),
         )
@@ -170,16 +174,21 @@ pub async fn status(
             },
             None,
         ),
-        Some((id, st, at, err, queued, leased)) => {
-            let running = st == Some(BackfillState::Running) && leased;
+        Some((id, st, at, err, queued, leased, claimed)) => {
+            // A job runs while the scheduler holds its queue entry, or
+            // (a cycle member has no entry) while the stored state says
+            // so and the account's lease is held.
+            let running = claimed || (st == Some(BackfillState::Running) && leased);
             let state = if running {
                 RepoState::Running
             } else if queued {
                 RepoState::Queued
             } else {
                 match st {
-                    Some(BackfillState::Queued) => RepoState::Queued,
-                    Some(BackfillState::Running) => RepoState::Running,
+                    // `running` without a lease or a claim: the process
+                    // that ran the job is gone, and the job waits to be
+                    // taken up again.
+                    Some(BackfillState::Queued | BackfillState::Running) => RepoState::Queued,
                     Some(BackfillState::Done) => RepoState::Done,
                     Some(BackfillState::Failed) => RepoState::Failed,
                     Some(BackfillState::Never) => RepoState::Never,
@@ -342,18 +351,28 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
         Err(Refusal::Capped(_) | Refusal::Refused(_)) => return Ok(RequestOutcome::InternRefused),
     };
     let conn: &mut PgConnection = t.conn;
-    let (st, done_at, queued, leased): (Option<BackfillState>, Option<DateTime<Utc>>, bool, bool) =
+    type Standing = (
+        Option<BackfillState>,
+        Option<DateTime<Utc>>,
+        bool,
+        bool,
+        bool,
+    );
+    let (st, done_at, queued, leased, claimed): Standing =
         sqlx::query_as(
             &format!("SELECT (SELECT state FROM backfill_state WHERE actor_id = $1),
                     (SELECT backfilled_at FROM backfill_state WHERE actor_id = $1 AND state = {REPO_DONE}),
-                    EXISTS (SELECT 1 FROM backfill_queue WHERE actor_id = $1 AND kind = {JOB_REPO}),
-                    EXISTS (SELECT 1 FROM job_leases WHERE did = $2 AND lease_until > now())"),
+                    EXISTS (SELECT 1 FROM backfill_queue WHERE actor_id = $1 AND kind = {JOB_REPO}
+                              AND claimed_by IS NULL),
+                    EXISTS (SELECT 1 FROM job_leases WHERE did = $2 AND lease_until > now()),
+                    EXISTS (SELECT 1 FROM backfill_queue WHERE actor_id = $1 AND kind = {JOB_REPO}
+                              AND claimed_until > now())"),
         )
         .bind(actor_id)
         .bind(did)
         .fetch_one(&mut *conn)
         .await?;
-    let running = st == Some(BackfillState::Running) && leased;
+    let running = claimed || (st == Some(BackfillState::Running) && leased);
     let fresh = match done_at {
         Some(at) => {
             let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
@@ -410,6 +429,7 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
         prio,
         req.requester.key,
         Some(REQUESTER_QUEUE_CAP),
+        None,
     )
     .await?;
     if r == Enqueued::CapReached {
@@ -438,6 +458,7 @@ async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome
             prio,
             req.requester.key,
             Some(REQUESTER_QUEUE_CAP),
+            None,
         )
         .await?;
         if r == Enqueued::Waiting {
@@ -468,7 +489,7 @@ async fn queue_position(conn: &mut PgConnection, actor_id: ActorId) -> Result<Op
     let me: Option<(Tier, RequesterKey, Priority, DateTime<Utc>, QueueId)> =
         sqlx::query_as(&format!(
             "SELECT tier, requester, priority, enqueued_at, id FROM backfill_queue
-         WHERE actor_id = $1 AND kind = {JOB_REPO}"
+         WHERE actor_id = $1 AND kind = {JOB_REPO} AND claimed_by IS NULL"
         ))
         .bind(actor_id)
         .fetch_optional(&mut *conn)
@@ -480,7 +501,7 @@ async fn queue_position(conn: &mut PgConnection, actor_id: ActorId) -> Result<Op
         "SELECT count(*) FILTER (WHERE priority = $3 AND (enqueued_at, id) < ($4, $5)),
                 count(*) FILTER (WHERE priority <> $3)
          FROM backfill_queue
-         WHERE tier = $1 AND requester = $2 AND id <> $5
+         WHERE tier = $1 AND requester = $2 AND id <> $5 AND claimed_by IS NULL
            AND (not_before IS NULL OR not_before <= now())",
     )
     .bind(tier)
@@ -493,7 +514,8 @@ async fn queue_position(conn: &mut PgConnection, actor_id: ActorId) -> Result<Op
     let rank = rank_in_requester(prio == Priority::High, same_ahead, other_kind);
     let others: Vec<i64> = sqlx::query_scalar(
         "SELECT count(*) FROM backfill_queue
-         WHERE tier = $1 AND requester <> $2 AND (not_before IS NULL OR not_before <= now())
+         WHERE tier = $1 AND requester <> $2 AND claimed_by IS NULL
+           AND (not_before IS NULL OR not_before <= now())
          GROUP BY requester",
     )
     .bind(tier)

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use farsight_core::record::parse_record;
 use farsight_core::{Collection, Did, RecordKey};
 use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Write, WriteAction};
-use farsight_storage::codes::sql::TRACK_PENDING;
+use farsight_storage::codes::sql::{TRACK_MISSING, TRACK_PENDING};
 use farsight_storage::codes::{
     DeferCause, JobKind, Priority, RecordState, RequesterKey, Tier, TrackState,
 };
@@ -21,6 +21,8 @@ use crate::xrpc;
 
 /// Weekly retry after the short schedules are exhausted.
 pub const WEEKLY: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+/// How long a check waits when another job holds the owner's lease.
+pub const BUSY_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A waiting list as phase 1 sees it.
 #[derive(Debug, Clone)]
@@ -118,6 +120,25 @@ async fn set_retry_at(
     Ok(())
 }
 
+/// Puts off the check of `list_id` by `delay` (its job ended without an
+/// outcome): a waiting list's job row, or a `missing` list's re-check.
+pub async fn postpone(
+    ctx: &Ctx,
+    list_id: ListId,
+    delay: std::time::Duration,
+) -> Result<(), sqlx::Error> {
+    set_job_not_before(ctx, list_id, delay).await?;
+    sqlx::query(&format!(
+        "UPDATE lists SET next_retry_at = now() + make_interval(secs => $2)
+         WHERE id = $1 AND track_state = {TRACK_MISSING}"
+    ))
+    .bind(list_id)
+    .bind(delay.as_secs_f64())
+    .execute(&ctx.pool)
+    .await?;
+    Ok(())
+}
+
 /// What the record check found.
 enum Check {
     Present,
@@ -165,12 +186,21 @@ async fn run_inner(ctx: &Ctx, list_id: ListId, cost: &mut u64) -> Result<Outcome
             .execute(&ctx.pool)
             .await?;
     }
-    // The owner's lease, only for the getRecord call.
-    if !jobs::acquire_lease(&ctx.pool, l.owner.as_str(), &ctx.lease_owner).await? {
+    // The owner's lease, only for the getRecord call. It is this job's
+    // own: while another job holds the owner's (its repo is being listed,
+    // say) the check waits and is looked at again shortly, and the other
+    // job's lease is left alone.
+    let lease = ctx.lease_owner();
+    if !jobs::acquire_lease(&ctx.pool, l.owner.as_str(), &lease).await? {
+        if l.state == TrackState::Missing {
+            set_retry_at(ctx, list_id, BUSY_RETRY).await?;
+        } else {
+            set_job_not_before(ctx, list_id, BUSY_RETRY).await?;
+        }
         return Ok(Outcome::Busy);
     }
     let check = record_check(ctx, &l, cost).await;
-    jobs::release_lease(&ctx.pool, l.owner.as_str(), &ctx.lease_owner).await;
+    jobs::release_lease(&ctx.pool, l.owner.as_str(), &lease).await;
     let cfg = ctx.cfg();
     match check {
         Check::Present => {
@@ -325,6 +355,7 @@ pub async fn pass(ctx: &Ctx, l: &ListRow) -> Result<(), farsight_storage::Storag
             Priority::Normal,
             RequesterKey::Lists,
             Some(cap),
+            None,
         )
         .await?;
     }

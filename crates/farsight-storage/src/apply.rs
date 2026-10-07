@@ -52,7 +52,17 @@ use crate::txn::{
 pub const MAX_DEADLOCK_ATTEMPTS: u32 = 8;
 
 /// A listing stamp may be applied only this long after it was read.
-pub const STAMP_VALIDITY: Duration = Duration::from_secs(72 * 3600);
+pub const STAMP_VALIDITY: Duration = farsight_core::config::LISTING_STAMP_VALIDITY;
+
+/// The most rows the reconciles of one batch remove. A batch that has
+/// more to remove says so in [`ApplyReport::reconcile_pending`], and the
+/// same reconciles applied again remove the next ones.
+pub const RECONCILE_ROWS: usize = 5_000;
+
+/// The most list locks the reconciles of one batch take: half of
+/// [`crate::txn::MAX_LOCKS`], which leaves the other half to the batch's
+/// writes.
+pub const RECONCILE_LOCKS: usize = crate::txn::MAX_LOCKS / 2;
 
 /// Where a batch comes from; decides stamps, witnesses and charging.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,23 +288,32 @@ async fn apply_once(
             }
         }
         let mut candidates: Vec<Vec<String>> = Vec::with_capacity(batch.reconciles.len());
+        // What the reconciles may still remove, and lock, in this
+        // transaction.
+        let mut room = ReconcileRoom {
+            rows: RECONCILE_ROWS,
+            locks: RECONCILE_LOCKS,
+        };
         for r in &batch.reconciles {
             let Some(author_id) = t.actor_id(&r.author).await? else {
                 candidates.push(Vec::new());
                 continue;
             };
-            let c = reconcile_candidates(&mut t, author_id, r).await?;
-            if matches!(r.collection, Collection::ListBlock | Collection::ListItem) {
-                for (owner, lrkey) in
-                    stored_list_targets(&mut t, author_id, r.collection, &c).await?
-                {
-                    locks.add(&owner, &lrkey, r.collection == Collection::ListBlock);
+            let found = reconcile_candidates(&mut t, author_id, r, room.rows + 1).await?;
+            let targets = match r.collection {
+                Collection::ListBlock | Collection::ListItem => {
+                    stored_row_targets(&mut t, author_id, r.collection, &found).await?
                 }
-            }
-            if r.collection == Collection::List {
-                for rkey in &c {
-                    locks.add(r.author.as_str(), rkey, true);
-                }
+                Collection::List => found
+                    .iter()
+                    .map(|rkey| (rkey.clone(), r.author.as_str().to_owned(), rkey.clone()))
+                    .collect(),
+                Collection::Block => Vec::new(),
+            };
+            let (c, keys, more) = room.take(r.collection, found, &targets);
+            t.report.reconcile_pending |= more;
+            for (owner, lrkey) in &keys {
+                locks.add(owner, lrkey, r.collection != Collection::ListItem);
             }
             candidates.push(c);
         }
@@ -381,6 +400,7 @@ async fn apply_once(
                     crate::codes::Priority::Normal,
                     crate::codes::RequesterKey::Firehose,
                     None,
+                    None,
                 )
                 .await?;
             }
@@ -447,6 +467,89 @@ async fn stored_list_targets(
         .bind(rkeys)
         .fetch_all(&mut *t.conn)
         .await?)
+}
+
+/// `(row rkey, list owner DID, list rkey)` of the author's stored rows at
+/// `rkeys`: the list each row points to.
+async fn stored_row_targets(
+    t: &mut Txn<'_>,
+    author_id: ActorId,
+    collection: Collection,
+    rkeys: &[String],
+) -> Result<Vec<(String, String, String)>> {
+    if rkeys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = match collection {
+        Collection::ListBlock => {
+            "SELECT r.rkey, a.did, l.rkey FROM list_blocks r
+             JOIN lists l ON l.id = r.list_id JOIN actors a ON a.id = l.owner_id
+             WHERE r.author_id = $1 AND r.rkey = ANY($2)"
+        }
+        Collection::ListItem => {
+            "SELECT r.rkey, a.did, l.rkey FROM list_items r
+             JOIN lists l ON l.id = r.list_id JOIN actors a ON a.id = l.owner_id
+             WHERE r.owner_id = $1 AND r.rkey = ANY($2)"
+        }
+        _ => return Ok(Vec::new()),
+    };
+    Ok(sqlx::query_as(sql)
+        .bind(author_id)
+        .bind(rkeys)
+        .fetch_all(&mut *t.conn)
+        .await?)
+}
+
+/// What the reconciles of one transaction may still remove and lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReconcileRoom {
+    /// Rows left.
+    pub rows: usize,
+    /// List locks left.
+    pub locks: usize,
+}
+
+impl ReconcileRoom {
+    /// The head of `found` (candidate rkeys, ascending) that fits the
+    /// room, the lists it locks, and whether candidates were left for a
+    /// later transaction. `targets` names the list of each candidate that
+    /// has one. A candidate goes in while a row is left and its list is
+    /// already locked or a lock is left; the first that does not fit ends
+    /// the head, so what is left is always a tail of the range.
+    pub(crate) fn take(
+        &mut self,
+        collection: Collection,
+        found: Vec<String>,
+        targets: &[(String, String, String)],
+    ) -> (Vec<String>, BTreeSet<(String, String)>, bool) {
+        let by_row: BTreeMap<&str, (&str, &str)> = targets
+            .iter()
+            .map(|(row, owner, lrkey)| (row.as_str(), (owner.as_str(), lrkey.as_str())))
+            .collect();
+        let locked = collection != Collection::Block;
+        let mut keys: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut taken = Vec::new();
+        let total = found.len();
+        for rkey in found {
+            if self.rows == 0 {
+                break;
+            }
+            if locked && let Some((owner, lrkey)) = by_row.get(rkey.as_str()) {
+                let key = ((*owner).to_owned(), (*lrkey).to_owned());
+                if !keys.contains(&key) {
+                    if self.locks == 0 {
+                        break;
+                    }
+                    self.locks -= 1;
+                    keys.insert(key);
+                }
+            }
+            self.rows -= 1;
+            taken.push(rkey);
+        }
+        let more = taken.len() < total;
+        (taken, keys, more)
+    }
 }
 
 /// The removal a write causes: a firehose event names its commit rev
@@ -525,7 +628,7 @@ async fn apply_write(t: &mut Txn<'_>, origin: &Origin, w: &Write) -> Result<()> 
                 deletes_only: true, ..
             } = origin
             {
-                return deletes_only_skip(t, &author, w).await;
+                return deletes_only_skip(t, origin, &author, w, record).await;
             }
             let cause = cause_for(&author, origin);
             match record {
@@ -539,14 +642,40 @@ async fn apply_write(t: &mut Txn<'_>, origin: &Origin, w: &Write) -> Result<()> 
 }
 
 /// Deletes-only mode: a would-be insert or update is skipped with a
-/// `refused` debt; a stale version (LWW loser) is simply stale.
-async fn deletes_only_skip(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<()> {
+/// `refused` debt; a stale version (LWW loser) is simply stale. A stored
+/// row that the skipped version would have pointed elsewhere is removed
+/// like any refused update (the row, then a refusal tombstone): the
+/// target it names is no longer the record's.
+async fn deletes_only_skip(
+    t: &mut Txn<'_>,
+    origin: &Origin,
+    author: &AuthorInfo,
+    w: &Write,
+    record: &Record,
+) -> Result<()> {
     let rkey = w.rkey.as_str();
     let row_rev = stored_rev(t, w.collection, author.id, rkey).await?;
     let tomb = t.tombstone_rev(w.collection, author.id, &w.rkey).await?;
     if !lww_upsert_wins(w.stamp, row_rev, tomb) {
         t.report.stale += 1;
         return Ok(());
+    }
+    if row_rev.is_some() && !same_target(t, author, rkey, record).await? {
+        let refused = removal_for(origin, w, Removed::RefusedUpdate);
+        match w.collection {
+            Collection::Block => {
+                block_delete_row(t, author, rkey, Some(&refused)).await?;
+            }
+            Collection::ListBlock => {
+                listblock_delete_row(t, author, rkey, Some(&refused)).await?;
+            }
+            Collection::ListItem => {
+                item_delete_row(t, author, rkey, Some(&refused)).await?;
+            }
+            Collection::List => {}
+        }
+        t.put_refusal_tombstone(w.collection, author.id, &w.rkey, w.stamp)
+            .await?;
     }
     t.refuse(
         author,
@@ -556,6 +685,43 @@ async fn deletes_only_skip(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> R
         w.witness,
     )
     .await
+}
+
+/// Whether the stored row at `rkey` names what `record` names: a
+/// block's subject, a listblock's list, a listitem's list and subject. A
+/// list record names nothing, and a missing row differs from nothing.
+async fn same_target(
+    t: &mut Txn<'_>,
+    author: &AuthorInfo,
+    rkey: &str,
+    record: &Record,
+) -> Result<bool> {
+    Ok(match record {
+        Record::List(_) => true,
+        Record::Block(r) => {
+            let stored: Option<ActorId> = sqlx::query_scalar(
+                "SELECT subject_id FROM blocks WHERE author_id = $1 AND rkey = $2",
+            )
+            .bind(author.id)
+            .bind(rkey)
+            .fetch_optional(&mut *t.conn)
+            .await?;
+            stored.is_none() || stored == t.actor_id(&r.subject).await?
+        }
+        Record::ListBlock(r) => match listblock_row(t, author.id, rkey).await? {
+            Some(row) => {
+                Some(row.list_id) == find_list(t, &r.subject.authority, &r.subject.rkey).await?
+            }
+            None => true,
+        },
+        Record::ListItem(r) => match item_row(t, author.id, rkey).await? {
+            Some(row) => {
+                Some(row.list_id) == find_list(t, &r.list.authority, &r.list.rkey).await?
+                    && Some(row.subject_id) == t.actor_id(&r.subject).await?
+            }
+            None => true,
+        },
+    })
 }
 
 async fn stored_rev(
@@ -1690,32 +1856,35 @@ async fn list_delete(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<
 
 // -------------------------------------------------------------- reconcile
 
+/// The author's rows a reconcile removes, ascending by rkey, `limit` of
+/// them at most.
 async fn reconcile_candidates(
     t: &mut Txn<'_>,
     author_id: ActorId,
     r: &Reconcile,
+    limit: usize,
 ) -> Result<Vec<String>> {
     let sql = match r.collection {
         Collection::Block => {
             "SELECT rkey FROM blocks WHERE author_id = $1 AND rev < $2
                AND ($3::text IS NULL OR rkey > $3) AND ($4::text IS NULL OR rkey <= $4)
-               AND NOT (rkey = ANY($5)) ORDER BY rkey"
+               AND NOT (rkey = ANY($5)) ORDER BY rkey LIMIT $6"
         }
         Collection::ListBlock => {
             "SELECT rkey FROM list_blocks WHERE author_id = $1 AND rev < $2
                AND ($3::text IS NULL OR rkey > $3) AND ($4::text IS NULL OR rkey <= $4)
-               AND NOT (rkey = ANY($5)) ORDER BY rkey"
+               AND NOT (rkey = ANY($5)) ORDER BY rkey LIMIT $6"
         }
         Collection::ListItem => {
             "SELECT rkey FROM list_items WHERE owner_id = $1 AND rev < $2
                AND ($3::text IS NULL OR rkey > $3) AND ($4::text IS NULL OR rkey <= $4)
-               AND NOT (rkey = ANY($5)) ORDER BY rkey"
+               AND NOT (rkey = ANY($5)) ORDER BY rkey LIMIT $6"
         }
         Collection::List => &format!(
             "SELECT rkey FROM lists WHERE owner_id = $1 AND record_state = {RECORD_PRESENT}
                AND (rev IS NULL OR rev < $2)
                AND ($3::text IS NULL OR rkey > $3) AND ($4::text IS NULL OR rkey <= $4)
-               AND NOT (rkey = ANY($5)) ORDER BY rkey"
+               AND NOT (rkey = ANY($5)) ORDER BY rkey LIMIT $6"
         ),
     };
     let keep: Vec<String> = r.keep.iter().map(|k| k.as_str().to_owned()).collect();
@@ -1725,6 +1894,7 @@ async fn reconcile_candidates(
         .bind(r.after.as_ref().map(|k| k.as_str().to_owned()))
         .bind(r.through.as_ref().map(|k| k.as_str().to_owned()))
         .bind(keep)
+        .bind(count(limit))
         .fetch_all(&mut *t.conn)
         .await?)
 }
@@ -1818,6 +1988,44 @@ mod tests {
         let b4 = deadlock_backoff(4);
         assert!(b4 >= Duration::from_millis(80) && b4 <= Duration::from_millis(160));
         assert!(deadlock_backoff(30) <= Duration::from_millis(2_000));
+    }
+
+    #[test]
+    fn a_reconcile_takes_no_more_rows_or_locks_than_its_room() {
+        let rkeys = |n: usize| (0..n).map(|i| format!("r{i:04}")).collect::<Vec<_>>();
+        // Every listblock on its own list: the locks run out first.
+        let found = rkeys(20);
+        let targets: Vec<(String, String, String)> = found
+            .iter()
+            .map(|r| (r.clone(), "did:plc:o".to_owned(), format!("l{r}")))
+            .collect();
+        let mut room = ReconcileRoom {
+            rows: 100,
+            locks: 7,
+        };
+        let (taken, keys, more) = room.take(Collection::ListBlock, found.clone(), &targets);
+        assert_eq!((taken.len(), keys.len(), more), (7, 7, true));
+        assert_eq!(taken, found[..7], "the head of the range");
+        assert_eq!(room, ReconcileRoom { rows: 93, locks: 0 });
+        // Rows of one list need one lock, and then the rows run out.
+        let one: Vec<(String, String, String)> = found
+            .iter()
+            .map(|r| (r.clone(), "did:plc:o".to_owned(), "l".to_owned()))
+            .collect();
+        let mut room = ReconcileRoom { rows: 12, locks: 3 };
+        let (taken, keys, more) = room.take(Collection::ListItem, found.clone(), &one);
+        assert_eq!((taken.len(), keys.len(), more), (12, 1, true));
+        assert_eq!(room, ReconcileRoom { rows: 0, locks: 2 });
+        // Blocks take no list lock.
+        let mut room = ReconcileRoom { rows: 50, locks: 0 };
+        let (taken, keys, more) = room.take(Collection::Block, found.clone(), &[]);
+        assert_eq!((taken.len(), keys.len(), more), (20, 0, false));
+        // Nothing left: every candidate waits.
+        let mut room = ReconcileRoom { rows: 0, locks: 5 };
+        let (taken, _, more) = room.take(Collection::Block, found, &[]);
+        assert!(taken.is_empty() && more);
+        let (taken, _, more) = room.take(Collection::Block, Vec::new(), &[]);
+        assert!(taken.is_empty() && !more);
     }
 
     #[test]

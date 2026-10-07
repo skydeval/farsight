@@ -919,10 +919,11 @@ pub async fn backfill_overview(conn: &mut PgConnection) -> Result<BackfillOvervi
     )
     .fetch_optional(&mut *conn)
     .await?;
-    let tiers: Vec<(Tier, i64)> =
-        sqlx::query_as("SELECT tier, count(*) FROM backfill_queue GROUP BY tier")
-            .fetch_all(&mut *conn)
-            .await?;
+    let tiers: Vec<(Tier, i64)> = sqlx::query_as(
+        "SELECT tier, count(*) FROM backfill_queue WHERE claimed_by IS NULL GROUP BY tier",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
     let mut queue_by_tier = [0i64; 3];
     for (t, n) in tiers {
         queue_by_tier[t.index()] = n;

@@ -202,7 +202,7 @@ impl H {
     /// A repo job the way the scheduler runs one (lease, run, release).
     async fn job(&self, d: &str, tier: i16, requester: &str) -> Res<JobResult> {
         let did = Did::parse(d).map_err(e)?;
-        if !jobs::acquire_lease(self.pool(), d, &self.ctx.lease_owner)
+        if !jobs::acquire_lease(self.pool(), d, &self.ctx.lease_owner())
             .await
             .map_err(e)?
         {
@@ -218,7 +218,7 @@ impl H {
             },
         )
         .await;
-        jobs::release_lease(self.pool(), d, &self.ctx.lease_owner).await;
+        jobs::release_lease(self.pool(), d, &self.ctx.lease_owner()).await;
         Ok(r)
     }
 
@@ -379,19 +379,15 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
     let world: Shared = Arc::default();
     let (pds, plc) = fake::start(world.clone()).await?;
     let cfg = base_config(&pg.url("bf"), &pds, &plc);
-    let net = Arc::new(Net::new(
-        Client::Plain(reqwest::Client::new()),
-        cfg.backfill.per_host_rps,
-        cfg.backfill.per_host_concurrency,
-        cfg.backfill.plc_rps,
-        &cfg.backfill.plc_url,
-    ));
-    let resolver = Resolver::new(net.clone(), pool.clone(), &cfg, None);
+    let net = Arc::new(Net::new(Client::Plain(reqwest::Client::new()), &cfg));
+    let counters = Ctx::counter_sink();
+    let resolver = Resolver::new(net.clone(), pool.clone(), &cfg, None, counters.clone());
     let ctx = Arc::new(Ctx::new(
         pool.clone(),
         Arc::new(cfg),
         net,
         resolver,
+        counters,
         "harness",
     ));
     let h = Arc::new(H {
@@ -432,6 +428,8 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
         ("extra: subject discovery", 12),
         ("extra: hostile hosts and failing jobs", 13),
         ("extra: a relay without listReposByCollection", 14),
+        ("extra: work survives a stop", 15),
+        ("extra: hosts that never finish, and bounded work", 16),
     ];
     for (name, n) in checks {
         c.section(name);
@@ -448,6 +446,8 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
             10 => check_feeder(&h, c).await,
             13 => check_hostile(&h, c).await,
             14 => check_fallback(&h, c).await,
+            15 => check_survives(&h, c).await,
+            16 => check_bounds(&h, c).await,
             _ => check_discovery(&h, c).await,
         };
         if let Err(x) = r {
@@ -575,9 +575,35 @@ async fn check_outcomes(h: &H, c: &mut Checks) -> Res<()> {
             "SELECT status::BIGINT FROM actors WHERE did = '{cc}'"
         ))
         .await?;
+    // The job does not purge: the transaction that recorded the deletion
+    // asked the server's purge task for it, which the harness runs here.
+    let asked = h
+        .i64(&format!(
+            "SELECT count(*) FROM account_purges p JOIN actors x ON x.id = p.actor_id WHERE x.did = '{cc}'"
+        ))
+        .await?;
+    let held = h
+        .i64(&format!(
+            "SELECT count(*) FROM blocks b JOIN actors x ON x.id = b.author_id WHERE x.did = '{cc}'"
+        ))
+        .await?;
+    let purges = farsight_storage::janitor::run_account_purges(
+        h.pool(),
+        &h.ctx.limits(),
+        &h.ctx.counters,
+        20,
+        25,
+    )
+    .await
+    .map_err(e)?;
     let after = h
         .i64(&format!(
             "SELECT count(*) FROM blocks b JOIN actors x ON x.id = b.author_id WHERE x.did = '{cc}'"
+        ))
+        .await?;
+    let left = h
+        .i64(&format!(
+            "SELECT count(*) FROM account_purges p JOIN actors x ON x.id = p.actor_id WHERE x.did = '{cc}'"
         ))
         .await?;
     let member = h
@@ -586,9 +612,9 @@ async fn check_outcomes(h: &H, c: &mut Checks) -> Res<()> {
         ))
         .await?;
     c.check(
-        "inactive: relay says deleted ⇒ status hidden, rows purged, last_outcome inactive, inactive_at_listing, membership settled",
-        r.outcome == Outcome::Inactive && row == (Some(3), true) && status != 0 && before == 2 && after == 0 && member == 0,
-        format!("outcome {:?}, row {row:?}, status {status}, blocks {before}→{after}, outstanding {member}", r.outcome),
+        "inactive: relay says deleted ⇒ status hidden, last_outcome inactive, inactive_at_listing, membership settled; the purge is asked for, not run by the job, and the purge task removes the rows",
+        r.outcome == Outcome::Inactive && row == (Some(3), true) && status != 0 && before == 2 && asked == 1 && held == 2 && purges.purged >= 1 && after == 0 && left == 0 && member == 0,
+        format!("outcome {:?}, row {row:?}, status {status}, purge requests {asked}→{left}, blocks {before}→{held} after the job→{after} after the purge task ({purges:?}), outstanding {member}", r.outcome),
     );
     // E: an account held as taken down, and a relay that gives no answer.
     // Only the relay's own answer lifts a hidden status: the account stays
@@ -1263,6 +1289,24 @@ async fn check_budget(h: &H, c: &mut Checks) -> Res<()> {
             ],
         );
     }
+    // A stored block whose record now names someone else.
+    let moved = did("bgc", 1);
+    let moved_rk = tid_now();
+    h.fh(
+        &moved,
+        Collection::Block,
+        &moved_rk,
+        block_v(&did("sub", 80)),
+    )
+    .await?;
+    h.put_repo(
+        &moved,
+        vec![(
+            Collection::Block,
+            moved_rk.clone(),
+            block_v(&did("sub", 81)),
+        )],
+    );
     // Budget below current usage (≈105%, under the 115% ceiling).
     let bytes = farsight_storage::gates::measure_database_bytes(h.pool())
         .await
@@ -1298,6 +1342,28 @@ async fn check_budget(h: &H, c: &mut Checks) -> Res<()> {
         "tier-2 job runs deletes-only: the stale block deleted, inserts skipped, refused debt, complete-with-debts (no clean point)",
         r.outcome == Outcome::CompleteWithDebts && keys.is_empty() && refused.is_some() && row == (Some(2), true),
         format!("outcome {:?}, blocks {keys:?}, refused debt cap_type {refused:?}, (last_outcome, no clean point) {row:?}", r.outcome),
+    );
+    let r = h.job(&moved, 2, "system:firehose").await?;
+    let mid = h.id(&moved).await?;
+    let still = h
+        .i64(&format!(
+            "SELECT count(*) FROM blocks WHERE author_id = {mid}"
+        ))
+        .await?;
+    let tomb = h
+        .i64(&format!(
+            "SELECT count(*) FROM tombstones WHERE author_id = {mid} AND rkey = '{moved_rk}'"
+        ))
+        .await?;
+    let refused = h
+        .bool(&format!(
+            "SELECT EXISTS (SELECT 1 FROM relist_debt WHERE actor_id = {mid} AND reason = 4)"
+        ))
+        .await?;
+    c.check(
+        "deletes-only: a stored block whose record now names another subject is removed, not kept with the subject it no longer names",
+        r.outcome == Outcome::CompleteWithDebts && still == 0 && tomb == 1 && refused,
+        format!("outcome {:?}, blocks stored {still}, refusal tombstones {tomb}, refused debt {refused}", r.outcome),
     );
     let r = h.job(&adm, 1, "admin").await?;
     let aid = h.id(&adm).await?;
@@ -1343,6 +1409,14 @@ async fn check_sweep(h: &H, c: &mut Checks) -> Res<()> {
     {
         let mut wd = w(&h.world);
         wd.collections_supported = true;
+        // Entries that are not DIDs: left out, or the cycle would never
+        // complete. They sort after the DIDs, so the first page is full.
+        for junk in ["not-a-did", "did:web:", "did:plc:~"] {
+            wd.by_collection
+                .entry(Collection::Block.nsid().to_owned())
+                .or_default()
+                .insert(junk.to_owned());
+        }
         for (i, d) in all.iter().enumerate() {
             let k = if i < 700 {
                 Collection::Block
@@ -1397,8 +1471,12 @@ async fn check_sweep(h: &H, c: &mut Checks) -> Res<()> {
     let mut passed_failed = false;
     let mut cycle: Option<i64> = None;
     let mut pages_seen = HashSet::new();
+    let mut junk_members = 0i64;
     while start.elapsed() < Duration::from_secs(300) {
         sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
+        junk_members += h
+            .i64("SELECT count(*) FROM cycle_outstanding WHERE did IN ('not-a-did', 'did:web:', 'did:plc:~')")
+            .await?;
         if cycle.is_none() {
             cycle = h
                 .opt_i64("SELECT max(id) FROM sweep_cycles WHERE kind = 1")
@@ -1501,6 +1579,14 @@ async fn check_sweep(h: &H, c: &mut Checks) -> Res<()> {
             row.1, row.2, row.5, row.4
         ),
     );
+    c.check(
+        "entries of the relay's listing that are not DIDs never become cycle members",
+        junk_members == 0 && row.2,
+        format!(
+            "members seen for them {junk_members}; cycle completed {}",
+            row.2
+        ),
+    );
     h.set_cfg(|c| c.backfill.sweep.enabled = false);
     Ok(())
 }
@@ -1561,6 +1647,11 @@ async fn check_repair(h: &H, c: &mut Checks) -> Res<()> {
         .await?;
     let open = h
         .i64("INSERT INTO firehose_gaps (from_at, to_at, cause) VALUES (now() - interval '1 minute', NULL, 1) RETURNING id")
+        .await?;
+    // A gap left by seam windows that could not be read again (cause 5,
+    // seam_unrepaired) is a closed gap like any other.
+    let seam = h
+        .i64("INSERT INTO firehose_gaps (from_at, to_at, cause) VALUES (now() - interval '8 minutes', now() - interval '7 minutes', 5) RETURNING id")
         .await?;
     let hits_before: HashMap<String, usize> = recent
         .iter()
@@ -1640,6 +1731,20 @@ async fn check_repair(h: &H, c: &mut Checks) -> Res<()> {
         "on completion the closed gap gets healed_at (by this cycle); the open gap waits",
         done && healed_c && rc == Some(id) && !healed_o,
         format!("completed {done}, closed healed {healed_c} by {rc:?}, open healed {healed_o}"),
+    );
+    let (healed_s, rs, from_ok): (bool, Option<i64>, bool) = sqlx::query_as(
+        "SELECT g.healed_at IS NOT NULL, g.repair_cycle_id, c.repair_from <= g.from_at
+         FROM firehose_gaps g, sweep_cycles c WHERE g.id = $1 AND c.id = $2",
+    )
+    .bind(seam)
+    .bind(id)
+    .fetch_one(h.pool())
+    .await
+    .map_err(e)?;
+    c.check(
+        "a gap of cause seam_unrepaired is claimed by the same repair, lies within its range and is healed by it",
+        healed_s && rs == Some(id) && from_ok,
+        format!("healed {healed_s} by {rs:?}; the repair starts at or before the gap {from_ok}"),
     );
     // A repair requested through admin.startRepair: the server inserts the
     // bare cycle row (this SQL mirrors farsight-api's start_repair_cycle);
@@ -2000,6 +2105,69 @@ async fn check_discovery(h: &H, c: &mut Checks) -> Res<()> {
         row.is_some_and(|(st, tr, n)| st == 3 && !tr && n == 4) && scopes == 2 && r.outcome == Outcome::Clean,
         format!("discovery_state {row:?}, subject_coverage rows {scopes}"),
     );
+    // A reference that cannot be checked: its author's PDS fails. The
+    // run found one blocker and may have missed the other, so it confirms
+    // nothing.
+    let (y, seen, hidden) = (did("dsy", 1), did("dsy", 2), did("dsy", 3));
+    let (rk1, rk2) = (tid_now(), tid_now());
+    h.put_repo(&seen, vec![(Collection::Block, rk1.clone(), block_v(&y))]);
+    h.put_repo(&hidden, vec![(Collection::Block, rk2.clone(), block_v(&y))]);
+    h.edit_repo(&hidden, |r| {
+        r.repo_error = Some("InternalServerError".into())
+    });
+    {
+        let mut wd = w(&h.world);
+        let b = Collection::Block.nsid().to_owned();
+        wd.backlinks.push((y.clone(), b.clone(), seen.clone(), rk1));
+        wd.backlinks.push((y.clone(), b, hidden.clone(), rk2));
+    }
+    let base = h.pds.clone();
+    h.set_cfg(|c| c.backfill.backlinks.url = base);
+    let yd = Did::parse(&y).map_err(e)?;
+    let token = farsight_storage::codes::RequesterKey::Token(7);
+    let r1 = jobs::discovery::run(&h.ctx, &yd, token).await;
+    let yid = h.id(&y).await?;
+    let state = |h: &H| {
+        let pool = h.pool().clone();
+        async move {
+            let row: Option<(i16, bool)> =
+                sqlx::query_as("SELECT state, truncated FROM discovery_state WHERE actor_id = $1")
+                    .bind(yid)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(e)?;
+            let scopes: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM subject_coverage WHERE actor_id = $1")
+                    .bind(yid)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(e)?;
+            let blockers: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM blocks WHERE subject_id = $1")
+                    .bind(yid)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(e)?;
+            Ok::<_, String>((row, scopes, blockers))
+        }
+    };
+    let first = state(h).await?;
+    // The PDS answers again: the next run checks both and confirms.
+    h.edit_repo(&hidden, |r| r.repo_error = None);
+    let r2 = jobs::discovery::run(&h.ctx, &yd, token).await;
+    let second = state(h).await?;
+    h.set_cfg(|c| c.backfill.backlinks.url = String::new());
+    c.check(
+        "a reference whose record could not be read truncates the run: nothing is confirmed until a run has checked every reference",
+        r1.outcome == Outcome::CompleteWithDebts
+            && first == (Some((3, true)), 0, 1)
+            && r2.outcome == Outcome::Clean
+            && second == (Some((3, false)), 2, 2),
+        format!(
+            "with a failing PDS: outcome {:?}, (state, truncated) / coverage rows / blockers {first:?}; after it answers: {:?}, {second:?}",
+            r1.outcome, r2.outcome
+        ),
+    );
     Ok(())
 }
 
@@ -2147,6 +2315,1037 @@ async fn check_hostile(h: &H, c: &mut Checks) -> Res<()> {
         "DELETE FROM backfill_queue WHERE actor_id IN (SELECT id FROM actors WHERE did IN ('{bad}', '{boom}', '{good}'))"
     ))
     .await?;
+    Ok(())
+}
+
+// ------------------------------------------------- work survives a stop
+
+/// `(claimed_by is set, not_before is in the future)` of the queue entry
+/// of `d` and `kind`, if it has one.
+async fn queue_entry(h: &H, d: &str, kind: i16) -> Res<Option<(bool, bool)>> {
+    sqlx::query_as(
+        "SELECT q.claimed_by IS NOT NULL, COALESCE(q.not_before > now(), false)
+         FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
+         WHERE a.did = $1 AND q.kind = $2 ORDER BY q.id LIMIT 1",
+    )
+    .bind(d)
+    .bind(kind)
+    .fetch_optional(h.pool())
+    .await
+    .map_err(e)
+}
+
+async fn repo_state(h: &H, d: &str) -> Res<&'static str> {
+    let mut conn = h.pool().acquire().await.map_err(e)?;
+    let did = Did::parse(d).map_err(e)?;
+    Ok(
+        farsight_storage::backfill_api::status(&mut conn, &did, false)
+            .await
+            .map_err(e)?
+            .repo
+            .state
+            .api_name(),
+    )
+}
+
+/// An owner with one list of two items that a listblock points at, phase
+/// 1 passed. Returns the owner's `actors.id` and the list's id.
+async fn fetchable_owner(h: &H, owner: &str, by: &str) -> Res<(i64, i64)> {
+    let rk = tid_now();
+    h.put_repo(
+        owner,
+        vec![
+            (Collection::List, rk.clone(), list_v("kept")),
+            (
+                Collection::ListItem,
+                tid_now(),
+                item_v(&did("sub", 91), &list_uri(owner, &rk)),
+            ),
+            (
+                Collection::ListItem,
+                tid_now(),
+                item_v(&did("sub", 92), &list_uri(owner, &rk)),
+            ),
+        ],
+    );
+    h.fh(
+        by,
+        Collection::ListBlock,
+        &tid_now(),
+        lb_v(&list_uri(owner, &rk)),
+    )
+    .await?;
+    let lid = h.list_id(owner, &rk).await?;
+    jobs::list_phase1::run(&h.ctx, ListId::new(lid)).await;
+    Ok((h.id(owner).await?, lid))
+}
+
+async fn check_survives(h: &H, c: &mut Checks) -> Res<()> {
+    h.exec("DELETE FROM backfill_queue").await?;
+    h.exec("DELETE FROM job_leases").await?;
+    // Two queue entries a process claimed before it was killed: the claim
+    // of one has run out, the other's is still good (its process lives).
+    let (dead, live, lost) = (did("sva", 1), did("svb", 1), did("svc", 1));
+    for d in [&dead, &live] {
+        h.put_repo(
+            d,
+            vec![(Collection::Block, tid_now(), block_v(&did("sub", 93)))],
+        );
+        queue_repo(h, d, "token:109").await?;
+    }
+    h.exec(&format!(
+        "UPDATE backfill_queue SET claimed_by = 'backfill-0-gone', claimed_until = now() - interval '1 minute'
+         WHERE actor_id = (SELECT id FROM actors WHERE did = '{dead}')"
+    ))
+    .await?;
+    h.exec(&format!(
+        "UPDATE backfill_queue SET claimed_by = 'backfill-0-other', claimed_until = now() + interval '10 minutes'
+         WHERE actor_id = (SELECT id FROM actors WHERE did = '{live}')"
+    ))
+    .await?;
+    // A repo job marked running that nothing holds: no entry, no lease.
+    sqlx::query("INSERT INTO actors (did) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(&lost)
+        .execute(h.pool())
+        .await
+        .map_err(e)?;
+    h.exec(&format!(
+        "INSERT INTO backfill_state (actor_id, state) SELECT id, 2 FROM actors WHERE did IN ('{dead}', '{live}', '{lost}')
+         ON CONFLICT (actor_id) DO UPDATE SET state = 2"
+    ))
+    .await?;
+    let before = (repo_state(h, &dead).await?, repo_state(h, &live).await?);
+    // A request made while the claimed job runs waits beside it.
+    queue_repo(h, &live, "token:110").await?;
+    let beside = h
+        .i64(&format!(
+            "SELECT count(*) FROM backfill_queue q JOIN actors a ON a.id = q.actor_id WHERE a.did = '{live}'"
+        ))
+        .await?;
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE claimed_by IS NULL AND actor_id = (SELECT id FROM actors WHERE did = '{live}')"
+    ))
+    .await?;
+    let rec = feeder::recover(&h.ctx).await.map_err(e)?;
+    let dead_entry = queue_entry(h, &dead, 1).await?;
+    let live_entry = queue_entry(h, &live, 1).await?;
+    let lost_row: Option<(i16, String, i16)> = sqlx::query_as(
+        "SELECT q.tier, q.requester, s.state FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
+         JOIN backfill_state s ON s.actor_id = a.id WHERE a.did = $1 AND q.kind = 1",
+    )
+    .bind(&lost)
+    .fetch_optional(h.pool())
+    .await
+    .map_err(e)?;
+    c.check(
+        "a killed process's work is taken up: an entry whose claim ran out waits again (reported queued, not running), a live claim is left alone (running), and a repo job marked running that nothing holds is queued again",
+        before == ("queued", "running")
+            && beside == 2
+            && rec.entries == 1
+            && rec.repo_jobs >= 1
+            && dead_entry == Some((false, false))
+            && live_entry == Some((true, false))
+            && lost_row == Some((2, "system:resync".to_owned(), 1)),
+        format!(
+            "status before {before:?}; entries for the DID with a running job and a new request {beside}; {rec:?}; expired entry (claimed, delayed) {dead_entry:?}; live {live_entry:?}; lost job (tier, requester, state) {lost_row:?}"
+        ),
+    );
+    // Only the two entries stay for the scheduler below.
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id NOT IN (SELECT id FROM actors WHERE did IN ('{dead}', '{live}'))"
+    ))
+    .await?;
+    // The scheduler serves the entry that waits again and leaves the one
+    // another process holds.
+    let sched = Scheduler::new(h.ctx.clone());
+    let (stop_tx, stop) = watch::channel(false);
+    let task = tokio::spawn(sched.clone().run(stop));
+    let served = eventually(30, || backfilled(h, &dead)).await?;
+    let gone = eventually(10, || async {
+        Ok(queue_entry(h, &dead, 1).await?.is_none())
+    })
+    .await?;
+    let other_served = backfilled(h, &live).await?;
+    let other_entry = queue_entry(h, &live, 1).await?;
+    c.check(
+        "the entry is served and deleted when its job has ended; the entry another process holds is not touched",
+        served && gone && !other_served && other_entry == Some((true, false)),
+        format!("served {served}, entry gone {gone}; the other: served {other_served}, entry {other_entry:?}"),
+    );
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id = (SELECT id FROM actors WHERE did = '{live}')"
+    ))
+    .await?;
+
+    // Stopping the scheduler stops its jobs: a job in the middle of a slow
+    // request ends, its entry waits again and its lease is gone, and the
+    // host is not asked again.
+    let slow = did("svd", 1);
+    h.put_repo(
+        &slow,
+        vec![(Collection::Block, tid_now(), block_v(&did("sub", 94)))],
+    );
+    h.edit_repo(&slow, |r| r.delay_ms = 3_000);
+    queue_repo(h, &slow, "token:109").await?;
+    let running = eventually(30, || async {
+        Ok(queue_entry(h, &slow, 1).await? == Some((true, false))
+            && h.bool(&format!(
+                "SELECT EXISTS (SELECT 1 FROM job_leases WHERE did = '{slow}')"
+            ))
+            .await?)
+    })
+    .await?;
+    let stop_started = Instant::now();
+    let _ = stop_tx.send(true);
+    let _ = task.await;
+    let stop_took = stop_started.elapsed();
+    let entry = queue_entry(h, &slow, 1).await?;
+    let lease = h
+        .bool(&format!(
+            "SELECT EXISTS (SELECT 1 FROM job_leases WHERE did = '{slow}')"
+        ))
+        .await?;
+    let hits = w(&h.world)
+        .hits
+        .iter()
+        .filter(|(_, d, _)| *d == slow)
+        .count();
+    tokio::time::sleep(Duration::from_millis(4_000)).await;
+    let hits_later = w(&h.world)
+        .hits
+        .iter()
+        .filter(|(_, d, _)| *d == slow)
+        .count();
+    c.check(
+        "stopping the scheduler stops a running job: it does not wait for the slow host, the entry waits again, the lease is released, nothing is in flight and the host is not asked again",
+        running
+            && stop_took < Duration::from_millis(2_500)
+            && entry == Some((false, false))
+            && !lease
+            && sched.in_flight() == ([0, 0, 0], 0)
+            && hits_later == hits,
+        format!(
+            "job was running {running}; stop took {stop_took:?}; entry (claimed, delayed) {entry:?}; lease held {lease}; in flight {:?}; requests to the host {hits} at the stop, {hits_later} four seconds later",
+            sched.in_flight()
+        ),
+    );
+    h.edit_repo(&slow, |r| r.delay_ms = 0);
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id = (SELECT id FROM actors WHERE did = '{slow}')"
+    ))
+    .await?;
+
+    // A list fetch run left open by a killed process, with a list claimed
+    // and no queue entry: only the recovery takes it up.
+    let (orphan, by) = (did("sve", 1), did("svf", 1));
+    let (oid, lid) = fetchable_owner(h, &orphan, &by).await?;
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id = {oid} AND kind = 2"
+    ))
+    .await?;
+    let run = h
+        .i64(&format!(
+            "INSERT INTO list_fetch_runs (owner_id, coverage_point) VALUES ({oid}, now()) RETURNING id"
+        ))
+        .await?;
+    h.exec(&format!(
+        "UPDATE lists SET fetch_run_id = {run}, fetch_run_epoch = admit_epoch WHERE id = {lid}"
+    ))
+    .await?;
+    feeder::pass(&h.ctx).await.map_err(e)?;
+    let fed = queue_entry(h, &orphan, 2).await?;
+    let rec = feeder::recover(&h.ctx).await.map_err(e)?;
+    let recovered = queue_entry(h, &orphan, 2).await?;
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id = {oid} AND kind = 2"
+    ))
+    .await?;
+    let od = Did::parse(&orphan).map_err(e)?;
+    let r = jobs::list_fetch::run(&h.ctx, ActorId::new(oid), &od).await;
+    let state = h.track(lid).await?;
+    let runs: Vec<(i64, Option<i16>)> =
+        sqlx::query_as("SELECT id, outcome FROM list_fetch_runs WHERE owner_id = $1 ORDER BY id")
+            .bind(oid)
+            .fetch_all(h.pool())
+            .await
+            .map_err(e)?;
+    let items = h
+        .i64(&format!(
+            "SELECT count(*) FROM list_items WHERE list_id = {lid}"
+        ))
+        .await?;
+    c.check(
+        "a list fetch run left open by a killed process is taken up: the owner is queued again, the run is resumed with its claimed list and finished",
+        fed.is_none()
+            && rec.fetch_runs >= 1
+            && recovered == Some((false, false))
+            && r.outcome == Outcome::Clean
+            && state == 2
+            && runs == vec![(run, Some(1))]
+            && items == 2,
+        format!(
+            "queued by the debt pass {fed:?}; {rec:?}; queued by the recovery {recovered:?}; outcome {:?}; list state {state}; runs {runs:?}; items {items}",
+            r.outcome
+        ),
+    );
+
+    // A run that an error ends is closed by the job itself: its claim is
+    // released and the owner queued again.
+    let failing = did("svg", 1);
+    let (fid, flid) = fetchable_owner(h, &failing, &by).await?;
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id = {fid} AND kind = 2"
+    ))
+    .await?;
+    h.edit_repo(&failing, |r| {
+        r.repo_error = Some("InternalServerError".into())
+    });
+    let fd = Did::parse(&failing).map_err(e)?;
+    let r = jobs::list_fetch::run(&h.ctx, ActorId::new(fid), &fd).await;
+    let open = h
+        .i64(&format!(
+            "SELECT count(*) FROM list_fetch_runs WHERE owner_id = {fid} AND finished_at IS NULL"
+        ))
+        .await?;
+    let closed = h
+        .i64(&format!(
+            "SELECT count(*) FROM list_fetch_runs WHERE owner_id = {fid} AND outcome = 2"
+        ))
+        .await?;
+    let claimed = h
+        .bool(&format!(
+            "SELECT fetch_run_id IS NOT NULL FROM lists WHERE id = {flid}"
+        ))
+        .await?;
+    let retry = queue_entry(h, &failing, 2).await?;
+    let lease = h
+        .bool(&format!(
+            "SELECT EXISTS (SELECT 1 FROM job_leases WHERE did = '{failing}')"
+        ))
+        .await?;
+    c.check(
+        "a list fetch run that an error ends is closed: no run stays open, the claim is released, the lease is released and the owner waits for its retry",
+        matches!(r.outcome, Outcome::Failed { .. })
+            && open == 0
+            && closed == 1
+            && !claimed
+            && retry == Some((false, true))
+            && !lease,
+        format!(
+            "outcome {:?}; open runs {open}, failed runs {closed}; list still claimed {claimed}; retry entry (claimed, delayed) {retry:?}; lease held {lease}",
+            r.outcome
+        ),
+    );
+    h.edit_repo(&failing, |r| r.repo_error = None);
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id IN ({oid}, {fid})"
+    ))
+    .await?;
+
+    // A phase-1 check leaves another job's lease on the owner alone.
+    let (held, by2) = (did("svh", 1), did("svi", 1));
+    let hrk = tid_now();
+    h.put_repo(&held, vec![(Collection::List, hrk.clone(), list_v("held"))]);
+    h.fh(
+        &by2,
+        Collection::ListBlock,
+        &tid_now(),
+        lb_v(&list_uri(&held, &hrk)),
+    )
+    .await?;
+    let hlid = h.list_id(&held, &hrk).await?;
+    let other = format!("{}#7", h.ctx.process);
+    sqlx::query(
+        "INSERT INTO job_leases (did, lease_owner, lease_until) VALUES ($1, $2, now() + interval '10 minutes')",
+    )
+    .bind(&held)
+    .bind(&other)
+    .execute(h.pool())
+    .await
+    .map_err(e)?;
+    let r = jobs::list_phase1::run(&h.ctx, ListId::new(hlid)).await;
+    let owner_of: Option<String> =
+        sqlx::query_scalar("SELECT lease_owner FROM job_leases WHERE did = $1")
+            .bind(&held)
+            .fetch_optional(h.pool())
+            .await
+            .map_err(e)?;
+    let waits = h
+        .bool(&format!(
+            "SELECT COALESCE(not_before > now(), false) FROM list_jobs WHERE list_id = {hlid}"
+        ))
+        .await?;
+    c.check(
+        "a phase-1 check finds the owner's lease held by another job of this process: it waits, and the lease is still that job's",
+        r.outcome == Outcome::Busy && owner_of.as_deref() == Some(other.as_str()) && waits,
+        format!("outcome {:?}; lease owner {owner_of:?}; check put off {waits}", r.outcome),
+    );
+    h.exec(&format!("DELETE FROM job_leases WHERE did = '{held}'"))
+        .await?;
+
+    // A failed job's retry does not push back a request that waits.
+    let flaky = did("svj", 1);
+    h.put_repo(
+        &flaky,
+        vec![(Collection::Block, tid_now(), block_v(&did("sub", 95)))],
+    );
+    h.edit_repo(&flaky, |r| {
+        r.fail_collection = Some(Collection::Block.nsid().to_owned());
+    });
+    h.set_cfg(|c| c.backfill.retry_schedule = vec![ConfigDuration::hours(1)]);
+    let r1 = h.job(&flaky, 1, "token:109").await?;
+    let alone = queue_entry(h, &flaky, 1).await?;
+    // A newer on-demand request for the same repo: it may run now.
+    h.exec(&format!(
+        "UPDATE backfill_queue SET not_before = NULL WHERE actor_id = (SELECT id FROM actors WHERE did = '{flaky}')"
+    ))
+    .await?;
+    let r2 = h.job(&flaky, 1, "token:109").await?;
+    let merged = queue_entry(h, &flaky, 1).await?;
+    h.set_cfg(|c| c.backfill.retry_schedule = vec![ConfigDuration::secs(1)]);
+    c.check(
+        "a failed job's retry waits out its backoff by itself, and leaves a request already waiting for the repo at its own, earlier time",
+        matches!(r1.outcome, Outcome::Failed { terminal: false, .. })
+            && alone == Some((false, true))
+            && matches!(r2.outcome, Outcome::Failed { terminal: false, .. })
+            && merged == Some((false, false)),
+        format!(
+            "first failure: {:?}, retry entry (claimed, delayed) {alone:?}; failure with a request waiting: {:?}, entry {merged:?}",
+            r1.outcome, r2.outcome
+        ),
+    );
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id = (SELECT id FROM actors WHERE did = '{flaky}')"
+    ))
+    .await?;
+    Ok(())
+}
+
+// ------------------------------- hosts that never finish, bounded work
+
+/// `n` arrays inside one another.
+fn nested(n: usize) -> Value {
+    let mut v = json!(1);
+    for _ in 0..n {
+        v = json!([v]);
+    }
+    v
+}
+
+async fn check_bounds(h: &H, c: &mut Checks) -> Res<()> {
+    h.exec("DELETE FROM backfill_queue").await?;
+    // A PDS whose listing goes round in a circle of cursors.
+    let circle = did("bda", 1);
+    h.put_repo(
+        &circle,
+        vec![(Collection::Block, tid_now(), block_v(&did("sub", 96)))],
+    );
+    h.edit_repo(&circle, |r| r.cursor_loop = true);
+    let r = h.job(&circle, 1, "token:109").await?;
+    let pages = h.hits("listRecords", &circle, "");
+    c.check(
+        "a listing whose cursors go round in a circle (a → b → a) is ended as a failure after one lap",
+        matches!(&r.outcome, Outcome::Failed { error, .. } if error.contains("cursor")) && pages == 3,
+        format!("outcome {:?}, listRecords pages {pages}", r.outcome),
+    );
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id = (SELECT id FROM actors WHERE did = '{circle}')"
+    ))
+    .await?;
+
+    // A PDS that answers too slowly for the attempt's time: the job
+    // stops, is counted and queued to go on; past the count it fails.
+    let slow = did("bdb", 1);
+    h.put_repo(
+        &slow,
+        vec![(Collection::Block, tid_now(), block_v(&did("sub", 97)))],
+    );
+    h.edit_repo(&slow, |r| r.delay_ms = 2_500);
+    h.set_cfg(|c| {
+        c.backfill.repo_job_max_duration = ConfigDuration::secs(1);
+        c.backfill.retry_schedule = vec![ConfigDuration::hours(1)];
+    });
+    let started = Instant::now();
+    let r1 = h.job(&slow, 1, "token:109").await?;
+    let took = started.elapsed();
+    let sid = h.id(&slow).await?;
+    let after_one: (i32, i16, bool) = sqlx::query_as(
+        "SELECT yields, state, current_run_id IS NOT NULL FROM backfill_state WHERE actor_id = $1",
+    )
+    .bind(sid)
+    .fetch_one(h.pool())
+    .await
+    .map_err(e)?;
+    let goes_on = queue_entry(h, &slow, 1).await?;
+    // The same run, as if it had stopped at a bound ten times already.
+    h.exec(&format!(
+        "UPDATE backfill_state SET yields = 10 WHERE actor_id = {sid}"
+    ))
+    .await?;
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id = {sid}"
+    ))
+    .await?;
+    let r2 = h.job(&slow, 1, "token:109").await?;
+    let after_many: (i32, i16, i32) =
+        sqlx::query_as("SELECT yields, state, attempts FROM backfill_state WHERE actor_id = $1")
+            .bind(sid)
+            .fetch_one(h.pool())
+            .await
+            .map_err(e)?;
+    let retry = queue_entry(h, &slow, 1).await?;
+    h.set_cfg(|c| {
+        c.backfill.repo_job_max_duration = Config::default().backfill.repo_job_max_duration;
+        c.backfill.retry_schedule = vec![ConfigDuration::secs(1)];
+    });
+    h.edit_repo(&slow, |r| r.delay_ms = 0);
+    c.check(
+        "an attempt that runs out of time stops and is queued to go on (yielded, counted); a run that keeps stopping at a bound fails and waits out the failure backoff",
+        r1.outcome == Outcome::Yielded
+            && took < Duration::from_millis(2_400)
+            && after_one == (1, 2, true)
+            && goes_on == Some((false, false))
+            && matches!(&r2.outcome, Outcome::Failed { error, terminal: false } if error.contains("bound"))
+            && after_many == (0, 4, 1)
+            && retry == Some((false, true)),
+        format!(
+            "first attempt: {:?} after {took:?}, (yields, state, run kept) {after_one:?}, entry (claimed, delayed) {goes_on:?}; eleventh: {:?}, (yields, state, attempts) {after_many:?}, entry {retry:?}",
+            r1.outcome, r2.outcome
+        ),
+    );
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id = {sid}"
+    ))
+    .await?;
+
+    // One record nested deeper than the JSON parser reads: the page's
+    // other records are stored.
+    let deep = did("bdc", 1);
+    let mut bad = block_v(&did("sub", 98));
+    bad["extra"] = nested(300);
+    h.put_repo(
+        &deep,
+        vec![
+            (Collection::Block, tid_now(), block_v(&did("sub", 99))),
+            (Collection::Block, tid_now(), bad),
+            (Collection::Block, tid_now(), block_v(&did("sub", 100))),
+        ],
+    );
+    let r = h.job(&deep, 1, "token:109").await?;
+    let stored = h
+        .i64(&format!(
+            "SELECT count(*) FROM blocks b JOIN actors a ON a.id = b.author_id WHERE a.did = '{deep}'"
+        ))
+        .await?;
+    c.check(
+        "a page with one record nested too deep to parse is listed all the same: the other records are stored",
+        r.outcome == Outcome::Clean && stored == 2,
+        format!("outcome {:?}, blocks stored {stored} of 3 listed", r.outcome),
+    );
+
+    // A PDS that lists out of order: the listing starts again with a set
+    // of the keys it sees and reconciles against it at the end.
+    let (unordered, overflowing) = (did("bdd", 1), did("bde", 1));
+    let mut stale = HashMap::new();
+    for d in [&unordered, &overflowing] {
+        let gone = tid_now();
+        h.fh(d, Collection::Block, &gone, block_v(&did("sub", 101)))
+            .await?;
+        stale.insert(d.clone(), gone);
+        h.put_repo(
+            d,
+            (0..3)
+                .map(|i| (Collection::Block, tid_now(), block_v(&did("sub", 102 + i))))
+                .collect(),
+        );
+        h.edit_repo(d, |r| r.descending = true);
+    }
+    let block_keys = |h: &H, d: &str| {
+        let (pool, d) = (h.pool().clone(), d.to_owned());
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT b.rkey FROM blocks b JOIN actors a ON a.id = b.author_id WHERE a.did = $1 ORDER BY 1",
+            )
+            .bind(d)
+            .fetch_all(&pool)
+            .await
+            .map_err(e)
+        }
+    };
+    let r = h.job(&unordered, 1, "token:109").await?;
+    let keys = block_keys(h, &unordered).await?;
+    let pages = h.hits("listRecords", &unordered, "");
+    c.check(
+        "an out-of-order listing is reconciled against the set of keys it saw: the three records are stored and the stale row is removed",
+        r.outcome == Outcome::Clean && keys.len() == 3 && !keys.contains(&stale[&unordered]) && pages == 2,
+        format!("outcome {:?}, keys {keys:?} (stale {}), listRecords pages {pages}", r.outcome, stale[&unordered]),
+    );
+    // More keys than the set holds: the listing goes on without it and
+    // reconciles nothing. It does not start again.
+    h.set_cfg(|c| c.backfill.seen_set_cap = 2);
+    let r = h.job(&overflowing, 1, "token:109").await?;
+    h.set_cfg(|c| c.backfill.seen_set_cap = Config::default().backfill.seen_set_cap);
+    let keys = block_keys(h, &overflowing).await?;
+    let pages = h.hits("listRecords", &overflowing, "");
+    let debt = h
+        .bool(&format!(
+            "SELECT EXISTS (SELECT 1 FROM relist_debt x JOIN actors a ON a.id = x.actor_id WHERE a.did = '{overflowing}' AND x.reason = 1)"
+        ))
+        .await?;
+    c.check(
+        "a listing with more keys than the seen-set holds is finished without reconcile and without starting again: its records are stored, the stale row stays, and the gap is a counted debt",
+        r.outcome == Outcome::CompleteWithDebts && keys.len() == 4 && keys.contains(&stale[&overflowing]) && pages == 2 && debt,
+        format!("outcome {:?}, keys {} (stale kept {}), listRecords pages {pages}, unreachable debt {debt}", r.outcome, keys.len(), keys.contains(&stale[&overflowing])),
+    );
+
+    // The divergence purge takes rows from before the divergence was
+    // found, and leaves what was written after.
+    let diverging = did("bdf", 1);
+    let before_rk = tid_now();
+    h.fh(
+        &diverging,
+        Collection::Block,
+        &before_rk,
+        block_v(&did("sub", 110)),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let found = Stamp::from_tid(Tid::parse(&tid_now()).map_err(e)?);
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let after_rk = tid_now();
+    h.fh(
+        &diverging,
+        Collection::Block,
+        &after_rk,
+        block_v(&did("sub", 111)),
+    )
+    .await?;
+    let dd = Did::parse(&diverging).map_err(e)?;
+    let mut batches = 0;
+    while !farsight_storage::janitor::purge_for_divergence_batch(
+        h.pool(),
+        &h.ctx.limits(),
+        &h.ctx.counters,
+        &dd,
+        10_000,
+        found,
+    )
+    .await
+    .map_err(e)?
+    {
+        batches += 1;
+        if batches > 10 {
+            return Err("the divergence purge did not end".into());
+        }
+    }
+    let keys = block_keys(h, &diverging).await?;
+    c.check(
+        "the divergence purge removes what was stored before the divergence was found and keeps what the firehose wrote after",
+        keys == vec![after_rk.clone()],
+        format!("rows left {keys:?}; written before {before_rk}, after {after_rk}"),
+    );
+
+    // Lock bounds: 1,200 listblocks on 1,200 lists of one owner.
+    let many = 1_200i64;
+    let (reconciled_author, purged_author, owner) = (did("bdg", 1), did("bdg", 2), did("bdg", 3));
+    sqlx::query("INSERT INTO actors (did) SELECT unnest($1::text[]) ON CONFLICT DO NOTHING")
+        .bind(vec![
+            reconciled_author.clone(),
+            purged_author.clone(),
+            owner.clone(),
+        ])
+        .execute(h.pool())
+        .await
+        .map_err(e)?;
+    let oid = h.id(&owner).await?;
+    for (n, author) in [&reconciled_author, &purged_author].into_iter().enumerate() {
+        let aid = h.id(author).await?;
+        sqlx::query(
+            "WITH l AS (
+               INSERT INTO lists (owner_id, rkey)
+               SELECT $1, 'bd' || $3::text || lpad(g::text, 6, '0') FROM generate_series(1, $4) g
+               RETURNING id, rkey)
+             INSERT INTO list_blocks (author_id, rkey, list_id, counted, rev, first_seen, last_seen)
+             SELECT $2, l.rkey, l.id, false, 1, now(), now() FROM l",
+        )
+        .bind(oid)
+        .bind(aid)
+        .bind(n as i32)
+        .bind(many)
+        .execute(h.pool())
+        .await
+        .map_err(e)?;
+        h.exec(&format!(
+            "UPDATE actors SET authored_listblocks = {many} WHERE id = {aid}"
+        ))
+        .await?;
+    }
+    // A whole-collection reconcile takes a bounded number of list locks
+    // per transaction, and says that more is left.
+    let mut b = Batch::new(Origin::Listing {
+        stamp_read_at: Utc::now(),
+        deletes_only: false,
+    });
+    b.reconciles.push(farsight_storage::apply::Reconcile {
+        author: Did::parse(&reconciled_author).map_err(e)?,
+        collection: Collection::ListBlock,
+        stamp: Stamp::from_tid(Tid::parse(&tid_now()).map_err(e)?),
+        after: None,
+        through: None,
+        keep: Vec::new(),
+    });
+    let mut passes = Vec::new();
+    loop {
+        let report = h.apply(&b).await?;
+        passes.push(report.reconciled);
+        if !report.reconcile_pending || passes.len() > 20 {
+            break;
+        }
+    }
+    let rid = h.id(&reconciled_author).await?;
+    let left = h
+        .i64(&format!(
+            "SELECT count(*) FROM list_blocks WHERE author_id = {rid}"
+        ))
+        .await?;
+    let bound = farsight_storage::apply::RECONCILE_LOCKS as u64;
+    c.check(
+        "a reconcile of 1,200 listblocks on as many lists removes them over several transactions, each locking no more lists than the bound",
+        passes.iter().all(|n| *n <= bound) && passes.iter().sum::<u64>() == many as u64 && passes.len() >= 5 && left == 0,
+        format!("rows removed per transaction {passes:?} (bound {bound}); left {left}"),
+    );
+    let pd = Did::parse(&purged_author).map_err(e)?;
+    let pid = h.id(&purged_author).await?;
+    h.exec(&format!(
+        "UPDATE actors SET status = 4, status_at = now() WHERE id = {pid}"
+    ))
+    .await?;
+    let mut per_batch = Vec::new();
+    loop {
+        let before = h
+            .i64(&format!(
+                "SELECT count(*) FROM list_blocks WHERE author_id = {pid}"
+            ))
+            .await?;
+        let done = farsight_storage::janitor::purge_account_batch(
+            h.pool(),
+            &h.ctx.limits(),
+            &h.ctx.counters,
+            &pd,
+            10_000,
+        )
+        .await
+        .map_err(e)?;
+        let after = h
+            .i64(&format!(
+                "SELECT count(*) FROM list_blocks WHERE author_id = {pid}"
+            ))
+            .await?;
+        per_batch.push(before - after);
+        if done || per_batch.len() > 20 {
+            break;
+        }
+    }
+    let max_locks = farsight_storage::txn::MAX_LOCKS as i64;
+    c.check(
+        "an account purge of 1,200 listblocks on as many lists ends each batch at the lock bound and finishes",
+        per_batch.iter().all(|n| *n <= max_locks) && per_batch.iter().sum::<i64>() == many && per_batch.len() >= 3,
+        format!("rows removed per batch {per_batch:?} (bound {max_locks})"),
+    );
+
+    // An account's stored rows are counted under its host once it is
+    // known, and no longer under `unresolved`.
+    let limits = h.ctx.limits();
+    h.ctx.counters.flush(h.pool(), &limits).await.map_err(e)?;
+    let usage = |h: &H| {
+        let pool = h.pool().clone();
+        async move {
+            let rows: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT bucket, stored_blocks FROM host_usage WHERE bucket = 'unresolved' OR bucket LIKE 'd:%' OR bucket LIKE 'ip:%'",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(e)?;
+            let of = |prefix: &str| -> i64 {
+                rows.iter()
+                    .filter(|(b, _)| b.starts_with(prefix))
+                    .map(|(_, n)| *n)
+                    .sum()
+            };
+            Ok::<_, String>((of("unresolved"), of("d:"), of("ip:")))
+        }
+    };
+    let mover = did("bdh", 1);
+    let u0 = usage(h).await?;
+    for i in 0..3 {
+        h.fh(
+            &mover,
+            Collection::Block,
+            &tid_now(),
+            block_v(&did("sub", 120 + i)),
+        )
+        .await?;
+    }
+    h.ctx.counters.flush(h.pool(), &limits).await.map_err(e)?;
+    let u1 = usage(h).await?;
+    h.put_repo(&mover, vec![]);
+    let md = Did::parse(&mover).map_err(e)?;
+    h.ctx.resolver.resolve(&md, false).await.map_err(e)?;
+    h.ctx.counters.flush(h.pool(), &limits).await.map_err(e)?;
+    let u2 = usage(h).await?;
+    c.check(
+        "when an account's host becomes known, its stored rows move from the unresolved bucket to the host's buckets",
+        u1 == (u0.0 + 3, u0.1, u0.2) && u2 == (u0.0, u0.1 + 3, u0.2 + 3),
+        format!("(unresolved, domain buckets, address buckets): before {u0:?}, three blocks stored {u1:?}, resolved {u2:?}"),
+    );
+
+    // The nightly rebuild of the approximate counters gives the exact
+    // counts when nothing is flushed meanwhile.
+    farsight_storage::recount::rebuild_approximate_counters(h.pool(), 500)
+        .await
+        .map_err(e)?;
+    let (stat_blocks, blocks, stat_listblocks, listblocks): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COALESCE(sum(value), 0)::BIGINT FROM stats_counters WHERE name = 'blocks'),
+                (SELECT count(*) FROM blocks),
+                (SELECT COALESCE(sum(value), 0)::BIGINT FROM stats_counters WHERE name = 'list_blocks'),
+                (SELECT count(*) FROM list_blocks)",
+    )
+    .fetch_one(h.pool())
+    .await
+    .map_err(e)?;
+    let (unresolved_usage, unresolved_rows): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COALESCE(sum(stored_blocks), 0)::BIGINT FROM host_usage WHERE bucket = 'unresolved'),
+                (SELECT COALESCE(sum(authored_blocks), 0)::BIGINT FROM actors
+                 WHERE pds_host_id IS NULL AND did LIKE 'did:plc:%' AND resolve_failures < 3)",
+    )
+    .fetch_one(h.pool())
+    .await
+    .map_err(e)?;
+    c.check(
+        "the counter rebuild sets the totals and the per-bucket usage to what is stored",
+        stat_blocks == blocks && stat_listblocks == listblocks && unresolved_usage == unresolved_rows,
+        format!("blocks {stat_blocks} counted / {blocks} stored; listblocks {stat_listblocks} / {listblocks}; unresolved usage {unresolved_usage} / {unresolved_rows} rows of unresolved authors"),
+    );
+
+    // Tables that only grow are pruned: old logged errors, finished list
+    // fetch runs, references to lists that were deleted.
+    let stale_error = h
+        .i64("INSERT INTO op_errors (at, component, message) VALUES (now() - interval '40 days', 'harness', 'old') RETURNING id")
+        .await?;
+    let fresh_error = h
+        .i64("INSERT INTO op_errors (component, message) VALUES ('harness', 'new') RETURNING id")
+        .await?;
+    let old_run = h
+        .i64(&format!(
+            "INSERT INTO list_fetch_runs (owner_id, started_at, finished_at, outcome)
+             VALUES ({oid}, now() - interval '10 days', now() - interval '10 days', 1) RETURNING id"
+        ))
+        .await?;
+    let new_run = h
+        .i64(&format!(
+            "INSERT INTO list_fetch_runs (owner_id, started_at, finished_at, outcome)
+             VALUES ({oid}, now() - interval '1 day', now() - interval '1 day', 1) RETURNING id"
+        ))
+        .await?;
+    let open_run = h
+        .i64(&format!(
+            "INSERT INTO list_fetch_runs (owner_id, started_at) VALUES ({oid}, now() - interval '10 days') RETURNING id"
+        ))
+        .await?;
+    let (dead_list, live_list) = (
+        h.i64(&format!("SELECT min(id) FROM lists WHERE owner_id = {oid}"))
+            .await?,
+        h.i64(&format!("SELECT max(id) FROM lists WHERE owner_id = {oid}"))
+            .await?,
+    );
+    h.exec(&format!(
+        "UPDATE lists SET record_state = 2 WHERE id = {dead_list}"
+    ))
+    .await?;
+    h.exec(&format!(
+        "INSERT INTO subject_lists (actor_id, list_id) VALUES ({oid}, {dead_list}), ({oid}, {live_list})"
+    ))
+    .await?;
+    let now = Utc::now();
+    let pruned = (
+        farsight_storage::janitor::prune_op_errors(h.pool(), now)
+            .await
+            .map_err(e)?,
+        farsight_storage::janitor::prune_fetch_runs(h.pool(), now)
+            .await
+            .map_err(e)?,
+        farsight_storage::janitor::prune_subject_lists(h.pool())
+            .await
+            .map_err(e)?,
+    );
+    let errors_left: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM op_errors WHERE id = ANY($1) ORDER BY id")
+            .bind(vec![stale_error, fresh_error])
+            .fetch_all(h.pool())
+            .await
+            .map_err(e)?;
+    let runs_left: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM list_fetch_runs WHERE id = ANY($1) ORDER BY id")
+            .bind(vec![old_run, new_run, open_run])
+            .fetch_all(h.pool())
+            .await
+            .map_err(e)?;
+    let named_left: Vec<i64> =
+        sqlx::query_scalar("SELECT list_id FROM subject_lists WHERE actor_id = $1 ORDER BY 1")
+            .bind(oid)
+            .fetch_all(h.pool())
+            .await
+            .map_err(e)?;
+    c.check(
+        "pruning: logged errors past 30 days, list fetch runs finished more than 7 days ago and references to deleted lists go; recent rows and an unfinished run stay",
+        errors_left == vec![fresh_error] && runs_left == vec![new_run, open_run] && named_left == vec![live_list] && pruned.0 >= 1 && pruned.1 >= 1 && pruned.2 == 1,
+        format!("rows pruned (errors, runs, references) {pruned:?}; errors left {errors_left:?} of [{stale_error}, {fresh_error}]; runs left {runs_left:?} of [{old_run}, {new_run}, {open_run}]; references left {named_left:?}"),
+    );
+    h.exec(&format!(
+        "DELETE FROM list_fetch_runs WHERE id = {open_run}"
+    ))
+    .await?;
+
+    // A deleted account that still holds rows and has no purge asked for
+    // (the request was lost) is found by the scan and purged.
+    let forgotten = did("bdi", 1);
+    h.fh(
+        &forgotten,
+        Collection::Block,
+        &tid_now(),
+        block_v(&did("sub", 130)),
+    )
+    .await?;
+    let gid = h.id(&forgotten).await?;
+    h.exec(&format!(
+        "UPDATE actors SET status = 4, status_at = now() WHERE id = {gid}"
+    ))
+    .await?;
+    let found = farsight_storage::janitor::request_pending_purges(h.pool(), 1_000)
+        .await
+        .map_err(e)?;
+    let asked = h
+        .i64(&format!(
+            "SELECT count(*) FROM account_purges WHERE actor_id = {gid}"
+        ))
+        .await?;
+    let purges = farsight_storage::janitor::run_account_purges(
+        h.pool(),
+        &limits,
+        &h.ctx.counters,
+        1_000,
+        25,
+    )
+    .await
+    .map_err(e)?;
+    let rows_left = h
+        .i64(&format!(
+            "SELECT count(*) FROM blocks WHERE author_id = {gid}"
+        ))
+        .await?;
+    let asked_after = h
+        .i64(&format!(
+            "SELECT count(*) FROM account_purges WHERE actor_id = {gid}"
+        ))
+        .await?;
+    // A purge asked for an account that is active again removes nothing.
+    let revived = did("bdi", 2);
+    h.fh(
+        &revived,
+        Collection::Block,
+        &tid_now(),
+        block_v(&did("sub", 131)),
+    )
+    .await?;
+    let vid = h.id(&revived).await?;
+    h.exec(&format!(
+        "INSERT INTO account_purges (actor_id) VALUES ({vid})"
+    ))
+    .await?;
+    farsight_storage::janitor::run_account_purges(h.pool(), &limits, &h.ctx.counters, 1_000, 25)
+        .await
+        .map_err(e)?;
+    let kept = h
+        .i64(&format!(
+            "SELECT count(*) FROM blocks WHERE author_id = {vid}"
+        ))
+        .await?;
+    let request = h
+        .i64(&format!(
+            "SELECT count(*) FROM account_purges WHERE actor_id = {vid}"
+        ))
+        .await?;
+    c.check(
+        "a purge asked for an account that is not deleted (it came back) removes nothing and the request goes",
+        kept == 1 && request == 0,
+        format!("blocks kept {kept}, request rows {request}"),
+    );
+    c.check(
+        "a deleted account with rows left and no purge asked for is found by the scan, purged, and its request removed",
+        found >= 1 && asked == 1 && rows_left == 0 && asked_after == 0 && purges.failed.is_empty(),
+        format!("found {found}; request rows {asked}→{asked_after}; blocks left {rows_left}; {purges:?}"),
+    );
+
+    // One cycle of a kind at a time, whoever starts it; and a member that
+    // is not a DID is settled so that its cycle can complete.
+    retire_cycles(h).await?;
+    let first = sqlx::query(
+        "INSERT INTO sweep_cycles (kind, source, collections, started_at, repair_from)
+         VALUES (2, 'relay_repos', '{1,2,3,4}', now(), now())",
+    )
+    .execute(h.pool())
+    .await;
+    let second = sqlx::query(
+        "INSERT INTO sweep_cycles (kind, source, collections, started_at, repair_from)
+         VALUES (2, 'relay_repos', '{1,2,3,4}', now(), now())",
+    )
+    .execute(h.pool())
+    .await;
+    c.check(
+        "a second open repair cycle cannot exist beside the first",
+        first.is_ok() && second.is_err(),
+        format!(
+            "first {:?}, second {:?}",
+            first.map(|r| r.rows_affected()),
+            second.map(|r| r.rows_affected())
+        ),
+    );
+    retire_cycles(h).await?;
+    let cycle = h
+        .i64("INSERT INTO sweep_cycles (kind, source, collections, started_at, effective_start, effective_start_witness, enumerated_at)
+              VALUES (1, 'relay_repos', '{1,2,3,4}', now(), now(), now(), now()) RETURNING id")
+        .await?;
+    h.exec(&format!(
+        "INSERT INTO cycle_outstanding (cycle_id, did, state) VALUES ({cycle}, 'not a did', 1)"
+    ))
+    .await?;
+    h.set_cfg(|c| c.backfill.sweep.enabled = true);
+    let sw = Arc::new(sweep::Sweep::default());
+    let sched = Scheduler::new(h.ctx.clone());
+    let (stop_tx, stop) = watch::channel(false);
+    let task = tokio::spawn(sched.clone().run(stop));
+    let completed = eventually(30, || async {
+        sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
+        h.bool(&format!(
+            "SELECT completed_at IS NOT NULL FROM sweep_cycles WHERE id = {cycle}"
+        ))
+        .await
+    })
+    .await?;
+    let _ = stop_tx.send(true);
+    let _ = task.await;
+    h.set_cfg(|c| c.backfill.sweep.enabled = false);
+    let failed = h
+        .i64(&format!(
+            "SELECT failed_terminal FROM sweep_cycles WHERE id = {cycle}"
+        ))
+        .await?;
+    c.check(
+        "a cycle member that is not a DID is settled as terminal when it is dispatched, and its cycle completes",
+        completed && failed == 1,
+        format!("cycle completed {completed}, failed_terminal {failed}"),
+    );
+    retire_cycles(h).await?;
     Ok(())
 }
 

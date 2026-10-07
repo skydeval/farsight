@@ -10,7 +10,7 @@ use sqlx::PgConnection;
 
 use crate::codes::{ActorStatus, CapType, DebtReason, TrackState};
 use crate::counters::{Deltas, stat};
-use crate::error::Result;
+use crate::error::{Result, StorageError};
 use crate::ids::{ActorId, ListId, Stamp};
 use crate::keys::{self, CapKind, HostFacts, Limits};
 
@@ -199,6 +199,54 @@ pub struct ApplyReport {
     pub deleted_accounts: Vec<Did>,
     /// Whether `NOTIFY farsight_coverage` was sent.
     pub notified: bool,
+    /// A reconcile of the batch had more rows to remove than one
+    /// transaction takes ([`crate::apply::RECONCILE_ROWS`]): the same
+    /// reconciles, applied again, remove the next ones.
+    pub reconcile_pending: bool,
+}
+
+/// The most advisory locks of one class a transaction takes. Postgres
+/// keeps every lock of every session in one shared table of
+/// `max_locks_per_transaction × max_connections` entries (6,400 with
+/// the defaults), and a transaction that finds it full fails with "out of
+/// shared memory". Work that would need more locks than this is split
+/// over several transactions.
+pub const MAX_LOCKS: usize = 500;
+
+/// Takes exclusive transaction-scoped advisory locks on `keys`, ascending,
+/// in one statement.
+pub async fn lock_ascending(conn: &mut PgConnection, keys: &BTreeSet<i64>) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let ks: Vec<i64> = keys.iter().copied().collect();
+    sqlx::query("SELECT pg_advisory_xact_lock(k) FROM unnest($1::BIGINT[]) AS u(k) ORDER BY k")
+        .bind(&ks)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Runs `f`, one transaction per call, again while a deadlock aborts it,
+/// up to [`crate::apply::MAX_DEADLOCK_ATTEMPTS`] times.
+pub async fn retry_deadlocks<T, F, Fut>(mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match f().await {
+            Err(e) if e.is_retryable_abort() => {
+                if attempt >= crate::apply::MAX_DEADLOCK_ATTEMPTS {
+                    return Err(StorageError::DeadlockRetriesExhausted(attempt));
+                }
+                tokio::time::sleep(crate::apply::deadlock_backoff(attempt)).await;
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Per-transaction state.
@@ -270,27 +318,33 @@ impl<'c> Txn<'c> {
         (self.report, self.deltas)
     }
 
-    /// Takes transaction-scoped author locks, ascending by key.
+    /// Takes transaction-scoped author locks, ascending by key, in one
+    /// statement.
     pub async fn lock_authors(&mut self, keys: &BTreeSet<i64>) -> Result<()> {
-        for k in keys {
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(*k)
-                .execute(&mut *self.conn)
-                .await?;
-        }
-        Ok(())
+        lock_ascending(&mut *self.conn, keys).await
     }
 
-    /// Takes list locks ascending by key; `true` = exclusive.
+    /// Takes list locks ascending by key, in one statement; `true` =
+    /// exclusive.
     pub async fn lock_lists(&mut self, keys: &BTreeMap<i64, bool>) -> Result<()> {
-        for (k, exclusive) in keys {
-            let sql = if *exclusive {
-                "SELECT pg_advisory_xact_lock($1)"
-            } else {
-                "SELECT pg_advisory_xact_lock_shared($1)"
-            };
-            sqlx::query(sql).bind(*k).execute(&mut *self.conn).await?;
-            *self.held_lists.entry(*k).or_insert(false) |= *exclusive;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let (ks, exclusive): (Vec<i64>, Vec<bool>) = keys.iter().map(|(k, x)| (*k, *x)).unzip();
+        // The keys are bound in ascending order and the rows are sorted by
+        // them again, so the locks are taken in that order however the
+        // statement is planned.
+        sqlx::query(
+            "SELECT CASE WHEN x THEN pg_advisory_xact_lock(k)
+                         ELSE pg_advisory_xact_lock_shared(k) END
+             FROM unnest($1::BIGINT[], $2::BOOLEAN[]) AS u(k, x) ORDER BY k",
+        )
+        .bind(&ks)
+        .bind(&exclusive)
+        .execute(&mut *self.conn)
+        .await?;
+        for (k, x) in keys {
+            *self.held_lists.entry(*k).or_insert(false) |= *x;
         }
         Ok(())
     }
@@ -321,13 +375,7 @@ impl<'c> Txn<'c> {
             .filter(|d| !existing.contains(d.as_str()))
             .map(|d| keys::intern_lock_key(d))
             .collect();
-        for k in &keys {
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(*k)
-                .execute(&mut *self.conn)
-                .await?;
-        }
-        Ok(())
+        lock_ascending(&mut *self.conn, &keys).await
     }
 
     /// `actors.id` for a DID, without creating it.

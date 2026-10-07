@@ -279,11 +279,15 @@ CREATE TABLE backfill_state (
   first_failed_at TIMESTAMPTZ,
   last_error      TEXT,
   current_run_id  BIGINT,
-  current_run_point TIMESTAMPTZ,        -- the coverage point of the running job, stored when it starts
+  current_run_point TIMESTAMPTZ,        -- the coverage point of the current run, stored when its first attempt starts
+  current_run_started_at TIMESTAMPTZ,   -- server time of that start; a later attempt of the run keeps both
   inactive_at_listing BOOLEAN NOT NULL DEFAULT false,
+  yields          INT NOT NULL DEFAULT 0, -- attempts of the current run that ended at a bound; reset when the run ends
   CONSTRAINT backfill_state_state_code CHECK (state IN (0, 1, 2, 3, 4)),
   CONSTRAINT backfill_state_last_outcome_code CHECK (last_outcome IN (1, 2, 3, 4))
 );
+
+CREATE INDEX backfill_state_running ON backfill_state (actor_id) WHERE state = 2; -- jobs a stopped process left behind are found here
 
 -- Which worker holds the job for a DID, and until when.
 CREATE TABLE job_leases (
@@ -309,7 +313,9 @@ CREATE TABLE backfill_cursors (
   CONSTRAINT backfill_cursors_job_kind_code CHECK (job_kind IN (1, 2))
 );
 
--- Waiting jobs only: a picked entry is deleted.
+-- Jobs that wait or run. The scheduler claims an entry when it starts
+-- the job and deletes it when the job has ended; a claim that is not
+-- renewed runs out and the entry waits again.
 CREATE TABLE backfill_queue (
   id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   actor_id     BIGINT   NOT NULL,
@@ -320,14 +326,21 @@ CREATE TABLE backfill_queue (
   cycle_id     BIGINT,
   enqueued_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   not_before   TIMESTAMPTZ,
+  claimed_by   TEXT,                 -- the process running the job; NULL while the entry waits
+  claimed_until TIMESTAMPTZ,         -- when the claim runs out unless it is renewed
   CONSTRAINT backfill_queue_kind_code CHECK (kind IN (1, 2, 3)),
   CONSTRAINT backfill_queue_tier_code CHECK (tier IN (1, 2, 3)),
   CONSTRAINT backfill_queue_priority_code CHECK (priority IN (0, 1))
 );
 
-CREATE UNIQUE INDEX backfill_queue_one_waiting ON backfill_queue (actor_id, kind); -- one waiting entry per account and kind
+CREATE UNIQUE INDEX backfill_queue_one_waiting ON backfill_queue (actor_id, kind)
+  WHERE claimed_by IS NULL; -- one waiting entry per account and kind
 
 CREATE INDEX backfill_queue_pick ON backfill_queue (tier, requester, priority DESC, enqueued_at);
+
+CREATE INDEX backfill_queue_by_requester ON backfill_queue (requester, priority); -- the per-requester caps
+
+CREATE INDEX backfill_queue_claimed ON backfill_queue (claimed_until) WHERE claimed_by IS NOT NULL;
 
 -- Lists waiting for their record to be read. Retry state is on lists.
 CREATE TABLE list_jobs (
@@ -350,6 +363,10 @@ CREATE TABLE list_fetch_runs (
   outcome     SMALLINT,               -- NULL while running; 1 ok 2 failed 3 owner_inactive 4 cancelled
   CONSTRAINT list_fetch_runs_outcome_code CHECK (outcome IN (1, 2, 3, 4))
 );
+
+CREATE INDEX list_fetch_runs_by_owner ON list_fetch_runs (owner_id, started_at);
+
+CREATE INDEX list_fetch_runs_unfinished ON list_fetch_runs (owner_id) WHERE finished_at IS NULL;
 
 -- Where an account's discovery run stands, and its coverage point.
 CREATE TABLE discovery_state (
@@ -388,6 +405,8 @@ CREATE TABLE sweep_cycles (
   CONSTRAINT sweep_cycles_collections_code CHECK (collections <@ ARRAY[1, 2, 3, 4]::SMALLINT[])
 );
 
+CREATE UNIQUE INDEX sweep_cycles_one_open ON sweep_cycles (kind) WHERE completed_at IS NULL; -- one cycle of a kind runs at a time
+
 -- The members of a cycle that are in flight or being retried.
 CREATE TABLE cycle_outstanding (
   cycle_id BIGINT NOT NULL,
@@ -416,6 +435,8 @@ CREATE TABLE subject_lists (
   actor_id BIGINT NOT NULL, list_id BIGINT NOT NULL,
   PRIMARY KEY (actor_id, list_id)
 );
+
+CREATE INDEX subject_lists_by_list ON subject_lists (list_id);
 
 -- The single source of per-account exceptions to coverage.
 CREATE TABLE relist_debt (
@@ -508,6 +529,17 @@ CREATE TABLE op_errors (
   did       TEXT,
   host      TEXT,
   message   TEXT NOT NULL
+);
+
+CREATE INDEX op_errors_at ON op_errors (at);
+
+-- Deleted accounts whose stored rows still have to be removed. The
+-- transaction that records the deletion adds the row; the server's
+-- purge task removes it when nothing of the account is left.
+CREATE TABLE account_purges (
+  actor_id     BIGINT PRIMARY KEY,
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  not_before   TIMESTAMPTZ             -- set after a failed purge: not tried again before this
 );
 
 -- Approximate totals, sharded: a total is the sum of its rows.

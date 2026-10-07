@@ -95,14 +95,17 @@ pub fn status_code(active: bool, status: Option<&str>) -> ActorStatus {
 }
 
 /// Owner keys (DID, list rkey) of a DID's `unavailable` lists, for lock
-/// discovery. Read-only.
+/// discovery: the [`crate::txn::MAX_LOCKS`] with the lowest ids, since one
+/// transaction locks no more. Lists beyond them keep their own retry.
+/// Read-only.
 pub async fn unavailable_list_keys(t: &mut Txn<'_>, did: &Did) -> Result<Vec<(ListId, String)>> {
     Ok(sqlx::query_as(
         "SELECT l.id, l.rkey FROM lists l JOIN actors a ON a.id = l.owner_id
-         WHERE a.did = $1 AND l.track_state = $2",
+         WHERE a.did = $1 AND l.track_state = $2 ORDER BY l.id LIMIT $3",
     )
     .bind(did.as_str())
     .bind(TrackState::Unavailable.code())
+    .bind(crate::txn::MAX_LOCKS as i64)
     .fetch_all(&mut *t.conn)
     .await?)
 }
@@ -148,6 +151,7 @@ impl Txn<'_> {
                     Priority::Normal,
                     RequesterKey::Resync,
                     Some(system_queue_cap),
+                    None,
                 )
                 .await?;
                 self.report.repo_events += 1;
@@ -226,6 +230,10 @@ impl Txn<'_> {
                     }
                 }
                 if new == ActorStatus::Deleted && old != ActorStatus::Deleted {
+                    // The purge is the server's task: the row asks for it
+                    // in the transaction that records the deletion, so it
+                    // cannot be lost and no writer waits for it.
+                    crate::janitor::request_account_purge(&mut *self.conn, id).await?;
                     self.report.deleted_accounts.push(did.clone());
                 }
             }
@@ -273,6 +281,7 @@ pub async fn record_poisoned(
             Priority::Normal,
             RequesterKey::Resync,
             Some(limits.system_queue_cap),
+            None,
         )
         .await?;
         t.send_notify().await?;

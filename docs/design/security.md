@@ -101,8 +101,12 @@ domain, gains nothing.
 A daily rebuild recounts the four `stored_*` record columns from the
 per-author counters, grouped by each author's current buckets; it
 leaves `stored_interned` as it is. Usage that was charged to
-`unresolved` therefore moves to the author's real buckets at the first
-rebuild after the author is resolved, not at the moment of resolution.
+`unresolved` moves to the author's real buckets at the moment the
+author is resolved: the resolver takes the author's exact counts out of
+the old buckets and adds them to the new ones
+([storage.md](storage.md#counters)). The rebuild corrects what is left:
+flushes lost in a crash, and a host whose own address block or
+large-host standing changed.
 
 Each row has a `capped_mask` with one bit per cap (blocks 1, list
 items 2, listblocks 4, lists 8, lifetime interning 16). A bit is set

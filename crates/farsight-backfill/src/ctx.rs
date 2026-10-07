@@ -12,6 +12,15 @@ use sqlx::PgPool;
 use crate::net::Net;
 use crate::resolve::Resolver;
 
+tokio::task_local! {
+    /// The number of the job running in this task (set by the scheduler).
+    pub static JOB: u64;
+}
+
+/// What separates the process name from the job number in a lease
+/// owner's name.
+pub const LEASE_JOB_SEP: char = '#';
+
 /// Shared state of the backfill process.
 pub struct Ctx {
     /// Backfill's own pool (separate from the server's).
@@ -28,23 +37,26 @@ pub struct Ctx {
     pub gates: SharedGates,
     /// The last gate state (sweep pause at ≥ 90%).
     pub gate_state: Mutex<GateState>,
-    /// `job_leases.lease_owner` of this process's jobs:
-    /// `backfill-<pid>-<12 random hex digits>`, new at every start, so a
-    /// lease left by an earlier process is never mistaken for a held one
-    /// and simply expires.
-    pub lease_owner: String,
+    /// The name this process holds its work under:
+    /// `backfill-<pid>-<12 random hex digits>`, new at every start, so
+    /// what an earlier process left behind is never mistaken for held and
+    /// simply expires. It is `backfill_queue.claimed_by` of the entries
+    /// whose jobs run here, and the stem of [`Ctx::lease_owner`].
+    pub process: String,
     /// Binary version (User-Agent).
     pub version: &'static str,
 }
 
 impl Ctx {
-    /// A context with open gates and a fresh lease owner name. Its counter
-    /// sink writes shard 2.
+    /// A context with open gates and a fresh process name. `counters` is
+    /// the sink of backfill's writes ([`Ctx::counter_sink`]), which the
+    /// resolver shares.
     pub fn new(
         pool: PgPool,
         config: Arc<Config>,
         net: Arc<Net>,
         resolver: Resolver,
+        counters: Arc<CounterSink>,
         version: &'static str,
     ) -> Ctx {
         let mut b = [0u8; 6];
@@ -54,15 +66,32 @@ impl Ctx {
             config: RwLock::new(config),
             net,
             resolver,
-            counters: Arc::new(CounterSink::new(2)),
+            counters,
             gates: SharedGates::default(),
             gate_state: Mutex::new(GateState::default()),
-            lease_owner: format!(
+            process: format!(
                 "backfill-{}-{}",
                 std::process::id(),
                 b.iter().map(|x| format!("{x:02x}")).collect::<String>()
             ),
             version,
+        }
+    }
+
+    /// The counter sink of the backfill process: shard 2.
+    pub fn counter_sink() -> Arc<CounterSink> {
+        Arc::new(CounterSink::new(2))
+    }
+
+    /// `job_leases.lease_owner` of the job running in this task: the
+    /// process name and, under the scheduler, the job's number. Each job
+    /// holds its leases under its own name, so two jobs of this process
+    /// that want the same DID exclude each other and neither releases
+    /// the other's lease.
+    pub fn lease_owner(&self) -> String {
+        match JOB.try_with(|n| *n) {
+            Ok(n) => format!("{}{LEASE_JOB_SEP}{n}", self.process),
+            Err(_) => self.process.clone(),
         }
     }
 

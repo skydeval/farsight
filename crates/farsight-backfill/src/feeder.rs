@@ -2,7 +2,10 @@
 //! `docs/design/backfill.md`): turns `relist_debt` rows into
 //! `system:resync` re-list jobs when, and only when, the re-list can clear
 //! them, and enqueues `list_fetch` runs for list work whose queue entry was
-//! dropped at the system-queue cap. Nothing loops: a debt whose cause still
+//! dropped at the system-queue cap. It also takes up what a stopped
+//! process left behind ([`recover`]): queue entries whose claim ran out,
+//! repo jobs marked running that nothing runs, and list fetch runs left
+//! open. Nothing loops: a debt whose cause still
 //! applies waits, a daily-rate debt is fed once per UTC day, and every
 //! other debt at most once per [`MIN_REFEED`] (a re-list that ended
 //! complete-with-debts does not clear, so without the bound it would be
@@ -259,6 +262,7 @@ pub async fn pass(ctx: &Ctx) -> Result<u64, farsight_storage::StorageError> {
             Priority::Normal,
             RequesterKey::Resync,
             cap,
+            None,
         )
         .await?
         {
@@ -273,6 +277,74 @@ pub async fn pass(ctx: &Ctx) -> Result<u64, farsight_storage::StorageError> {
     }
     fed += feed_list_fetches(ctx, &limits).await?;
     Ok(fed)
+}
+
+/// What [`recover`] found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Recovered {
+    /// Queue entries whose claim had run out: they wait again.
+    pub entries: u64,
+    /// Repo jobs marked running that nothing ran: queued again.
+    pub repo_jobs: u64,
+    /// Owners with a list fetch run left open: queued, so the run is
+    /// taken up.
+    pub fetch_runs: u64,
+}
+
+impl Recovered {
+    /// How much was taken up.
+    pub fn total(&self) -> u64 {
+        self.entries + self.repo_jobs + self.fetch_runs
+    }
+}
+
+/// Takes up the work a stopped process left behind. A process that is
+/// killed (an image update, the OOM killer) cannot give its work back;
+/// what it held is told by a claim or a lease that ran out:
+///
+/// - a queue entry whose claim ran out waits again;
+/// - a repo job marked `running` with no lease, no queue entry and no
+///   place in an open cycle is queued again;
+/// - an owner with an unfinished list fetch run, no lease and no queue
+///   entry is queued, and its run is resumed with its claimed lists.
+pub async fn recover(ctx: &Ctx) -> Result<Recovered, farsight_storage::StorageError> {
+    let pool = &ctx.pool;
+    let entries = queue::release_expired(pool).await?;
+    let repo_jobs = queue::requeue_stopped(pool).await?;
+    let owners: Vec<ActorId> = sqlx::query_scalar(&format!(
+        "SELECT DISTINCT r.owner_id FROM list_fetch_runs r JOIN actors a ON a.id = r.owner_id
+         WHERE r.finished_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM job_leases j
+                           WHERE j.did = a.did AND j.lease_until > now())
+           AND NOT EXISTS (SELECT 1 FROM backfill_queue q
+                           WHERE q.actor_id = r.owner_id AND q.kind = {JOB_LIST_FETCH})
+         LIMIT $1"
+    ))
+    .bind(PASS)
+    .fetch_all(pool)
+    .await?;
+    let mut fetch_runs = 0;
+    let mut conn = pool.acquire().await?;
+    for o in owners {
+        // No cap: the run holds claims that only its own job releases.
+        queue::enqueue(
+            &mut conn,
+            o,
+            JobKind::ListFetch,
+            Tier::OnDemand,
+            Priority::Normal,
+            RequesterKey::Lists,
+            None,
+            None,
+        )
+        .await?;
+        fetch_runs += 1;
+    }
+    Ok(Recovered {
+        entries,
+        repo_jobs,
+        fetch_runs,
+    })
 }
 
 /// `list_fetch` work whose queue entry was dropped at the system cap:
@@ -310,6 +382,7 @@ async fn feed_list_fetches(
             Priority::Normal,
             RequesterKey::Lists,
             Some(limits.system_queue_cap),
+            None,
         )
         .await?
         {

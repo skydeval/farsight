@@ -35,6 +35,39 @@ database schema; each entry says so where it does.
 - The database schema is one initial migration, and the database checks
   every stored code: a column that holds a code accepts only the codes
   its enumeration defines. Schema version 1.
+- The metrics listeners (`metrics.bind`, `metrics.backfill_bind`)
+  default to loopback, `127.0.0.1:9464` and `127.0.0.1:9465`. The
+  compose file sets them to every interface of the container, where the
+  ports are not published. Outside compose, set them, and set
+  `metrics.bearer_token_sha256` with a bind another host can reach.
+- The compose file gives both containers 45 seconds to stop
+  (`stop_grace_period`); they take up to 30.
+- New settings: `backfill.repo_job_max_duration` (`"1h"`),
+  `backfill.per_domain_rps` (20), `backfill.per_domain_concurrency`
+  (8) and `backfill.on_demand_reserved` (4). They are described under
+  Fixed.
+- The config is checked more strictly, and a file that fails does not
+  load: `backfill.concurrency` is 1 to 512; no step of
+  `backfill.retry_schedule`, `missing_retry` or `phase1_retry` is
+  `0s`; `backfill.system_queue_cap`, the request limits and
+  `list_fetch_max_attempts` are positive; `backfill.relay_url`,
+  `backfill.plc_url` and `backfill.backlinks.url` are `http` or `https`
+  URLs; `storage.tombstone_ttl` is at least `72h`, the time a listing
+  may still be applied after it was read.
+- Backfill: a change of `backfill.per_host_rps`,
+  `per_host_concurrency` or `plc_rps` applies to the next request and
+  no longer rebuilds the process. A change of `backfill.concurrency`
+  now rebuilds its tasks, so the database pool always has a connection
+  for every worker.
+- The `account_purges` task runs every 10 seconds, not once a day; the
+  new `account_purge_scan` and `table_pruning` tasks run daily. The
+  series `farsight_ingest_storage_errors_total{op="purge_account"}` is
+  gone, because the firehose writer no longer purges.
+- Schema: `backfill_queue.claimed_by` and `claimed_until`,
+  `backfill_state.yields` and `current_run_started_at`, the table
+  `account_purges`, and indexes on `backfill_queue`, `backfill_state`,
+  `list_fetch_runs`, `subject_lists`, `op_errors` and `sweep_cycles`.
+  Schema version 1.
 
 ### Fixed
 
@@ -123,6 +156,131 @@ database schema; each entry says so where it does.
   by a replay of the stream and stay until the daily purge. A commit of
   a deleted account witnessed no later than its deletion stores
   nothing.
+- Backfill: work under way was lost when the process was killed or
+  updated. A queue entry was deleted when its job started, so the job
+  was gone with the process and `getBackfillStatus` said `running`
+  from then on. An entry is now claimed while its job runs and deleted
+  when the job has ended; a claim that is not renewed runs out within
+  10 minutes and the entry waits again. A job left marked running with
+  nothing running it is queued again, and is reported as `queued`
+  until then.
+- Backfill: a list fetch run that was cut off by a restart, or that
+  ended in a database or resolver error, stayed open for good with its
+  lists claimed, and that owner's lists were never fetched or refreshed
+  again. Every error now closes the run and queues the owner again, and
+  a run left open by a killed process is taken up and resumed.
+- Backfill: jobs kept running after a shutdown signal and after a
+  config change that rebuilds the process, where the old jobs went on
+  beside the new ones with the old limits. The scheduler now stops its
+  jobs, gives their queue entries and leases back, and one network
+  layer with one set of host limits, cooldowns and breaker state
+  serves the process across rebuilds.
+- Backfill: a PDS could keep a worker for days by answering every page
+  slowly with a new cursor, and enough such hosts kept every worker. An
+  attempt of a repository job now runs for at most
+  `backfill.repo_job_max_duration` and 25,000 pages, then stops and is
+  queued to go on from its cursor, with a growing wait from the third
+  time. A run that stops this way more than 10 times in a row is a
+  failure, retried on the failure schedule and terminal after
+  `backfill.terminal_after`. A cursor that comes back, also through a
+  cycle of several cursors, fails the job.
+- Backfill: the per-host request limits were per host name, so an
+  operator with one name per account under one domain was limited per
+  account. All hosts of one registrable domain now also share
+  `backfill.per_domain_rps` and `backfill.per_domain_concurrency`. The
+  hosts in `limits.large_hosts` are exempt.
+- Backfill: the on-demand tier's share was only an order of dispatch,
+  and long-running sweep jobs could hold every worker.
+  `backfill.on_demand_reserved` workers are now never used by the sweep
+  or by the firehose's new authors. A requester is charged for its
+  jobs' requests as they are made, not when the jobs end, so a
+  requester with long jobs no longer keeps looking cheapest.
+- Backfill: a resumed repository job took a new coverage point for
+  pages an earlier attempt had read before it. A run keeps the coverage
+  point and start of its first attempt.
+- Backfill: a job that panicked was neither retried on a schedule nor
+  recorded. It is now recorded as a failed job: a repository job is
+  retried with backoff and becomes an `unreachable` debt if it keeps
+  failing.
+- Backfill: one page of `listRecords` with a record nested deeper than
+  the JSON parser allows made the whole page, and so the repository,
+  unreadable. Each record is parsed on its own, and one that cannot be
+  parsed is dropped by itself. A page with more than the 100 records
+  asked for fails the job.
+- Backfill: a PDS that listed records out of order could make a job
+  hold a gigabyte of keys, and one that listed more keys than
+  `backfill.seen_set_cap` made the job start the collection again
+  without end. Keys are remembered as 8-byte hashes, and past the cap
+  the listing goes on to its end without reconcile, as documented.
+- Sweep: one entry in the relay's listing that was not a valid DID kept
+  its cycle open for good, and coverage at `sweep_incomplete`. Such
+  entries are left out, and one that is already a member is settled.
+- Backfill: the retry of a failed job set its backoff on the waiting
+  entry for the account even when that entry was a newer on-demand
+  request, which then waited an hour to a day. A waiting entry keeps
+  the earlier time.
+- Discovery: a reference that could not be checked (its author did not
+  resolve, or the PDS did not answer) was skipped, and the run still
+  confirmed subject coverage. Such a run is now marked `truncated`,
+  like one that hit its reference cap, and confirms nothing.
+- Backfill: with `backfill.plc_seed_from_export`, or a cached
+  resolution, a repository read from a host the account had left could
+  look diverged and have its stored rows purged. The account is now
+  resolved at the directory before a divergence is acted on.
+- Gap repair: the backfill process and `admin.startRepair` could each
+  start a repair cycle at the same moment. Both start one under the
+  same lock, and the database allows one open cycle of a kind.
+- A repository that went backwards was reported as fully covered while
+  its rows were being purged, and what the firehose wrote for it during
+  the purge could be removed with the rest. The `resync` debt is
+  recorded first, and the purge takes only what was stored before the
+  divergence was found.
+- Purging a deleted account with many rows paused the firehose for the
+  length of the purge. The deletion now asks the server's purge task
+  for it, and neither the firehose writer nor a backfill job waits.
+- A purge, a re-evaluation of uncounted listblocks or a reconcile of a
+  whole collection could take one advisory lock per list in a single
+  transaction, tens of thousands of them, and fail with "out of shared
+  memory" on the same account every time. Every transaction now takes a
+  bounded number (at most 500 list locks) in one statement, and larger
+  work is split over several transactions.
+- Every new author on the firehose made the batch count up to a million
+  queue rows while it held its locks. The tier-2 cap is read from the
+  planner's estimate of the table, and the per-requester caps have an
+  index.
+- Per-host usage drifted: a new author's rows were counted under
+  `unresolved` and their deletes taken from its host's bucket once the
+  host was known, so `unresolved` only grew until the nightly rebuild,
+  and at its cap every unresolved author was refused. An account's
+  usage now moves with it when its host becomes known or changes.
+- The nightly counter rebuild lost or doubled the changes written while
+  it counted, a minute or more of them. It counts in one snapshot and
+  adds what was flushed since.
+- `list_fetch_runs` and `op_errors` grew without end, and
+  `subject_lists` kept references to lists that no longer name the
+  account. Finished runs are deleted after 7 days, logged errors after
+  30 days, and a discovery run that checked every reference replaces
+  the account's set of lists.
+- Storage gate: under deletes-only, a stored block, listblock or
+  listitem whose record had come to name another subject or list was
+  kept with the old one. It is removed, like any refused update.
+- Two lists of one owner re-admitted at the same moment could both take
+  the last of the owner's daily re-admission budget, and a divergence
+  charged the budget for a `retained` list that nothing would re-admit.
+  The charge is one conditional update, and a list nothing counts on is
+  purged without a charge.
+- The nightly recount stopped at the first list that had been deleted
+  since it was picked. It goes on.
+- A deadlock in a purge or in a list transition fired by a job or a
+  task ended the work with an error. It is retried, as in the write
+  path.
+- Backfill: a record check for a list released the lease of another job
+  that was reading the same owner's repository. Each job holds leases
+  under its own name; a check that finds the owner busy waits 30
+  seconds.
+- Backfill: the resolver's memory of DIDs that do not exist was never
+  emptied, and the host limiter remembered every host it ever asked.
+  Both are bounded.
 - API: `query.getListMembers` answered `ready`, no members and
   `complete` for a list whose owner is deactivated, taken down,
   suspended or deleted, with the list's name and purpose. Such a list

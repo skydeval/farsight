@@ -426,9 +426,11 @@ have no value.
 
 `discovery.state` is `disabled` when no backlink source is configured,
 else `never`, `queued`, `running`, `done` or `failed`.
-`discovery.truncated` means the discovery stopped at its reference cap
-(`backfill.backlinks.max_refs`), and incoming coverage for the account
-stays `partial`. Both enums are open.
+`discovery.truncated` means the discovery did not check every
+reference: it stopped at its reference cap
+(`backfill.backlinks.max_refs`), or a reference could not be read
+(its author did not resolve, or the PDS did not answer). Incoming
+coverage for the account stays `partial`. Both enums are open.
 
 The response is `Cache-Control: no-store, private`.
 
