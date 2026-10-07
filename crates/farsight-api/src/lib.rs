@@ -458,10 +458,8 @@ async fn dispatch(
             };
             // Per-caller headers only on responses edge caches never
             // replay.
-            if !shared {
-                if let Some(r) = &rate {
-                    put_rate_headers(h, r);
-                }
+            if !shared && let Some(r) = &rate {
+                put_rate_headers(h, r);
             }
             r
         }

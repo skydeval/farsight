@@ -55,10 +55,10 @@ pub async fn handle_to_did(safe: &SafeClient, handle: &str) -> Result<Did, Handl
     }
     if let Ok(txts) = safe.txt(&format!("_atproto.{handle}")).await {
         for t in txts {
-            if let Some(d) = t.strip_prefix("did=") {
-                if let Ok(did) = Did::parse(d.trim()) {
-                    return Ok(did);
-                }
+            if let Some(d) = t.strip_prefix("did=")
+                && let Ok(did) = Did::parse(d.trim())
+            {
+                return Ok(did);
             }
         }
     }

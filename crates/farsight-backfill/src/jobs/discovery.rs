@@ -215,24 +215,24 @@ async fn run_inner(
     };
     // (a) Direct blocks of X.
     for l in run.links(x.as_str(), Collection::Block.nsid()).await? {
-        if let Some((did, rkey, rec)) = run.verify(&l, Collection::Block).await {
-            if matches!(&rec, Record::Block(b) if b.subject == *x) {
-                run.push(did, Collection::Block, rkey, rec).await?;
-            }
+        if let Some((did, rkey, rec)) = run.verify(&l, Collection::Block).await
+            && matches!(&rec, Record::Block(b) if b.subject == *x)
+        {
+            run.push(did, Collection::Block, rkey, rec).await?;
         }
     }
     // (b) Listitems naming X, authored in the list's own repo.
     let mut lists: Vec<AtUri> = Vec::new();
     for l in run.links(x.as_str(), Collection::ListItem.nsid()).await? {
-        if let Some((did, rkey, rec)) = run.verify(&l, Collection::ListItem).await {
-            if let Record::ListItem(i) = &rec {
-                if i.subject == *x && i.list.authority == did {
-                    if !lists.contains(&i.list) {
-                        lists.push(i.list.clone());
-                    }
-                    run.push(did, Collection::ListItem, rkey, rec).await?;
-                }
+        if let Some((did, rkey, rec)) = run.verify(&l, Collection::ListItem).await
+            && let Record::ListItem(i) = &rec
+            && i.subject == *x
+            && i.list.authority == did
+        {
+            if !lists.contains(&i.list) {
+                lists.push(i.list.clone());
             }
+            run.push(did, Collection::ListItem, rkey, rec).await?;
         }
     }
     run.flush().await?;
@@ -248,10 +248,10 @@ async fn run_inner(
             .links(&list.to_string(), Collection::ListBlock.nsid())
             .await?
         {
-            if let Some((did, rkey, rec)) = run.verify(&l, Collection::ListBlock).await {
-                if matches!(&rec, Record::ListBlock(b) if b.subject == *list) {
-                    run.push(did, Collection::ListBlock, rkey, rec).await?;
-                }
+            if let Some((did, rkey, rec)) = run.verify(&l, Collection::ListBlock).await
+                && matches!(&rec, Record::ListBlock(b) if b.subject == *list)
+            {
+                run.push(did, Collection::ListBlock, rkey, rec).await?;
             }
         }
     }

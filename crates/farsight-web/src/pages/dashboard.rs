@@ -401,16 +401,15 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, DashboardError> 
         // added below, from the cycle itself.
         if s["state"] != SweepState::Completed.api_name()
             && s["source"] != CycleSource::RelayRepos.as_str()
+            && let Some(p) = s["progress"].as_f64()
         {
-            if let Some(p) = s["progress"].as_f64() {
-                let mut line = format!("{:.1}% of accounts swept", (p * 100.0).min(99.9));
-                if s["state"] == SweepState::Paused.api_name() {
-                    line.push_str(", paused");
-                } else if let Some(e) = s["etaSeconds"].as_i64() {
-                    line.push_str(&format!(", about {} left", long_secs(e)));
-                }
-                d.catching.push(stat("History", line));
+            let mut line = format!("{:.1}% of accounts swept", (p * 100.0).min(99.9));
+            if s["state"] == SweepState::Paused.api_name() {
+                line.push_str(", paused");
+            } else if let Some(e) = s["etaSeconds"].as_i64() {
+                line.push_str(&format!(", about {} left", long_secs(e)));
             }
+            d.catching.push(stat("History", line));
         }
     } else {
         d.backfill.push(stat("Sweep", "not started"));

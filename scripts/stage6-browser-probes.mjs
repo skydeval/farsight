@@ -72,7 +72,14 @@ const problems = [];
 function watch(page) {
   page.on("console", (m) => {
     if (m.type() === "error") {
-      problems.push(m.text());
+      // A failed load is reported without its address; the location has it.
+      const at = m.location().url;
+      // A card the server will not serve answers 404, and the browser
+      // logs every 404; the card probes check what the visitor sees.
+      if (at.includes("/card/") && m.text().includes("404")) {
+        return;
+      }
+      problems.push(at ? `${m.text()} [${at}]` : m.text());
     }
   });
   page.on("pageerror", (e) => problems.push(String(e)));

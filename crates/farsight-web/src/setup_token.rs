@@ -145,10 +145,10 @@ pub fn expires_at(t: &SetupToken, now: DateTime<Utc>, active: bool) -> DateTime<
 /// (written and printed). `active` = a verified session in the last hour.
 pub fn current_or_rotate(path: &Path, active: bool) -> std::io::Result<(SetupToken, bool)> {
     let now = Utc::now();
-    if let Some(t) = read(path) {
-        if now < expires_at(&t, now, active) {
-            return Ok((t, false));
-        }
+    if let Some(t) = read(path)
+        && now < expires_at(&t, now, active)
+    {
+        return Ok((t, false));
     }
     let t = generate();
     write(path, &t)?;

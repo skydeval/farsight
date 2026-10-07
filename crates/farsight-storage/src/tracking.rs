@@ -369,17 +369,18 @@ impl Txn<'_> {
             if after.state.is_waiting() && !state.is_waiting() {
                 return Ok(());
             }
-            if after.state.is_waiting() && state.is_waiting() {
-                if let Some(k) = sched_key {
-                    self.adjust_sched_key(list_id, k, delta).await?;
-                }
+            if after.state.is_waiting()
+                && state.is_waiting()
+                && let Some(k) = sched_key
+            {
+                self.adjust_sched_key(list_id, k, delta).await?;
             }
             return Ok(());
         }
-        if state.is_waiting() {
-            if let Some(k) = sched_key {
-                self.adjust_sched_key(list_id, k, delta).await?;
-            }
+        if state.is_waiting()
+            && let Some(k) = sched_key
+        {
+            self.adjust_sched_key(list_id, k, delta).await?;
         }
         if delta < 0 && count == 0 {
             self.fire(list_id, Event::Minus, FireArgs::default())

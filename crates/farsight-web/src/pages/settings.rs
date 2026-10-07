@@ -62,20 +62,18 @@ fn redact_file(text: &str) -> String {
             .get_mut(sec)
             .and_then(|s| s.as_table_mut())
             .and_then(|s| s.get_mut(key))
+            && v.as_str().is_some_and(|s| !s.is_empty())
         {
-            if v.as_str().is_some_and(|s| !s.is_empty()) {
-                *v = toml::Value::String(REDACTED.into());
-            }
+            *v = toml::Value::String(REDACTED.into());
         }
     }
     if let Some(v) = t
         .get_mut("storage")
         .and_then(|s| s.as_table_mut())
         .and_then(|s| s.get_mut("database_url"))
+        && let Some(s) = v.as_str()
     {
-        if let Some(s) = v.as_str() {
-            *v = toml::Value::String(crate::setup::redact_dsn(s));
-        }
+        *v = toml::Value::String(crate::setup::redact_dsn(s));
     }
     toml::to_string_pretty(&t).unwrap_or_else(|_| text.to_owned())
 }
@@ -106,11 +104,11 @@ fn unredact(submitted: &str, current: &str) -> Result<String, SettingsError> {
                 REDACTED.to_owned()
             }
         });
-        if v.as_str() == Some(REDACTED) || (v.as_str().is_some() && v.as_str() == shown.as_deref())
+        if (v.as_str() == Some(REDACTED)
+            || (v.as_str().is_some() && v.as_str() == shown.as_deref()))
+            && let Some(o) = original
         {
-            if let Some(o) = original {
-                *v = o;
-            }
+            *v = o;
         }
     }
     Ok(toml::to_string_pretty(&t)?)

@@ -80,7 +80,7 @@ impl fmt::Display for ConfigDuration {
             ("m", 60_000),
             ("s", 1_000),
         ] {
-            if ms != 0 && ms % per == 0 {
+            if ms != 0 && ms.is_multiple_of(per) {
                 return write!(f, "{}{}", ms / per, unit);
             }
         }

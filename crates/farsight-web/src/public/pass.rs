@@ -269,7 +269,7 @@ async fn check_one(st: Arc<WebState>, item: Item) -> Option<(String, Option<Stri
     let under = why.as_ref().and_then(failed_under);
     if let Some(why) = why {
         let n = UNESTABLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n % LOG_EVERY == 0 {
+        if n.is_multiple_of(LOG_EVERY) {
             tracing::warn!(
                 outcome = found.label(),
                 why = why.to_string(),

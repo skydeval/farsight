@@ -238,20 +238,20 @@ fn check_monotonic(c: &mut Checks, samples: &[StateSample], label: &str) {
         if a.source_url != b.source_url {
             continue;
         }
-        if let (Some(x), Some(y)) = (a.cursor_seq, b.cursor_seq) {
-            if y < x {
-                bad.push(format!("seq {x}→{y}"));
-            }
+        if let (Some(x), Some(y)) = (a.cursor_seq, b.cursor_seq)
+            && y < x
+        {
+            bad.push(format!("seq {x}→{y}"));
         }
-        if let (Some(x), Some(y)) = (a.cursor_us, b.cursor_us) {
-            if y < x {
-                bad.push(format!("cursor_us {x}→{y}"));
-            }
+        if let (Some(x), Some(y)) = (a.cursor_us, b.cursor_us)
+            && y < x
+        {
+            bad.push(format!("cursor_us {x}→{y}"));
         }
-        if let (Some(x), Some(y)) = (a.applied_us, b.applied_us) {
-            if y < x {
-                bad.push(format!("applied {x}→{y}"));
-            }
+        if let (Some(x), Some(y)) = (a.applied_us, b.applied_us)
+            && y < x
+        {
+            bad.push(format!("applied {x}→{y}"));
         }
     }
     c.check(
@@ -456,12 +456,11 @@ fn check_metrics(c: &mut Checks, early: &Scrape, late: &Scrape, run_secs: f64) {
             || n.ends_with("_count")
             || n.ends_with("_sum")
             || n.ends_with("_bucket");
-        if counter {
-            if let Some(v2) = late.get(k) {
-                if v2 < v {
-                    regress.push(format!("{k}: {v} → {v2}"));
-                }
-            }
+        if counter
+            && let Some(v2) = late.get(k)
+            && v2 < v
+        {
+            regress.push(format!("{k}: {v} → {v2}"));
         }
     }
     c.check(

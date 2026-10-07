@@ -68,10 +68,8 @@ impl Model {
             CommitAction::Upsert { record, .. } => {
                 let wins =
                     st.row.as_ref().is_none_or(|(r, _)| w > *r) && st.tomb.is_none_or(|t| w > t);
-                if wins {
-                    if let Some(t) = target(record) {
-                        st.row = Some((w, t));
-                    }
+                if wins && let Some(t) = target(record) {
+                    st.row = Some((w, t));
                 }
             }
         }

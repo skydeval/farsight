@@ -119,13 +119,14 @@ pub fn plan(
     };
     let same_instance = p.source_url.as_deref() == Some(url);
     if same_instance {
-        if protocol == Protocol::V2 && p.protocol == Some(Protocol::V2) {
-            if let Some(seq) = p.cursor_seq {
-                return Plan {
-                    cursor: Cursor::Seq(seq.saturating_add(1)),
-                    gap: GapRule::None,
-                };
-            }
+        if protocol == Protocol::V2
+            && p.protocol == Some(Protocol::V2)
+            && let Some(seq) = p.cursor_seq
+        {
+            return Plan {
+                cursor: Cursor::Seq(seq.saturating_add(1)),
+                gap: GapRule::None,
+            };
         }
         let base = p.cursor_us.unwrap_or(applied);
         let requested = base.saturating_sub(us(V1_REPLAY));

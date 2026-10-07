@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 chrono.workspace = true
-hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config"] }
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio", "system-config"] }
 ipnet.workspace = true
 metrics = "0.24"
 psl.workspace = true

@@ -287,10 +287,10 @@ impl Server {
     pub async fn wait_live(&self, http: &Http, timeout: Duration) -> Result<(), String> {
         let start = Instant::now();
         while start.elapsed() < timeout {
-            if let Ok(r) = http.get(&format!("{}/livez", self.base), &[]).await {
-                if r.status == 200 {
-                    return Ok(());
-                }
+            if let Ok(r) = http.get(&format!("{}/livez", self.base), &[]).await
+                && r.status == 200
+            {
+                return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }

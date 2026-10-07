@@ -452,6 +452,7 @@
     zoneNote();
     tabs();
     pending();
+    homeLive();
     swaps();
     pagers();
     finds();
@@ -1092,6 +1093,50 @@
     again();
   }
   var pendingRun = 0;
+
+  // The home page left open keeps itself current: once a minute, while
+  // it is visible, it reads itself again and takes the totals and the
+  // "Last updated" line from the answer, both or neither.
+  function homeLive() {
+    var totals = document.querySelector("dl.home-totals");
+    if (!totals || !window.fetch) {
+      return;
+    }
+    var busy = false;
+    function read() {
+      if (document.hidden || busy) {
+        return;
+      }
+      busy = true;
+      fetch(location.pathname, { credentials: "same-origin", cache: "no-store" })
+        .then(function (r) {
+          if (r.status !== 200 || r.redirected) {
+            throw new Error("not the page");
+          }
+          return r.text();
+        })
+        .then(function (html) {
+          var doc = new DOMParser().parseFromString(html, "text/html");
+          var freshTotals = doc.querySelector("dl.home-totals");
+          var freshLine = doc.querySelector(".footer-updated");
+          var line = document.querySelector(".footer-updated");
+          if (!freshTotals || !freshLine || !line) {
+            return;
+          }
+          totals.innerHTML = freshTotals.innerHTML;
+          line.innerHTML = freshLine.innerHTML;
+          times(line);
+        })
+        .catch(function () {
+          // The page stays as it is until the next reading.
+        })
+        .then(function () {
+          busy = false;
+        });
+    }
+    setInterval(read, REFRESH_EVERY);
+    document.addEventListener("visibilitychange", read);
+  }
 
   // A section swapped in by htmx carries new times.
   document.addEventListener("htmx:afterSwap", function (event) {

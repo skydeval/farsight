@@ -1347,10 +1347,10 @@ impl Config {
 pub fn to_toml(config: &Config) -> Result<String, ConfigError> {
     let mut table =
         toml::Table::try_from(config).map_err(|e| ConfigError::Schema(e.to_string()))?;
-    if let Some(t) = table.get_mut("access").and_then(toml::Value::as_table_mut) {
-        if t.get("admin_did").and_then(toml::Value::as_str) == Some("") {
-            t.remove("admin_did");
-        }
+    if let Some(t) = table.get_mut("access").and_then(toml::Value::as_table_mut)
+        && t.get("admin_did").and_then(toml::Value::as_str) == Some("")
+    {
+        t.remove("admin_did");
     }
     toml::to_string_pretty(&table).map_err(|e| ConfigError::Schema(e.to_string()))
 }

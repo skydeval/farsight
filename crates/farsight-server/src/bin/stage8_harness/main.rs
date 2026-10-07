@@ -207,11 +207,11 @@ impl Srv {
         };
         let http = Http::new(None);
         loop {
-            if let Ok(r) = http.get(&format!("{}/livez", s.base), &[]).await {
-                if r.status == 200 {
-                    s.came_up = started.elapsed();
-                    return Ok(s);
-                }
+            if let Ok(r) = http.get(&format!("{}/livez", s.base), &[]).await
+                && r.status == 200
+            {
+                s.came_up = started.elapsed();
+                return Ok(s);
             }
             if started.elapsed() > Duration::from_secs(90) {
                 return Err(format!("farsight did not come up: {}", s.log_tail(15)));

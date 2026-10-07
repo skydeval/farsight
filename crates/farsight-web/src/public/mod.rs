@@ -269,10 +269,11 @@ impl PublicState {
     ) -> Result<Withheld, sqlx::Error> {
         {
             let g = self.excluded.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(c) = g.as_ref() {
-                if Arc::ptr_eq(&c.config, cfg) && c.at.elapsed() < EXCLUDED_REFRESH {
-                    return Ok(c.withheld.clone());
-                }
+            if let Some(c) = g.as_ref()
+                && Arc::ptr_eq(&c.config, cfg)
+                && c.at.elapsed() < EXCLUDED_REFRESH
+            {
+                return Ok(c.withheld.clone());
             }
         }
         let list = &cfg.config.public_ui.excluded_dids;

@@ -170,11 +170,11 @@ async fn composite(
                     c.partial(r);
                 }
             }
-            if v.snap.pending.considered > 0 {
-                if let Some(d) = ac.discovered_witness {
-                    c.cap_indexed(d);
-                    c.note("list_pending");
-                }
+            if v.snap.pending.considered > 0
+                && let Some(d) = ac.discovered_witness
+            {
+                c.cap_indexed(d);
+                c.note("list_pending");
             }
         }
     }

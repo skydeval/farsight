@@ -307,10 +307,8 @@ pub async fn finish_repo(
                 .bind(f.stamp)
                 .execute(pool)
                 .await?;
-                if clean {
-                    if let Some(p) = f.point {
-                        farsight_storage::debts::clear_for_clean_run(pool, id, p).await?;
-                    }
+                if clean && let Some(p) = f.point {
+                    farsight_storage::debts::clear_for_clean_run(pool, id, p).await?;
                 }
                 sqlx::query(&format!(
                     "DELETE FROM backfill_cursors WHERE actor_id = $1 AND job_kind = {JOB_REPO}"

@@ -56,7 +56,7 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -219,10 +219,10 @@ pub fn authenticate(
     if well_formed(token, ADMIN_PREFIX) && is_admin_token(token, cfg) {
         return Ok(Caller::Admin);
     }
-    if well_formed(token, KEY_PREFIX) {
-        if let Some(k) = keys.lookup(&sha256(token)) {
-            return Ok(Caller::Key(k));
-        }
+    if well_formed(token, KEY_PREFIX)
+        && let Some(k) = keys.lookup(&sha256(token))
+    {
+        return Ok(Caller::Key(k));
     }
     Err(XrpcError::auth_required("invalid or revoked token"))
 }

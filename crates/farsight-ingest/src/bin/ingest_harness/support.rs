@@ -225,10 +225,10 @@ pub async fn scrape(addr: &str) -> Result<Scrape, String> {
         if line.starts_with('#') || line.trim().is_empty() {
             continue;
         }
-        if let Some((series, value)) = line.rsplit_once(' ') {
-            if let Ok(v) = value.parse::<f64>() {
-                out.insert(series.to_owned(), v);
-            }
+        if let Some((series, value)) = line.rsplit_once(' ')
+            && let Ok(v) = value.parse::<f64>()
+        {
+            out.insert(series.to_owned(), v);
         }
     }
     Ok(out)

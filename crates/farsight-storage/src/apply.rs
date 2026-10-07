@@ -484,14 +484,14 @@ fn cause_for(author: &AuthorInfo, origin: &Origin) -> Cause {
 
 async fn apply_write(t: &mut Txn<'_>, origin: &Origin, w: &Write) -> Result<()> {
     let author = t.author(&w.author).await?;
-    if let WriteAction::Upsert(record) = &w.action {
-        if record.collection() != w.collection {
-            return Err(StorageError::Invariant(format!(
-                "write for {} carries a {} record",
-                w.collection,
-                record.collection()
-            )));
-        }
+    if let WriteAction::Upsert(record) = &w.action
+        && record.collection() != w.collection
+    {
+        return Err(StorageError::Invariant(format!(
+            "write for {} carries a {} record",
+            w.collection,
+            record.collection()
+        )));
     }
     match &w.action {
         WriteAction::Delete => match w.collection {
@@ -1163,11 +1163,11 @@ async fn listblock_delete(
     w: &Write,
 ) -> Result<()> {
     let rkey = w.rkey.as_str();
-    if let Some(row) = listblock_row(t, author.id, rkey).await? {
-        if row.rev < w.stamp {
-            let removal = removal_for(origin, w, Removed::Delete);
-            listblock_delete_row(t, author, rkey, Some(&removal)).await?;
-        }
+    if let Some(row) = listblock_row(t, author.id, rkey).await?
+        && row.rev < w.stamp
+    {
+        let removal = removal_for(origin, w, Removed::Delete);
+        listblock_delete_row(t, author, rkey, Some(&removal)).await?;
     }
     t.put_tombstone(Collection::ListBlock, author.id, &w.rkey, w.stamp)
         .await?;
@@ -1478,31 +1478,31 @@ pub(crate) async fn item_delete_rows(
     let n = count(gone.len());
     t.deltas.stat(stat::LIST_ITEMS, -n);
     t.deltas.host(&author.buckets, CapKind::Items, -n);
-    if let Some(r) = removal {
-        if author.status != crate::codes::ActorStatus::Deleted {
-            let rows: Vec<GoneRow> = gone
-                .into_iter()
-                .filter_map(
-                    |(rkey, subject_id, created_at, first_seen, last_seen, ts, rs, lr)| {
-                        let tracked = ts
-                            .and_then(TrackState::from_code)
-                            .is_some_and(TrackState::is_tracked);
-                        let record_deleted = rs == Some(RecordState::Deleted);
-                        let list_rkey = lr?;
-                        (tracked || record_deleted).then_some(GoneRow {
-                            rkey,
-                            actor_id: subject_id,
-                            list_rkey: Some(list_rkey),
-                            created_at,
-                            first_seen,
-                            last_seen,
-                        })
-                    },
-                )
-                .collect();
-            t.record_removals(author, Table::ListItems, &rows, r)
-                .await?;
-        }
+    if let Some(r) = removal
+        && author.status != crate::codes::ActorStatus::Deleted
+    {
+        let rows: Vec<GoneRow> = gone
+            .into_iter()
+            .filter_map(
+                |(rkey, subject_id, created_at, first_seen, last_seen, ts, rs, lr)| {
+                    let tracked = ts
+                        .and_then(TrackState::from_code)
+                        .is_some_and(TrackState::is_tracked);
+                    let record_deleted = rs == Some(RecordState::Deleted);
+                    let list_rkey = lr?;
+                    (tracked || record_deleted).then_some(GoneRow {
+                        rkey,
+                        actor_id: subject_id,
+                        list_rkey: Some(list_rkey),
+                        created_at,
+                        first_seen,
+                        last_seen,
+                    })
+                },
+            )
+            .collect();
+        t.record_removals(author, Table::ListItems, &rows, r)
+            .await?;
     }
     Ok(n as u64)
 }
@@ -1524,11 +1524,11 @@ async fn listitem_delete(
     w: &Write,
 ) -> Result<()> {
     let rkey = w.rkey.as_str();
-    if let Some(row) = item_row(t, author.id, rkey).await? {
-        if row.rev < w.stamp {
-            let removal = removal_for(origin, w, Removed::Delete);
-            item_delete_row(t, author, rkey, Some(&removal)).await?;
-        }
+    if let Some(row) = item_row(t, author.id, rkey).await?
+        && row.rev < w.stamp
+    {
+        let removal = removal_for(origin, w, Removed::Delete);
+        item_delete_row(t, author, rkey, Some(&removal)).await?;
     }
     t.put_tombstone(Collection::ListItem, author.id, &w.rkey, w.stamp)
         .await?;
@@ -1656,11 +1656,11 @@ async fn list_delete(t: &mut Txn<'_>, author: &AuthorInfo, w: &Write) -> Result<
             .bind(rkey)
             .fetch_optional(&mut *t.conn)
             .await?;
-    if let Some((id, rev, state)) = row {
-        if rev.is_none_or(|r| r < w.stamp) {
-            let was_present = state == RecordState::Present;
-            list_mark_deleted(t, author, id, was_present, w.stamp).await?;
-        }
+    if let Some((id, rev, state)) = row
+        && rev.is_none_or(|r| r < w.stamp)
+    {
+        let was_present = state == RecordState::Present;
+        list_mark_deleted(t, author, id, was_present, w.stamp).await?;
     }
     t.put_tombstone(Collection::List, author.id, &w.rkey, w.stamp)
         .await?;

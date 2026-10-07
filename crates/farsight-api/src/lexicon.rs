@@ -139,12 +139,11 @@ impl Lexicons {
         fn walk(l: &Lexicons, base: &str, v: &Value, out: &mut Vec<String>) {
             match v {
                 Value::Object(m) => {
-                    if m.get("type").and_then(Value::as_str) == Some("ref") {
-                        if let Some(r) = m.get("ref").and_then(Value::as_str) {
-                            if l.resolve(base, r).is_none() {
-                                out.push(format!("{base}: {r}"));
-                            }
-                        }
+                    if m.get("type").and_then(Value::as_str) == Some("ref")
+                        && let Some(r) = m.get("ref").and_then(Value::as_str)
+                        && l.resolve(base, r).is_none()
+                    {
+                        out.push(format!("{base}: {r}"));
                     }
                     for x in m.values() {
                         walk(l, base, x, out);
@@ -257,10 +256,10 @@ impl Lexicons {
                 let Some(a) = v.as_array() else {
                     return bad("expected array".into());
                 };
-                if let Some(max) = schema.get("maxLength").and_then(Value::as_u64) {
-                    if a.len() as u64 > max {
-                        bad(format!("array longer than {max}"));
-                    }
+                if let Some(max) = schema.get("maxLength").and_then(Value::as_u64)
+                    && a.len() as u64 > max
+                {
+                    bad(format!("array longer than {max}"));
                 }
                 if let Some(items) = schema.get("items") {
                     for (i, x) in a.iter().enumerate() {
@@ -272,10 +271,10 @@ impl Lexicons {
                 let Some(s) = v.as_str() else {
                     return bad("expected string".into());
                 };
-                if let Some(max) = schema.get("maxLength").and_then(Value::as_u64) {
-                    if s.len() as u64 > max {
-                        bad(format!("string longer than {max} bytes"));
-                    }
+                if let Some(max) = schema.get("maxLength").and_then(Value::as_u64)
+                    && s.len() as u64 > max
+                {
+                    bad(format!("string longer than {max} bytes"));
                 }
                 match schema.get("format").and_then(Value::as_str) {
                     Some("did") if farsight_core::Did::parse(s).is_err() => {
@@ -294,15 +293,15 @@ impl Lexicons {
                 let Some(n) = v.as_i64() else {
                     return bad("expected integer".into());
                 };
-                if let Some(min) = schema.get("minimum").and_then(Value::as_i64) {
-                    if n < min {
-                        bad(format!("{n} < minimum {min}"));
-                    }
+                if let Some(min) = schema.get("minimum").and_then(Value::as_i64)
+                    && n < min
+                {
+                    bad(format!("{n} < minimum {min}"));
                 }
-                if let Some(max) = schema.get("maximum").and_then(Value::as_i64) {
-                    if n > max {
-                        bad(format!("{n} > maximum {max}"));
-                    }
+                if let Some(max) = schema.get("maximum").and_then(Value::as_i64)
+                    && n > max
+                {
+                    bad(format!("{n} > maximum {max}"));
                 }
             }
             "boolean" => {

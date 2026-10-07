@@ -331,29 +331,29 @@ async fn fetch(
             // Owner inactive (relay-confirmed) ⇒ OI on claimed pending lists.
             let relay = cfg.backfill.relay_url.clone();
             *cost += 1;
-            if let Ok(s) = xrpc::repo_status(&ctx.net, &relay, owner).await {
-                if !s.active {
-                    repo::apply_status(ctx, owner, false, s.status)
-                        .await
-                        .map_err(JobError::Status)?;
-                    let limits = ctx.limits();
-                    for (id, state) in claimed(ctx, run_id).await? {
-                        if state == TrackState::Pending {
-                            farsight_storage::janitor::fire_event(
-                                pool,
-                                &limits,
-                                &ctx.counters,
-                                id,
-                                Event::OwnerInactive,
-                                FireArgs::default(),
-                            )
-                            .await?;
-                        }
+            if let Ok(s) = xrpc::repo_status(&ctx.net, &relay, owner).await
+                && !s.active
+            {
+                repo::apply_status(ctx, owner, false, s.status)
+                    .await
+                    .map_err(JobError::Status)?;
+                let limits = ctx.limits();
+                for (id, state) in claimed(ctx, run_id).await? {
+                    if state == TrackState::Pending {
+                        farsight_storage::janitor::fire_event(
+                            pool,
+                            &limits,
+                            &ctx.counters,
+                            id,
+                            Event::OwnerInactive,
+                            FireArgs::default(),
+                        )
+                        .await?;
                     }
-                    release_claim(ctx, run_id).await?;
-                    finish_run(ctx, run_id, FetchOutcome::OwnerInactive).await?;
-                    return Ok(Outcome::Inactive);
                 }
+                release_claim(ctx, run_id).await?;
+                finish_run(ctx, run_id, FetchOutcome::OwnerInactive).await?;
+                return Ok(Outcome::Inactive);
             }
             x.to_string()
         }

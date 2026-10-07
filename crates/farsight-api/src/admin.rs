@@ -177,10 +177,10 @@ pub async fn list_errors(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcEr
         })
         .collect();
     let mut body = json!({ "errors": errors });
-    if rows.len() as i64 == limit {
-        if let Some(last) = rows.last() {
-            body["cursor"] = json!(crate::cursor::encode(&[json!(last.0.get())]));
-        }
+    if rows.len() as i64 == limit
+        && let Some(last) = rows.last()
+    {
+        body["cursor"] = json!(crate::cursor::encode(&[json!(last.0.get())]));
     }
     Ok(Reply::ok(body))
 }

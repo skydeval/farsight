@@ -262,10 +262,10 @@ pub fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 /// its host must equal `Host`. Requests carrying neither (non-browser
 /// clients) pass; the CSRF token still applies.
 pub fn same_origin(headers: &HeaderMap) -> bool {
-    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
-        if site != "same-origin" {
-            return false;
-        }
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok())
+        && site != "same-origin"
+    {
+        return false;
     }
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         let host = headers

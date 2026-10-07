@@ -124,14 +124,18 @@ for (const [name, engine] of [
       continue;
     }
     const card = page.locator(".who-wrap.open .profile-card");
+    const hovered = Date.now();
     await card.locator(".pc-did").waitFor({ state: "visible", timeout: 8000 }).catch(() => {});
+    // The card shows the DID at once and the rest when the answer is in.
+    await card.getByText("DID created").waitFor({ state: "visible", timeout: 8000 }).catch(() => {});
+    const filled = Date.now() - hovered;
     const text = (await card.count()) ? await card.innerText() : "";
     // While the card is open the link's title is put aside as data-did.
     const did = (await first.getAttribute("title")) || (await first.getAttribute("data-did"));
     out(
       `${name}: resting the pointer on an account in an admin table opens its profile card, fetched from /admin/card/{did} with the session cookie`,
       marked >= 50 && text.includes(did) && text.includes("DID created") && requests.length === 1 && requests[0] === `/admin/card/${did}`,
-      `${marked} links; request ${requests.join(",")}; card: ${text.replace(/\s+/g, " ").slice(0, 120)}`,
+      `${marked} links; request ${requests.join(",")}; filled after ${filled} ms; card: ${text.replace(/\s+/g, " ").slice(0, 120)}`,
     );
     const below = await page.evaluate(() => {
       const c = document.querySelector(".who-wrap.open .profile-card");

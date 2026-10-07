@@ -1519,14 +1519,13 @@ async fn check_repair(h: &H, c: &mut Checks) -> Res<()> {
                 "SELECT EXISTS (SELECT 1 FROM relist_debt WHERE actor_id = {bid} AND reason = 2)"
             ))
             .await?;
-        if let Some(id) = cycle {
-            if h.bool(&format!(
+        if let Some(id) = cycle
+            && h.bool(&format!(
                 "SELECT completed_at IS NOT NULL FROM sweep_cycles WHERE id = {id}"
             ))
             .await?
-            {
-                break;
-            }
+        {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

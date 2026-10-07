@@ -149,10 +149,10 @@ impl Srv {
         let http = Http::new(None);
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if let Ok(r) = http.get(&format!("{}/livez", s.base), &[]).await {
-                if r.status == 200 {
-                    return Ok(s);
-                }
+            if let Ok(r) = http.get(&format!("{}/livez", s.base), &[]).await
+                && r.status == 200
+            {
+                return Ok(s);
             }
             if Instant::now() > deadline {
                 return Err(format!("farsight did not come up: {}", s.log_tail(15)));

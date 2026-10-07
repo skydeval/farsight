@@ -169,10 +169,10 @@ fn remember_sign_in(st: &WebState, ip: IpAddr) {
     let mut m = st.recent_logins.lock().unwrap_or_else(|e| e.into_inner());
     if m.len() >= MAX_RECENT_LOGINS && !m.contains_key(&ip) {
         m.retain(|_, t| t.elapsed() < SESSION_ABSOLUTE);
-        if m.len() >= MAX_RECENT_LOGINS {
-            if let Some(oldest) = m.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
-                m.remove(&oldest);
-            }
+        if m.len() >= MAX_RECENT_LOGINS
+            && let Some(oldest) = m.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k)
+        {
+            m.remove(&oldest);
         }
     }
     m.insert(ip, Instant::now());
@@ -239,20 +239,20 @@ pub async fn submit(
     // One bucket for the whole process bounds what anonymous callers can
     // make Farsight send; an address that signed in recently is outside
     // it, so that the admin is not kept out by other people's starts.
-    if !recently_signed_in(&st, ip) {
-        if let Err((_, retry)) = st.api.limiter.check(
+    if !recently_signed_in(&st, ip)
+        && let Err((_, retry)) = st.api.limiter.check(
             Class::UiLoginStart,
             PROCESS_KEY,
             Class::UiLoginStart.limit(&cfg.config, None),
-        ) {
-            let page = sign_in_page(
-                &cfg,
-                &headers,
-                local,
-                Some("Sign-in is busy; try again in a few seconds.".into()),
-            );
-            return too_many(page, Class::UiLoginStart, retry);
-        }
+        )
+    {
+        let page = sign_in_page(
+            &cfg,
+            &headers,
+            local,
+            Some("Sign-in is busy; try again in a few seconds.".into()),
+        );
+        return too_many(page, Class::UiLoginStart, retry);
     }
     let unreachable = |why: &str| {
         tracing::warn!(reason = why, "admin sign-in could not be started");

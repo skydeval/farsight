@@ -174,7 +174,7 @@ pub fn thousands(n: i64) -> String {
     let digits = n.abs().to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -193,11 +193,11 @@ pub fn duration_words(d: std::time::Duration) -> String {
             format!("{} {unit}s", thousands(n as i64))
         }
     };
-    if s >= 86_400 && s % 86_400 == 0 {
+    if s >= 86_400 && s.is_multiple_of(86_400) {
         plural(s / 86_400, "day")
-    } else if s >= 3_600 && s % 3_600 == 0 {
+    } else if s >= 3_600 && s.is_multiple_of(3_600) {
         plural(s / 3_600, "hour")
-    } else if s >= 60 && s % 60 == 0 {
+    } else if s >= 60 && s.is_multiple_of(60) {
         plural(s / 60, "minute")
     } else {
         plural(s, "second")

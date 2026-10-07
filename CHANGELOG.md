@@ -26,6 +26,12 @@ database schema; each entry says so where it does.
   throughout the Rust code (`farsight-storage/src/codes.rs`, `ids.rs`),
   and failures in the web UI, the backfill jobs and the server tasks
   are error enums. Nothing an operator sees changes.
+- Public home page: left open, it now brings its totals and its "Last
+  updated" line up to date together, once a minute while the tab is
+  visible.
+- The DNS resolver (`hickory-resolver`) is at 0.26, which clears two
+  advisories against 0.25; `deny.toml` no longer ignores any. Building
+  from source needs Rust 1.88 or later.
 - The database schema is one initial migration, and the database checks
   every stored code: a column that holds a code accepts only the codes
   its enumeration defines. Schema version 1.

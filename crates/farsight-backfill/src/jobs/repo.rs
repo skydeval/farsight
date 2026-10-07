@@ -566,19 +566,19 @@ pub async fn run(ctx: &Ctx, req: &JobReq) -> JobResult {
 }
 
 async fn requeue_yielded(ctx: &Ctx, req: &JobReq) {
-    if let Ok(id) = jobs::intern(ctx, &req.did).await {
-        if let Ok(mut conn) = ctx.pool.acquire().await {
-            let _ = farsight_storage::queue::enqueue(
-                &mut conn,
-                id,
-                JobKind::Repo,
-                req.tier,
-                Priority::Normal,
-                req.requester,
-                None,
-            )
-            .await;
-        }
+    if let Ok(id) = jobs::intern(ctx, &req.did).await
+        && let Ok(mut conn) = ctx.pool.acquire().await
+    {
+        let _ = farsight_storage::queue::enqueue(
+            &mut conn,
+            id,
+            JobKind::Repo,
+            req.tier,
+            Priority::Normal,
+            req.requester,
+            None,
+        )
+        .await;
     }
 }
 

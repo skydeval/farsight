@@ -242,10 +242,10 @@ pub fn read_history(body: &[u8]) -> Option<LogHistory> {
             .and_then(|p| Url::parse(p).ok())
             .and_then(|u| u.host_str().map(str::to_owned));
         for (list, value) in [(&mut out.handles, claim), (&mut out.hosts, host)] {
-            if let Some(value) = value {
-                if list.last().is_none_or(|h| h.value != value) {
-                    list.push(Held { value, since });
-                }
+            if let Some(value) = value
+                && list.last().is_none_or(|h| h.value != value)
+            {
+                list.push(Held { value, since });
             }
         }
     }

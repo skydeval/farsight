@@ -17,18 +17,7 @@ all-features = true
 version = 2
 # A yanked version in Cargo.lock fails the check, like a vulnerability.
 yanked = "deny"
-ignore = [
-    # hickory-proto 0.25: an unbounded loop in DNSSEC validation. The code
-    # is compiled only with the `dnssec-ring` or `dnssec-aws-lc-rs`
-    # feature; Farsight builds hickory-resolver with `tokio` and
-    # `system-config` alone and validates no DNSSEC.
-    { id = "RUSTSEC-2026-0118", reason = "DNSSEC validation is not compiled in (no dnssec feature)" },
-    # hickory-proto 0.25: quadratic name compression when a message with
-    # many records is encoded. Farsight uses the stub resolver only, which
-    # encodes its own one-question queries and never a message a peer
-    # supplied. Fixed in hickory 0.26.1; remove this entry with that upgrade.
-    { id = "RUSTSEC-2026-0119", reason = "only one-question queries are encoded; remove when hickory-resolver is 0.26.1 or later" },
-]
+ignore = []
 
 [licenses]
 version = 2

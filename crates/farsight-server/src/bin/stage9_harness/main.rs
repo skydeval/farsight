@@ -190,10 +190,10 @@ impl Srv {
         let http = Http::new(None);
         let started = Instant::now();
         loop {
-            if let Ok(r) = http.get(&format!("{}/livez", s.base), &[]).await {
-                if r.status == 200 {
-                    return Ok(s);
-                }
+            if let Ok(r) = http.get(&format!("{}/livez", s.base), &[]).await
+                && r.status == 200
+            {
+                return Ok(s);
             }
             if started.elapsed() > Duration::from_secs(90) {
                 return Err(format!(
@@ -1134,10 +1134,9 @@ impl Wiz {
                 .http
                 .get(&format!("{}/setup", self.srv.base), &[])
                 .await
+                && r.status == 404
             {
-                if r.status == 404 {
-                    return Ok(());
-                }
+                return Ok(());
             }
             if started.elapsed() > Duration::from_secs(60) {
                 return Err(format!(

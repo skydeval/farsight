@@ -477,10 +477,10 @@ async fn page_all(
         let items = r.body[field].as_array().cloned().unwrap_or_default();
         out.extend(items.iter().map(key));
         pages += 1;
-        if let Some((after, f)) = between.as_mut() {
-            if pages == *after {
-                f().await?;
-            }
+        if let Some((after, f)) = between.as_mut()
+            && pages == *after
+        {
+            f().await?;
         }
         match r.body["cursor"].as_str() {
             Some(cu) => cursor = Some(cu.to_owned()),
@@ -859,10 +859,10 @@ async fn check_semaphore(
     );
     let mut ok = 0;
     for h in holders {
-        if let Ok(Ok(r)) = h.await {
-            if r.status == 200 {
-                ok += 1;
-            }
+        if let Ok(Ok(r)) = h.await
+            && r.status == 200
+        {
+            ok += 1;
         }
     }
     c.check(
@@ -1224,15 +1224,23 @@ async fn check_client_ip(
     )
     .await;
     let limited = rs.iter().any(|r| r.status == 429);
-    let other = untrusted
-        .get(&url, &[("cf-connecting-ip", "203.0.113.61")])
-        .await?;
+    // Several requests at once: on a slow machine the bucket has a token
+    // or two again by now, and one request alone could take it.
+    let (rs, _) = burst(
+        &untrusted,
+        &url,
+        vec![("cf-connecting-ip".into(), "203.0.113.61".into())],
+        10,
+        None,
+    )
+    .await;
+    let other = rs.iter().filter(|r| r.status == 429).count();
     c.check(
         "untrusted peer + CF-Connecting-IP ⇒ rate-limited by the peer (forged header ignored)",
-        limited && other.status == 429,
+        limited && other > 0,
         format!(
-            "first header limited: {limited}; different header from the same peer: HTTP {}",
-            other.status
+            "first header limited: {limited}; different header from the same peer: {other} of {} limited",
+            rs.len()
         ),
     );
     Ok(())

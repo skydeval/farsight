@@ -406,11 +406,11 @@ impl Writer {
     }
 
     async fn refresh_gauges(&self) {
-        if let Ok(st) = firehose::read_state(&self.pool).await {
-            if let Some(a) = st.applied_through {
-                let lag = (Utc::now() - a).num_microseconds().unwrap_or(0) as f64 / 1e6;
-                metrics::gauge!(m::LAG).set(lag.max(0.0));
-            }
+        if let Ok(st) = firehose::read_state(&self.pool).await
+            && let Some(a) = st.applied_through
+        {
+            let lag = (Utc::now() - a).num_microseconds().unwrap_or(0) as f64 / 1e6;
+            metrics::gauge!(m::LAG).set(lag.max(0.0));
         }
         if let Ok(gaps) = firehose::unhealed_gaps(&self.pool).await {
             metrics::gauge!(m::OPEN_GAPS).set(gaps.len() as f64);

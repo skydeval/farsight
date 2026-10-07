@@ -744,6 +744,11 @@ collapsed under its heading; the other public pages have the same
 guide behind a button in the bar, which otherwise holds the icon, the
 search form and the theme toggle.
 
+A home page left open keeps itself current. Once a minute, while the
+tab is visible, the script reads the page again and replaces the
+totals and the "Last updated" line together, so the two never
+disagree. Without JavaScript the page changes on a reload.
+
 **Top lists** are optional. Two switches, each off by default, add
 them:
 

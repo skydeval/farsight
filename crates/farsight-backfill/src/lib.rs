@@ -378,10 +378,10 @@ async fn run_normal(
             move || {
                 let ctx = ctx.clone();
                 async move {
-                    if let Ok(now) = jobs::db_now(&ctx.pool).await {
-                        if let Err(e) = jobs::list_phase1::pending_timeouts(&ctx, now).await {
-                            tracing::warn!(error = %e, "pending_max_age pass failed");
-                        }
+                    if let Ok(now) = jobs::db_now(&ctx.pool).await
+                        && let Err(e) = jobs::list_phase1::pending_timeouts(&ctx, now).await
+                    {
+                        tracing::warn!(error = %e, "pending_max_age pass failed");
                     }
                 }
             }
@@ -456,11 +456,11 @@ async fn watch_config(ctx: &Ctx, path: &Path, shutdown: &mut watch::Receiver<boo
     let mut listener = sqlx::postgres::PgListener::connect_with(&ctx.pool)
         .await
         .ok();
-    if let Some(l) = listener.as_mut() {
-        if let Err(e) = l.listen("farsight_config").await {
-            tracing::warn!(error = %e, "LISTEN farsight_config failed; polling only");
-            listener = None;
-        }
+    if let Some(l) = listener.as_mut()
+        && let Err(e) = l.listen("farsight_config").await
+    {
+        tracing::warn!(error = %e, "LISTEN farsight_config failed; polling only");
+        listener = None;
     }
     let mut seen = mtime(path);
     loop {

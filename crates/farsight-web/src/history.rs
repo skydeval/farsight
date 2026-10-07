@@ -153,10 +153,10 @@ pub struct Pager {
 fn next_link(base: &str, q: &Params, keys: &[&str], key: &str, value: &str) -> String {
     let mut s = url::form_urlencoded::Serializer::new(String::new());
     for k in keys {
-        if *k != key {
-            if let Some(v) = q.get(k) {
-                s.append_pair(k, v);
-            }
+        if *k != key
+            && let Some(v) = q.get(k)
+        {
+            s.append_pair(k, v);
         }
     }
     s.append_pair(key, value);

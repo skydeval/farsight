@@ -614,6 +614,31 @@ so the public pages are deliberately narrower than the API:
 - **Link previews and titles** carry no data: every page is titled
   "Farsight", and the preview image is one static file.
 
+### What is off until an operator turns it on
+
+An index of blocks can be used to look people up as well as to enforce
+their blocks. The design draws the line in three places:
+
+- **The API never offers it.** Nothing returns everyone an account
+  blocks, the records that were removed, or a ranking of accounts
+  (see [api.md](api.md#what-the-api-leaves-out-and-why)).
+- **The public pages offer it only by a deliberate choice.** The
+  public UI is off by default, and turning it on shows what becomes
+  public and asks for confirmation. On top of that, three things have
+  switches of their own, each off by default:
+  `public_ui.show_outgoing_blocks` (the blocks an account has made and
+  the lists it subscribes to), `public_ui.show_top_blockers` and
+  `public_ui.show_top_blocked` (the home page's rankings; the second
+  names the most-blocked accounts on the front page, and its setting
+  says so).
+- **Some things have no switch.** Removed records, record addresses
+  and one-click copying of identifiers are never on a public page.
+
+An instance installed and left alone therefore exposes what an AppView
+needs and nothing aimed at finding people. Anything further is a
+decision an operator makes for their own instance, with its effect
+stated where the decision is made.
+
 The operator's view of all this is in
 [../guide/public-ui.md](../guide/public-ui.md).
 

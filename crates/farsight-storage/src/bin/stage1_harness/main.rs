@@ -204,10 +204,10 @@ async fn run(server: &Server, args: &Args) -> i32 {
     }
     let mut summary = Vec::new();
     for s in streams() {
-        if let Some(only) = &args.only {
-            if !only.contains(&s.n) {
-                continue;
-            }
+        if let Some(only) = &args.only
+            && !only.contains(&s.n)
+        {
+            continue;
         }
         println!("\n== stream {}: {} ==", s.n, s.name);
         let started = Instant::now();

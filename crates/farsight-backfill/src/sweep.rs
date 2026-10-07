@@ -468,10 +468,10 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
             let mut members = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for op in ops.into_iter().filter(|o| !o.nullified) {
-                if cfg.backfill.plc_seed_from_export {
-                    if let Some(p) = &op.pds {
-                        ctx.resolver.seed(&op.did, p);
-                    }
+                if cfg.backfill.plc_seed_from_export
+                    && let Some(p) = &op.pds
+                {
+                    ctx.resolver.seed(&op.did, p);
                 }
                 if seen.insert(op.did.clone()) {
                     members.push(Member {

@@ -100,10 +100,10 @@ fn random() -> String {
 
 fn oauth_error(status: StatusCode, error: &str, nonce: Option<&str>) -> Response {
     let mut r = (status, axum::Json(json!({"error": error}))).into_response();
-    if let Some(n) = nonce {
-        if let Ok(v) = HeaderValue::from_str(n) {
-            r.headers_mut().insert("dpop-nonce", v);
-        }
+    if let Some(n) = nonce
+        && let Ok(v) = HeaderValue::from_str(n)
+    {
+        r.headers_mut().insert("dpop-nonce", v);
     }
     r
 }

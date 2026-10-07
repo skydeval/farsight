@@ -84,10 +84,10 @@ pub fn resolve(peer: IpAddr, headers: &HeaderMap, mode: ProxyMode, trusted: &[Ip
     if !in_any(peer, trusted) {
         return peer;
     }
-    if mode == ProxyMode::Cloudflare {
-        if let Some(ip) = header_ip(headers, "cf-connecting-ip") {
-            return ip;
-        }
+    if mode == ProxyMode::Cloudflare
+        && let Some(ip) = header_ip(headers, "cf-connecting-ip")
+    {
+        return ip;
     }
     let xff: Vec<IpAddr> = headers
         .get_all("x-forwarded-for")
@@ -117,15 +117,15 @@ impl ProxyTrust {
     /// The effective trusted set for `cfg`.
     pub fn trusted(&self, cfg: &ProxyConfig) -> Vec<IpNet> {
         let mut v = cfg.trusted.clone();
-        if cfg.mode == ProxyMode::Cloudflare && cfg.cloudflare_refresh {
-            if let Some(cf) = self
+        if cfg.mode == ProxyMode::Cloudflare
+            && cfg.cloudflare_refresh
+            && let Some(cf) = self
                 .refreshed_cf
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
-            {
-                v.extend(cf.iter().copied());
-            }
+        {
+            v.extend(cf.iter().copied());
         }
         v
     }

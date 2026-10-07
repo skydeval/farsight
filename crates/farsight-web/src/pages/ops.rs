@@ -75,16 +75,16 @@ async fn ops_render(
         repair_auto: cfg.config.backfill.repair.auto_start,
         env_managed: cfg.from_env_only,
     };
-    if let Ok(mut conn) = st.api.pool.acquire().await {
-        if let Ok(rows) = farsight_storage::queries::op_errors(&mut conn, None, 25).await {
-            for (_, at, component, did, _, msg) in rows {
-                page.errors.push((
-                    at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-                    component,
-                    did.unwrap_or_default(),
-                    msg,
-                ));
-            }
+    if let Ok(mut conn) = st.api.pool.acquire().await
+        && let Ok(rows) = farsight_storage::queries::op_errors(&mut conn, None, 25).await
+    {
+        for (_, at, component, did, _, msg) in rows {
+            page.errors.push((
+                at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                component,
+                did.unwrap_or_default(),
+                msg,
+            ));
         }
     }
     if let Ok(keys) = farsight_storage::auth::list_tokens(&st.api.pool).await {

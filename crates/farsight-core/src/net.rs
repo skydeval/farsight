@@ -186,15 +186,18 @@ impl reqwest::dns::Resolve for VettingResolver {
 }
 
 fn system_resolver() -> hickory_resolver::TokioResolver {
-    use hickory_resolver::config::ResolverConfig;
-    use hickory_resolver::name_server::TokioConnectionProvider;
-    match hickory_resolver::TokioResolver::builder_tokio() {
-        Ok(b) => b.build(),
+    use hickory_resolver::config::{GOOGLE, ResolverConfig};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+    // The system's resolver configuration, or public name servers where
+    // it cannot be read.
+    match hickory_resolver::TokioResolver::builder_tokio().and_then(|b| b.build()) {
+        Ok(r) => r,
         Err(_) => hickory_resolver::TokioResolver::builder_with_config(
-            ResolverConfig::default(),
-            TokioConnectionProvider::default(),
+            ResolverConfig::udp_and_tcp(&GOOGLE),
+            TokioRuntimeProvider::default(),
         )
-        .build(),
+        .build()
+        .expect("a resolver with fixed name servers builds"),
     }
 }
 
@@ -234,12 +237,16 @@ impl SafeClient {
     pub async fn txt(&self, name: &str) -> Result<Vec<String>, OutboundError> {
         match self.dns.txt_lookup(name).await {
             Ok(r) => Ok(r
+                .answers()
                 .iter()
-                .map(|t| {
-                    t.txt_data()
-                        .iter()
-                        .map(|d| String::from_utf8_lossy(d).into_owned())
-                        .collect::<String>()
+                .filter_map(|record| match &record.data {
+                    hickory_resolver::proto::rr::RData::TXT(t) => Some(
+                        t.txt_data
+                            .iter()
+                            .map(|d| String::from_utf8_lossy(d).into_owned())
+                            .collect::<String>(),
+                    ),
+                    _ => None,
                 })
                 .collect()),
             Err(e) if e.is_no_records_found() => Ok(Vec::new()),
@@ -391,21 +398,21 @@ pub fn check_url(url: &Url, config: &SafeClientConfig) -> Result<(), OutboundErr
         other => return Err(OutboundError::Scheme(other.to_owned())),
     }
     // Literal IPs are checked here; names are checked after resolution.
-    if let Some(url::Host::Ipv4(a)) = url.host() {
-        if let Some(reason) = blocked_ip_reason(IpAddr::V4(a)) {
-            return Err(OutboundError::ForbiddenAddress {
-                addr: IpAddr::V4(a),
-                reason,
-            });
-        }
+    if let Some(url::Host::Ipv4(a)) = url.host()
+        && let Some(reason) = blocked_ip_reason(IpAddr::V4(a))
+    {
+        return Err(OutboundError::ForbiddenAddress {
+            addr: IpAddr::V4(a),
+            reason,
+        });
     }
-    if let Some(url::Host::Ipv6(a)) = url.host() {
-        if let Some(reason) = blocked_ip_reason(IpAddr::V6(a)) {
-            return Err(OutboundError::ForbiddenAddress {
-                addr: IpAddr::V6(a),
-                reason,
-            });
-        }
+    if let Some(url::Host::Ipv6(a)) = url.host()
+        && let Some(reason) = blocked_ip_reason(IpAddr::V6(a))
+    {
+        return Err(OutboundError::ForbiddenAddress {
+            addr: IpAddr::V6(a),
+            reason,
+        });
     }
     Ok(())
 }

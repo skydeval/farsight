@@ -280,23 +280,23 @@ pub async fn run(
                     n += 1;
                     // Sign-in flows older than their lifetime (they are already
                     // refused at lookup; this frees the memory).
-                    if n % 2 == 0 {
+                    if n.is_multiple_of(2) {
                         web.oauth.flows.sweep(std::time::Instant::now());
                     }
                     if let Err(e) = keys.refresh(&pool).await {
                         tracing::warn!(error = %e, "API key refresh failed");
                     }
-                    if n % 2 == 0 {
+                    if n.is_multiple_of(2) {
                         let _ = keys.flush_usage(&pool).await;
                     }
-                    if n % 20 == 0 {
+                    if n.is_multiple_of(20) {
                         limiter.sweep(Duration::from_secs(600));
                     }
                     // Opt-in daily refresh of the Cloudflare ranges.
                     let proxy = config.current().config.proxy.clone();
                     if proxy.cloudflare_refresh
                         && proxy.mode == farsight_core::config::ProxyMode::Cloudflare
-                        && (n == 1 || n % 2880 == 0)
+                        && (n == 1 || n.is_multiple_of(2880))
                     {
                         match refresh_cloudflare().await {
                             Ok(nets) => {

@@ -153,10 +153,9 @@ impl Resolver {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(did.as_str())
+            && at.elapsed() < MEMORY_TTL
         {
-            if at.elapsed() < MEMORY_TTL {
-                return Some(p.clone());
-            }
+            return Some(p.clone());
         }
         let row: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
             "SELECT h.host, a.pds_resolved_at FROM actors a JOIN pds_hosts h ON h.id = a.pds_host_id

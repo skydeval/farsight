@@ -122,10 +122,10 @@ pub(super) async fn logout(
     if let Err(r) = check_form(&session, &headers, &form) {
         return r;
     }
-    if let Some(raw) = read_cookie(&headers, ADMIN_COOKIE) {
-        if let Some(key) = session_key(&st.api.config.current(), &raw) {
-            let _ = farsight_storage::auth::delete_session(&st.api.pool, &key).await;
-        }
+    if let Some(raw) = read_cookie(&headers, ADMIN_COOKIE)
+        && let Some(key) = session_key(&st.api.config.current(), &raw)
+    {
+        let _ = farsight_storage::auth::delete_session(&st.api.pool, &key).await;
     }
     let mut r = common::redirect("/enter");
     r.headers_mut().append(
