@@ -1426,3 +1426,162 @@ pub async fn s11_instance_cursors(env: &mut Env, c: &mut Checks) -> Result<()> {
     );
     Ok(())
 }
+
+/// Holds a list's advisory lock in a transaction of its own until the
+/// transaction is rolled back.
+async fn hold_list_lock<'a>(
+    env: &'a Env,
+    owner: &farsight_core::Did,
+    rkey: &str,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+    let mut tx = env.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(farsight_storage::keys::list_lock_key(owner.as_str(), rkey))
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+/// Stream 12: a list that turns `unavailable` after a reactivating batch
+/// read its lock set, and before the batch holds its list locks, is not
+/// given OA without its lock.
+///
+/// The interleaving is forced with two outside sessions: one holds the
+/// lock of an unrelated list the batch also needs, which stops the batch
+/// between its read and its list locks; the other then holds the lock of
+/// the list that turned `unavailable` in the meantime.
+pub async fn s12_reactivation_lock(env: &mut Env, c: &mut Checks) -> Result<()> {
+    use farsight_storage::repo_events::RepoEvent as E;
+    use farsight_storage::transition::Event;
+    let w = now_micros();
+    let (o, b, x, mo) = (
+        plc("rxowner", 1),
+        plc("rxblocker", 1),
+        plc("rxother", 1),
+        plc("rxmowner", 1),
+    );
+    // L is pending; its owner is deactivated.
+    env.firehose(vec![
+        list(&o, "L", rev(1)),
+        listblock(&b, "lb", &o, "L", rev(2)),
+    ])
+    .await?;
+    let l = env.list_id(&o, "L").await?.unwrap_or(-1);
+    events_batch(
+        env,
+        vec![E::Account {
+            did: o.clone(),
+            witness: w,
+            active: false,
+            status: Some("deactivated".into()),
+        }],
+    )
+    .await?;
+    c.eq(
+        "setup: L is pending and has no unavailable sibling",
+        env.list_view(l).await?.state,
+        TrackState::Pending,
+    );
+
+    // The batch: a listblock on M (so it needs list(M)) and the owner's
+    // reactivation.
+    let hold_m = hold_list_lock(env, &mo, "M").await?;
+    let mut batch = Batch::new(Origin::Firehose);
+    let mut on_m = listblock(&x, "lbm", &mo, "M", rev(3));
+    on_m.witness = Some(w);
+    batch.writes.push(on_m);
+    batch.events.push(E::Account {
+        did: o.clone(),
+        witness: w + chrono::Duration::seconds(1),
+        active: true,
+        status: None,
+    });
+    let ctx = env.ctx();
+    let applying = apply::apply(&env.pool, &ctx, &batch);
+    tokio::pin!(applying);
+    // It takes its author locks, reads the owner's unavailable lists
+    // (none) and waits for list(M).
+    // (Should the batch complete where it is expected to wait, its
+    // result is kept: the check below then fails on what it did.)
+    let mut done = None;
+    let waits_for_m = match tokio::time::timeout(Duration::from_millis(1500), &mut applying).await {
+        Err(_) => true,
+        Ok(r) => {
+            done = Some(r);
+            false
+        }
+    };
+    // Meanwhile L times out: pending → unavailable, under list(L) alone.
+    janitor::fire_event(
+        &env.pool,
+        &env.limits,
+        &env.counters,
+        l,
+        Event::FailTerminal,
+        farsight_storage::tracking::FireArgs::default(),
+    )
+    .await?;
+    let turned = env.list_view(l).await?.state;
+    // Another writer now holds list(L); list(M) is released.
+    let hold_l = hold_list_lock(env, &o, "L").await?;
+    hold_m.rollback().await?;
+    let waits_for_l = done.is_none()
+        && match tokio::time::timeout(Duration::from_millis(2500), &mut applying).await {
+            Err(_) => true,
+            Ok(r) => {
+                done = Some(r);
+                false
+            }
+        };
+    let during = env.list_view(l).await?;
+    c.check(
+        "the batch does not touch a list that turned unavailable after its read while another writer holds that list's lock",
+        waits_for_m
+            && turned == TrackState::Unavailable
+            && waits_for_l
+            && during.state == TrackState::Unavailable,
+        format!(
+            "waited for list(M) {waits_for_m}; L turned {turned:?}; waited for list(L) {waits_for_l}; L meanwhile {:?}",
+            during.state
+        ),
+    );
+    hold_l.rollback().await?;
+    let finished = match done {
+        Some(r) => Ok(r),
+        None => tokio::time::timeout(Duration::from_secs(20), &mut applying).await,
+    };
+    let report = match finished {
+        Ok(r) => r?,
+        Err(_) => {
+            c.check(
+                "the batch completes once list(L) is free",
+                false,
+                "timed out",
+            );
+            return Ok(());
+        }
+    };
+    let after = env.list_view(l).await?;
+    let oa: Vec<_> = report
+        .transitions
+        .iter()
+        .filter(|t| t.list_id == l && t.event == Event::OwnerActive)
+        .map(|t| (t.from, t.to))
+        .collect();
+    c.check(
+        "once the lock is free the batch runs again with L in its lock set and fires OA: unavailable → pending",
+        oa == vec![(TrackState::Unavailable, TrackState::Pending)]
+            && after.state == TrackState::Pending
+            && report.deadlock_retries >= 1,
+        format!(
+            "OA transitions {oa:?}; L {:?}; attempts retried {}",
+            after.state, report.deadlock_retries
+        ),
+    );
+    c.eq(
+        "the listblock of the same batch is stored once",
+        scalar(env, "SELECT count(*) FROM list_blocks WHERE rkey = 'lbm'").await?,
+        1,
+    );
+    Ok(())
+}

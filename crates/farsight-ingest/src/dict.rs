@@ -35,7 +35,10 @@ pub enum DecompressError {
 /// Decompresses one zstd frame against `dict`.
 pub fn decompress(frame: &[u8], dict: &[u8]) -> Result<Vec<u8>, DecompressError> {
     let decoder = zstd::stream::read::Decoder::with_dictionary(frame, dict)?;
-    let mut out = Vec::with_capacity(frame.len() * 4);
+    // A guess at the expanded size, never more than a frame may be: the
+    // frame's length is the sender's.
+    let guess = frame.len().saturating_mul(4).min(MAX_FRAME_BYTES as usize);
+    let mut out = Vec::with_capacity(guess);
     let n = decoder.take(MAX_FRAME_BYTES + 1).read_to_end(&mut out)?;
     if n as u64 > MAX_FRAME_BYTES {
         return Err(DecompressError::TooLarge);

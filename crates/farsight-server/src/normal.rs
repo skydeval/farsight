@@ -5,6 +5,12 @@
 //! tasks, the UI sort-index builder and the handle-warming worker. Ends on
 //! shutdown or on a config reset (then the caller enters setup mode
 //! in-process).
+//!
+//! Every background task here keeps its state outside itself and runs
+//! under `farsight_core::task::supervise`: a panic is logged, counted and
+//! the task started again. Ingest is the exception: its reader and writer
+//! are not started again in place, so a panic in either ends normal mode
+//! with an error and the process exits (see `farsight_ingest`).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -27,6 +33,8 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use tokio::sync::{Semaphore, watch};
 
+use farsight_core::task::supervise;
+
 use crate::tasks::{self, TaskCtx};
 use crate::{ModeEnd, VERSION, health, metrics_http, sort_indexes};
 
@@ -37,6 +45,21 @@ pub const API_POOL_EXTRA: u32 = 8;
 pub const TASKS_POOL: u32 = 4;
 /// Counter sink shard of the server's own writes (ingest uses 0).
 pub const TASKS_SHARD: i16 = 1;
+
+/// The supervised tasks of normal mode, by the name their panics are
+/// counted under (the periodic jobs are counted under their own names).
+pub const TASKS: [&str; 10] = [
+    "counter_flush",
+    "coverage_snapshot",
+    "housekeeping",
+    "periodic_scheduler",
+    "metrics_listener",
+    "handle_warming",
+    "handle_pass",
+    "top_lists",
+    "sort_index_builder",
+    farsight_web::public::warming::CHECK_TASK,
+];
 
 async fn connect_retry(
     url: &str,
@@ -126,16 +149,19 @@ pub async fn run(
         let counters = counters.clone();
         let pool = tasks_pool.clone();
         let config = config.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(FLUSH_INTERVAL);
-            loop {
-                tick.tick().await;
-                let limits = Limits::from_config(&config.current().config);
-                if let Err(e) = counters.flush(&pool, &limits).await {
-                    tracing::warn!(error = %e, "counter flush failed");
+        tokio::spawn(supervise("counter_flush", move || {
+            let (counters, pool, config) = (counters.clone(), pool.clone(), config.clone());
+            async move {
+                let mut tick = tokio::time::interval(FLUSH_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    let limits = Limits::from_config(&config.current().config);
+                    if let Err(e) = counters.flush(&pool, &limits).await {
+                        tracing::warn!(error = %e, "counter flush failed");
+                    }
                 }
             }
-        })
+        }))
     };
 
     // Coverage snapshot: one read before serving, then the refresher.
@@ -152,12 +178,22 @@ pub async fn run(
             }
         }
     }
-    let refresher = tokio::spawn(farsight_api::snapshot::run_refresher(
-        snapshot.clone(),
-        api_pool.clone(),
-        config.clone(),
-        stop_rx.clone(),
-    ));
+    let refresher = tokio::spawn(supervise("coverage_snapshot", {
+        let (snapshot, pool, config, stop) = (
+            snapshot.clone(),
+            api_pool.clone(),
+            config.clone(),
+            stop_rx.clone(),
+        );
+        move || {
+            farsight_api::snapshot::run_refresher(
+                snapshot.clone(),
+                pool.clone(),
+                config.clone(),
+                stop.clone(),
+            )
+        }
+    }));
 
     let keys = Arc::new(farsight_api::auth::KeyTable::default());
     keys.refresh(&api_pool)
@@ -171,6 +207,8 @@ pub async fn run(
     farsight_web::public::metrics::register();
     farsight_web::public::warming::register();
     farsight_web::public::pass::register();
+    farsight_core::task::register(&TASKS);
+    farsight_core::task::register(&tasks::job_names());
     // Which UI sections sort by shown time: read once before serving, then
     // kept by the index builder.
     let sort = Arc::new(farsight_storage::ui_rows::SortIndexes::default());
@@ -221,43 +259,54 @@ pub async fn run(
         let config = config.clone();
         let status = status.clone();
         let web = web.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(30));
-            let mut n: u64 = 0;
-            loop {
-                tick.tick().await;
-                n += 1;
-                // Sign-in flows older than their lifetime (they are already
-                // refused at lookup; this frees the memory).
-                if n % 2 == 0 {
-                    web.oauth.flows.sweep(std::time::Instant::now());
-                }
-                if let Err(e) = keys.refresh(&pool).await {
-                    tracing::warn!(error = %e, "API key refresh failed");
-                }
-                if n % 2 == 0 {
-                    let _ = keys.flush_usage(&pool).await;
-                }
-                if n % 20 == 0 {
-                    limiter.sweep(Duration::from_secs(600));
-                }
-                // Opt-in daily refresh of the Cloudflare ranges.
-                let proxy = config.current().config.proxy.clone();
-                if proxy.cloudflare_refresh
-                    && proxy.mode == farsight_core::config::ProxyMode::Cloudflare
-                    && (n == 1 || n % 2880 == 0)
-                {
-                    match refresh_cloudflare().await {
-                        Ok(nets) => {
-                            tracing::info!(ranges = nets.len(), "Cloudflare ranges refreshed");
-                            trust.set_refreshed(nets);
-                            status.update(|s| s.cf_refreshed_at = Some(chrono::Utc::now()));
+        tokio::spawn(supervise("housekeeping", move || {
+            let (keys, limiter, pool, trust, config, status, web) = (
+                keys.clone(),
+                limiter.clone(),
+                pool.clone(),
+                trust.clone(),
+                config.clone(),
+                status.clone(),
+                web.clone(),
+            );
+            async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(30));
+                let mut n: u64 = 0;
+                loop {
+                    tick.tick().await;
+                    n += 1;
+                    // Sign-in flows older than their lifetime (they are already
+                    // refused at lookup; this frees the memory).
+                    if n % 2 == 0 {
+                        web.oauth.flows.sweep(std::time::Instant::now());
+                    }
+                    if let Err(e) = keys.refresh(&pool).await {
+                        tracing::warn!(error = %e, "API key refresh failed");
+                    }
+                    if n % 2 == 0 {
+                        let _ = keys.flush_usage(&pool).await;
+                    }
+                    if n % 20 == 0 {
+                        limiter.sweep(Duration::from_secs(600));
+                    }
+                    // Opt-in daily refresh of the Cloudflare ranges.
+                    let proxy = config.current().config.proxy.clone();
+                    if proxy.cloudflare_refresh
+                        && proxy.mode == farsight_core::config::ProxyMode::Cloudflare
+                        && (n == 1 || n % 2880 == 0)
+                    {
+                        match refresh_cloudflare().await {
+                            Ok(nets) => {
+                                tracing::info!(ranges = nets.len(), "Cloudflare ranges refreshed");
+                                trust.set_refreshed(nets);
+                                status.update(|s| s.cf_refreshed_at = Some(chrono::Utc::now()));
+                            }
+                            Err(e) => tracing::warn!(error = %e, "Cloudflare range refresh failed"),
                         }
-                        Err(e) => tracing::warn!(error = %e, "Cloudflare range refresh failed"),
                     }
                 }
             }
-        })
+        }))
     };
 
     let task_ctx = Arc::new(TaskCtx::new(
@@ -267,14 +316,19 @@ pub async fn run(
         gates.clone(),
         status.clone(),
     ));
-    let scheduler = tokio::spawn(tasks::run_scheduler(task_ctx, stop_rx.clone()));
+    let scheduler = tokio::spawn(supervise("periodic_scheduler", {
+        let stop = stop_rx.clone();
+        move || tasks::run_scheduler(task_ctx.clone(), stop.clone())
+    }));
     let metrics_task = metrics_handle.map(|h| {
-        tokio::spawn(metrics_http::serve(
-            h,
+        let (bind, token, stop) = (
             cfg.metrics.bind.clone(),
             cfg.metrics.bearer_token_sha256.clone(),
             stop_rx.clone(),
-        ))
+        );
+        tokio::spawn(supervise("metrics_listener", move || {
+            metrics_http::serve(h.clone(), bind.clone(), token.clone(), stop.clone())
+        }))
     });
 
     let layer = IpLayer {
@@ -305,26 +359,50 @@ pub async fn run(
     // index builder runs until the four indexes are valid. Both start
     // once normal mode is serving (after a wizard run too): a long index
     // build never stands between a start and a healthy instance.
-    let warming = tokio::spawn(farsight_web::public::warming::run(
-        web.clone(),
-        stop_rx.clone(),
-    ));
-    let pass = tokio::spawn(farsight_web::public::pass::run(
-        web.clone(),
-        stop_rx.clone(),
-    ));
-    let top_lists = tokio::spawn(farsight_web::public::top::run(web.clone(), stop_rx.clone()));
-    let index_builder = tokio::spawn(
-        sort_indexes::Builder {
-            pool: tasks_pool.clone(),
-            database_url: cfg.storage.database_url.clone(),
-            config: config.clone(),
-            sort,
-            status: status.clone(),
+    let warming = tokio::spawn(supervise("handle_warming", {
+        let (web, stop) = (web.clone(), stop_rx.clone());
+        move || farsight_web::public::warming::run(web.clone(), stop.clone())
+    }));
+    let pass = tokio::spawn(supervise("handle_pass", {
+        let (web, stop) = (web.clone(), stop_rx.clone());
+        move || farsight_web::public::pass::run(web.clone(), stop.clone())
+    }));
+    let top_lists = tokio::spawn(supervise("top_lists", {
+        let (web, stop) = (web.clone(), stop_rx.clone());
+        move || farsight_web::public::top::run(web.clone(), stop.clone())
+    }));
+    let index_builder = tokio::spawn(supervise("sort_index_builder", {
+        let (pool, database_url, config, status, stop) = (
+            tasks_pool.clone(),
+            cfg.storage.database_url.clone(),
+            config.clone(),
+            status.clone(),
+            stop_rx.clone(),
+        );
+        move || {
+            sort_indexes::Builder {
+                pool: pool.clone(),
+                database_url: database_url.clone(),
+                config: config.clone(),
+                sort: sort.clone(),
+                status: status.clone(),
+            }
+            .run(stop.clone())
         }
-        .run(stop_rx.clone()),
-    );
+    }));
 
+    // A panic in ingest's reader or writer ends normal mode: the listener
+    // stops, everything is torn down in order, and the process exits with
+    // an error for its supervisor to start it again.
+    let ingest_failed = Arc::new(Mutex::new(None::<&'static str>));
+    let ingest_wait = {
+        let failed = ingest.failed();
+        let seen = ingest_failed.clone();
+        async move {
+            let name = failed.await;
+            *seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(name);
+        }
+    };
     let shutdown_wait = shutdown.clone();
     let mut reset_wait = reset_rx.clone();
     let served = axum::serve(
@@ -334,6 +412,7 @@ pub async fn run(
     .with_graceful_shutdown(async move {
         tokio::select! {
             _ = stopped(shutdown_wait) => {}
+            _ = ingest_wait => {}
             _ = async { while !*reset_wait.borrow() { if reset_wait.changed().await.is_err() { break; } } } => {
                 // Let the reset page reach the browser first.
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -366,6 +445,11 @@ pub async fn run(
     api_pool.close().await;
     tasks_pool.close().await;
     served.map_err(|e| format!("listener: {e}"))?;
+    if let Some(task) = *ingest_failed.lock().unwrap_or_else(|e| e.into_inner()) {
+        return Err(format!(
+            "the ingest task {task} panicked; exiting so that ingest resumes from its stored position"
+        ));
+    }
     if *reset_rx.borrow_and_update() {
         tracing::info!("configuration reset; entering setup mode in-process");
         return Ok(ModeEnd::Switch);
@@ -373,22 +457,37 @@ pub async fn run(
     Ok(ModeEnd::Shutdown)
 }
 
+/// Largest Cloudflare range list accepted.
+const CLOUDFLARE_LIST_MAX_BYTES: usize = 256 * 1024;
+
 async fn refresh_cloudflare() -> Result<Vec<ipnet::IpNet>, String> {
+    // Direct, like every other outbound request: a proxy named in the
+    // environment is not used.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
+        .no_proxy()
         .build()
         .map_err(|e| e.to_string())?;
     let mut all = Vec::new();
     for url in farsight_core::cloudflare::REFRESH_URLS {
-        let text = client
+        let mut resp = client
             .get(url)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| e.to_string())?
-            .text()
-            .await
             .map_err(|e| e.to_string())?;
+        // The lists are a few hundred bytes; the cap is what a response
+        // may cost at most.
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+            if body.len() + chunk.len() > CLOUDFLARE_LIST_MAX_BYTES {
+                return Err(format!(
+                    "{url}: larger than {CLOUDFLARE_LIST_MAX_BYTES} bytes"
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8(body).map_err(|e| format!("{url}: {e}"))?;
         let nets = farsight_core::cloudflare::parse_list(&text)
             .ok_or_else(|| format!("{url}: unexpected content"))?;
         if nets.is_empty() {

@@ -90,7 +90,10 @@ Farsight can be an OAuth client in two ways:
   tunnel to it, at `http://127.0.0.1:<port>/enter`
   (`ssh -L 8080:127.0.0.1:8080 your-host`). Use `127.0.0.1`, not
   `localhost`. Browsers share cookies across ports of `127.0.0.1`, so two
-  instances tunnelled at once sign each other out.
+  instances tunnelled at once sign each other out. This way of signing
+  in is offered only to a browser on the machine or tunnelled to it: a
+  request that arrives from a public address is told where to sign in
+  instead, whatever address it claims to be asking for.
 
 The account's server must be reachable from Farsight at a public
 address: like every request Farsight makes to an address it learned

@@ -258,13 +258,33 @@ refuses private, loopback and link-local addresses; see
 
 ### Two client modes
 
-The OAuth client identity is chosen per request from the `Host`
-header.
+The OAuth client identity is chosen per request, from the `Host`
+header and, for loopback mode, the client's address.
 
 | Mode | When | `client_id` | `redirect_uri` |
 |---|---|---|---|
 | Hostname | `Host` names `server.hostname`, and that is a domain name (no port, no IP address, no single label) | `https://<hostname>/.well-known/atproto-oauth-client-metadata` | `https://<hostname>/enter/callback` |
-| Loopback | `Host` is `127.0.0.1` or `[::1]`, any port | `http://localhost?redirect_uri=…&scope=atproto` | `http://<host>/enter/callback` |
+| Loopback | `Host` is `127.0.0.1` or `[::1]`, any port, **and** the client is local | `http://localhost?redirect_uri=…&scope=atproto` | `http://<host>/enter/callback` |
+
+A client is **local** when its address is loopback or private
+(RFC 1918, link-local, unique local). The address is the resolved
+client address that rate limits use
+([security.md](security.md#client-address)): the TCP peer, or, when
+the peer is a trusted proxy, the address the proxy forwarded. Private
+addresses count because a container runtime delivers a connection
+made to a published port on the host, which is what a browser on the
+machine and an SSH tunnel make, from its bridge's gateway and not from
+`127.0.0.1`. A request with `Host: 127.0.0.1` from a public address
+gets the page that says where to sign in, and `POST /enter` answers
+it `400` before any rate limit is charged or any request is sent.
+
+Two deployments make every client look local, and there the rule adds
+nothing: a reverse proxy on the same machine that is not listed in
+`proxy.trusted` (or that sends no client address), and a container
+runtime that hides peer addresses (rootless Docker, Docker Desktop).
+In the first case list the proxy in `proxy.trusted`; in the second
+publish the port on loopback (`FARSIGHT_PORT=127.0.0.1:8080`) or put a
+trusted proxy in front.
 
 In hostname mode the authorization server fetches the client metadata
 document, which Farsight serves only on the hostname it describes
@@ -273,8 +293,9 @@ nothing reachable from outside and is how an instance on an IP
 address, a port or a private network is administered: on the machine
 itself or through an SSH tunnel. `localhost` is not accepted as a
 `Host`, because the callback arrives on the address, which is a
-different cookie host. Any other `Host` gets the sign-in page with a
-`400` and no flow.
+different cookie host. Any other `Host`, and a loopback `Host` from a
+client that is not local, gets the sign-in page with a `400` and no
+flow.
 
 ### Sessions
 
@@ -322,6 +343,14 @@ Every state-changing request must pass two checks:
    time.
 
 A failure is `403`.
+
+Two requests have no session yet and pass the first check alone:
+`POST /enter` (it starts a sign-in) and `POST /setup` (it presents
+the setup token and creates the setup session). Every other `POST`
+passes both, `POST /admin/logout` included: a logout without the
+token is refused, the session goes on and its cookie is left alone.
+Without a session, `POST /admin/logout` answers with the redirect to
+`/enter` and changes nothing.
 
 ### Changing the admin DID
 
@@ -411,7 +440,7 @@ removed records.
 | `GET, POST /admin/settings`; `POST /admin/settings/public-ui`, `…/public-ui/confirm`, `…/token` | Settings |
 | `GET, POST /admin/reset` | Config reset |
 | `GET /admin/card/{did}` | Profile-card fragment for admin tables |
-| `POST /admin/logout` | Ends the session |
+| `POST /admin/logout` | Ends the session (same-origin and the form token, like every other `POST`) |
 | `GET, POST /enter`, `GET /enter/callback`, `GET /.well-known/atproto-oauth-client-metadata` | Sign-in |
 
 ### Dashboard

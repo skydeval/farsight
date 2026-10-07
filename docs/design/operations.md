@@ -502,7 +502,9 @@ from the clock: the first run is the stated delay after start plus up
 to a quarter of it, and each later run follows after the period plus
 up to 5%. A task that fails is logged and recorded among the
 operational errors as `task:<name>` (`admin.listErrors`, and the
-admin UI).
+admin UI). A run that panics is treated the same, is counted in
+`farsight_task_panics_total{task="<name>"}`, and the task runs again
+at its next time.
 
 | Task | Every | First run after | What it does |
 |---|---|---|---|
@@ -517,6 +519,7 @@ admin UI).
 | `deferred_retry` | 1 day | 10 min | Re-admits `deferred` lists whose retry time has come (those deferred by the owner re-admission allowance). Lists deferred by a storage gate are re-admitted by the budget monitor. |
 | `placeholder_lists` | 1 day | 15 min | Deletes placeholder `lists` rows (record never seen, untracked) that nothing refers to any more, each under its list lock. |
 | `rate_tables` | 1 day | 16 min | Deletes `admission_rate`, `intern_rate` and `history_rate` rows older than two days. |
+| `account_purges` | 1 day | 25 min | Finishes the purge of accounts with status `deleted` that still author rows: one that was interrupted, or that ingest gave up on. A purge that fails is recorded with the account's DID and the others still run. |
 | `orphaned_cursors` | 1 day | 17 min | Deletes listing-cursor rows of runs that are no longer current. |
 | `history_retention` | 1 day | 18 min | Deletes history rows older than `storage.block_history_retention`. Does not run with `"0s"`. |
 | `counter_recount` | 1 day | 20 min | Recounts the per-list and per-account counters exactly, in batches of 1,000, each list under its list lock. Drift is repaired; where a repair takes a list's listblock count across zero the tracking transition is run. Any drift is recorded as an operational error. |
@@ -548,12 +551,34 @@ flushes on a busy instance.
 Handle verification and the UI tasks are described in
 [web-ui.md](web-ui.md).
 
+### When a task panics
+
+A panic ends the task it happens in and nothing else, so every
+long-running task in both processes is supervised. The panic is logged
+at `ERROR` (`background task panicked`, with the task's name and the
+panic message), counted in `farsight_task_panics_total{task}`, and
+then:
+
+| Task | After a panic |
+|---|---|
+| Every task in the two tables above except ingest; in the backfill process the scheduler loop, the sweep and the metrics listener | Started again after 5 seconds. Their state is in the database or shared with the rest of the process, so nothing is lost. |
+| One run of a periodic task (either process) | That run is over; the next one runs on schedule. |
+| One backfill job, one handle check | That job or check is over. Its worker slot and its in-flight mark are given back; the job's queue entry or debt brings it back, the check is repeated on the next lap. |
+| The ingest reader or writer | The server exits with an error and is started again by its supervisor ([firehose.md](firehose.md#a-panic-in-the-reader-or-the-writer)). The compose file's `restart: unless-stopped` does that. |
+
+A series that is not zero is a bug worth reporting, with the log line.
+
 ### Outbound connections
 
 Both processes make many short requests to many hosts. Idle outbound
 connections are closed after 10 seconds and at most two are kept per
 host, so that a walk over thousands of PDS hosts does not exhaust the
 process's open-file limit.
+
+Every outbound request is made directly. `HTTPS_PROXY`, `HTTP_PROXY`
+and `ALL_PROXY` in the environment are ignored
+([security.md](security.md#the-safe-outbound-client)); an instance
+that can reach the network only through a proxy cannot run.
 
 ## Health endpoints
 
@@ -591,6 +616,12 @@ port is published; a scraper joins the compose network. With
 Metric names are kept stable on a best-effort basis and are not part
 of the API contract.
 
+### Both processes
+
+| Metric | Type | Labels |
+|---|---|---|
+| `farsight_task_panics_total` | counter | `task`: the task that panicked ([When a task panics](#when-a-task-panics)). Server: `ingest_reader`, `ingest_writer`, `ingest_counter_flush`, `counter_flush`, `coverage_snapshot`, `housekeeping`, `periodic_scheduler`, `metrics_listener`, `handle_warming`, `handle_warming_check`, `handle_pass`, `handle_pass_check`, `top_lists`, `sort_index_builder`, and the names of the periodic tasks. Backfill: `backfill_scheduler`, `backfill_job`, `backfill_sweep`, `backfill_feeder`, `backfill_budget_monitor`, `backfill_pending_timeouts`, `backfill_gauges`, `backfill_counter_flush`, `backfill_metrics_listener`. |
+
 ### Firehose and ingest (server)
 
 | Metric | Type | Labels |
@@ -606,6 +637,7 @@ of the API contract.
 | `farsight_ingest_batch_seconds` | histogram | |
 | `farsight_ingest_buffer_depth` | gauge | |
 | `farsight_ingest_dropped_total` | counter | `reason` (`invalid`, `foreign_listitem`, `poisoned`) |
+| `farsight_ingest_storage_errors_total` | counter | `op` (`mark_connected`, `set_connected`, `record_gap`, `read_state`, `open_sync_unavailable`, `close_sync_unavailable`, `purge_account`, `record_poisoned`): storage calls of the ingest writer that failed permanently and were given up ([firehose.md](firehose.md#storage-calls-outside-a-batch)) |
 
 ### API (server)
 

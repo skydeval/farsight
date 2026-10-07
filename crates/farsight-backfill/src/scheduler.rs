@@ -3,6 +3,16 @@
 //! share flows to the others), cost-based deficit round-robin across tier-1
 //! requesters charged in outbound requests, `high` before `normal` 4:1
 //! within a requester, and the list-job lanes inside `system:lists`.
+//!
+//! A job is charged when it is dispatched, not when it ends: one request
+//! ([`DISPATCH_CHARGE`]) at once, the rest of its cost when it finishes.
+//! Charged only at the end, a requester would look cheapest for as long as
+//! its jobs ran and take every free worker in one go.
+//!
+//! Each job runs in its own task. Its worker slot and its in-flight
+//! markers are held by a guard and given back when the task ends, however
+//! it ends: a job that panics is logged, counted and costs its slot
+//! nothing.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -23,6 +33,27 @@ pub const SYSTEM_SWEEP: &str = "system:sweep";
 pub const SYSTEM_REPAIR: &str = "system:repair";
 /// High-priority picks per normal pick within a requester.
 pub const HIGH_PER_NORMAL: u32 = 4;
+/// What a job is charged when it is dispatched, in outbound requests: the
+/// least a job costs. The remainder follows when it finishes.
+pub const DISPATCH_CHARGE: u64 = 1;
+/// The task name panics of jobs are counted under.
+pub const JOB_TASK: &str = "backfill_job";
+
+/// Charges `requester` for a job being dispatched.
+pub fn charge_dispatch(charged: &mut HashMap<String, f64>, requester: &str) {
+    *charged.entry(requester.to_owned()).or_insert(0.0) += DISPATCH_CHARGE as f64;
+}
+
+/// What a finished job of cost `cost` still owes after its dispatch
+/// charge.
+pub fn remaining_charge(cost: u64) -> u64 {
+    cost.max(DISPATCH_CHARGE) - DISPATCH_CHARGE
+}
+
+/// Charges `requester` the rest of a finished job's cost.
+pub fn charge_finish(charged: &mut HashMap<String, f64>, requester: &str, cost: u64) {
+    *charged.entry(requester.to_owned()).or_insert(0.0) += remaining_charge(cost) as f64;
+}
 
 /// Picks the tier to serve: among tiers with work, the one furthest below
 /// its guaranteed share (running / share), so every share is a minimum and
@@ -101,6 +132,49 @@ struct State {
     tier3_last: Option<Instant>,
 }
 
+impl Work {
+    /// The tier-1 requester the job is charged to, as far as it is known
+    /// before the job runs.
+    fn requester(&self) -> &str {
+        match self {
+            Work::Queue { requester, .. } => requester,
+            Work::List { .. } => crate::jobs::list_phase1::SYSTEM_LISTS,
+            Work::Member { requester, .. } => requester,
+        }
+    }
+}
+
+/// A dispatched job's hold on the pool: one worker of its tier and its
+/// in-flight markers. Dropping it gives them back and wakes the
+/// dispatcher, so they are returned when the job's task ends for any
+/// reason, a panic included.
+struct Running {
+    sched: Arc<Scheduler>,
+    tier: usize,
+    work: Work,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        {
+            let mut s = self.sched.st();
+            s.running[self.tier] = s.running[self.tier].saturating_sub(1);
+            match &self.work {
+                Work::Queue { did, .. } | Work::Member { did, .. } => {
+                    s.inflight_dids.remove(did);
+                }
+                Work::List { cand, .. } => {
+                    s.inflight_items.remove(&cand.item);
+                    if let Item::Fetch { owner, .. } = &cand.item {
+                        s.inflight_dids.remove(owner);
+                    }
+                }
+            }
+        }
+        self.sched.freed.notify_waiters();
+    }
+}
+
 /// The scheduler.
 pub struct Scheduler {
     ctx: Arc<Ctx>,
@@ -109,6 +183,9 @@ pub struct Scheduler {
     /// Harness: run every job as a no-op that records its pick time.
     #[cfg(feature = "harness")]
     dry: bool,
+    /// Harness: a job for one of these DIDs panics when it starts.
+    #[cfg(feature = "harness")]
+    panic_dids: Mutex<HashSet<String>>,
 }
 
 type QueueRow = (i64, i64, String, i16, i16, i16, String);
@@ -122,6 +199,8 @@ impl Scheduler {
             freed: Notify::new(),
             #[cfg(feature = "harness")]
             dry: false,
+            #[cfg(feature = "harness")]
+            panic_dids: Mutex::default(),
         })
     }
 
@@ -133,7 +212,19 @@ impl Scheduler {
             st: Mutex::new(State::default()),
             freed: Notify::new(),
             dry: true,
+            panic_dids: Mutex::default(),
         })
+    }
+
+    /// Harness: makes jobs for `did` panic (`on`), or stops doing so.
+    #[cfg(feature = "harness")]
+    pub fn panic_for(&self, did: &str, on: bool) {
+        let mut set = self.panic_dids.lock().unwrap_or_else(|e| e.into_inner());
+        if on {
+            set.insert(did.to_owned());
+        } else {
+            set.remove(did);
+        }
     }
 
     fn st(&self) -> std::sync::MutexGuard<'_, State> {
@@ -425,6 +516,13 @@ impl Scheduler {
         }
     }
 
+    /// Workers busy per tier, and DIDs with a job in flight (harness and
+    /// tests: what a finished or failed job must have given back).
+    pub fn in_flight(&self) -> ([usize; 3], usize) {
+        let s = self.st();
+        (s.running, s.inflight_dids.len() + s.inflight_items.len())
+    }
+
     fn start(self: &Arc<Self>, tier: usize, work: Work) {
         {
             let mut s = self.st();
@@ -440,76 +538,88 @@ impl Scheduler {
                     }
                 }
             }
-        }
-        let me = self.clone();
-        tokio::spawn(async move {
-            let started = Instant::now();
-            let (result, requester, lane) = me.execute(&work).await;
-            // One line per job at the default level.
-            let (kind, subject) = match &work {
-                Work::Queue { kind, did, .. } => (
-                    match kind {
-                        2 => "list_fetch",
-                        3 => "discovery",
-                        _ => "repo",
-                    },
-                    did.clone(),
-                ),
-                Work::Member { did, .. } => ("repo", did.clone()),
-                Work::List { cand, .. } => match &cand.item {
-                    Item::Phase1 { list_id } => ("list_phase1", list_id.to_string()),
-                    Item::Fetch { owner, .. } => ("list_fetch", owner.clone()),
-                },
-            };
-            match &result.outcome {
-                Outcome::Failed { error, terminal } => tracing::info!(
-                    kind,
-                    subject,
-                    tier = tier + 1,
-                    requester,
-                    outcome = result.outcome.label(),
-                    terminal,
-                    error,
-                    cost = result.cost,
-                    ms = started.elapsed().as_millis() as u64,
-                    "job finished"
-                ),
-                o => tracing::info!(
-                    kind,
-                    subject,
-                    tier = tier + 1,
-                    requester,
-                    outcome = o.label(),
-                    cost = result.cost,
-                    ms = started.elapsed().as_millis() as u64,
-                    "job finished"
-                ),
-            }
-            let mut s = me.st();
-            s.running[tier] = s.running[tier].saturating_sub(1);
-            match &work {
-                Work::Queue { did, .. } | Work::Member { did, .. } => {
-                    s.inflight_dids.remove(did);
-                }
-                Work::List { cand, .. } => {
-                    s.inflight_items.remove(&cand.item);
-                    if let Item::Fetch { owner, .. } = &cand.item {
-                        s.inflight_dids.remove(owner);
-                    }
-                }
-            }
+            // Charged now, so the next pick already sees this job.
             if tier == 0 {
-                *s.charged.entry(requester.clone()).or_insert(0.0) += result.cost.max(1) as f64;
+                charge_dispatch(&mut s.charged, work.requester());
             }
-            if let Some(l) = lane {
-                s.lanes.charge(&l, result.cost);
+            if let Work::List { lane, .. } = &work {
+                s.lanes.charge(lane, DISPATCH_CHARGE);
             }
-            if !matches!(result.outcome, Outcome::Busy | Outcome::Yielded) {
-                s.completions.push_back(Instant::now());
+        }
+        let running = Running {
+            sched: self.clone(),
+            tier,
+            work,
+        };
+        tokio::spawn(async move {
+            // `running` is owned by this task: it is dropped when the task
+            // ends, whether the job returned or panicked.
+            if let Err(message) =
+                farsight_core::task::catch(running.sched.run_job(running.tier, &running.work)).await
+            {
+                farsight_core::task::report_panic(JOB_TASK, &message);
             }
-            drop(s);
-            me.freed.notify_waiters();
         });
+    }
+
+    /// Runs one dispatched job, logs it and settles its cost.
+    async fn run_job(&self, tier: usize, work: &Work) {
+        let started = Instant::now();
+        let (result, requester, lane) = self.execute(work).await;
+        // One line per job at the default level.
+        let (kind, subject) = match work {
+            Work::Queue { kind, did, .. } => (
+                match kind {
+                    2 => "list_fetch",
+                    3 => "discovery",
+                    _ => "repo",
+                },
+                did.clone(),
+            ),
+            Work::Member { did, .. } => ("repo", did.clone()),
+            Work::List { cand, .. } => match &cand.item {
+                Item::Phase1 { list_id } => ("list_phase1", list_id.to_string()),
+                Item::Fetch { owner, .. } => ("list_fetch", owner.clone()),
+            },
+        };
+        match &result.outcome {
+            Outcome::Failed { error, terminal } => tracing::info!(
+                kind,
+                subject,
+                tier = tier + 1,
+                requester,
+                outcome = result.outcome.label(),
+                terminal,
+                error,
+                cost = result.cost,
+                ms = started.elapsed().as_millis() as u64,
+                "job finished"
+            ),
+            o => tracing::info!(
+                kind,
+                subject,
+                tier = tier + 1,
+                requester,
+                outcome = o.label(),
+                cost = result.cost,
+                ms = started.elapsed().as_millis() as u64,
+                "job finished"
+            ),
+        }
+        let mut s = self.st();
+        // The dispatch charge is already in; the rest of the cost follows.
+        if tier == 0 {
+            charge_finish(&mut s.charged, &requester, result.cost);
+        }
+        if let Some(l) = lane {
+            let rest = remaining_charge(result.cost);
+            if rest > 0 {
+                s.lanes.charge(&l, rest);
+            }
+        }
+        if !matches!(result.outcome, Outcome::Busy | Outcome::Yielded) {
+            s.completions.push_back(Instant::now());
+        }
     }
 
     async fn execute(&self, work: &Work) -> (JobResult, String, Option<String>) {
@@ -517,6 +627,15 @@ impl Scheduler {
         #[cfg(feature = "harness")]
         if self.dry {
             return self.dry_run(work).await;
+        }
+        #[cfg(feature = "harness")]
+        if let Work::Queue { did, .. } = work {
+            let hit = self
+                .panic_dids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(did);
+            assert!(!hit, "injected job panic (harness) for {did}");
         }
         match work {
             Work::Queue {
@@ -760,6 +879,32 @@ mod tests {
         }
         assert!((served["b"] as i32 - served["c"] as i32).abs() <= 1);
         assert!((served["a"] as f64 / served["b"] as f64 - 1.0 / 3.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn jobs_dispatched_together_are_shared_between_requesters() {
+        // Eight free workers, two requesters with work, no job finished
+        // yet: the dispatch charge alone must spread the picks.
+        let mut c = HashMap::new();
+        let reqs = vec!["a".to_owned(), "b".to_owned()];
+        let mut served: HashMap<String, u32> = HashMap::new();
+        for _ in 0..8 {
+            let r = pick_requester(&mut c, &reqs).unwrap();
+            charge_dispatch(&mut c, &r);
+            *served.entry(r).or_default() += 1;
+        }
+        assert_eq!(served["a"], 4, "{served:?}");
+        assert_eq!(served["b"], 4, "{served:?}");
+    }
+
+    #[test]
+    fn dispatch_and_finish_charge_the_cost_once() {
+        for cost in [0u64, 1, 2, 37] {
+            let mut c = HashMap::new();
+            charge_dispatch(&mut c, "a");
+            charge_finish(&mut c, "a", cost);
+            assert_eq!(c["a"], cost.max(1) as f64, "cost {cost}");
+        }
     }
 
     #[test]

@@ -6,6 +6,10 @@
 //! the three row-deleting functions of [`crate::apply`] when their caller
 //! names a cause, inside the removing transaction and under the same
 //! author lock. The account purge and the divergence purge name none.
+//!
+//! Each of those functions removes a set of rows with one statement, and
+//! the history of the set is written the same way: one charge to the
+//! daily rate for as many rows as it allows, one insert for those rows.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::PgPool;
@@ -146,6 +150,24 @@ pub struct Gone<'a> {
     pub last_seen: Option<DateTime<Utc>>,
 }
 
+/// A removed live row on its way to its history table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GoneRow {
+    /// Record key.
+    pub rkey: String,
+    /// `blocks`, `list_items`: the subject. `list_blocks`: the list's
+    /// owner.
+    pub actor_id: i64,
+    /// `list_blocks`, `list_items`: the list's rkey.
+    pub list_rkey: Option<String>,
+    /// Author-claimed `createdAt`.
+    pub created_at: Option<DateTime<Utc>>,
+    /// Witness bound.
+    pub first_seen: Option<DateTime<Utc>>,
+    /// Witness bound.
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
 /// The history row a transaction wrote last, so that a subject change
 /// whose new version is then refused can be re-labelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,10 +199,13 @@ impl Counts {
         }
     }
 
-    fn bump_skipped(&mut self, table: Table) {
+    fn bump_skipped(&mut self, table: Table, by: u64) {
+        if by == 0 {
+            return;
+        }
         match self.skipped.iter_mut().find(|(t, _)| *t == table) {
-            Some((_, n)) => *n += 1,
-            None => self.skipped.push((table, 1)),
+            Some((_, n)) => *n += by,
+            None => self.skipped.push((table, by)),
         }
     }
 
@@ -248,26 +273,136 @@ impl Txn<'_> {
         Ok(r.is_some())
     }
 
-    /// Whether a history row may be written for `author`'s removed row:
-    /// history is enabled and the author's admission key has rate left.
-    /// Counts the skip otherwise.
-    async fn history_admit(&mut self, author: &AuthorInfo, table: Table) -> Result<bool> {
-        if !self.limits.history_enabled {
-            return Ok(false);
+    /// Charges up to `want` history rows to `key` for today and returns
+    /// how many its daily limit left room for. Exact: runs inside the
+    /// removing transaction, and the row is locked while it is read.
+    async fn charge_history_many(&mut self, key: &str, want: i64) -> Result<i64> {
+        let limit = self.limits.history_limit(key);
+        if limit <= 0 || want <= 0 {
+            return Ok(0);
         }
-        if !self.charge_history(&author.key).await? {
-            self.deltas.history.bump_skipped(table);
-            return Ok(false);
+        if want == 1 {
+            return Ok(i64::from(self.charge_history(key).await?));
         }
-        Ok(true)
+        sqlx::query(
+            "INSERT INTO history_rate (key, utc_day, n) VALUES ($1, $2, 0)
+             ON CONFLICT (key, utc_day) DO NOTHING",
+        )
+        .bind(key)
+        .bind(self.today)
+        .execute(&mut *self.conn)
+        .await?;
+        let granted: Option<i64> = sqlx::query_scalar(
+            "WITH cur AS (
+               SELECT n FROM history_rate WHERE key = $1 AND utc_day = $2 FOR UPDATE)
+             UPDATE history_rate h SET n = LEAST(cur.n + $3, GREATEST(cur.n, $4))
+             FROM cur WHERE h.key = $1 AND h.utc_day = $2
+             RETURNING h.n - cur.n",
+        )
+        .bind(key)
+        .bind(self.today)
+        .bind(want)
+        .bind(limit)
+        .fetch_optional(&mut *self.conn)
+        .await?;
+        Ok(granted.unwrap_or(0).clamp(0, want))
     }
 
-    fn history_written(&mut self, table: Table, id: i64, cause: Cause) {
-        self.deltas.history.bump_written(table, cause, 1);
-        self.last_history = Some(Written { table, id, cause });
+    /// How many of `want` removed rows of `author` may get a history row:
+    /// none with history off, otherwise as many as the author's admission
+    /// key has rate left for. Counts the rest as skipped.
+    async fn history_admit(
+        &mut self,
+        author: &AuthorInfo,
+        table: Table,
+        want: usize,
+    ) -> Result<usize> {
+        if !self.limits.history_enabled || want == 0 {
+            return Ok(0);
+        }
+        let asked = i64::try_from(want).unwrap_or(i64::MAX);
+        let granted = self.charge_history_many(&author.key, asked).await?;
+        let granted = usize::try_from(granted).unwrap_or(0).min(want);
+        self.deltas
+            .history
+            .bump_skipped(table, (want - granted) as u64);
+        Ok(granted)
     }
 
-    /// Records a removed `blocks` row.
+    /// Records removed rows of `table`, in the order given, as far as the
+    /// author's daily rate allows: the first rows are recorded, the rest
+    /// counted as skipped. For `list_items` the caller has checked the
+    /// membership condition (the owner is not `deleted`; the list is
+    /// tracked or its record is deleted). `list_blocks` and `list_items`
+    /// rows name the list by owner and rkey, because `lists` rows can be
+    /// deleted.
+    pub(crate) async fn record_removals(
+        &mut self,
+        author: &AuthorInfo,
+        table: Table,
+        rows: &[GoneRow],
+        r: &Removal,
+    ) -> Result<()> {
+        let granted = self.history_admit(author, table, rows.len()).await?;
+        let rows = &rows[..granted];
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let columns = match table {
+            Table::Blocks => {
+                "blocks_history (author_id, rkey, subject_id, created_at, first_seen, last_seen,
+                                 removed_at, removed_rev, cause)
+                 SELECT $1, u.rkey, u.actor_id,"
+            }
+            Table::ListBlocks => {
+                "list_blocks_history (author_id, rkey, list_owner_id, list_rkey, created_at,
+                                      first_seen, last_seen, removed_at, removed_rev, cause)
+                 SELECT $1, u.rkey, u.actor_id, u.list_rkey,"
+            }
+            Table::ListItems => {
+                "list_items_history (owner_id, rkey, list_rkey, subject_id, created_at,
+                                     first_seen, last_seen, removed_at, removed_rev, cause)
+                 SELECT $1, u.rkey, u.list_rkey, u.actor_id,"
+            }
+        };
+        let ids: Vec<i64> = sqlx::query_scalar(&format!(
+            "INSERT INTO {columns} u.created_at, u.first_seen, u.last_seen,
+                    GREATEST($8, u.last_seen), $9, $10
+             FROM UNNEST($2::text[], $3::bigint[], $4::text[], $5::timestamptz[],
+                         $6::timestamptz[], $7::timestamptz[]) WITH ORDINALITY
+                  AS u(rkey, actor_id, list_rkey, created_at, first_seen, last_seen, ord)
+             ORDER BY u.ord
+             RETURNING id"
+        ))
+        .bind(author.id)
+        .bind(rows.iter().map(|g| g.rkey.clone()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|g| g.actor_id).collect::<Vec<_>>())
+        .bind(rows.iter().map(|g| g.list_rkey.clone()).collect::<Vec<_>>())
+        .bind(rows.iter().map(|g| g.created_at).collect::<Vec<_>>())
+        .bind(rows.iter().map(|g| g.first_seen).collect::<Vec<_>>())
+        .bind(rows.iter().map(|g| g.last_seen).collect::<Vec<_>>())
+        .bind(self.seen_at(r.witness))
+        .bind(r.rev)
+        .bind(r.cause.code())
+        .fetch_all(&mut *self.conn)
+        .await?;
+        self.deltas.history.bump_written(
+            table,
+            r.cause,
+            i64::try_from(ids.len()).unwrap_or(i64::MAX),
+        );
+        if let Some(id) = ids.iter().max() {
+            self.last_history = Some(Written {
+                table,
+                id: *id,
+                cause: r.cause,
+            });
+        }
+        Ok(())
+    }
+
+    /// Records one removed `blocks` row (a subject change keeps the live
+    /// row and records its old target).
     pub(crate) async fn record_block_removal(
         &mut self,
         author: &AuthorInfo,
@@ -275,98 +410,15 @@ impl Txn<'_> {
         subject_id: i64,
         r: &Removal,
     ) -> Result<()> {
-        if !self.history_admit(author, Table::Blocks).await? {
-            return Ok(());
-        }
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO blocks_history (author_id, rkey, subject_id, created_at, first_seen,
-                                         last_seen, removed_at, removed_rev, cause)
-             VALUES ($1, $2, $3, $4, $5, $6, GREATEST($7, $6), $8, $9) RETURNING id",
-        )
-        .bind(author.id)
-        .bind(gone.rkey)
-        .bind(subject_id)
-        .bind(gone.created_at)
-        .bind(gone.first_seen)
-        .bind(gone.last_seen)
-        .bind(self.seen_at(r.witness))
-        .bind(r.rev)
-        .bind(r.cause.code())
-        .fetch_one(&mut *self.conn)
-        .await?;
-        self.history_written(Table::Blocks, id, r.cause);
-        Ok(())
-    }
-
-    /// Records a removed `list_blocks` row. The target is stored as the
-    /// list's owner and rkey: `lists` rows can be deleted.
-    pub(crate) async fn record_listblock_removal(
-        &mut self,
-        author: &AuthorInfo,
-        gone: &Gone<'_>,
-        list_id: i64,
-        r: &Removal,
-    ) -> Result<()> {
-        if !self.history_admit(author, Table::ListBlocks).await? {
-            return Ok(());
-        }
-        let id: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO list_blocks_history (author_id, rkey, list_owner_id, list_rkey,
-                                              created_at, first_seen, last_seen, removed_at,
-                                              removed_rev, cause)
-             SELECT $1, $2, l.owner_id, l.rkey, $4, $5, $6, GREATEST($7, $6), $8, $9
-             FROM lists l WHERE l.id = $3 RETURNING id",
-        )
-        .bind(author.id)
-        .bind(gone.rkey)
-        .bind(list_id)
-        .bind(gone.created_at)
-        .bind(gone.first_seen)
-        .bind(gone.last_seen)
-        .bind(self.seen_at(r.witness))
-        .bind(r.rev)
-        .bind(r.cause.code())
-        .fetch_optional(&mut *self.conn)
-        .await?;
-        if let Some(id) = id {
-            self.history_written(Table::ListBlocks, id, r.cause);
-        }
-        Ok(())
-    }
-
-    /// Records a removed `list_items` row. The caller has checked the
-    /// membership condition (the owner is not `deleted`; the list is
-    /// tracked or its record is deleted).
-    pub(crate) async fn record_item_removal(
-        &mut self,
-        owner: &AuthorInfo,
-        gone: &Gone<'_>,
-        list_rkey: &str,
-        subject_id: i64,
-        r: &Removal,
-    ) -> Result<()> {
-        if !self.history_admit(owner, Table::ListItems).await? {
-            return Ok(());
-        }
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO list_items_history (owner_id, rkey, list_rkey, subject_id, created_at,
-                                             first_seen, last_seen, removed_at, removed_rev, cause)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, GREATEST($8, $7), $9, $10) RETURNING id",
-        )
-        .bind(owner.id)
-        .bind(gone.rkey)
-        .bind(list_rkey)
-        .bind(subject_id)
-        .bind(gone.created_at)
-        .bind(gone.first_seen)
-        .bind(gone.last_seen)
-        .bind(self.seen_at(r.witness))
-        .bind(r.rev)
-        .bind(r.cause.code())
-        .fetch_one(&mut *self.conn)
-        .await?;
-        self.history_written(Table::ListItems, id, r.cause);
-        Ok(())
+        let row = GoneRow {
+            rkey: gone.rkey.to_owned(),
+            actor_id: subject_id,
+            list_rkey: None,
+            created_at: gone.created_at,
+            first_seen: gone.first_seen,
+            last_seen: gone.last_seen,
+        };
+        self.record_removals(author, Table::Blocks, &[row], r).await
     }
 
     /// Forgets the last written history row, so that a later
@@ -541,9 +593,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [&(Table::ListBlocks, Cause::RefusedUpdate, 1)]
         );
-        c.bump_skipped(Table::Blocks);
-        c.bump_skipped(Table::Blocks);
-        assert_eq!(c.skipped, [(Table::Blocks, 2)]);
+        c.bump_skipped(Table::Blocks, 1);
+        c.bump_skipped(Table::Blocks, 0);
+        c.bump_skipped(Table::Blocks, 3);
+        assert_eq!(c.skipped, [(Table::Blocks, 4)]);
         assert!(!c.is_empty());
     }
 }

@@ -79,7 +79,13 @@ reader ─► bounded channel (10,000 events) ─► single writer ─► Postgr
 
 - **The reader** owns the websocket connection: protocol detection, resume,
   stall detection, gap detection, failover. It decodes and validates
-  each event before queueing it.
+  each event before queueing it. An event's position is validated
+  with it: a witness time before the epoch or more than 24 hours ahead
+  of the server's clock, or a `seq` that is negative or the largest
+  value, is not an event. The frame is refused like one that cannot be
+  decoded and the session ends, so a position an instance made up is
+  never stored as the cursor or as `applied_through`. A websocket
+  message, compressed or not, may be at most 16 MiB.
 - **The channel** is bounded. When it is full the reader stops
   reading, and TCP pushes back on the instance. A connection the
   instance drops for that is resumed from the persisted cursor.
@@ -140,6 +146,35 @@ For any other failure:
 So a single event that the code cannot apply never blocks the stream,
 and what it would have changed is recovered by reading the repository.
 
+### Storage calls outside a batch
+
+The writer also writes what is not an event: the connected flag, gaps,
+the purge of an account that became `deleted`, the record of a
+poisoned event. These follow the same rule about errors. A transient
+one is retried until it passes. Any other error is tried 3 times;
+then the call is given up, logged, recorded in `op_errors` (with the
+DID, when it concerns one account) and counted in
+`farsight_ingest_storage_errors_total{op}`, and the writer goes on. No
+single call that cannot succeed stops ingest.
+
+What going on leaves behind:
+
+| Call (`op`) | Left behind |
+|---|---|
+| `purge_account` | The account is `deleted` and its rows are still stored. They are withheld by the status; the purge is taken up again by the daily `account_purges` task and at the next start. |
+| `record_poisoned` | The event has no `resync` debt. The operational error names its DID; `admin.requestBackfill` re-reads the repository. |
+| `record_gap`, `open_sync_unavailable`, `close_sync_unavailable` | Nothing: these are not passed over. Coverage is claimed from the recorded gaps, so a gap that cannot be written stops the writer, which ends the process (see below); the next start resumes from the stored cursor and meets the gap again. |
+| `mark_connected`, `set_connected`, `read_state` | The connected flag keeps its last value until the next session change. |
+
+### A panic in the reader or the writer
+
+The reader and the writer are one pipeline: a batch the writer holds
+exists nowhere else. If either panics, the other ends with it, the
+panic is logged and counted in `farsight_task_panics_total`, and the
+server exits with an error. Its supervisor (the container's restart
+policy) starts it again, and ingest resumes from the persisted cursor
+like after any other stop.
+
 ## Cursors, reconnects and gaps
 
 ### Per-instance cursors
@@ -191,12 +226,20 @@ starting point from the first committed batch (see
 - **Stall.** No message for `firehose.tuning.stall_timeout` (60 s)
   ends the session.
 - A closed socket, a read error or a v2 error frame ends the session.
-- The reader reconnects with exponential backoff from 0.5 s up to
-  30 s.
-- **Failover.** After 3 consecutive sessions on an instance that fail
-  before delivering a single event, the reader moves to the next URL
-  in `firehose.urls`, wrapping around. With one URL it keeps retrying
-  that one.
+- **Backoff.** The reader waits before each reconnect: 0.5 s at
+  first, doubled every time, up to 30 s. After a session that
+  delivered events and lasted at least 60 s the wait starts again at
+  0.5 s. So a process that has run for months reconnects as promptly
+  as a new one, and an instance that drops every session within
+  seconds is approached more and more slowly.
+- **Failover.** A session **fails** when it cannot be opened, or
+  when it ends without having delivered a single event: closed, an
+  error, or silence for the stall timeout after the socket was
+  accepted. After 3 failed sessions in a row on an instance the reader
+  moves to the next URL in `firehose.urls`, wrapping around. With one
+  URL it keeps retrying that one. The wait is kept across a failover,
+  so with every instance down the attempts still slow down to one
+  every 30 s.
 - `admin.restartFirehose` drops the session; the reader reconnects at
   once from the persisted cursor.
 
@@ -427,6 +470,7 @@ speaks; see the [setup guide](../guide/setup.md).
 | `farsight_ingest_batch_seconds` | batch duration |
 | `farsight_ingest_buffer_depth` | events waiting in the channel |
 | `farsight_ingest_dropped_total{reason}` | `invalid`, `foreign_listitem`, `poisoned` |
+| `farsight_ingest_storage_errors_total{op}` | storage calls outside a batch that failed permanently and were given up |
 
 `getStats` reports the same state in its `firehose` object:
 `connected`, `protocol`, `lagSeconds`, `sourceLagSeconds` and

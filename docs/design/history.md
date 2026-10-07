@@ -222,10 +222,15 @@ skip is counted. The limits are chosen, not derived: an account that
 removes more than 10,000 records in a day loses the excess from
 history, and the counter shows it.
 
-A drain deletes a list's items in record-key order, in batches of
-10,000, so of a deleted list larger than the owner's remaining budget
-the first members in that order are recorded and the rest are counted
-as skipped.
+A removal of many rows at once (a reconcile, a drain batch) is
+charged once, for as many rows as the key's budget still allows; of
+its rows, in record-key order, that many are recorded and the rest
+are counted as skipped.
+
+A drain deletes a list's items in batches of 10,000, each read
+through the list's index (by member, then record key), so of a
+deleted list larger than the owner's remaining budget the members of
+the first batches are recorded and the rest are counted as skipped.
 
 Every recorded membership removal is the owner's own act (a delete, an
 edit, the deletion of the list) or is found in the owner's repository

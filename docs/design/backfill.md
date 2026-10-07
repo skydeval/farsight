@@ -251,7 +251,15 @@ The shares are `backfill.tier_shares` (three percentages that sum to
   requesters: each API token, the admin token, `system:lists`,
   `system:resync`. A requester is charged the outbound requests its
   jobs made; the least-charged requester with work goes next, and one
-  that joins starts at the current minimum.
+  that joins starts at the current minimum. A job is charged one
+  request when it is dispatched and the rest of its cost when it
+  ends, so the jobs already running count: several free workers are
+  shared between the requesters that have work, not all given to
+  the one that looked cheapest a moment ago.
+- **A job that panics** is logged and counted in
+  `farsight_task_panics_total{task="backfill_job"}`. Its worker and
+  the mark that its DID is being worked on are given back when its
+  task ends, however it ends, so no failure of a job shrinks the pool.
 - **Priority inside a requester**: `high` before `normal`, four to
   one. Within a priority, oldest first.
 - **Caps.** At most 10,000 waiting entries per API requester
@@ -297,12 +305,13 @@ Every outbound request waits for a slot on its host:
 | PLC directory, requests per second in total | `backfill.plc_rps` | 10 |
 
 - A `429`, or a response with `RateLimit-Remaining: 0`, cools the host
-  for the time its `Retry-After` names (60 seconds when it names
-  none). Requests to a cooling host fail at once and the job is
-  retried later.
+  for the seconds its `Retry-After` names, at most 1 hour (60 seconds
+  when it names none, or a date). Requests to a cooling host fail at
+  once and the job is retried later.
 - **Circuit breaker.** Five consecutive failures on a host trip it for
   1 minute; a second trip within an hour of the last lasts 1 hour.
-- A request waits at most 2 minutes for a slot.
+- A request waits at most 2 minutes for a slot. A slot is given back
+  when its request ends, also when the request is abandoned midway.
 - Half of `plc_rps` is reserved for DID resolution; enumeration of the
   PLC export uses the other half only.
 - The User-Agent is `farsight/<version> (+https://<hostname>;
@@ -333,10 +342,17 @@ from `sweep_incomplete` to complete coverage.
 | `plc` | the PLC directory's `/export`, in order | Every `did:plc` ever registered, and no `did:web` |
 
 The relay is `backfill.relay_url` (default `https://bsky.network`).
-Before the first `relay_collections` cycle the process probes the
-relay; if it does not implement `listReposByCollection`, the sweep
-falls back to `relay_repos`, logs a warning, and the cycle's
-`sweep_cycles.source` records what was used.
+Before every `relay_collections` cycle the process probes the relay
+with a request for one repository. If the relay does not have
+`listReposByCollection` (it answers `MethodNotImplemented`, or `404`,
+`405` or `501`), the cycle uses `relay_repos` and a warning is logged;
+a relay that has gained the method by the next cycle is used with it
+again. A relay that is down or busy says nothing about the method:
+the cycle starts on `relay_collections` and its pages are retried. If
+a page of a cycle under way is answered with "no such method", that
+cycle continues with `relay_repos` from the start of the listing; the
+members it already enumerated stay. `sweep_cycles.source` records
+what a cycle uses.
 
 Every member has to be resolved before it can be read, so for a large
 source expect resolution at `plc_rps` to set the pace of the first
@@ -669,7 +685,10 @@ resolved; see
   lane. A run that only refreshes is in the fallback lane alone.
 - The least-charged lane that has a servable item serves its oldest
   admission. A lane new to the round starts at the current minimum.
-  A lane is charged the outbound requests of what it served.
+  A lane is charged the outbound requests of what it served: one
+  when the item is dispatched, the rest when it ends. At most 5,000
+  waiting items of each kind are considered at a time, the oldest
+  admissions first.
 - An item is servable when it is not already running and its owner's
   host has a free slot and is not cooling down. A lane whose head is
   blocked serves its next servable item, or yields its turn.

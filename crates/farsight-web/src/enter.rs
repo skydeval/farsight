@@ -80,11 +80,24 @@ fn status(mut r: Response, s: StatusCode) -> Response {
     r
 }
 
-/// The sign-in page for this request's `Host`: the button where a client
-/// mode applies, otherwise where to go instead.
-fn sign_in_page(cfg: &LoadedConfig, headers: &HeaderMap, error: Option<String>) -> Response {
+/// Whether the request comes from a local client (see
+/// [`oauth::is_local_client`]): judged by the resolved client address,
+/// which is the TCP peer unless a trusted proxy forwarded another. A
+/// request without one is not local.
+fn is_local(client: Option<&ClientIp>) -> bool {
+    client.is_some_and(|c| oauth::is_local_client(c.ip))
+}
+
+/// The sign-in page for this request's `Host` and client: the button
+/// where a client mode applies, otherwise where to go instead.
+fn sign_in_page(
+    cfg: &LoadedConfig,
+    headers: &HeaderMap,
+    local: bool,
+    error: Option<String>,
+) -> Response {
     let hostname = cfg.config.server.hostname.clone();
-    let kind = if oauth::client_for(&hostname, host_header(headers)).is_some() {
+    let kind = if oauth::client_for(&hostname, host_header(headers), local).is_some() {
         "signin"
     } else {
         "elsewhere"
@@ -116,8 +129,13 @@ fn unconfigured_page(cfg: &LoadedConfig) -> Response {
 }
 
 /// `GET /enter`.
-pub async fn page(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+pub async fn page(
+    State(st): State<Arc<WebState>>,
+    headers: HeaderMap,
+    client: Option<axum::Extension<ClientIp>>,
+) -> Response {
     let cfg = st.api.config.current();
+    let local = is_local(client.as_ref().map(|c| &c.0));
     match cfg.admin_auth() {
         AdminAuth::Disabled => common::not_found(),
         AdminAuth::Unconfigured => unconfigured_page(&cfg),
@@ -125,7 +143,7 @@ pub async fn page(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Respon
             if admin(&st, &headers).await.is_some() {
                 return common::redirect("/admin");
             }
-            sign_in_page(&cfg, &headers, None)
+            sign_in_page(&cfg, &headers, local, None)
         }
     }
 }
@@ -194,9 +212,14 @@ pub async fn submit(
     if !common::same_origin(&headers) {
         return common::forbidden("cross-origin request refused");
     }
-    let Some(oauth_client) = oauth::client_for(&cfg.config.server.hostname, host_header(&headers))
+    let local = is_local(client.as_ref());
+    let Some(oauth_client) =
+        oauth::client_for(&cfg.config.server.hostname, host_header(&headers), local)
     else {
-        return status(sign_in_page(&cfg, &headers, None), StatusCode::BAD_REQUEST);
+        return status(
+            sign_in_page(&cfg, &headers, local, None),
+            StatusCode::BAD_REQUEST,
+        );
     };
     let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
     if let Err((_, retry)) = st.api.limiter.check(
@@ -207,6 +230,7 @@ pub async fn submit(
         let page = sign_in_page(
             &cfg,
             &headers,
+            local,
             Some("Too many sign-in attempts; wait a minute.".into()),
         );
         return too_many(page, Class::UiLogin, retry);
@@ -223,6 +247,7 @@ pub async fn submit(
             let page = sign_in_page(
                 &cfg,
                 &headers,
+                local,
                 Some("Sign-in is busy; try again in a few seconds.".into()),
             );
             return too_many(page, Class::UiLoginStart, retry);
@@ -234,6 +259,7 @@ pub async fn submit(
             sign_in_page(
                 &cfg,
                 &headers,
+                local,
                 Some("The admin account's server could not be reached. Try again shortly.".into()),
             ),
             StatusCode::BAD_GATEWAY,
@@ -438,7 +464,9 @@ pub async fn client_metadata(State(st): State<Arc<WebState>>, headers: HeaderMap
         return common::not_found();
     }
     let hostname = &cfg.config.server.hostname;
-    match oauth::client_for(hostname, host_header(&headers)) {
+    // Only the hosted client has a metadata document, so whether the
+    // client is local does not matter here.
+    match oauth::client_for(hostname, host_header(&headers), false) {
         Some(c) if !c.loopback => (
             [
                 (header::CONTENT_TYPE, "application/json"),

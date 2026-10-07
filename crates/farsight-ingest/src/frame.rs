@@ -132,6 +132,35 @@ pub enum Frame {
 #[error("undecodable frame: {0}")]
 pub struct FrameError(pub String);
 
+/// How far ahead of this machine's clock a witness time may be.
+pub const MAX_WITNESS_AHEAD_US: i64 = 24 * 3600 * 1_000_000;
+
+/// Checks a witness time an instance reports before anything is computed
+/// from it or stored: it is the stream position, kept as a running
+/// maximum, so one far in the future would stand as `applied_through`
+/// for good, and one outside the range of the arithmetic done on
+/// positions would overflow it. Accepted: the epoch up to
+/// [`MAX_WITNESS_AHEAD_US`] past `now_us`.
+pub fn check_witness(us: i64, now_us: i64) -> Result<i64, FrameError> {
+    if us < 0 || us > now_us.saturating_add(MAX_WITNESS_AHEAD_US) {
+        return Err(FrameError(format!("witness time {us} out of range")));
+    }
+    Ok(us)
+}
+
+/// Checks a v2 `seq`: not negative, and with room for the `seq + 1` a
+/// resume asks for.
+pub fn check_seq(seq: i64) -> Result<i64, FrameError> {
+    if !(0..i64::MAX).contains(&seq) {
+        return Err(FrameError(format!("seq {seq} out of range")));
+    }
+    Ok(seq)
+}
+
+fn now_us() -> i64 {
+    chrono::Utc::now().timestamp_micros()
+}
+
 fn str_of<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
     v.get(k).and_then(Value::as_str)
 }
@@ -187,6 +216,7 @@ pub fn decode_v1(bytes: &[u8]) -> Result<Frame, FrameError> {
         .get("time_us")
         .and_then(Value::as_i64)
         .ok_or_else(|| FrameError("missing time_us".into()))?;
+    let witness_us = check_witness(witness_us, now_us())?;
     let body = match str_of(&v, "kind") {
         Some("commit") => match v.get("commit") {
             Some(c) => commit_body(did, c),
@@ -244,10 +274,12 @@ pub fn decode_v2(bytes: &[u8]) -> Result<Frame, FrameError> {
         .get("seq")
         .and_then(Value::as_i64)
         .ok_or_else(|| FrameError("event without seq".into()))?;
+    let seq = check_seq(seq)?;
     let witness_us = str_of(p, "witnessedAt")
         .or_else(|| str_of(p, "time"))
         .and_then(parse_time_us)
         .ok_or_else(|| FrameError("event without a parseable witnessedAt/time".into()))?;
+    let witness_us = check_witness(witness_us, now_us())?;
     let did = str_of(p, "did").ok_or_else(|| FrameError("event without did".into()))?;
     let body = match kind {
         // v2 commit fields (rev, operation, collection, rkey, record) are
@@ -435,5 +467,42 @@ mod tests {
             }
         );
         assert!(decode_v2(br#"{"$type":"message","payload":{"$type":"x#commit"}}"#).is_err());
+    }
+
+    #[test]
+    fn positions_out_of_range_are_not_events() {
+        let now = 1_800_000_000_000_000i64;
+        assert_eq!(check_witness(0, now), Ok(0));
+        assert_eq!(check_witness(now, now), Ok(now));
+        assert_eq!(
+            check_witness(now + MAX_WITNESS_AHEAD_US, now),
+            Ok(now + MAX_WITNESS_AHEAD_US)
+        );
+        for bad in [-1, i64::MIN, now + MAX_WITNESS_AHEAD_US + 1, i64::MAX] {
+            assert!(check_witness(bad, now).is_err(), "{bad}");
+        }
+        assert_eq!(check_seq(0), Ok(0));
+        assert_eq!(check_seq(i64::MAX - 1), Ok(i64::MAX - 1));
+        for bad in [-1, i64::MIN, i64::MAX] {
+            assert!(check_seq(bad).is_err(), "{bad}");
+        }
+
+        // The decoders refuse them: the session ends as on any frame that
+        // cannot be decoded, and nothing of the frame is stored.
+        for time_us in [i64::MIN, -1, i64::MAX] {
+            let e = json!({"did": A, "time_us": time_us, "kind": "identity", "identity": {}});
+            assert!(decode_v1(e.to_string().as_bytes()).is_err(), "{time_us}");
+        }
+        let event = |seq: i64, at: &str| {
+            v2(
+                json!({"$type": "network.bsky.jetstream.subscribeEvents#identity",
+                "seq": seq, "did": A, "time": at}),
+            )
+        };
+        assert!(decode_v2(&event(5, "2026-09-30T16:00:00Z")).is_ok());
+        assert!(decode_v2(&event(i64::MAX, "2026-09-30T16:00:00Z")).is_err());
+        assert!(decode_v2(&event(-3, "2026-09-30T16:00:00Z")).is_err());
+        assert!(decode_v2(&event(5, "9999-12-31T23:59:59Z")).is_err());
+        assert!(decode_v2(&event(5, "0001-01-01T00:00:00Z")).is_err());
     }
 }

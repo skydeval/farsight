@@ -26,6 +26,9 @@ pub const BATCH_SECONDS: &str = "farsight_ingest_batch_seconds";
 pub const BUFFER_DEPTH: &str = "farsight_ingest_buffer_depth";
 /// `farsight_ingest_dropped_total{reason}` (counter).
 pub const DROPPED: &str = "farsight_ingest_dropped_total";
+/// `farsight_ingest_storage_errors_total{op}` (counter): storage calls
+/// of the writer that failed permanently and were given up.
+pub const STORAGE_ERRORS: &str = "farsight_ingest_storage_errors_total";
 
 /// `farsight_firehose_seam_repairs_total{trigger}` (counter).
 pub const SEAM_REPAIRS: &str = "farsight_firehose_seam_repairs_total";
@@ -33,7 +36,8 @@ pub const SEAM_REPAIRS: &str = "farsight_firehose_seam_repairs_total";
 pub const SEAM_REPAIR_EVENTS: &str = "farsight_firehose_seam_repair_events_total";
 
 /// Every ingest metric name.
-pub const ALL: [&str; 11] = [
+pub const ALL: [&str; 12] = [
+    STORAGE_ERRORS,
     SEAM_REPAIRS,
     SEAM_REPAIR_EVENTS,
     CONNECTED,
@@ -87,8 +91,25 @@ pub fn describe() {
         DROPPED,
         "events dropped before apply by reason (invalid, foreign_listitem, poisoned)"
     );
+    describe_counter!(
+        STORAGE_ERRORS,
+        "storage calls of the ingest writer that failed permanently and were given up, by call"
+    );
     register_zeroes();
 }
+
+/// The storage calls the writer makes outside a batch (the `op` label of
+/// [`STORAGE_ERRORS`]).
+pub const STORAGE_OPS: [&str; 8] = [
+    "mark_connected",
+    "set_connected",
+    "record_gap",
+    "read_state",
+    "open_sync_unavailable",
+    "close_sync_unavailable",
+    "purge_account",
+    "record_poisoned",
+];
 
 /// Registers every known label set at zero, so dashboards and the
 /// harness see each series before its first event.
@@ -120,6 +141,10 @@ pub fn register_zeroes() {
         metrics::counter!(SEAM_REPAIRS, "trigger" => trigger).increment(0);
     }
     metrics::counter!(SEAM_REPAIR_EVENTS).increment(0);
+    for op in STORAGE_OPS {
+        metrics::counter!(STORAGE_ERRORS, "op" => op).increment(0);
+    }
+    farsight_core::task::register(&crate::TASKS);
     for c in farsight_storage::codes::CapType::ALL {
         metrics::counter!(ABUSE_CAPPED, "kind" => c.label()).increment(0);
     }

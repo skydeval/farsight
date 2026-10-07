@@ -120,13 +120,13 @@ pub fn plan(
         if protocol == Protocol::V2 && p.protocol == Some(Protocol::V2) {
             if let Some(seq) = p.cursor_seq {
                 return Plan {
-                    cursor: Cursor::Seq(seq + 1),
+                    cursor: Cursor::Seq(seq.saturating_add(1)),
                     gap: GapRule::None,
                 };
             }
         }
         let base = p.cursor_us.unwrap_or(applied);
-        let requested = base - us(V1_REPLAY);
+        let requested = base.saturating_sub(us(V1_REPLAY));
         return Plan {
             cursor: Cursor::TimeUs(requested),
             gap: GapRule::IfClamped {
@@ -136,11 +136,11 @@ pub fn plan(
             },
         };
     }
-    let gap_from = applied - us(FAILOVER_GAP);
+    let gap_from = applied.saturating_sub(us(FAILOVER_GAP));
     match lag {
         Some(l) if l <= t.failover_max_lag => {
             let rewind = t.failover_rewind_min.max(l + FAILOVER_LAG_MARGIN);
-            let requested = applied - us(rewind);
+            let requested = applied.saturating_sub(us(rewind));
             Plan {
                 cursor: Cursor::TimeUs(requested),
                 gap: GapRule::IfClamped {
@@ -180,7 +180,8 @@ pub fn gap_for_first_event(
             // A clamp loses data only if the server's first event is past
             // our position; if it replayed from an older floor, nothing
             // was skipped.
-            let clamped = clamped_notice || first_us - requested_us > us(t.gap_threshold);
+            let clamped =
+                clamped_notice || first_us.saturating_sub(requested_us) > us(t.gap_threshold);
             if clamped && first_us > from_us {
                 Some((from_us, first_us, cause))
             } else {

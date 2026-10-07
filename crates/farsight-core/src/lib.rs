@@ -1,6 +1,6 @@
 //! Shared types for Farsight: DID, AT-URI, TID and NSID handling, record
-//! validation, configuration loading (TOML plus environment overrides) and the
-//! safe outbound HTTP client.
+//! validation, configuration loading (TOML plus environment overrides), the
+//! safe outbound HTTP client and the supervision of background tasks.
 
 #![warn(missing_docs)]
 
@@ -12,6 +12,7 @@ pub mod duration;
 pub mod net;
 pub mod nsid;
 pub mod record;
+pub mod task;
 pub mod tid;
 
 pub use aturi::{AtUri, AtUriError, RecordKey, RecordKeyError};

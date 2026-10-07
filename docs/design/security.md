@@ -286,14 +286,24 @@ from a backlink index — goes through one client
 - accepts only `https` URLs, with no credentials in them. Plain `http`
   is allowed for the hosts in `net.allow_http_hosts`, which exists for
   development;
-- refuses addresses that are not public: unspecified and `0.0.0.0/8`,
-  loopback, private (RFC 1918), link-local (which includes the cloud
-  metadata address `169.254.169.254`), CGNAT (`100.64.0.0/10`),
-  multicast, broadcast and `240.0.0.0/4`; in IPv6 unspecified,
-  loopback, unique local (`fc00::/7`), link-local and multicast. An
-  IPv4 address embedded in IPv6 — IPv4-mapped, or under the NAT64
-  prefix `64:ff9b::/96` — is judged as the IPv4 address it carries. A
-  host in `net.allow_http_hosts` is not exempt from this;
+- refuses addresses that are not public. In IPv4: unspecified and
+  `0.0.0.0/8`, loopback, private (RFC 1918), link-local (which
+  includes the cloud metadata address `169.254.169.254`), CGNAT
+  (`100.64.0.0/10`), protocol assignments (`192.0.0.0/24`), the 6to4
+  relay anycast range (`192.88.99.0/24`), benchmarking
+  (`198.18.0.0/15`), multicast, broadcast and `240.0.0.0/4`. In IPv6:
+  unspecified, loopback, unique local (`fc00::/7`), link-local,
+  site-local (`fec0::/10`), multicast, discard-only (`100::/64`),
+  benchmarking (`2001:2::/48`) and local-use NAT64
+  (`64:ff9b:1::/48`). An IPv4 address embedded in IPv6 — IPv4-mapped,
+  or under the NAT64 prefix `64:ff9b::/96` — is judged as the IPv4
+  address it carries. The forms that tunnel to an IPv4 address are
+  refused whatever address they carry: 6to4 (`2002::/16`), Teredo
+  (`2001::/32`) and IPv4-compatible addresses (`::/96`). A host in
+  `net.allow_http_hosts` is not exempt from any of this;
+- connects directly. A proxy named in the environment (`HTTPS_PROXY`,
+  `HTTP_PROXY`, `ALL_PROXY`) is not used: a proxy would resolve and
+  contact the target itself, past the address check;
 - follows at most 3 redirects, and applies every check again to each
   hop. A form `POST` (used by the admin sign-in) follows none: a 3xx is
   returned as it is, so a form is never re-sent to another host;
@@ -550,7 +560,17 @@ left, so requests are never starved by it. The handle pass
 - **CSRF.** Every state-changing request must satisfy a same-origin check
   (`Sec-Fetch-Site: same-origin` when the browser sends that header;
   an `Origin` whose host equals `Host` when it sends that one) and
-  carry the session's form token, compared in constant time.
+  carry the session's form token, compared in constant time. That
+  includes `POST /admin/logout`. The two requests that create a
+  session have none to carry a token of and pass the same-origin
+  check alone: `POST /enter`, which starts a sign-in, and
+  `POST /setup`, which presents the setup token.
+- **Loopback sign-in is for local clients.** The loopback OAuth
+  client is used only when the request's `Host` is `127.0.0.1` or
+  `[::1]` **and** its client address is loopback or private. The
+  header alone would let any remote client start sign-ins (it could
+  not complete one: the account's server decides that). See
+  [web-ui.md](web-ui.md#two-client-modes).
 - **Content-Security-Policy.** Every admin page, the setup wizard and
   the sign-in page are sent with `default-src 'none'; style-src
   'self'; script-src 'self'; img-src 'self' https:; connect-src

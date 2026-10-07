@@ -562,6 +562,36 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
         to_enter(&nocookie),
         brief(&nocookie),
     );
+    let no_token = a.post("/admin/logout", &[("cookie", cookie)], &[]).await?;
+    let wrong_token = a
+        .post(
+            "/admin/logout",
+            &[("cookie", cookie)],
+            &[("csrf", "0000000000000000")],
+        )
+        .await?;
+    let cross = a
+        .post(
+            "/admin/logout",
+            &[("cookie", cookie), ("origin", "https://evil.example")],
+            &[("csrf", &csrf)],
+        )
+        .await?;
+    let still = a.admin_get(cookie, "/admin").await?;
+    c.check(
+        "POST /admin/logout with the session but without its form token, with a wrong one, or from another origin: 403, no cookie is cleared, and the session goes on",
+        [&no_token, &wrong_token, &cross]
+            .iter()
+            .all(|r| r.status == 403 && r.header("set-cookie").is_none())
+            && still.status == 200,
+        format!(
+            "{} | {} | {} | then /admin {}",
+            brief(&no_token),
+            brief(&wrong_token),
+            brief(&cross),
+            still.status
+        ),
+    );
     let out = a
         .post("/admin/logout", &[("cookie", cookie)], &[("csrf", &csrf)])
         .await?;

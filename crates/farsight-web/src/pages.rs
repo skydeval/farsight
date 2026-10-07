@@ -965,15 +965,31 @@ pub(crate) fn metrics_rate_limited(c: Class) {
     farsight_api::metrics::rate_limited(c);
 }
 
-async fn logout(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+/// `POST /admin/logout`: ends the session of a request that is
+/// same-origin and carries the session's form token, like every other
+/// state-changing request. Without a session there is nothing to end and
+/// the answer is the redirect to the sign-in page; the cookie is cleared
+/// only together with the session, so a request forged from another site
+/// can neither end a session nor remove its cookie.
+async fn logout(
+    State(st): State<Arc<WebState>>,
+    headers: HeaderMap,
+    form: Result<Form<HashMap<String, String>>, axum::extract::rejection::FormRejection>,
+) -> Response {
     if st.api.config.current().admin_auth() == AdminAuth::Disabled {
         return common::not_found();
     }
+    let Some(session) = admin(&st, &headers).await else {
+        return common::redirect("/enter");
+    };
+    // A body that is not a form carries no token.
+    let form = form.map(|f| f.0).unwrap_or_default();
+    if let Err(r) = check_form(&session, &headers, &form) {
+        return r;
+    }
     if let Some(raw) = read_cookie(&headers, ADMIN_COOKIE) {
-        if common::same_origin(&headers) {
-            if let Some(key) = session_key(&st.api.config.current(), &raw) {
-                let _ = farsight_storage::auth::delete_session(&st.api.pool, &key).await;
-            }
+        if let Some(key) = session_key(&st.api.config.current(), &raw) {
+            let _ = farsight_storage::auth::delete_session(&st.api.pool, &key).await;
         }
     }
     let mut r = common::redirect("/enter");

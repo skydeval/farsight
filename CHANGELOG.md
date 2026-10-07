@@ -7,11 +7,59 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Before 1.0, a minor version may change addresses, settings or the
 database schema; each entry says so where it does.
 
-No version has been tagged yet. The entries below were written
-afterwards from the commit history, and each is linked to the range of
-commits it covers.
-
 ## [Unreleased]
+
+### Fixed
+
+- Backfill: a host answering `429` with an enormous `Retry-After`
+  crashed the job that asked and took its worker out of the pool for
+  good. The header is now honoured for at most an hour, and a job that
+  fails in any way gives its worker back.
+- A panic in a background task no longer silently stops that part of
+  Farsight. Tasks are started again and the panic is logged and counted
+  in the new metric `farsight_task_panics_total{task}`. A panic in the
+  firehose reader or writer makes the server exit, so that its
+  supervisor starts it again and ingest resumes from the stored cursor.
+- Sweep: with a relay that has no `listReposByCollection`, the sweep
+  never fell back to `listRepos` as documented and retried without
+  end. It now falls back, also in the middle of a cycle, and asks the
+  relay again before every full cycle.
+- Firehose: after about seven disconnects in the life of a process
+  every reconnect waited 30 seconds. The wait now starts again at
+  half a second after a session that ran well for a minute.
+- Firehose: an instance that accepted the connection and then sent
+  nothing was never failed over. A session that delivers no event now
+  counts as failed, and three in a row move on to the next instance.
+- Firehose: an event with a time far in the future or outside the
+  representable range could be stored as the stream position. Such a
+  frame now ends the session and is not stored. Websocket messages are
+  limited to 16 MiB.
+- Ingest: one database call that could never succeed, such as a broken
+  purge of a deleted account, stopped ingest or kept the server from
+  starting. Such a call is now tried three times, recorded as an
+  operational error with the account's DID and counted in
+  `farsight_ingest_storage_errors_total{op}`, and ingest goes on. A
+  daily task, `account_purges`, finishes purges that were left over.
+- Backfill: a requester could take every free worker at once, because
+  jobs were charged only when they ended. They are now charged when
+  they start.
+- Admin sign-in on `127.0.0.1` was offered to any client that sent
+  that `Host` header. It is now offered only to a client whose address
+  is loopback or private.
+- `POST /admin/logout` did not check the form token, so another site
+  could sign the admin out. It now does, like every other form.
+- Outbound requests used a proxy named in `HTTPS_PROXY`, `HTTP_PROXY`
+  or `ALL_PROXY`, which bypassed the check that refuses private
+  addresses. They are now always made directly. An instance that
+  reached the network only through such a proxy stops working.
+- Outbound requests are now also refused to 6to4 (`2002::/16`), Teredo
+  (`2001::/32`) and IPv4-compatible IPv6 addresses, to
+  `198.18.0.0/15`, and to a few other ranges that are not public.
+- Purging a list or a deleted account deleted its rows one at a time,
+  several database round trips each. A batch of 10,000 rows is now a
+  few statements, and so is a reconcile.
+- A list of a reactivated account that had timed out at the same
+  moment could be re-admitted without its lock being held.
 
 ## [0.6.0] - 2026-10-06
 

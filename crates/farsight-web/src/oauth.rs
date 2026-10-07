@@ -80,12 +80,36 @@ pub fn is_loopback_host(host: &str) -> bool {
         .any(|a| host.strip_prefix(a).is_some_and(port_ok))
 }
 
-/// The client for a request, chosen from its `Host` header: hosted when
-/// the header names `server.hostname` and that is a domain name, loopback
-/// when it names a loopback address, otherwise none.
-pub fn client_for(hostname: &str, host_header: &str) -> Option<Client> {
+/// Whether a request's client address is one a browser on this machine
+/// (or tunnelled to it) arrives from: loopback, or a private address —
+/// a container runtime delivers connections made to a published port on
+/// the host from its bridge's gateway, not from `127.0.0.1`. A public
+/// address is somebody else's browser, whatever `Host` it sent.
+pub fn is_local_client(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(a) => a.is_loopback() || a.is_private() || a.is_link_local(),
+        std::net::IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return is_local_client(std::net::IpAddr::V4(v4));
+            }
+            let first = a.segments()[0];
+            a.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// The client for a request: hosted when its `Host` header names
+/// `server.hostname` and that is a domain name; loopback when the header
+/// names a loopback address **and** the request's client is local
+/// (`local`, from [`is_local_client`] of the resolved client address);
+/// otherwise none. The header alone does not select loopback mode: any
+/// client can send `Host: 127.0.0.1`.
+pub fn client_for(hostname: &str, host_header: &str, local: bool) -> Option<Client> {
     let host = host_header.trim().to_ascii_lowercase();
     if is_loopback_host(&host) {
+        if !local {
+            return None;
+        }
         let redirect_uri = format!("http://{host}{CALLBACK_PATH}");
         let encoded: String =
             url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect();
@@ -780,7 +804,7 @@ mod tests {
             issuer: "https://as.example".into(),
             token: Url::parse("https://as.example/token").unwrap(),
             did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            client: client_for("farsight.example", "farsight.example").unwrap(),
+            client: client_for("farsight.example", "farsight.example", false).unwrap(),
             cookie_sha256: cookie,
             created,
         }
@@ -788,7 +812,7 @@ mod tests {
 
     #[test]
     fn client_modes() {
-        let hosted = client_for("farsight.example", "Farsight.Example").unwrap();
+        let hosted = client_for("farsight.example", "Farsight.Example", false).unwrap();
         assert!(!hosted.loopback);
         assert_eq!(
             hosted.client_id,
@@ -799,34 +823,39 @@ mod tests {
             "https://farsight.example/enter/callback"
         );
         assert_eq!(
-            client_for("farsight.example", "farsight.example:443"),
+            client_for("farsight.example", "farsight.example:443", true),
             Some(hosted)
         );
         // Another name, a port, an IP or a single label is not hosted mode.
-        assert_eq!(client_for("farsight.example", "other.example"), None);
+        assert_eq!(client_for("farsight.example", "other.example", true), None);
         assert_eq!(
-            client_for("farsight.example", "farsight.example:8080"),
+            client_for("farsight.example", "farsight.example:8080", true),
             None
         );
         assert_eq!(
-            client_for("farsight.example:8080", "farsight.example:8080"),
+            client_for("farsight.example:8080", "farsight.example:8080", true),
             None
         );
-        assert_eq!(client_for("203.0.113.7", "203.0.113.7"), None);
-        assert_eq!(client_for("farsight", "farsight"), None);
-        assert_eq!(client_for("farsight.example", "localhost:8080"), None);
+        assert_eq!(client_for("203.0.113.7", "203.0.113.7", true), None);
+        assert_eq!(client_for("farsight", "farsight", true), None);
+        assert_eq!(client_for("farsight.example", "localhost:8080", true), None);
         assert_eq!(
-            client_for("farsight.example", "127.0.0.1.evil.example"),
+            client_for("farsight.example", "127.0.0.1.evil.example", true),
             None
         );
-        assert_eq!(client_for("farsight.example", "127.0.0.1:99999"), None);
+        assert_eq!(
+            client_for("farsight.example", "127.0.0.1:99999", true),
+            None
+        );
         // Loopback, whatever the hostname is.
         for (host, redirect) in [
             ("127.0.0.1:18093", "http://127.0.0.1:18093/enter/callback"),
             ("127.0.0.1", "http://127.0.0.1/enter/callback"),
             ("[::1]:8080", "http://[::1]:8080/enter/callback"),
         ] {
-            let c = client_for("203.0.113.7:8080", host).unwrap();
+            let c = client_for("203.0.113.7:8080", host, true).unwrap();
+            // The same Host from a client that is not local: no client.
+            assert_eq!(client_for("203.0.113.7:8080", host, false), None);
             assert!(c.loopback);
             assert_eq!(c.redirect_uri, redirect);
             let u = Url::parse(&c.client_id).unwrap();
@@ -1057,6 +1086,38 @@ mod tests {
         let s = OAuthState::default();
         assert!(s.may_warn_mismatch());
         assert!(!s.may_warn_mismatch());
+    }
+
+    #[test]
+    fn local_clients() {
+        for ok in [
+            "127.0.0.1",
+            "127.8.0.3",
+            "::1",
+            // A container bridge's gateway, a private network.
+            "172.18.0.1",
+            "10.0.0.5",
+            "192.168.1.20",
+            "169.254.1.1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:172.17.0.1",
+        ] {
+            assert!(is_local_client(ok.parse().unwrap()), "{ok}");
+        }
+        for bad in [
+            "203.0.113.9",
+            "8.8.8.8",
+            "100.64.0.1",
+            "172.32.0.1",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(!is_local_client(bad.parse().unwrap()), "{bad}");
+        }
     }
 
     #[test]

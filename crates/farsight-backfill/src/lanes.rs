@@ -52,17 +52,21 @@ pub struct Candidate {
 /// re-check is due, and due `list_fetch` queue entries.
 pub async fn load(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
     type P1 = (i64, Option<DateTime<Utc>>, Option<String>);
+    // Ordered as a lane serves (oldest admission first, lists never
+    // admitted before those), so when more wait than are loaded, the ones
+    // left out are the youngest and the same ones on every load.
     let p1: Vec<P1> = sqlx::query_as(
-        "SELECT l.id, l.admitted_at, h.host FROM list_jobs j
-         JOIN lists l ON l.id = j.list_id JOIN actors o ON o.id = l.owner_id
-         LEFT JOIN pds_hosts h ON h.id = o.pds_host_id
-         WHERE (j.not_before IS NULL OR j.not_before <= now()) AND l.track_state IN (1, 4, 6)
-         UNION ALL
-         SELECT l.id, l.admitted_at, h.host FROM lists l
-         JOIN actors o ON o.id = l.owner_id LEFT JOIN pds_hosts h ON h.id = o.pds_host_id
-         WHERE l.track_state = 6 AND (l.next_retry_at IS NULL OR l.next_retry_at <= now())
-           AND NOT EXISTS (SELECT 1 FROM list_jobs j WHERE j.list_id = l.id)
-         LIMIT $1",
+        "SELECT id, admitted_at, host FROM (
+           SELECT l.id, l.admitted_at, h.host FROM list_jobs j
+           JOIN lists l ON l.id = j.list_id JOIN actors o ON o.id = l.owner_id
+           LEFT JOIN pds_hosts h ON h.id = o.pds_host_id
+           WHERE (j.not_before IS NULL OR j.not_before <= now()) AND l.track_state IN (1, 4, 6)
+           UNION ALL
+           SELECT l.id, l.admitted_at, h.host FROM lists l
+           JOIN actors o ON o.id = l.owner_id LEFT JOIN pds_hosts h ON h.id = o.pds_host_id
+           WHERE l.track_state = 6 AND (l.next_retry_at IS NULL OR l.next_retry_at <= now())
+             AND NOT EXISTS (SELECT 1 FROM list_jobs j WHERE j.list_id = l.id)) w
+         ORDER BY admitted_at NULLS FIRST, id LIMIT $1",
     )
     .bind(LOAD_LIMIT)
     .fetch_all(pool)
@@ -77,7 +81,7 @@ pub async fn load(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
          FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
          LEFT JOIN pds_hosts h ON h.id = a.pds_host_id
          WHERE q.kind = 2 AND (q.not_before IS NULL OR q.not_before <= now())
-         ORDER BY q.enqueued_at LIMIT $1",
+         ORDER BY q.enqueued_at, q.id LIMIT $1",
     )
     .bind(LOAD_LIMIT)
     .fetch_all(pool)

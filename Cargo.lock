@@ -535,13 +535,16 @@ dependencies = [
  "chrono",
  "hickory-resolver",
  "ipnet",
+ "metrics",
  "proptest",
  "psl",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "toml",
+ "tracing",
  "url",
 ]
 

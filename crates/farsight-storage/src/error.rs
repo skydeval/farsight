@@ -17,6 +17,11 @@ pub enum StorageError {
     /// this as a poisoned event.
     #[error("deadlock retries exhausted after {0} attempts")]
     DeadlockRetriesExhausted(u32),
+    /// The lists a batch has to lock changed between reading them and
+    /// locking them. The transaction is rolled back and run again; like a
+    /// deadlock abort this says nothing about the batch's events.
+    #[error("the lock set of the batch changed while it was being taken")]
+    LockSetChanged,
     /// A listing stamp read more than 72 h ago. The job must restart with a
     /// fresh stamp.
     #[error("listing stamp read at {0} is older than 72 h")]
@@ -43,6 +48,14 @@ impl StorageError {
             }
             _ => false,
         }
+    }
+}
+
+impl StorageError {
+    /// Whether the transaction was aborted for a reason that running it
+    /// again resolves: a deadlock, or a lock set that changed under it.
+    pub fn is_retryable_abort(&self) -> bool {
+        self.is_deadlock() || matches!(self, StorageError::LockSetChanged)
     }
 }
 

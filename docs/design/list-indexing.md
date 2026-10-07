@@ -93,7 +93,9 @@ Rules:
 - A listblock update that changes the subject decrements the old list
   and increments the new one in the same transaction.
 - **Every** path that deletes `list_blocks` rows (firehose delete,
-  range or whole reconcile, account purge) uses one function. That
+  range or whole reconcile, account purge) uses one function. It
+  deletes a set of one author's rows with one statement and then
+  applies the count change list by list. That
   function also writes `list_blocks_history` (see
   [history.md](history.md#when-a-row-is-written)): its caller names the cause of the
   removal, and the purges name none. Counted and uncounted rows are
@@ -212,6 +214,18 @@ union. This discovery only reads: an author without an `actors` row
 has no stored rows. After the list locks, the transaction checks which
 of its DIDs have no `actors` row and takes their intern locks, sorted.
 
+One lock set is not stable under the author lock: the `unavailable`
+lists of an account that an `account` event reactivates, on which
+**OA** fires. A list turns `unavailable` under its list lock alone (a
+list job's timeout), so one can do so after the batch read the set
+and before it holds its list locks. The batch therefore reads the set
+again once the list locks are held. If a list in it is not locked,
+the transaction is rolled back and run again from the start, like
+after a deadlock abort, so the list is locked in its place in the
+order. **OA** itself fires only on lists whose lock the transaction
+holds; a list that turns `unavailable` later still is ordered after
+the batch and keeps its own retry.
+
 ### Locks per write
 
 | Write | Locks |
@@ -221,6 +235,7 @@ of its DIDs have no `actors` row and takes their intern locks, sorted.
 | `list` record write by O for L | author(O); list(L) exclusive |
 | list-job record check or promotion | author(O); list(L) exclusive |
 | purge batch of L | author(O); list(L) exclusive |
+| reactivation of O (`account` event, active) | author(O); list(L) exclusive for every `unavailable` list of O |
 | account purge of D | author(D); then, per batch, the list locks it touches |
 | discovery write of `subject_lists` for (X, L) | list(L) shared |
 | placeholder-list cleanup of L | list(L) exclusive |
@@ -237,8 +252,9 @@ row is held, so two writers of the same `lists` row are already
 serialized by the list lock.
 
 Deadlock aborts remain possible in principle (hash collisions,
-autovacuum). Every apply transaction retries on SQLSTATE `40P01`, and
-deadlock retries never count toward poisoned-event handling.
+autovacuum). Every apply transaction retries on SQLSTATE `40P01` and
+on a lock set that changed while it was taken, and neither kind of
+retry counts toward poisoned-event handling.
 
 ## The transition function
 

@@ -1079,19 +1079,35 @@ async fn check_rate_limits(
         answers.iter().all(|(s, l)| *s == 303 && l == "/enter"),
         format!("{answers:?}"),
     );
-    // UI login: 5/min per IP.
+    // UI login: 5/min per IP. The requests name the loopback address as
+    // their Host, so the client the proxy forwards has to be a local one:
+    // a private address.
     let mut statuses = Vec::new();
     for _ in 0..7 {
         let r = ctx
             .http
             .post_form(
                 &format!("{base}/enter"),
-                &[("cf-connecting-ip", &cf_ip(21))],
+                &[("cf-connecting-ip", "10.21.0.7")],
                 &[],
             )
             .await?;
         statuses.push(r.status);
     }
+    // The same from a public address is refused before the limit counts.
+    let public = ctx
+        .http
+        .post_form(
+            &format!("{base}/enter"),
+            &[("cf-connecting-ip", &cf_ip(21))],
+            &[],
+        )
+        .await?;
+    c.check(
+        "a sign-in start on the loopback Host forwarded for a public address: 400, not rate-limited",
+        public.status == 400,
+        format!("{}", public.status),
+    );
     // Each admitted start tries to reach the harness admin DID's server,
     // which does not exist (502); what is checked here is the limit.
     c.check(
@@ -1350,7 +1366,16 @@ async fn check_reset(
         blocks_before == blocks_after && blocks_after > 0,
         format!("{blocks_before} → {blocks_after} blocks"),
     );
-    let x1 = ctx.http.get(&x(base, "query.getStats", ""), &[]).await?;
+    // The switch closes the listener and binds it again: for a moment the
+    // port answers nothing.
+    let switched = Instant::now();
+    let x1 = loop {
+        match ctx.http.get(&x(base, "query.getStats", ""), &[]).await {
+            Ok(r) => break r,
+            Err(e) if switched.elapsed() > Duration::from_secs(10) => return Err(e),
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    };
     let h = ctx.http.get(&format!("{base}/health"), &[]).await?;
     let st = ctx.http.get(&format!("{base}/setup"), &[]).await?;
     c.check(

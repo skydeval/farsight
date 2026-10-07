@@ -328,10 +328,10 @@ impl Txn<'_> {
         Ok(())
     }
 
-    /// Applies a counted-listblock count change on `list_id` (+1 or −1)
-    /// under list(L) exclusive: updates `listblock_count`, the lane of
-    /// `sched_key` while the list is waiting, and fires **+** / **−** on a
-    /// 0 ↔ ≥ 1 crossing.
+    /// Applies a counted-listblock count change of `delta` on `list_id`
+    /// (rows sharing one `sched_key`) under list(L) exclusive: updates
+    /// `listblock_count`, the lane of `sched_key` while the list is
+    /// waiting, and fires **+** / **−** on a 0 ↔ ≥ 1 crossing.
     pub async fn change_listblock_count(
         &mut self,
         list_id: i64,

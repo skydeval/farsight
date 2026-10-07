@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use farsight_storage::codes::GapCause;
 use farsight_storage::firehose;
@@ -23,6 +23,96 @@ use crate::writer::Item;
 
 /// Consecutive failed sessions on one instance before failing over.
 pub const FAILOVER_AFTER: u32 = 3;
+/// Wait before the first reconnect; doubled after each one.
+pub const BACKOFF_FIRST: Duration = Duration::from_millis(500);
+/// Longest wait between reconnects.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A session that delivered events and lasted this long was a healthy
+/// one: the wait starts again from [`BACKOFF_FIRST`] after it.
+pub const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+/// Most events one seam repair collects before it applies what it has.
+pub const SEAM_REPAIR_MAX_EVENTS: usize = 500_000;
+/// Longest one seam repair reads for.
+pub const SEAM_REPAIR_MAX_READ: Duration = Duration::from_secs(600);
+
+/// How an attempt to read from an instance ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// The connection or the handshake failed.
+    ConnectFailed,
+    /// The session opened and ended without one event: the instance
+    /// closed it, sent an error, or sent nothing for the stall timeout.
+    Silent,
+    /// The session delivered events for this long before it ended.
+    Delivered(Duration),
+    /// The session was dropped on command; nothing is learned from it.
+    Killed,
+}
+
+/// What to do before the next attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Next {
+    /// How long to wait.
+    pub wait: Duration,
+    /// Move to the next instance.
+    pub failover: bool,
+}
+
+/// Reconnect pacing and failover: the wait between attempts and the count
+/// of consecutive failed sessions on the current instance.
+///
+/// - The wait doubles with every reconnect, up to [`BACKOFF_MAX`], and
+///   starts again after a session that was healthy for
+///   [`HEALTHY_SESSION`]: a process that has run for months reconnects
+///   as promptly as a new one, while an instance that drops every
+///   session after a few events is still approached more and more slowly.
+/// - A session is a failure if it could not be opened or delivered no
+///   event. [`FAILOVER_AFTER`] failures in a row move on to the next
+///   instance, if there is one. The wait is kept across a failover, so
+///   that with every instance down the attempts still slow down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reconnects {
+    backoff: Duration,
+    failures: u32,
+}
+
+impl Default for Reconnects {
+    fn default() -> Self {
+        Reconnects {
+            backoff: BACKOFF_FIRST,
+            failures: 0,
+        }
+    }
+}
+
+impl Reconnects {
+    /// Records how an attempt ended and says what comes next. `instances`
+    /// is the number of configured instances.
+    pub fn next(&mut self, ended: Ended, instances: usize) -> Next {
+        match ended {
+            Ended::Killed => {
+                return Next {
+                    wait: Duration::ZERO,
+                    failover: false,
+                };
+            }
+            Ended::ConnectFailed | Ended::Silent => self.failures += 1,
+            Ended::Delivered(lasted) => {
+                self.failures = 0;
+                if lasted >= HEALTHY_SESSION {
+                    self.backoff = BACKOFF_FIRST;
+                }
+            }
+        }
+        let failover = self.failures >= FAILOVER_AFTER && instances > 1;
+        if failover {
+            self.failures = 0;
+        }
+        let wait = self.backoff;
+        self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+        Next { wait, failover }
+    }
+}
 
 /// Seam repair settings (`firehose.tuning.seam_repair_*`). Public instances
 /// were observed to drop events witnessed within about a second of a cursor
@@ -240,11 +330,10 @@ impl Reader {
     /// Runs until shutdown or the writer goes away.
     pub async fn run(mut self) {
         let mut idx = 0usize;
-        let mut failures = 0u32;
+        let mut reconnects = Reconnects::default();
         let mut lag = LagTracker::new();
         let mut prev_instance_lag: Option<Duration> = None;
         let mut current_url: Option<String> = None;
-        let mut backoff = Duration::from_millis(500);
         loop {
             // Drain the pipeline so the persisted cursor reflects every
             // event already read (a dropped connection reconnects from
@@ -292,19 +381,17 @@ impl Reader {
                     tracing::warn!(url, error = %e, "connect failed");
                     metrics::counter!(m::RECONNECTS, "reason" => "connect_error").increment(1);
                     self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
-                    failures += 1;
-                    if failures >= FAILOVER_AFTER && self.cfg.urls.len() > 1 {
+                    let next = reconnects.next(Ended::ConnectFailed, self.cfg.urls.len());
+                    if next.failover {
                         prev_instance_lag = lag.instance_lag();
                         lag.reset();
                         idx += 1;
-                        failures = 0;
                         metrics::counter!(m::RECONNECTS, "reason" => "failover").increment(1);
                         tracing::warn!(next = %self.cfg.urls[idx % self.cfg.urls.len()], "failing over");
                     }
-                    if self.sleep_or_shutdown(backoff).await {
+                    if self.sleep_or_shutdown(next.wait).await {
                         return;
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
                     continue;
                 }
             };
@@ -332,9 +419,11 @@ impl Reader {
             {
                 return;
             }
-            let end = self
-                .read_session(&mut session, rule, prior, failover, &mut lag, &mut failures)
+            let started = Instant::now();
+            let (end, delivered) = self
+                .read_session(&mut session, rule, prior, failover, &mut lag)
                 .await;
+            let lasted = started.elapsed();
             session.close().await;
             set_connected_gauge(None);
             if self.tx.send(Item::Disconnected).await.is_err() {
@@ -346,18 +435,23 @@ impl Reader {
                     tracing::warn!(url, reason, "jetstream session ended; reconnecting");
                     metrics::counter!(m::RECONNECTS, "reason" => reason).increment(1);
                     self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
-                    if failures >= FAILOVER_AFTER && self.cfg.urls.len() > 1 {
+                    let ended = if reason == "kill" {
+                        Ended::Killed
+                    } else if delivered {
+                        Ended::Delivered(lasted)
+                    } else {
+                        Ended::Silent
+                    };
+                    let next = reconnects.next(ended, self.cfg.urls.len());
+                    if next.failover {
                         prev_instance_lag = lag.instance_lag();
                         lag.reset();
                         idx += 1;
-                        failures = 0;
                         metrics::counter!(m::RECONNECTS, "reason" => "failover").increment(1);
+                        tracing::warn!(next = %self.cfg.urls[idx % self.cfg.urls.len()], "failing over");
                     }
-                    if reason != "kill" {
-                        if self.sleep_or_shutdown(backoff).await {
-                            return;
-                        }
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                    if !next.wait.is_zero() && self.sleep_or_shutdown(next.wait).await {
+                        return;
                     }
                 }
             }
@@ -392,8 +486,8 @@ impl Reader {
         // protocols accept µs).
         let cfg = self.cfg.seam;
         let us = |d: Duration| i64::try_from(d.as_micros()).unwrap_or(i64::MAX);
-        let until = caught_up_us + us(cfg.after);
-        let cursor = Cursor::TimeUs(connect_us - us(cfg.before));
+        let until = caught_up_us.saturating_add(us(cfg.after));
+        let cursor = Cursor::TimeUs(connect_us.saturating_sub(us(cfg.before)));
         tracing::info!(connect_us, caught_up_us, trigger, "seam repair scheduled");
         let handle = tokio::spawn(async move {
             tokio::time::sleep(cfg.delay).await;
@@ -405,7 +499,19 @@ impl Reader {
                 }
             };
             let mut events = Vec::new();
+            let read_started = Instant::now();
             loop {
+                // The window ends where the instance says it does. One
+                // that never reaches the end is read up to these bounds.
+                if events.len() >= SEAM_REPAIR_MAX_EVENTS
+                    || read_started.elapsed() >= SEAM_REPAIR_MAX_READ
+                {
+                    tracing::warn!(
+                        events = events.len(),
+                        "seam repair: window not finished within its bounds; applying what was read"
+                    );
+                    break;
+                }
                 match tokio::time::timeout(Duration::from_secs(30), s.next_frame()).await {
                     Ok(Some(Ok(Frame::Event(ev)))) => {
                         let past = ev.witness_us > until;
@@ -448,6 +554,8 @@ impl Reader {
         }
     }
 
+    /// Reads one session to its end. Returns why it ended and whether it
+    /// delivered an event.
     async fn read_session(
         &mut self,
         session: &mut Session,
@@ -455,8 +563,7 @@ impl Reader {
         prior: bool,
         failover: bool,
         lag: &mut LagTracker,
-        failures: &mut u32,
-    ) -> End {
+    ) -> (End, bool) {
         let mut first = true;
         let mut clamped_notice = false;
         let mut since_gauge = 0u32;
@@ -472,39 +579,31 @@ impl Reader {
         loop {
             let frame = tokio::select! {
                 c = self.control.recv() => match c {
-                    Some(Control::KillSocket) => return End::Reconnect("kill"),
+                    Some(Control::KillSocket) => return (End::Reconnect("kill"), !first),
                     #[cfg(feature = "harness")]
                     Some(Control::KillAndRewind { us }) => {
                         self.rewind = Some(us);
-                        return End::Reconnect("kill");
+                        return (End::Reconnect("kill"), !first);
                     }
                     Some(Control::Inject(evs)) => {
                         for ev in evs {
                             let ev = at_position(ev, position_us);
                             if self.tx.send(Item::Event(ev)).await.is_err() {
-                                return End::Shutdown;
+                                return (End::Shutdown, !first);
                             }
                         }
                         continue;
                     }
-                    Some(Control::Shutdown) | None => return End::Shutdown,
+                    Some(Control::Shutdown) | None => return (End::Shutdown, !first),
                 },
                 f = tokio::time::timeout(self.cfg.stall_timeout, session.next_frame()) => f,
             };
             let frame = match frame {
-                Err(_) => return End::Reconnect("stall"),
-                Ok(None) => {
-                    if first {
-                        *failures += 1;
-                    }
-                    return End::Reconnect("closed");
-                }
+                Err(_) => return (End::Reconnect("stall"), !first),
+                Ok(None) => return (End::Reconnect("closed"), !first),
                 Ok(Some(Err(e))) => {
                     tracing::warn!(error = %e, "read error");
-                    if first {
-                        *failures += 1;
-                    }
-                    return End::Reconnect("error");
+                    return (End::Reconnect("error"), !first);
                 }
                 Ok(Some(Ok(f))) => f,
             };
@@ -518,13 +617,12 @@ impl Reader {
                 }
                 Frame::Error { error, message } => {
                     tracing::warn!(%error, message = ?message, "jetstream error frame");
-                    return End::Reconnect("server_error");
+                    return (End::Reconnect("server_error"), !first);
                 }
                 Frame::Event(ev) => ev,
             };
             if first {
                 first = false;
-                *failures = 0;
                 let gap = resume::gap_for_first_event(
                     rule,
                     ev.witness_us,
@@ -554,7 +652,7 @@ impl Reader {
                         .await
                         .is_err()
                     {
-                        return End::Shutdown;
+                        return (End::Shutdown, !first);
                     }
                 }
             }
@@ -576,7 +674,7 @@ impl Reader {
                 let now = chrono::Utc::now().timestamp_micros();
                 let margin =
                     i64::try_from(self.cfg.seam.catchup_margin.as_micros()).unwrap_or(i64::MAX);
-                if now - ev.witness_us <= margin {
+                if now.saturating_sub(ev.witness_us) <= margin {
                     seam_trigger = None;
                     tracing::warn!(
                         connect_us,
@@ -608,19 +706,19 @@ impl Reader {
                 tokio::select! {
                     r = &mut send => {
                         if r.is_err() {
-                            return End::Shutdown;
+                            return (End::Shutdown, !first);
                         }
                         break;
                     }
                     c = self.control.recv() => match c {
-                        Some(Control::KillSocket) => return End::Reconnect("kill"),
+                        Some(Control::KillSocket) => return (End::Reconnect("kill"), !first),
                         #[cfg(feature = "harness")]
                         Some(Control::KillAndRewind { us }) => {
                             self.rewind = Some(us);
-                            return End::Reconnect("kill");
+                            return (End::Reconnect("kill"), !first);
                         }
                         Some(Control::Inject(evs)) => self.pending_inject.extend(evs),
-                        Some(Control::Shutdown) | None => return End::Shutdown,
+                        Some(Control::Shutdown) | None => return (End::Shutdown, !first),
                     },
                 }
             }
@@ -634,7 +732,7 @@ impl Reader {
             for ev in std::mem::take(&mut self.pending_inject) {
                 let ev = at_position(ev, position_us);
                 if self.tx.send(Item::Event(ev)).await.is_err() {
-                    return End::Shutdown;
+                    return (End::Shutdown, !first);
                 }
             }
         }
@@ -648,4 +746,104 @@ fn at_position(mut ev: InEvent, position_us: Option<i64>) -> InEvent {
         ev.witness_us = us;
     }
     ev
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LONG: Duration = Duration::from_secs(3600);
+    const SHORT: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn the_wait_starts_again_after_a_healthy_session() {
+        let mut r = Reconnects::default();
+        // Twenty disconnects over a long life, each after hours of events.
+        for _ in 0..20 {
+            assert_eq!(
+                r.next(Ended::Delivered(LONG), 2),
+                Next {
+                    wait: BACKOFF_FIRST,
+                    failover: false
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_wait_grows_while_sessions_fail_or_end_early() {
+        let mut r = Reconnects::default();
+        let mut waits = Vec::new();
+        for i in 0..10 {
+            let ended = if i % 2 == 0 {
+                Ended::Delivered(SHORT)
+            } else {
+                Ended::ConnectFailed
+            };
+            waits.push(r.next(ended, 1).wait);
+        }
+        assert_eq!(waits[0], BACKOFF_FIRST);
+        assert!(waits.windows(2).all(|w| w[1] >= w[0]), "{waits:?}");
+        assert_eq!(waits[9], BACKOFF_MAX);
+        // One healthy session later the next reconnect is prompt again.
+        assert_eq!(
+            r.next(Ended::Delivered(HEALTHY_SESSION), 1).wait,
+            BACKOFF_FIRST
+        );
+    }
+
+    #[test]
+    fn an_instance_that_sends_nothing_is_failed_over() {
+        let mut r = Reconnects::default();
+        // Accepts the socket, then silence until the stall timeout.
+        assert!(!r.next(Ended::Silent, 2).failover);
+        assert!(!r.next(Ended::Silent, 2).failover);
+        assert!(r.next(Ended::Silent, 2).failover);
+        // The count starts again on the next instance.
+        assert!(!r.next(Ended::Silent, 2).failover);
+        // Connect errors and silent sessions count alike.
+        assert!(!r.next(Ended::ConnectFailed, 2).failover);
+        assert!(r.next(Ended::Silent, 2).failover);
+    }
+
+    #[test]
+    fn events_clear_the_failures_and_one_instance_never_fails_over() {
+        let mut r = Reconnects::default();
+        r.next(Ended::Silent, 2);
+        r.next(Ended::Silent, 2);
+        assert!(!r.next(Ended::Delivered(SHORT), 2).failover);
+        assert!(!r.next(Ended::Silent, 2).failover);
+        let mut one = Reconnects::default();
+        for _ in 0..10 {
+            assert!(!one.next(Ended::Silent, 1).failover);
+        }
+    }
+
+    #[test]
+    fn the_wait_is_kept_across_a_failover() {
+        let mut r = Reconnects::default();
+        let mut last = Duration::ZERO;
+        // Every instance down: attempts keep slowing down.
+        for _ in 0..12 {
+            let n = r.next(Ended::ConnectFailed, 2);
+            assert!(n.wait >= last);
+            last = n.wait;
+        }
+        assert_eq!(last, BACKOFF_MAX);
+    }
+
+    #[test]
+    fn a_killed_session_changes_nothing() {
+        let mut r = Reconnects::default();
+        r.next(Ended::Silent, 2);
+        let before = r;
+        assert_eq!(
+            r.next(Ended::Killed, 2),
+            Next {
+                wait: Duration::ZERO,
+                failover: false
+            }
+        );
+        assert_eq!(r, before);
+    }
 }

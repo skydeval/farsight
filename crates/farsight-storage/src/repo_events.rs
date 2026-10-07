@@ -6,7 +6,7 @@
 //! | Event | Effect |
 //! |---|---|
 //! | `identity` | known DID ⇒ PDS cache cleared (`pds_resolved_at = NULL`) |
-//! | `account` | known DID ⇒ status set from the event; `desynchronized` ⇒ `resync` debt; **any** DID becoming active: known with `inactive_at_listing` or a hidden status ⇒ `resync` debt + **OA** on its `unavailable` lists; unknown ⇒ no row, no job (counted in the report); `deleted` ⇒ purge after commit |
+//! | `account` | known DID ⇒ status set from the event; `desynchronized` ⇒ `resync` debt; **any** DID becoming active: known with `inactive_at_listing` or a hidden status ⇒ `resync` debt + **OA** on its `unavailable` lists whose list lock the transaction holds; unknown ⇒ no row, no job (counted in the report); `deleted` ⇒ purge after commit |
 //! | `#sync` | any DID ⇒ `resync` debt + tier-1 `system:resync` re-list |
 
 use chrono::{DateTime, Utc};
@@ -103,6 +103,13 @@ impl Txn<'_> {
     /// Applies one non-commit event. The caller holds author(did) and,
     /// for reactivations, list(L) exclusive on the DID's unavailable
     /// lists, and the intern lock if the DID has no `actors` row.
+    ///
+    /// **OA** fires only on lists whose exclusive lock this transaction
+    /// holds. A list can turn `unavailable` under its list lock alone (a
+    /// list job's timeout), so the set read here may hold a list the
+    /// caller did not lock; that one turned `unavailable` after the
+    /// caller fixed its lock set, is ordered after this event, and keeps
+    /// its own retry.
     pub async fn apply_repo_event(&mut self, ev: &RepoEvent, system_queue_cap: i64) -> Result<()> {
         match ev {
             RepoEvent::Identity { did, .. } => {
@@ -188,14 +195,19 @@ impl Txn<'_> {
                     self.add_debt(id, DebtReason::Resync, None, Some(*witness))
                         .await?;
                     self.report.resyncs += 1;
-                    let lists: Vec<i64> = sqlx::query_scalar(
-                        "SELECT id FROM lists WHERE owner_id = $1 AND track_state = $2 ORDER BY id",
+                    let lists: Vec<(i64, String)> = sqlx::query_as(
+                        "SELECT id, rkey FROM lists WHERE owner_id = $1 AND track_state = $2
+                         ORDER BY id",
                     )
                     .bind(id)
                     .bind(TrackState::Unavailable.code())
                     .fetch_all(&mut *self.conn)
                     .await?;
-                    for list_id in lists {
+                    for (list_id, rkey) in lists {
+                        let key = crate::keys::list_lock_key(did.as_str(), &rkey);
+                        if !self.holds_list_exclusive(key) {
+                            continue;
+                        }
                         self.fire(list_id, Event::OwnerActive, FireArgs::default())
                             .await?;
                     }

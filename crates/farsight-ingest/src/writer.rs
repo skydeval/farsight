@@ -3,6 +3,14 @@
 //! in one transaction with the cursor, `applied_through` and the
 //! `firehose_clock` row, and handles poisoned events.
 //!
+//! Storage calls outside the batch (session and gap bookkeeping, account
+//! purges, the record of a poisoned event) go through
+//! [`Writer::call_or_record`]: a transient error (the database is away)
+//! is retried until it passes; any other error is tried
+//! [`PERMANENT_ATTEMPTS`] times, then recorded as an operational error
+//! and counted, and the writer goes on. Nothing the writer does waits
+//! for ever on a call that cannot succeed.
+//!
 //! Ordering: every non-event item (session start, gap, disconnect,
 //! barrier) first flushes the events before it, so gaps and the connected
 //! flag are recorded in stream order.
@@ -37,6 +45,30 @@ pub const BATCH_MAX: usize = 500;
 pub const BATCH_WINDOW: Duration = Duration::from_millis(250);
 /// Attempts of one event alone before it is poisoned.
 pub const POISON_STRIKES: u32 = 3;
+/// Attempts of a storage call that fails with an error that is not
+/// transient, before the writer records the failure and goes on.
+pub const PERMANENT_ATTEMPTS: u32 = 3;
+
+/// What a storage call that failed should get next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// Try again after a pause, however often it takes.
+    Again,
+    /// Record the failure and go on.
+    GiveUp,
+}
+
+/// Decides between another attempt and giving up: a transient error is
+/// always retried; any other error until it has failed
+/// [`PERMANENT_ATTEMPTS`] times (`failed` counts the attempts that ended
+/// in an error that was not transient, this one included).
+pub fn retry_decision(transient: bool, failed: u32) -> Retry {
+    if transient || failed < PERMANENT_ATTEMPTS {
+        Retry::Again
+    } else {
+        Retry::GiveUp
+    }
+}
 
 /// What the reader sends the writer.
 #[derive(Debug)]
@@ -104,7 +136,9 @@ struct SessionState {
 
 /// Whether an error is transient (retried forever, never a poison strike):
 /// connection loss, a restarting server, pool exhaustion, exhausted
-/// deadlock retries (never count toward poisoned-event handling).
+/// deadlock retries (never count toward poisoned-event handling). Every
+/// other error is permanent as far as the writer can tell: the same call
+/// would fail the same way.
 pub fn is_transient(e: &StorageError) -> bool {
     match e {
         StorageError::DeadlockRetriesExhausted(_) => true,
@@ -257,7 +291,9 @@ impl Writer {
             }
             Item::Session { url, protocol } => {
                 let u = url.clone();
-                self.retry_transient(|| {
+                // Given up, the connected flag stays as it was; the batches
+                // of the session carry its URL and protocol themselves.
+                self.call_or_record("mark_connected", None, || {
                     firehose::mark_connected(&self.pool, &u, protocol.storage())
                 })
                 .await;
@@ -275,16 +311,20 @@ impl Writer {
                 to_us,
                 cause,
             } => {
-                self.retry_transient(|| {
-                    firehose::record_gap(&self.pool, dt(from_us), dt(to_us), cause)
-                })
-                .await;
+                let recorded = self
+                    .call_or_record("record_gap", None, || {
+                        firehose::record_gap(&self.pool, dt(from_us), dt(to_us), cause)
+                    })
+                    .await;
+                Self::gap_written("record_gap", recorded.is_some());
                 self.stats.gaps.fetch_add(1, Ordering::Relaxed);
                 self.refresh_gauges().await;
             }
             Item::Disconnected => {
-                self.retry_transient(|| firehose::set_connected(&self.pool, false))
-                    .await;
+                self.call_or_record("set_connected", None, || {
+                    firehose::set_connected(&self.pool, false)
+                })
+                .await;
             }
             Item::Barrier(ack) => {
                 let _ = ack.send(());
@@ -292,19 +332,73 @@ impl Writer {
         }
     }
 
-    async fn retry_transient<F, Fut, T>(&self, mut f: F) -> T
+    /// A gap that cannot be written must not be passed over: coverage is
+    /// claimed from the recorded gaps, so going on would claim more than
+    /// was witnessed. The writer stops instead (a panic here ends the
+    /// process, as any writer panic does), and the next start resumes
+    /// from the persisted cursor and meets the same gap again.
+    fn gap_written(op: &'static str, written: bool) {
+        assert!(
+            written,
+            "{op} failed permanently: a firehose gap could not be recorded"
+        );
+    }
+
+    /// Makes a storage call, retrying as [`retry_decision`] says. Returns
+    /// `None` when it was given up: the failure is then logged, counted
+    /// in `farsight_ingest_storage_errors_total{op}` and recorded in
+    /// `op_errors` (with `did`, when the call concerns one account), and
+    /// the caller goes on without the call's effect.
+    async fn call_or_record<F, Fut, T>(
+        &self,
+        op: &'static str,
+        did: Option<&Did>,
+        mut f: F,
+    ) -> Option<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T, StorageError>>,
     {
         let mut backoff = Duration::from_millis(200);
+        let mut failed = 0u32;
         loop {
-            match f().await {
-                Ok(v) => return v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "ingest storage call failed; retrying");
+            let e = match f().await {
+                Ok(v) => return Some(v),
+                Err(e) => e,
+            };
+            let transient = is_transient(&e);
+            if !transient {
+                failed += 1;
+            }
+            match retry_decision(transient, failed) {
+                Retry::Again => {
+                    tracing::warn!(op, error = %e, transient, "ingest storage call failed; retrying");
+                    if transient {
+                        self.stats.transient_retries.fetch_add(1, Ordering::Relaxed);
+                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+                Retry::GiveUp => {
+                    tracing::error!(
+                        op,
+                        did = did.map(Did::as_str),
+                        error = %e,
+                        "ingest storage call failed permanently; going on without it"
+                    );
+                    metrics::counter!(m::STORAGE_ERRORS, "op" => op).increment(1);
+                    let message = format!("{op} failed permanently: {e}");
+                    if let Err(e) = farsight_storage::auth::record_op_error(
+                        &self.pool,
+                        "ingest",
+                        did.map(Did::as_str),
+                        &message,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "recording the operational error failed");
+                    }
+                    return None;
                 }
             }
         }
@@ -347,17 +441,25 @@ impl Writer {
         let first_us = events[0].witness_us;
         if live && s.open_v1_gap {
             let from = self
-                .retry_transient(|| firehose::read_state(&self.pool))
+                .call_or_record("read_state", None, || firehose::read_state(&self.pool))
                 .await
-                .applied_through
+                .and_then(|st| st.applied_through)
                 .unwrap_or_else(|| dt(first_us));
-            self.retry_transient(|| firehose::open_sync_unavailable(&self.pool, from))
+            let opened = self
+                .call_or_record("open_sync_unavailable", None, || {
+                    firehose::open_sync_unavailable(&self.pool, from)
+                })
                 .await;
+            Self::gap_written("open_sync_unavailable", opened.is_some());
             s.open_v1_gap = false;
         }
         if live && s.close_v1_gap {
-            self.retry_transient(|| firehose::close_sync_unavailable(&self.pool, dt(first_us)))
+            let closed = self
+                .call_or_record("close_sync_unavailable", None, || {
+                    firehose::close_sync_unavailable(&self.pool, dt(first_us))
+                })
                 .await;
+            Self::gap_written("close_sync_unavailable", closed.is_some());
             s.close_v1_gap = false;
         }
 
@@ -443,8 +545,12 @@ impl Writer {
         // Purge accounts that became `deleted` (multi-transaction,
         // after the status commit; resumed at start-up if interrupted).
         let purge_started = Instant::now();
+        // A purge given up leaves the account `deleted` with rows still
+        // stored: its rows are already withheld by its status, and the
+        // purge is taken up again by the daily task and at the next start
+        // (`janitor::accounts_pending_purge`).
         for did in &report.deleted_accounts {
-            self.retry_transient(|| {
+            self.call_or_record("purge_account", Some(did), || {
                 janitor::purge_account(&self.pool, &self.limits, &self.counters, did)
             })
             .await;
@@ -569,7 +675,9 @@ impl Writer {
                 if let Some(did) = event_did(ev) {
                     let msg = format!("poisoned event (witness {}): {last_err}", ev.witness_us);
                     tracing::error!(%did, "{msg}");
-                    self.retry_transient(|| {
+                    // Given up, the event has no `resync` debt; the
+                    // operational error names its DID.
+                    self.call_or_record("record_poisoned", Some(did), || {
                         record_poisoned(
                             &self.pool,
                             &self.limits,
@@ -604,5 +712,42 @@ impl Writer {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_errors_are_retried_without_end() {
+        for failed in [0, 1, PERMANENT_ATTEMPTS, 10_000] {
+            assert_eq!(retry_decision(true, failed), Retry::Again);
+        }
+    }
+
+    #[test]
+    fn a_permanent_error_is_given_up_after_its_attempts() {
+        assert_eq!(retry_decision(false, 1), Retry::Again);
+        assert_eq!(retry_decision(false, PERMANENT_ATTEMPTS - 1), Retry::Again);
+        assert_eq!(retry_decision(false, PERMANENT_ATTEMPTS), Retry::GiveUp);
+        assert_eq!(retry_decision(false, PERMANENT_ATTEMPTS + 1), Retry::GiveUp);
+    }
+
+    #[test]
+    fn errors_are_classified() {
+        // The database is away: wait for it.
+        assert!(is_transient(&StorageError::Db(sqlx::Error::PoolTimedOut)));
+        assert!(is_transient(&StorageError::Db(sqlx::Error::PoolClosed)));
+        assert!(is_transient(&StorageError::Db(sqlx::Error::Io(
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset)
+        ))));
+        assert!(is_transient(&StorageError::DeadlockRetriesExhausted(8)));
+        // The call itself is wrong: the same call fails the same way.
+        assert!(!is_transient(&StorageError::Invariant("bad row".into())));
+        assert!(!is_transient(&StorageError::Db(sqlx::Error::RowNotFound)));
+        assert!(!is_transient(&StorageError::Db(
+            sqlx::Error::ColumnNotFound("x".into())
+        )));
     }
 }

@@ -1195,7 +1195,7 @@ pub async fn test_firehose(url: &str, limit: Duration) -> (Vec<String>, bool) {
             Ok(Some(Ok(Frame::Event(ev)))) => {
                 events += 1;
                 let now_us = Utc::now().timestamp_micros();
-                last_lag = Some((now_us - ev.witness_us) as f64 / 1e6);
+                last_lag = Some(now_us.saturating_sub(ev.witness_us) as f64 / 1e6);
             }
             Ok(Some(Ok(_))) => {}
             Ok(Some(Err(e))) => {

@@ -998,7 +998,9 @@ When an applied event
 ### The purge of a deleted account
 
 The purge runs in batches of 10,000 rows, each batch under the
-account's author lock and the list locks it touches:
+account's author lock and the list locks it touches. The rows of a
+batch are deleted with one statement per table, which also adjusts the
+counters they were counted in:
 
 - rows the account **authored** in `blocks`, `list_blocks` and
   `list_items` are deleted. Listblocks go through the same path as any
@@ -1021,10 +1023,13 @@ account's author lock and the list locks it touches:
 
 An account counts as pending purge while it has status `deleted` and
 still authors any live row, any list not yet marked deleted, or any
-history row. The server looks for such accounts at start and finishes
-their purge, so an interrupted purge is completed, and a history row
-written later by a replayed event is removed at the next start or when
-it ages out. Until then it is never shown, because `deleted` is a
+history row. The server looks for such accounts at start and once a
+day (the `account_purges` task) and finishes their purge, so an
+interrupted purge is completed, and a history row written later by a
+replayed event is removed within a day or when it ages out. A purge
+that fails is recorded among the operational errors with the
+account's DID, and neither the start nor the other accounts wait for
+it. Until then it is never shown, because `deleted` is a
 hidden status.
 
 ## Counters

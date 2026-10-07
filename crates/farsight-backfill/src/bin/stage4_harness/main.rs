@@ -428,6 +428,8 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
         ("9. repair cycle", 9),
         ("10. debt feeder", 10),
         ("extra: subject discovery", 12),
+        ("extra: hostile hosts and failing jobs", 13),
+        ("extra: a relay without listReposByCollection", 14),
     ];
     for (name, n) in checks {
         c.section(name);
@@ -442,6 +444,8 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
             8 => check_sweep(&h, c).await,
             9 => check_repair(&h, c).await,
             10 => check_feeder(&h, c).await,
+            13 => check_hostile(&h, c).await,
+            14 => check_fallback(&h, c).await,
             _ => check_discovery(&h, c).await,
         };
         if let Err(x) = r {
@@ -1924,6 +1928,250 @@ async fn check_discovery(h: &H, c: &mut Checks) -> Res<()> {
         row.is_some_and(|(st, tr, n)| st == 3 && !tr && n == 4) && scopes == 2 && r.outcome == Outcome::Clean,
         format!("discovery_state {row:?}, subject_coverage rows {scopes}"),
     );
+    Ok(())
+}
+
+// ------------------------------------------------------- hostile hosts
+
+/// A PDS that answers every request with `429` and the largest
+/// `Retry-After` a number can hold.
+async fn start_hostile_pds() -> Res<String> {
+    async fn refuse() -> axum::response::Response {
+        use axum::response::IntoResponse;
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "18446744073709551615")],
+            axum::Json(json!({"error": "RateLimitExceeded"})),
+        )
+            .into_response()
+    }
+    let app = axum::Router::new().fallback(refuse);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(e)?;
+    let addr = l.local_addr().map_err(e)?;
+    tokio::spawn(async move {
+        let _ = axum::serve(l, app).await;
+    });
+    Ok(format!("http://{addr}"))
+}
+
+/// Queues a tier-1 repo job for `d`.
+async fn queue_repo(h: &H, d: &str, requester: &str) -> Res<()> {
+    sqlx::query("INSERT INTO actors (did) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(d)
+        .execute(h.pool())
+        .await
+        .map_err(e)?;
+    sqlx::query(
+        "INSERT INTO backfill_queue (actor_id, kind, tier, priority, requester)
+         SELECT id, 1, 1, 0, $2 FROM actors WHERE did = $1",
+    )
+    .bind(d)
+    .bind(requester)
+    .execute(h.pool())
+    .await
+    .map_err(e)?;
+    Ok(())
+}
+
+async fn backfilled(h: &H, d: &str) -> Res<bool> {
+    h.bool(&format!(
+        "SELECT EXISTS (SELECT 1 FROM backfill_state b JOIN actors a ON a.id = b.actor_id
+                        WHERE a.did = '{d}' AND b.last_outcome IN (1, 2))"
+    ))
+    .await
+}
+
+/// Polls `f` until it is true or `secs` passed.
+async fn eventually<F, Fut>(secs: u64, f: F) -> Res<bool>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Res<bool>>,
+{
+    let start = Instant::now();
+    loop {
+        if f().await? {
+            return Ok(true);
+        }
+        if start.elapsed() > Duration::from_secs(secs) {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn check_hostile(h: &H, c: &mut Checks) -> Res<()> {
+    h.exec("DELETE FROM backfill_queue").await?;
+    let hostile = start_hostile_pds().await?;
+    let host = farsight_backfill::net::host_key(&url::Url::parse(&hostile).map_err(e)?);
+    let (bad, good, boom) = (did("hsa", 1), did("hsb", 1), did("hsc", 1));
+    w(&h.world).plc.insert(bad.clone(), hostile.clone());
+    for d in [&good, &boom] {
+        h.put_repo(
+            d,
+            vec![(Collection::Block, tid_now(), block_v(&did("sub", 9)))],
+        );
+    }
+    let sched = Scheduler::new(h.ctx.clone());
+    sched.panic_for(&boom, true);
+    let (stop_tx, stop) = watch::channel(false);
+    let task = tokio::spawn(sched.clone().run(stop));
+    queue_repo(h, &bad, "token:h").await?;
+    queue_repo(h, &boom, "token:h").await?;
+    queue_repo(h, &good, "token:h").await?;
+
+    // The hostile host's answer has been taken in once it is cooling.
+    let cooled = eventually(30, || async {
+        Ok(h.ctx.net.hosts.cooling(&host).is_some())
+    })
+    .await?;
+    let cooling = h.ctx.net.hosts.cooling(&host);
+    c.check(
+        "a host answering 429 with Retry-After 18446744073709551615 is cooled down for at most an hour",
+        cooled && cooling.is_some_and(|s| s <= 3600),
+        format!("cooling for {cooling:?} s"),
+    );
+    let good_done = eventually(30, || backfilled(h, &good)).await?;
+    // The panicking job was claimed (its queue row is gone) and ended.
+    let claimed = eventually(30, || async {
+        let queued = h
+            .i64(&format!(
+                "SELECT count(*) FROM backfill_queue q JOIN actors a ON a.id = q.actor_id WHERE a.did = '{boom}'"
+            ))
+            .await?;
+        Ok(queued == 0)
+    })
+    .await?;
+    // The job on the hostile host is retried while the scheduler runs:
+    // end its retries, then nothing may be left in flight.
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id IN (SELECT id FROM actors WHERE did = '{bad}')"
+    ))
+    .await?;
+    let idle = eventually(30, || async { Ok(sched.in_flight() == ([0, 0, 0], 0)) }).await?;
+    c.check(
+        "a job that panics, and a job refused by a hostile host, give back their worker and their in-flight marker; other jobs are served meanwhile",
+        claimed && good_done && idle,
+        format!(
+            "panicking job claimed {claimed}; job on the healthy host done {good_done}; in flight at the end {:?}",
+            sched.in_flight()
+        ),
+    );
+    // The DID whose job panicked can be run again.
+    sched.panic_for(&boom, false);
+    h.exec(&format!("DELETE FROM job_leases WHERE did = '{boom}'"))
+        .await?;
+    queue_repo(h, &boom, "token:h").await?;
+    let again = eventually(30, || backfilled(h, &boom)).await?;
+    c.check(
+        "the DID whose job panicked is dispatched again and completes",
+        again,
+        format!("in flight {:?}", sched.in_flight()),
+    );
+    let _ = stop_tx.send(true);
+    let _ = task.await;
+    h.exec(&format!(
+        "DELETE FROM backfill_queue WHERE actor_id IN (SELECT id FROM actors WHERE did IN ('{bad}', '{boom}', '{good}'))"
+    ))
+    .await?;
+    Ok(())
+}
+
+// -------------------------------------------- relay without the listing
+
+/// Ends every open cycle and makes a new full cycle due.
+async fn retire_cycles(h: &H) -> Res<()> {
+    h.exec("DELETE FROM cycle_outstanding").await?;
+    h.exec("UPDATE sweep_cycles SET completed_at = now() WHERE completed_at IS NULL")
+        .await?;
+    h.exec("UPDATE sweep_cycles SET started_at = started_at - interval '400 days' WHERE kind = 1")
+        .await?;
+    Ok(())
+}
+
+async fn open_full_cycle(h: &H) -> Res<Option<(i64, String, Option<String>)>> {
+    sqlx::query_as(
+        "SELECT id, source, checkpoint FROM sweep_cycles
+         WHERE kind = 1 AND completed_at IS NULL ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(h.pool())
+    .await
+    .map_err(e)
+}
+
+async fn check_fallback(h: &H, c: &mut Checks) -> Res<()> {
+    let listed: Vec<String> = (0..5).map(|i| did("fbk", i)).collect();
+    {
+        let mut wd = w(&h.world);
+        wd.collections_supported = false;
+        wd.listed = listed
+            .iter()
+            .map(|d| (d.clone(), tid_now(), true))
+            .collect();
+    }
+    retire_cycles(h).await?;
+    h.set_cfg(|c| {
+        c.backfill.sweep.enabled = true;
+        c.backfill.sweep.source = SweepSource::RelayCollections;
+        c.backfill.sweep.full_every_days = 1;
+        c.backfill.sweep.max_outstanding = 5000;
+        c.backfill.repair.auto_start = false;
+    });
+    let sw = sweep::Sweep::default();
+    // The relay answers the probe with 501 MethodNotImplemented.
+    sweep::tick(&h.ctx, &sw).await?;
+    let first = open_full_cycle(h).await?;
+    let members = h
+        .i64("SELECT count(*) FROM cycle_outstanding WHERE did LIKE 'did:plc:fbk%'")
+        .await?;
+    c.check(
+        "a relay without listReposByCollection: the full cycle starts on relay_repos and enumerates listRepos",
+        first.as_ref().is_some_and(|(_, s, _)| s == "relay_repos") && members == 5,
+        format!("cycle {first:?}; {members} of 5 listed repos outstanding"),
+    );
+
+    // The relay gains the method: the next cycle is probed again, with
+    // the same process state, and uses it.
+    retire_cycles(h).await?;
+    w(&h.world).collections_supported = true;
+    sweep::tick(&h.ctx, &sw).await?;
+    let second = open_full_cycle(h).await?;
+    c.check(
+        "the relay is probed before every full cycle: once it has the method, the next cycle is relay_collections again",
+        second.as_ref().is_some_and(|(id, s, _)| {
+            s == "relay_collections" && Some(*id) != first.as_ref().map(|f| f.0)
+        }),
+        format!("{second:?}"),
+    );
+
+    // The relay loses the method while the cycle enumerates.
+    w(&h.world).collections_supported = false;
+    h.exec("DELETE FROM cycle_outstanding WHERE did LIKE 'did:plc:fbk%'")
+        .await?;
+    sweep::tick(&h.ctx, &sw).await?;
+    let switched = open_full_cycle(h).await?;
+    sweep::tick(&h.ctx, &sw).await?;
+    let after = open_full_cycle(h).await?;
+    let members = h
+        .i64("SELECT count(*) FROM cycle_outstanding WHERE did LIKE 'did:plc:fbk%'")
+        .await?;
+    c.check(
+        "a cycle whose relay stops offering listReposByCollection continues with relay_repos from its start, in the same cycle",
+        switched.as_ref().map(|s| (s.0, s.1.as_str(), s.2.is_none()))
+            == second.as_ref().map(|s| (s.0, "relay_repos", true))
+            && members == 5,
+        format!("after the refused page {switched:?}; a tick later {after:?}, {members} of 5 listed repos outstanding"),
+    );
+
+    retire_cycles(h).await?;
+    w(&h.world).collections_supported = true;
+    h.set_cfg(|c| {
+        c.backfill.sweep.enabled = false;
+        c.backfill.sweep.full_every_days = 0;
+        c.backfill.sweep.max_outstanding = 200;
+        c.backfill.repair.auto_start = true;
+    });
     Ok(())
 }
 

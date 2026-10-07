@@ -18,6 +18,9 @@ use crate::xrpc::{self, Backlink};
 
 /// Verified references applied per transaction.
 const APPLY_BATCH: usize = 100;
+/// Pages without a reference, in a row, before a backlink query is ended
+/// as truncated.
+const MAX_EMPTY_PAGES: u32 = 3;
 
 struct Run<'a> {
     ctx: &'a Ctx,
@@ -35,6 +38,7 @@ impl Run<'_> {
     async fn links(&mut self, target: &str, collection: &str) -> Result<Vec<Backlink>, String> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut empty_pages = 0u32;
         loop {
             if self.refs >= self.max_refs {
                 self.truncated = true;
@@ -51,6 +55,18 @@ impl Run<'_> {
             .await
             .map_err(|e| e.to_string())?;
             self.cost += 1;
+            // The reference cap counts references, so an index that
+            // answers page after page with a new cursor and no reference
+            // would be followed without end.
+            if page.is_empty() {
+                empty_pages += 1;
+                if empty_pages >= MAX_EMPTY_PAGES {
+                    self.truncated = true;
+                    return Ok(out);
+                }
+            } else {
+                empty_pages = 0;
+            }
             for l in page {
                 if self.refs >= self.max_refs {
                     self.truncated = true;

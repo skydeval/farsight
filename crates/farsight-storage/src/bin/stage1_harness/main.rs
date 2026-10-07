@@ -110,6 +110,11 @@ fn streams() -> Vec<Stream> {
             name: "per-instance cursors",
             run: stream!(streams_more::s11_instance_cursors),
         },
+        Stream {
+            n: 12,
+            name: "reactivation: OA only under the list lock",
+            run: stream!(streams_more::s12_reactivation_lock),
+        },
     ]
 }
 

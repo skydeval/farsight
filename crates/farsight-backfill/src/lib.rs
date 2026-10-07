@@ -7,6 +7,11 @@
 //! scheduler, the sweep, the debt feeder and its own budget monitor on its
 //! own pool. Config reloads on `NOTIFY farsight_config` and every 60 s by
 //! mtime.
+//!
+//! Every task is supervised (`farsight_core::task`): a panic in the
+//! scheduler loop, the sweep or the metrics listener is logged, counted
+//! and the task started again; a panic in one pass of a periodic task
+//! costs that pass; a panic in a job costs that job (see `scheduler`).
 
 #![warn(missing_docs)]
 #![allow(clippy::result_large_err)]
@@ -63,6 +68,19 @@ const COUNTER_FLUSH: Duration = Duration::from_secs(5);
 /// Series not updated for this long are dropped (bounded host labels).
 const METRIC_IDLE: Duration = Duration::from_secs(900);
 
+/// The supervised tasks, by the name their panics are counted under.
+pub const TASKS: [&str; 9] = [
+    "backfill_scheduler",
+    scheduler::JOB_TASK,
+    "backfill_sweep",
+    "backfill_feeder",
+    "backfill_budget_monitor",
+    "backfill_pending_timeouts",
+    "backfill_gauges",
+    "backfill_counter_flush",
+    "backfill_metrics_listener",
+];
+
 /// The config file path.
 pub fn config_path() -> PathBuf {
     std::env::var_os(CONFIG_PATH_ENV)
@@ -77,6 +95,7 @@ pub fn install_metrics() -> Option<PrometheusHandle> {
     match b.install_recorder() {
         Ok(h) => {
             metrics::register();
+            farsight_core::task::register(&TASKS);
             // Reconciles write history rows in this process.
             farsight_storage::history::register_metrics();
             Some(h)
@@ -242,7 +261,11 @@ fn client(cfg: &Config) -> Client {
     #[cfg(feature = "harness")]
     if std::env::var(HARNESS_PLAIN_ENV).is_ok_and(|v| v == "1") {
         tracing::warn!("harness build: outbound requests over plain HTTP");
-        return Client::Plain(reqwest::Client::new());
+        // The fakes are on loopback: a proxy named in the environment
+        // has no part in reaching them.
+        if let Ok(plain) = reqwest::Client::builder().no_proxy().build() {
+            return Client::Plain(plain);
+        }
     }
     Client::Safe(SafeClient::new(SafeClientConfig::from_config(cfg, VERSION)))
 }
@@ -284,15 +307,27 @@ async fn run_normal(
     if let Some(h) = metrics_handle {
         let c = cfg.clone();
         let s = stop.clone();
-        tasks.spawn(async move { serve_metrics(h, &c, s).await });
+        tasks.spawn(farsight_core::task::supervise(
+            "backfill_metrics_listener",
+            move || {
+                let (h, c, s) = (h.clone(), c.clone(), s.clone());
+                async move { serve_metrics(h, &c, s).await }
+            },
+        ));
     }
     // The gates first: no job runs before the budget state is known.
     budget_monitor(&ctx).await;
     let sched = Scheduler::new(ctx.clone());
-    tasks.spawn(sched.clone().run(stop.clone()));
+    tasks.spawn(farsight_core::task::supervise("backfill_scheduler", {
+        let (sched, stop) = (sched.clone(), stop.clone());
+        move || sched.clone().run(stop.clone())
+    }));
     let sweep = Arc::new(sweep::Sweep::default());
-    tasks.spawn(sweep::run(ctx.clone(), sweep, stop.clone()));
-    tasks.spawn(every(FEEDER_EVERY, stop.clone(), {
+    tasks.spawn(farsight_core::task::supervise("backfill_sweep", {
+        let (ctx, stop) = (ctx.clone(), stop.clone());
+        move || sweep::run(ctx.clone(), sweep.clone(), stop.clone())
+    }));
+    tasks.spawn(every("backfill_feeder", FEEDER_EVERY, stop.clone(), {
         let ctx = ctx.clone();
         move || {
             let ctx = ctx.clone();
@@ -305,44 +340,59 @@ async fn run_normal(
             }
         }
     }));
-    tasks.spawn(every(BUDGET_EVERY, stop.clone(), {
-        let ctx = ctx.clone();
-        move || {
+    tasks.spawn(every(
+        "backfill_budget_monitor",
+        BUDGET_EVERY,
+        stop.clone(),
+        {
             let ctx = ctx.clone();
-            async move { budget_monitor(&ctx).await }
-        }
-    }));
-    tasks.spawn(every(PERIODIC_EVERY, stop.clone(), {
-        let ctx = ctx.clone();
-        move || {
+            move || {
+                let ctx = ctx.clone();
+                async move { budget_monitor(&ctx).await }
+            }
+        },
+    ));
+    tasks.spawn(every(
+        "backfill_pending_timeouts",
+        PERIODIC_EVERY,
+        stop.clone(),
+        {
             let ctx = ctx.clone();
-            async move {
-                if let Ok(now) = jobs::db_now(&ctx.pool).await {
-                    if let Err(e) = jobs::list_phase1::pending_timeouts(&ctx, now).await {
-                        tracing::warn!(error = %e, "pending_max_age pass failed");
+            move || {
+                let ctx = ctx.clone();
+                async move {
+                    if let Ok(now) = jobs::db_now(&ctx.pool).await {
+                        if let Err(e) = jobs::list_phase1::pending_timeouts(&ctx, now).await {
+                            tracing::warn!(error = %e, "pending_max_age pass failed");
+                        }
                     }
                 }
             }
-        }
-    }));
-    tasks.spawn(every(GAUGES_EVERY, stop.clone(), {
+        },
+    ));
+    tasks.spawn(every("backfill_gauges", GAUGES_EVERY, stop.clone(), {
         let sched = sched.clone();
         move || {
             let sched = sched.clone();
             async move { sched.publish_gauges().await }
         }
     }));
-    tasks.spawn(every(COUNTER_FLUSH, stop.clone(), {
-        let ctx = ctx.clone();
-        move || {
+    tasks.spawn(every(
+        "backfill_counter_flush",
+        COUNTER_FLUSH,
+        stop.clone(),
+        {
             let ctx = ctx.clone();
-            async move {
-                if let Err(e) = ctx.counters.flush(&ctx.pool, &ctx.limits()).await {
-                    tracing::warn!(error = %e, "counter flush failed");
+            move || {
+                let ctx = ctx.clone();
+                async move {
+                    if let Err(e) = ctx.counters.flush(&ctx.pool, &ctx.limits()).await {
+                        tracing::warn!(error = %e, "counter flush failed");
+                    }
                 }
             }
-        }
-    }));
+        },
+    ));
     tracing::info!(concurrency = cfg.backfill.concurrency, "backfill running");
     let end = watch_config(&ctx, path, &mut shutdown).await;
     let _ = stop_tx.send(true);
@@ -361,13 +411,17 @@ async fn run_normal(
 }
 
 /// Runs `f` every `period` until `stop` flips (never overlapping itself).
-async fn every<F, Fut>(period: Duration, mut stop: watch::Receiver<bool>, f: F)
+/// A pass that panics is reported under `task` and the next one runs as
+/// scheduled.
+async fn every<F, Fut>(task: &'static str, period: Duration, mut stop: watch::Receiver<bool>, f: F)
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     loop {
-        f().await;
+        if let Err(message) = farsight_core::task::catch(f()).await {
+            farsight_core::task::report_panic(task, &message);
+        }
         tokio::select! {
             _ = tokio::time::sleep(period) => {}
             _ = stop.changed() => {}

@@ -10,7 +10,7 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use farsight_core::Did;
 use sqlx::PgPool;
 
-use crate::apply::{block_delete_row, item_delete_row, listblock_delete_row};
+use crate::apply::{block_delete_rows, item_delete_rows, listblock_delete_rows};
 use crate::codes::TrackState;
 use crate::counters::{CounterSink, stat};
 use crate::error::{Result, StorageError};
@@ -141,7 +141,8 @@ pub struct PurgeReport {
 
 /// Runs one batch of every `purging` list (purge→X): deletes up to
 /// [`PURGE_BATCH`] items under author(owner) + list(L) exclusive,
-/// re-checking `purging`; fires **PD** when none remain.
+/// re-checking `purging`; fires **PD** when none remain. A batch is read
+/// through the list's own index and deleted with one statement.
 pub async fn process_purges(
     pool: &PgPool,
     limits: &Limits,
@@ -176,22 +177,22 @@ pub async fn process_purges(
             let mut finished = false;
             if state == TrackState::Purging {
                 let author = t.author(&owner_did).await?;
+                // In the order of `list_items_by_list`, so the batch is the
+                // head of an index scan. Which items go first does not
+                // matter: the list is drained to the end.
                 let rkeys: Vec<String> = sqlx::query_scalar(
-                    "SELECT rkey FROM list_items WHERE list_id = $1 ORDER BY rkey LIMIT $2",
+                    "SELECT rkey FROM list_items WHERE list_id = $1
+                     ORDER BY subject_id, rkey LIMIT $2",
                 )
                 .bind(list_id)
                 .bind(PURGE_BATCH)
                 .fetch_all(&mut *t.conn)
                 .await?;
                 // Recorded only while the list's record is deleted and its
-                // owner is not; `item_delete_row` checks both. Every other
+                // owner is not; `item_delete_rows` checks both. Every other
                 // drain is a change of tracking.
                 let drained = Removal::listing(Cause::ListDeleted);
-                for rk in &rkeys {
-                    if item_delete_row(&mut t, &author, rk, Some(&drained)).await? {
-                        deleted += 1;
-                    }
-                }
+                deleted = item_delete_rows(&mut t, &author, &rkeys, None, Some(&drained)).await?;
                 if (rkeys.len() as i64) < PURGE_BATCH {
                     t.fire(list_id, Event::PurgeDone, FireArgs::default())
                         .await?;
@@ -375,15 +376,11 @@ pub async fn purge_account_batch(
             locks.insert(keys::list_lock_key(did.as_str(), lrkey), true);
         }
         t.lock_lists(&locks).await?;
-        for rk in &blocks {
-            block_delete_row(&mut t, &author, rk, None).await?;
-        }
-        for (rk, _, _) in &lbs {
-            listblock_delete_row(&mut t, &author, rk, None).await?;
-        }
-        for (rk, _) in &items {
-            item_delete_row(&mut t, &author, rk, None).await?;
-        }
+        let lb_keys: Vec<String> = lbs.iter().map(|(rk, _, _)| rk.clone()).collect();
+        let item_keys: Vec<String> = items.iter().map(|(rk, _)| rk.clone()).collect();
+        block_delete_rows(&mut t, &author, &blocks, None, None).await?;
+        listblock_delete_rows(&mut t, &author, &lb_keys, None, None).await?;
+        item_delete_rows(&mut t, &author, &item_keys, None, None).await?;
         for (list_id, _, record_state) in &own_lists {
             sqlx::query(
                 "UPDATE lists SET record_state = 2, purpose = NULL, name = NULL, created_at = NULL,
@@ -536,15 +533,11 @@ pub async fn purge_for_divergence_batch(
                 .or_insert(false);
         }
         t.lock_lists(&locks).await?;
-        for rk in &blocks {
-            block_delete_row(&mut t, &author, rk, None).await?;
-        }
-        for (rk, _, _) in &lbs {
-            listblock_delete_row(&mut t, &author, rk, None).await?;
-        }
-        for (rk, _) in &items {
-            item_delete_row(&mut t, &author, rk, None).await?;
-        }
+        let lb_keys: Vec<String> = lbs.iter().map(|(rk, _, _)| rk.clone()).collect();
+        let item_keys: Vec<String> = items.iter().map(|(rk, _)| rk.clone()).collect();
+        block_delete_rows(&mut t, &author, &blocks, None, None).await?;
+        listblock_delete_rows(&mut t, &author, &lb_keys, None, None).await?;
+        item_delete_rows(&mut t, &author, &item_keys, None, None).await?;
         let done = (blocks.len() as i64) < batch
             && (lbs.len() as i64) < batch
             && (items.len() as i64) < batch;

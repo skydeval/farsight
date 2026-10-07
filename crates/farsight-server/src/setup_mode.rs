@@ -86,24 +86,27 @@ pub async fn run(
     // Token housekeeping: expiry check every minute, re-print every 10.
     let ticker = {
         let state = state.clone();
-        tokio::spawn(async move {
-            let mut minute = tokio::time::interval(Duration::from_secs(60));
-            let mut since_print = Duration::ZERO;
-            minute.tick().await;
-            loop {
+        tokio::spawn(farsight_core::task::supervise("setup_token", move || {
+            let state = state.clone();
+            async move {
+                let mut minute = tokio::time::interval(Duration::from_secs(60));
+                let mut since_print = Duration::ZERO;
                 minute.tick().await;
-                since_print += Duration::from_secs(60);
-                match state.check_token() {
-                    Ok((_, true)) => since_print = Duration::ZERO,
-                    Ok((t, false)) if since_print >= setup_token::REPRINT => {
-                        since_print = Duration::ZERO;
-                        setup_token::print(&t);
+                loop {
+                    minute.tick().await;
+                    since_print += Duration::from_secs(60);
+                    match state.check_token() {
+                        Ok((_, true)) => since_print = Duration::ZERO,
+                        Ok((t, false)) if since_print >= setup_token::REPRINT => {
+                            since_print = Duration::ZERO;
+                            setup_token::print(&t);
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!(error = %e, "setup token file"),
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::error!(error = %e, "setup token file"),
                 }
             }
-        })
+        }))
     };
 
     let mut stop = shutdown.clone();

@@ -170,7 +170,8 @@ pub struct ApplyReport {
     pub refusals: Vec<RefusalRecord>,
     /// Tracking transitions, in order.
     pub transitions: Vec<TransitionRecord>,
-    /// Deadlock aborts retried before success.
+    /// Aborted attempts retried before success: deadlocks, and lock sets
+    /// that changed while they were being taken.
     pub deadlock_retries: u32,
     /// Per write, in batch order: what happened to it.
     pub write_outcomes: Vec<WriteOutcome>,
@@ -210,6 +211,8 @@ pub struct Txn<'c> {
     /// The history row written last (see `history`).
     pub(crate) last_history: Option<crate::history::Written>,
     authors: HashMap<Did, AuthorInfo>,
+    /// The list locks this transaction holds; `true` = exclusive.
+    held_lists: BTreeMap<i64, bool>,
     /// Counter deltas, merged into the sink only after commit.
     pub deltas: Deltas,
     /// Send `NOTIFY farsight_coverage` before commit.
@@ -245,6 +248,7 @@ impl<'c> Txn<'c> {
             now,
             last_history: None,
             authors: HashMap::new(),
+            held_lists: BTreeMap::new(),
             deltas: Deltas::default(),
             notify: false,
             report: ApplyReport::default(),
@@ -276,8 +280,14 @@ impl<'c> Txn<'c> {
                 "SELECT pg_advisory_xact_lock_shared($1)"
             };
             sqlx::query(sql).bind(*k).execute(&mut *self.conn).await?;
+            *self.held_lists.entry(*k).or_insert(false) |= *exclusive;
         }
         Ok(())
+    }
+
+    /// Whether this transaction holds the list lock `key` exclusively.
+    pub fn holds_list_exclusive(&self, key: i64) -> bool {
+        self.held_lists.get(&key).copied().unwrap_or(false)
     }
 
     /// Takes intern locks, ascending by key, for those of `dids` that have

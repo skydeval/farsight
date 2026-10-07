@@ -2,7 +2,9 @@
 //! `docs/design/list-indexing.md`, `docs/design/storage.md` and
 //! `docs/design/security.md`): one process-wide scheduler with jitter.
 //! Each job runs in its own task and never overlaps itself; a slow
-//! nightly job does not delay the budget monitor.
+//! nightly job does not delay the budget monitor. A run that panics is
+//! logged, counted and recorded like a failed one, and the job runs again
+//! at its next time.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -184,6 +186,12 @@ fn jobs() -> Vec<Job> {
         ),
         job!("rate_tables", DAY, Duration::from_secs(960), rate_tables),
         job!(
+            "account_purges",
+            DAY,
+            Duration::from_secs(1500),
+            account_purges
+        ),
+        job!(
             "history_retention",
             DAY,
             Duration::from_secs(1080),
@@ -208,6 +216,21 @@ fn jobs() -> Vec<Job> {
             counter_rebuild
         ),
     ]
+}
+
+/// The names of the periodic jobs (their panics are counted under them).
+pub fn job_names() -> Vec<&'static str> {
+    jobs().iter().map(|j| j.name).collect()
+}
+
+/// Marks a job as running until dropped, so the mark is cleared when the
+/// job's task ends, whatever ends it.
+struct RunningFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for RunningFlag {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Runs the scheduler until `stop` flips.
@@ -237,13 +260,21 @@ pub async fn run_scheduler(ctx: Arc<TaskCtx>, mut stop: watch::Receiver<bool>) {
             }
             due[i] = now + j.period + jitter(j.period / 20);
             running[i].store(true, std::sync::atomic::Ordering::Relaxed);
-            let flag = running[i].clone();
+            let flag = RunningFlag(running[i].clone());
             let ctx = ctx.clone();
             let name = j.name;
             let f = j.run;
             tokio::spawn(async move {
+                let _running = flag;
                 let started = Instant::now();
-                match f(ctx.clone()).await {
+                let result = match farsight_core::task::catch(f(ctx.clone())).await {
+                    Ok(r) => r,
+                    Err(message) => {
+                        farsight_core::task::report_panic(name, &message);
+                        Err(format!("panicked: {message}"))
+                    }
+                };
+                match result {
                     Ok(summary) if !summary.is_empty() => {
                         tracing::info!(
                             task = name,
@@ -263,7 +294,6 @@ pub async fn run_scheduler(ctx: Arc<TaskCtx>, mut stop: watch::Receiver<bool>) {
                         .await;
                     }
                 }
-                flag.store(false, std::sync::atomic::Ordering::Relaxed);
             });
         }
     }
@@ -561,6 +591,38 @@ async fn placeholder_lists(ctx: Arc<TaskCtx>) -> Result<String, String> {
         }
     }
     Ok(format!("{total} placeholder lists deleted"))
+}
+
+/// Purges of `deleted` accounts that are not finished: one that was
+/// interrupted, or that the ingest writer gave up on. An account whose
+/// purge fails is recorded and the others still run.
+async fn account_purges(ctx: Arc<TaskCtx>) -> Result<String, String> {
+    let pending = janitor::accounts_pending_purge(&ctx.pool, 1000)
+        .await
+        .map_err(err)?;
+    let limits = ctx.limits();
+    let (mut purged, mut failed) = (0u32, 0u32);
+    for did in &pending {
+        match janitor::purge_account(&ctx.pool, &limits, &ctx.counters, did).await {
+            Ok(()) => purged += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(%did, error = %e, "purging a deleted account failed");
+                let _ = farsight_storage::auth::record_op_error(
+                    &ctx.pool,
+                    "task:account_purges",
+                    Some(did.as_str()),
+                    &e.to_string(),
+                )
+                .await;
+            }
+        }
+    }
+    Ok(if pending.is_empty() {
+        String::new()
+    } else {
+        format!("{purged} deleted accounts purged, {failed} failed")
+    })
 }
 
 async fn rate_tables(ctx: Arc<TaskCtx>) -> Result<String, String> {

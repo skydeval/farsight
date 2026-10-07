@@ -200,6 +200,10 @@ impl SafeClient {
         let dns = std::sync::Arc::new(system_resolver());
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // A proxy named in the environment (`HTTPS_PROXY`, `HTTP_PROXY`,
+            // `ALL_PROXY`) would resolve and contact the target itself, past
+            // the resolver below that vets every address.
+            .no_proxy()
             .dns_resolver(std::sync::Arc::new(VettingResolver { dns: dns.clone() }))
             .user_agent(config.user_agent.clone())
             .timeout(config.timeout)
@@ -414,6 +418,12 @@ fn v4_reason(a: Ipv4Addr) -> Option<&'static str> {
         Some("link-local (incl. cloud metadata)")
     } else if o[0] == 100 && (o[1] & 0xc0) == 64 {
         Some("CGNAT (100.64.0.0/10)")
+    } else if o[0] == 198 && (o[1] & 0xfe) == 18 {
+        Some("benchmarking (198.18.0.0/15)")
+    } else if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        Some("protocol assignments (192.0.0.0/24)")
+    } else if o[0] == 192 && o[1] == 88 && o[2] == 99 {
+        Some("6to4 relay (192.88.99.0/24)")
     } else if a.is_multicast() {
         Some("multicast")
     } else if a.is_broadcast() || o[0] >= 240 {
@@ -433,6 +443,8 @@ fn v6_reason(a: Ipv6Addr) -> Option<&'static str> {
         Some("unique local (ULA)")
     } else if (s[0] & 0xffc0) == 0xfe80 {
         Some("link-local")
+    } else if (s[0] & 0xffc0) == 0xfec0 {
+        Some("site-local (fec0::/10)")
     } else if a.is_multicast() {
         Some("multicast")
     } else if let Some(v4) = a.to_ipv4_mapped() {
@@ -441,15 +453,34 @@ fn v6_reason(a: Ipv6Addr) -> Option<&'static str> {
         // NAT64 well-known prefix: judge the embedded IPv4 address.
         let v4 = Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
         v4_reason(v4)
+    } else if s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1 {
+        Some("local-use NAT64 (64:ff9b:1::/48)")
+    } else if s[..6] == [0, 0, 0, 0, 0, 0] {
+        // `::a.b.c.d`: an IPv4 address with no route of its own in IPv6.
+        Some("IPv4-compatible (::/96)")
+    } else if s[0] == 0x2002 {
+        // 6to4 and Teredo carry an IPv4 address the packet is tunnelled
+        // to: whatever that address is, the destination is not the
+        // address that was vetted.
+        Some("6to4 (2002::/16)")
+    } else if s[0] == 0x2001 && s[1] == 0 {
+        Some("Teredo (2001::/32)")
+    } else if s[0] == 0x2001 && s[1] == 2 && s[2] == 0 {
+        Some("benchmarking (2001:2::/48)")
+    } else if s[..4] == [0x100, 0, 0, 0] {
+        Some("discard-only (100::/64)")
     } else {
         None
     }
 }
 
 /// Why an address must not be contacted, or `None` if it is public:
-/// loopback, private (RFC 1918, ULA), link-local (incl. 169.254.169.254),
-/// CGNAT, multicast, unspecified and reserved addresses are refused,
-/// including IPv4 addresses embedded in IPv6 forms.
+/// loopback, private (RFC 1918, ULA, site-local), link-local (incl.
+/// 169.254.169.254), CGNAT, benchmarking, multicast, unspecified and
+/// reserved addresses are refused, as are the IPv6
+/// forms that carry an IPv4 address: IPv4-mapped and NAT64 addresses are
+/// judged by the address they carry, 6to4, Teredo and IPv4-compatible
+/// addresses are refused outright.
 pub fn blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(a) => v4_reason(a),
@@ -495,6 +526,21 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
             "64:ff9b::a00:1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "192.0.0.8",
+            "192.88.99.1",
+            // 6to4 carrying 127.0.0.1, and carrying a public address.
+            "2002:7f00:1::1",
+            "2002:808:808::1",
+            // Teredo.
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:2::1",
+            "::127.0.0.1",
+            "::8.8.8.8",
+            "64:ff9b:1::a00:1",
+            "fec0::1",
+            "100::1",
         ] {
             let ip: IpAddr = bad.parse().unwrap();
             assert!(blocked_ip_reason(ip).is_some(), "allowed {bad}");
@@ -505,6 +551,20 @@ mod tests {
             "8.8.8.8",
             "2606:4700::1111",
             "::ffff:8.8.8.8",
+            // The neighbours of the refused ranges.
+            "198.17.255.255",
+            "198.20.0.1",
+            "192.0.1.1",
+            "192.88.98.1",
+            "64:ff9b::808:808",
+            "2001:1::1",
+            "2001:4860:4860::8888",
+            "2003::1",
+            // The documentation ranges are routed nowhere and stay
+            // allowed: the integration tests put their stand-in servers
+            // on one.
+            "198.51.100.7",
+            "2001:db8::1",
         ] {
             let ip: IpAddr = ok.parse().unwrap();
             assert_eq!(blocked_ip_reason(ip), None, "blocked {ok}");

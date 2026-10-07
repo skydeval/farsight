@@ -15,8 +15,14 @@
 //!    the same transaction (see `docs/design/firehose.md` and
 //!    `docs/design/coverage.md`), and `NOTIFY farsight_coverage`.
 //!
-//! Deadlock aborts (`40P01`) are retried; they never count toward
-//! poisoned-event handling (the error type says so).
+//! Deadlock aborts (`40P01`) are retried, and so is a batch whose lock set
+//! changed while it was being taken (a reactivated account's list turned
+//! `unavailable` between the read in step 2 and the locks of step 3).
+//! Neither counts toward poisoned-event handling (the error type says so).
+//!
+//! Rows are deleted by one function per table, a set at a time: one
+//! statement removes the rows and adjusts the counters they were counted
+//! in, and their history is written by one more.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -31,7 +37,7 @@ use crate::codes::{CapType, DebtReason, RecordState, TrackState};
 use crate::counters::{CounterSink, stat};
 use crate::error::{Result, StorageError};
 use crate::firehose::FirehoseProgress;
-use crate::history::{Cause as Removed, Gone, Removal};
+use crate::history::{Cause as Removed, Gone, GoneRow, Removal, Table};
 use crate::keys::{self, CapKind, Limits};
 use crate::repo_events::{RepoEvent, unavailable_list_keys};
 use crate::tracking::FireArgs;
@@ -163,7 +169,7 @@ pub async fn apply(pool: &PgPool, ctx: &ApplyCtx<'_>, batch: &Batch) -> Result<A
                 report.deadlock_retries = attempt - 1;
                 return Ok(report);
             }
-            Err(e) if e.is_deadlock() => {
+            Err(e) if e.is_retryable_abort() => {
                 if attempt >= MAX_DEADLOCK_ATTEMPTS {
                     return Err(StorageError::DeadlockRetriesExhausted(attempt));
                 }
@@ -298,6 +304,21 @@ async fn apply_once(
 
         // 3. List locks.
         t.lock_lists(&locks.0).await?;
+
+        // The author lock does not keep a list from turning `unavailable`:
+        // a list job's timeout runs under list(L) alone. One that did so
+        // after the read above is not locked, and locking it now would
+        // break the order; the transaction is given up and run again, and
+        // its next read sees the list. Lists that turn later still are
+        // ordered after this batch (`apply_repo_event` fires OA only under
+        // a lock that is held).
+        for e in batch.events.iter().filter(|e| e.may_reactivate()) {
+            for (_, lrkey) in unavailable_list_keys(&mut t, e.did()).await? {
+                if !t.holds_list_exclusive(keys::list_lock_key(e.did().as_str(), &lrkey)) {
+                    return Err(StorageError::LockSetChanged);
+                }
+            }
+        }
 
         // 3b. Intern locks for every DID this batch may create an `actors`
         // row for, ascending. Without them two batches interning the same
@@ -689,72 +710,111 @@ async fn block_insert(
     Ok(Ok(()))
 }
 
-/// `subject_id, created_at, first_seen, last_seen` of a deleted block.
+/// `rkey, subject_id, created_at, first_seen, last_seen` of a deleted
+/// block.
 type BlockGone = (
+    String,
     i64,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
 );
 
-/// `list_id, counted, sched_key, created_at, first_seen, last_seen` of a
-/// deleted listblock.
+/// `rkey, list_id, counted, sched_key, created_at, first_seen, last_seen`
+/// of a deleted listblock, and its list's `owner_id, rkey`.
 type ListBlockGone = (
+    String,
     i64,
     bool,
     Option<String>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
+    Option<i64>,
+    Option<String>,
 );
 
-/// `list_id, subject_id, created_at, first_seen, last_seen` of a deleted
-/// listitem.
+/// `rkey, subject_id, created_at, first_seen, last_seen` of a deleted
+/// listitem, and its list's `track_state, record_state, rkey`.
 type ItemGone = (
+    String,
     i64,
-    i64,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
+    Option<i16>,
+    Option<i16>,
+    Option<String>,
 );
 
-/// Deletes one block row (with its counters). Returns whether a row went.
-/// Every path deleting `blocks` rows uses this function; it is also where
-/// `blocks_history` is written: the caller names the removal, and the
-/// account and divergence purges name none.
+fn count(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// Deletes the author's block rows at `rkeys` (with their counters) in
+/// one statement; with `below`, only rows whose rev is lower. Returns how
+/// many rows went. Every path deleting `blocks` rows uses this function;
+/// it is also where `blocks_history` is written: the caller names the
+/// removal, and the account and divergence purges name none.
+pub(crate) async fn block_delete_rows(
+    t: &mut Txn<'_>,
+    author: &AuthorInfo,
+    rkeys: &[String],
+    below: Option<i64>,
+    removal: Option<&Removal>,
+) -> Result<u64> {
+    if rkeys.is_empty() {
+        return Ok(0);
+    }
+    let gone: Vec<BlockGone> = sqlx::query_as(
+        "WITH gone AS (
+           DELETE FROM blocks
+           WHERE author_id = $1 AND rkey = ANY($2) AND ($3::BIGINT IS NULL OR rev < $3)
+           RETURNING rkey, subject_id, created_at, first_seen, last_seen),
+         author AS (
+           UPDATE actors
+           SET authored_blocks = authored_blocks - (SELECT count(*) FROM gone)::INT
+           WHERE id = $1 AND EXISTS (SELECT 1 FROM gone))
+         SELECT rkey, subject_id, created_at, first_seen, last_seen FROM gone ORDER BY rkey",
+    )
+    .bind(author.id)
+    .bind(rkeys)
+    .bind(below)
+    .fetch_all(&mut *t.conn)
+    .await?;
+    if gone.is_empty() {
+        return Ok(0);
+    }
+    let n = count(gone.len());
+    t.deltas.stat(stat::BLOCKS, -n);
+    t.deltas.host(&author.buckets, CapKind::Blocks, -n);
+    if let Some(r) = removal {
+        let rows: Vec<GoneRow> = gone
+            .into_iter()
+            .map(
+                |(rkey, subject_id, created_at, first_seen, last_seen)| GoneRow {
+                    rkey,
+                    actor_id: subject_id,
+                    list_rkey: None,
+                    created_at,
+                    first_seen,
+                    last_seen,
+                },
+            )
+            .collect();
+        t.record_removals(author, Table::Blocks, &rows, r).await?;
+    }
+    Ok(n as u64)
+}
+
+/// [`block_delete_rows`] for one row. Returns whether a row went.
 pub(crate) async fn block_delete_row(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
     rkey: &str,
     removal: Option<&Removal>,
 ) -> Result<bool> {
-    let gone: Option<BlockGone> = sqlx::query_as(
-        "DELETE FROM blocks WHERE author_id = $1 AND rkey = $2
-             RETURNING subject_id, created_at, first_seen, last_seen",
-    )
-    .bind(author.id)
-    .bind(rkey)
-    .fetch_optional(&mut *t.conn)
-    .await?;
-    let Some((subject_id, created_at, first_seen, last_seen)) = gone else {
-        return Ok(false);
-    };
-    sqlx::query("UPDATE actors SET authored_blocks = authored_blocks - 1 WHERE id = $1")
-        .bind(author.id)
-        .execute(&mut *t.conn)
-        .await?;
-    t.deltas.stat(stat::BLOCKS, -1);
-    t.deltas.host(&author.buckets, CapKind::Blocks, -1);
-    if let Some(r) = removal {
-        let gone = Gone {
-            rkey,
-            created_at,
-            first_seen,
-            last_seen,
-        };
-        t.record_block_removal(author, &gone, subject_id, r).await?;
-    }
-    Ok(true)
+    Ok(block_delete_rows(t, author, &[rkey.to_owned()], None, removal).await? > 0)
 }
 
 async fn block_delete(
@@ -1000,55 +1060,94 @@ async fn listblock_insert(
     Ok(Ok(()))
 }
 
-/// The counter path: deletes one listblock row and, if it was counted,
-/// decrements `listblock_count`, `fetch_triggers` and the lane of its
-/// stored `sched_key`, firing **−** on 1 → 0. Every path deleting
-/// `list_blocks` rows uses this function. The caller holds author(A) and
-/// list(L) exclusive. It is also where `list_blocks_history` is written:
-/// the caller names the removal, and the two purges name none. Counted
-/// and uncounted rows are recorded alike.
+/// The counter path: deletes the author's listblock rows at `rkeys` in
+/// one statement (with `below`, only rows whose rev is lower) and, for
+/// those that were counted, decrements `listblock_count`,
+/// `fetch_triggers` and the lane of each row's stored `sched_key`, firing
+/// **−** on a list that reaches 0. Every path deleting `list_blocks` rows
+/// uses this function. The caller holds author(A) and list(L) exclusive
+/// for every list the rows target. It is also where `list_blocks_history`
+/// is written: the caller names the removal, and the two purges name
+/// none. Counted and uncounted rows are recorded alike. Returns how many
+/// rows went.
+pub(crate) async fn listblock_delete_rows(
+    t: &mut Txn<'_>,
+    author: &AuthorInfo,
+    rkeys: &[String],
+    below: Option<i64>,
+    removal: Option<&Removal>,
+) -> Result<u64> {
+    if rkeys.is_empty() {
+        return Ok(0);
+    }
+    let gone: Vec<ListBlockGone> = sqlx::query_as(
+        "WITH gone AS (
+           DELETE FROM list_blocks
+           WHERE author_id = $1 AND rkey = ANY($2) AND ($3::BIGINT IS NULL OR rev < $3)
+           RETURNING rkey, list_id, counted, sched_key, created_at, first_seen, last_seen),
+         author AS (
+           UPDATE actors
+           SET authored_listblocks = authored_listblocks - (SELECT count(*) FROM gone)::INT,
+               fetch_triggers = fetch_triggers - (SELECT count(*) FROM gone WHERE counted)::INT
+           WHERE id = $1 AND EXISTS (SELECT 1 FROM gone))
+         SELECT g.rkey, g.list_id, g.counted, g.sched_key, g.created_at, g.first_seen,
+                g.last_seen, l.owner_id, l.rkey
+         FROM gone g LEFT JOIN lists l ON l.id = g.list_id ORDER BY g.rkey",
+    )
+    .bind(author.id)
+    .bind(rkeys)
+    .bind(below)
+    .fetch_all(&mut *t.conn)
+    .await?;
+    if gone.is_empty() {
+        return Ok(0);
+    }
+    let n = count(gone.len());
+    t.deltas.stat(stat::LIST_BLOCKS, -n);
+    t.deltas.host(&author.buckets, CapKind::Listblocks, -n);
+    // Counted rows per list and lane, in the order the rows went.
+    let mut lanes: Vec<((i64, Option<String>), i32)> = Vec::new();
+    let mut rows: Vec<GoneRow> = Vec::new();
+    for (rkey, list_id, counted, sched_key, created_at, first_seen, last_seen, owner, list_rkey) in
+        gone
+    {
+        if counted {
+            let lane = (list_id, sched_key);
+            match lanes.iter_mut().find(|(l, _)| *l == lane) {
+                Some((_, n)) => *n += 1,
+                None => lanes.push((lane, 1)),
+            }
+        }
+        if let (Some(owner), Some(list_rkey)) = (owner, list_rkey) {
+            rows.push(GoneRow {
+                rkey,
+                actor_id: owner,
+                list_rkey: Some(list_rkey),
+                created_at,
+                first_seen,
+                last_seen,
+            });
+        }
+    }
+    if let Some(r) = removal {
+        t.record_removals(author, Table::ListBlocks, &rows, r)
+            .await?;
+    }
+    for ((list_id, sched_key), n) in lanes {
+        t.change_listblock_count(list_id, -n, sched_key.as_deref())
+            .await?;
+    }
+    Ok(n as u64)
+}
+
+/// [`listblock_delete_rows`] for one row. Returns whether a row went.
 pub(crate) async fn listblock_delete_row(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
     rkey: &str,
     removal: Option<&Removal>,
 ) -> Result<bool> {
-    let gone: Option<ListBlockGone> = sqlx::query_as(
-        "DELETE FROM list_blocks WHERE author_id = $1 AND rkey = $2
-         RETURNING list_id, counted, sched_key, created_at, first_seen, last_seen",
-    )
-    .bind(author.id)
-    .bind(rkey)
-    .fetch_optional(&mut *t.conn)
-    .await?;
-    let Some((list_id, counted, sched_key, created_at, first_seen, last_seen)) = gone else {
-        return Ok(false);
-    };
-    if let Some(r) = removal {
-        let gone = Gone {
-            rkey,
-            created_at,
-            first_seen,
-            last_seen,
-        };
-        t.record_listblock_removal(author, &gone, list_id, r)
-            .await?;
-    }
-    sqlx::query("UPDATE actors SET authored_listblocks = authored_listblocks - 1 WHERE id = $1")
-        .bind(author.id)
-        .execute(&mut *t.conn)
-        .await?;
-    t.deltas.stat(stat::LIST_BLOCKS, -1);
-    t.deltas.host(&author.buckets, CapKind::Listblocks, -1);
-    if counted {
-        sqlx::query("UPDATE actors SET fetch_triggers = fetch_triggers - 1 WHERE id = $1")
-            .bind(author.id)
-            .execute(&mut *t.conn)
-            .await?;
-        t.change_listblock_count(list_id, -1, sched_key.as_deref())
-            .await?;
-    }
-    Ok(true)
+    Ok(listblock_delete_rows(t, author, &[rkey.to_owned()], None, removal).await? > 0)
 }
 
 async fn listblock_delete(
@@ -1306,58 +1405,90 @@ async fn item_insert(
     Ok(Ok(()))
 }
 
-/// Deletes one listitem row and its counters. The caller holds author(O)
-/// and list(L) (shared suffices: all writers of L's items hold author(O)).
-/// Every path deleting `list_items` rows uses this function; it is also
-/// where `list_items_history` is written, when the caller names the
-/// removal **and** the owner is not `deleted` **and** the list is tracked
-/// or its record is deleted — so a change of tracking is never recorded as
-/// a change of membership.
+/// Deletes the owner's listitem rows at `rkeys` and their counters in one
+/// statement; with `below`, only rows whose rev is lower. The caller
+/// holds author(O) and list(L) for every list the rows are in (shared
+/// suffices: all writers of L's items hold author(O)). Every path
+/// deleting `list_items` rows uses this function; it is also where
+/// `list_items_history` is written, when the caller names the removal
+/// **and** the owner is not `deleted` **and** the row's list is tracked
+/// or its record is deleted — so a change of tracking is never recorded
+/// as a change of membership. Returns how many rows went.
+pub(crate) async fn item_delete_rows(
+    t: &mut Txn<'_>,
+    author: &AuthorInfo,
+    rkeys: &[String],
+    below: Option<i64>,
+    removal: Option<&Removal>,
+) -> Result<u64> {
+    if rkeys.is_empty() {
+        return Ok(0);
+    }
+    let gone: Vec<ItemGone> = sqlx::query_as(
+        "WITH gone AS (
+           DELETE FROM list_items
+           WHERE owner_id = $1 AND rkey = ANY($2) AND ($3::BIGINT IS NULL OR rev < $3)
+           RETURNING rkey, list_id, subject_id, created_at, first_seen, last_seen),
+         per_list AS (
+           UPDATE lists l SET item_count = l.item_count - g.n
+           FROM (SELECT list_id, count(*)::INT AS n FROM gone GROUP BY list_id) g
+           WHERE l.id = g.list_id
+           RETURNING l.id, l.track_state, l.record_state, l.rkey),
+         owner AS (
+           UPDATE actors SET owned_items = owned_items - (SELECT count(*) FROM gone)::INT
+           WHERE id = $1 AND EXISTS (SELECT 1 FROM gone))
+         SELECT g.rkey, g.subject_id, g.created_at, g.first_seen, g.last_seen,
+                p.track_state, p.record_state, p.rkey
+         FROM gone g LEFT JOIN per_list p ON p.id = g.list_id ORDER BY g.rkey",
+    )
+    .bind(author.id)
+    .bind(rkeys)
+    .bind(below)
+    .fetch_all(&mut *t.conn)
+    .await?;
+    if gone.is_empty() {
+        return Ok(0);
+    }
+    let n = count(gone.len());
+    t.deltas.stat(stat::LIST_ITEMS, -n);
+    t.deltas.host(&author.buckets, CapKind::Items, -n);
+    if let Some(r) = removal {
+        if author.status != crate::codes::actor_status::DELETED {
+            let rows: Vec<GoneRow> = gone
+                .into_iter()
+                .filter_map(
+                    |(rkey, subject_id, created_at, first_seen, last_seen, ts, rs, lr)| {
+                        let tracked = ts
+                            .and_then(TrackState::from_code)
+                            .is_some_and(TrackState::is_tracked);
+                        let record_deleted = rs == Some(RecordState::Deleted.code());
+                        let list_rkey = lr?;
+                        (tracked || record_deleted).then_some(GoneRow {
+                            rkey,
+                            actor_id: subject_id,
+                            list_rkey: Some(list_rkey),
+                            created_at,
+                            first_seen,
+                            last_seen,
+                        })
+                    },
+                )
+                .collect();
+            t.record_removals(author, Table::ListItems, &rows, r)
+                .await?;
+        }
+    }
+    Ok(n as u64)
+}
+
+/// [`item_delete_rows`] for one row. Returns whether a row went.
 pub(crate) async fn item_delete_row(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
     rkey: &str,
     removal: Option<&Removal>,
 ) -> Result<bool> {
-    let gone: Option<ItemGone> = sqlx::query_as(
-        "DELETE FROM list_items WHERE owner_id = $1 AND rkey = $2
-             RETURNING list_id, subject_id, created_at, first_seen, last_seen",
-    )
-    .bind(author.id)
-    .bind(rkey)
-    .fetch_optional(&mut *t.conn)
-    .await?;
-    let Some((list_id, subject_id, created_at, first_seen, last_seen)) = gone else {
-        return Ok(false);
-    };
-    let list: Option<(i16, i16, String)> = sqlx::query_as(
-        "UPDATE lists SET item_count = item_count - 1 WHERE id = $1
-         RETURNING track_state, record_state, rkey",
-    )
-    .bind(list_id)
-    .fetch_optional(&mut *t.conn)
-    .await?;
-    if let (Some(r), Some((track_state, record_state, list_rkey))) = (removal, &list) {
-        let tracked = TrackState::from_code(*track_state).is_some_and(TrackState::is_tracked);
-        let record_deleted = *record_state == RecordState::Deleted.code();
-        if author.status != crate::codes::actor_status::DELETED && (tracked || record_deleted) {
-            let gone = Gone {
-                rkey,
-                created_at,
-                first_seen,
-                last_seen,
-            };
-            t.record_item_removal(author, &gone, list_rkey, subject_id, r)
-                .await?;
-        }
-    }
-    sqlx::query("UPDATE actors SET owned_items = owned_items - 1 WHERE id = $1")
-        .bind(author.id)
-        .execute(&mut *t.conn)
-        .await?;
-    t.deltas.stat(stat::LIST_ITEMS, -1);
-    t.deltas.host(&author.buckets, CapKind::Items, -1);
-    Ok(true)
+    Ok(item_delete_rows(t, author, &[rkey.to_owned()], None, removal).await? > 0)
 }
 
 async fn listitem_delete(
@@ -1556,43 +1687,42 @@ async fn apply_reconcile(t: &mut Txn<'_>, r: &Reconcile, candidates: &[String]) 
     // A listing knows only its stamp, which is neither the removing
     // commit's rev nor a bound on it: no rev, the listing clock.
     let found = Removal::listing(Removed::Reconcile);
-    for rkey in candidates {
-        // Re-check `rev < R` (a write earlier in this batch may have
-        // re-stamped the row).
-        let rev = stored_rev(t, r.collection, author.id, rkey).await?;
-        let gone = match (r.collection, rev) {
-            (_, Some(rev)) if rev >= r.stamp => false,
-            (Collection::Block, Some(_)) => {
-                block_delete_row(t, &author, rkey, Some(&found)).await?
-            }
-            (Collection::ListBlock, Some(_)) => {
-                listblock_delete_row(t, &author, rkey, Some(&found)).await?
-            }
-            (Collection::ListItem, Some(_)) => {
-                item_delete_row(t, &author, rkey, Some(&found)).await?
-            }
-            (Collection::List, _) => {
-                let row: Option<(i64, i16)> = sqlx::query_as(
-                    "SELECT id, record_state FROM lists WHERE owner_id = $1 AND rkey = $2",
+    // `rev < R` is checked again as the rows go: a write earlier in this
+    // batch may have re-stamped one.
+    let below = Some(r.stamp);
+    let gone = match r.collection {
+        Collection::Block => block_delete_rows(t, &author, candidates, below, Some(&found)).await?,
+        Collection::ListBlock => {
+            listblock_delete_rows(t, &author, candidates, below, Some(&found)).await?
+        }
+        Collection::ListItem => {
+            item_delete_rows(t, &author, candidates, below, Some(&found)).await?
+        }
+        Collection::List => {
+            let mut gone = 0;
+            for rkey in candidates {
+                let row: Option<(i64, i16, Option<i64>)> = sqlx::query_as(
+                    "SELECT id, record_state, rev FROM lists WHERE owner_id = $1 AND rkey = $2",
                 )
                 .bind(author.id)
                 .bind(rkey.as_str())
                 .fetch_optional(&mut *t.conn)
                 .await?;
                 match row {
-                    Some((id, state)) if state == RecordState::Present.code() => {
+                    Some((id, state, rev))
+                        if state == RecordState::Present.code()
+                            && rev.is_none_or(|rev| rev < r.stamp) =>
+                    {
                         list_mark_deleted(t, &author, id, true, r.stamp).await?;
-                        true
+                        gone += 1;
                     }
-                    _ => false,
+                    _ => {}
                 }
             }
-            (_, None) => false,
-        };
-        if gone {
-            t.report.reconciled += 1;
+            gone
         }
-    }
+    };
+    t.report.reconciled += gone;
     Ok(())
 }
 

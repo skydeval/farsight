@@ -103,8 +103,12 @@ impl Checked {
     }
 }
 
+/// Task name panics of single checks are counted under.
+pub const CHECK_TASK: &str = "handle_pass_check";
+
 /// Registers the series at zero.
 pub fn register() {
+    farsight_core::task::register(&[CHECK_TASK]);
     for label in ["handle", "gone", "unresolved", "unknown"] {
         ::metrics::counter!(PASS, "outcome" => label).increment(0);
     }
@@ -444,10 +448,23 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
         let mut failed: Vec<Option<String>> = Vec::new();
         while let Some(r) = checks.join_next().await {
             all += 1;
-            if let Ok(Some((did, under))) = r {
-                failed.push(under);
-                if retry.len() < RETRY_CAP {
-                    retry.push_back(did);
+            match r {
+                Ok(Some((did, under))) => {
+                    failed.push(under);
+                    if retry.len() < RETRY_CAP {
+                        retry.push_back(did);
+                    }
+                }
+                Ok(None) => {}
+                // The check's slot went back as its task unwound; the
+                // account is checked again on the next lap.
+                Err(e) => {
+                    if let Ok(panic) = e.try_into_panic() {
+                        farsight_core::task::report_panic(
+                            CHECK_TASK,
+                            &farsight_core::task::panic_message(panic.as_ref()),
+                        );
+                    }
                 }
             }
         }

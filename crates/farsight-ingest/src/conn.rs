@@ -13,6 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -145,7 +146,17 @@ pub async fn connect(
             HeaderValue::from_static(V2_SUBPROTOCOL),
         );
     }
-    let res = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(req)).await;
+    // No message, compressed or not, may be larger than a decompressed
+    // frame may be: the library's own limit is four times that.
+    let limit = usize::try_from(dict::MAX_FRAME_BYTES).unwrap_or(usize::MAX);
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(limit))
+        .max_frame_size(Some(limit));
+    let res = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(req, Some(config), false),
+    )
+    .await;
     let ws = match res {
         Err(_) => return Err(ConnectError::Transport("handshake timed out".into())),
         Ok(Ok((ws, _))) => ws,

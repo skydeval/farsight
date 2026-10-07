@@ -53,8 +53,13 @@ impl LagTracker {
 
     /// Median `witness − rev time`, clamped at zero; `None` if empty.
     pub fn instance_lag(&self) -> Option<Duration> {
-        median(self.samples.iter().map(|(w, r)| w - r).collect())
-            .map(|d| Duration::from_micros(u64::try_from(d).unwrap_or(0)))
+        median(
+            self.samples
+                .iter()
+                .map(|(w, r)| w.saturating_sub(*r))
+                .collect(),
+        )
+        .map(|d| Duration::from_micros(u64::try_from(d).unwrap_or(0)))
     }
 
     /// `now − median rev time`, in seconds; `None` if empty.

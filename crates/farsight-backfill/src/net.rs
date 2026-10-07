@@ -53,6 +53,20 @@ impl NetError {
         }
     }
 
+    /// Whether the server says it does not have the method asked for:
+    /// the XRPC error `MethodNotImplemented`, or a status that means the
+    /// route does not exist (`404`, `405`, `501`). Asked of a relay's
+    /// `listReposByCollection`, which takes no repo, so a `404` there is
+    /// never about a repo.
+    pub fn method_missing(&self) -> bool {
+        match self {
+            NetError::Http { status, name } => {
+                name == "MethodNotImplemented" || matches!(status, 404 | 405 | 501)
+            }
+            _ => false,
+        }
+    }
+
     /// The metric `kind` label.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -134,8 +148,55 @@ pub const BREAKER_FIRST: Duration = Duration::from_secs(60);
 pub const BREAKER_REPEAT: Duration = Duration::from_secs(3600);
 /// Cooldown after a 429 without `Retry-After`.
 pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Longest cooldown a host can ask for with `Retry-After`: the header is
+/// the host's own word, and a larger value would shelve the host for as
+/// long as it likes.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 /// Longest a request waits for a per-host slot before giving up.
 pub const MAX_SLOT_WAIT: Duration = Duration::from_secs(120);
+
+/// How a request that held a slot ended, for the breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotOutcome {
+    /// The host answered (a `4xx` is a healthy host saying no).
+    Healthy,
+    /// `429` or `RateLimit-Remaining: 0`: cool down this long.
+    RateLimited(Duration),
+    /// A `5xx`, a transport error or a timeout: counts toward the breaker.
+    Failed,
+}
+
+/// A slot on a host, from [`HostLimiter::acquire`]. [`Slot::release`]
+/// frees it with the request's outcome; a slot dropped without one (the
+/// request's future was cancelled, or it panicked) is freed all the same
+/// and leaves the breaker as it was.
+#[derive(Debug)]
+pub struct Slot<'a> {
+    limiter: &'a HostLimiter,
+    host: String,
+    released: bool,
+}
+
+impl Slot<'_> {
+    /// Frees the slot and records the result for the breaker.
+    pub fn release(mut self, outcome: SlotOutcome) {
+        self.released = true;
+        self.limiter.release(&self.host, Some(outcome));
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.limiter.release(&self.host, None);
+        }
+    }
+}
+
+/// `now + d`, or `now` where the sum cannot be represented.
+fn after(now: Instant, d: Duration) -> Instant {
+    now.checked_add(d).unwrap_or(now)
+}
 
 /// Per-host limits: token bucket, concurrency, cooldown, breaker.
 #[derive(Debug)]
@@ -197,7 +258,7 @@ impl HostLimiter {
     }
 
     /// Waits for a slot on `host` (bucket token + concurrency).
-    pub async fn acquire(&self, host: &str) -> Result<(), NetError> {
+    pub async fn acquire(&self, host: &str) -> Result<Slot<'_>, NetError> {
         let start = Instant::now();
         loop {
             let wait = {
@@ -217,7 +278,11 @@ impl HostLimiter {
                 if s.inflight < conc && s.tokens >= 1.0 {
                     s.tokens -= 1.0;
                     s.inflight += 1;
-                    return Ok(());
+                    return Ok(Slot {
+                        limiter: self,
+                        host: host.to_owned(),
+                        released: false,
+                    });
                 }
                 if s.tokens < 1.0 {
                     Duration::from_secs_f64(((1.0 - s.tokens) / rps).max(0.005))
@@ -238,20 +303,22 @@ impl HostLimiter {
         }
     }
 
-    /// Releases a slot and records the result for the breaker.
-    pub fn release(&self, host: &str, outcome: Result<(), Option<Duration>>) {
+    /// Frees a slot; with an outcome, records it for the breaker.
+    fn release(&self, host: &str, outcome: Option<SlotOutcome>) {
         let mut map = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
         let rps = self.rps;
         let s = Self::state(&mut map, host, rps);
         s.inflight = s.inflight.saturating_sub(1);
         let now = Instant::now();
         match outcome {
-            Ok(()) => s.consecutive_failures = 0,
-            Err(Some(retry_after)) => {
-                // 429 / RateLimit-Remaining: 0: honour Retry-After.
-                s.cooldown_until = Some(now + retry_after);
+            None => {}
+            Some(SlotOutcome::Healthy) => s.consecutive_failures = 0,
+            Some(SlotOutcome::RateLimited(retry_after)) => {
+                // 429 / RateLimit-Remaining: 0: honour Retry-After, up to
+                // the bound.
+                s.cooldown_until = Some(after(now, retry_after.min(MAX_RETRY_AFTER)));
             }
-            Err(None) => {
+            Some(SlotOutcome::Failed) => {
                 s.consecutive_failures += 1;
                 if s.consecutive_failures >= BREAKER_FAILURES {
                     let repeat = s
@@ -262,7 +329,7 @@ impl HostLimiter {
                     } else {
                         BREAKER_FIRST
                     };
-                    s.cooldown_until = Some(now + d);
+                    s.cooldown_until = Some(after(now, d));
                     s.trips += 1;
                     s.last_trip = Some(now);
                     s.consecutive_failures = 0;
@@ -369,9 +436,11 @@ fn retry_after(r: &OutboundResponse) -> Option<Duration> {
             .map(|(_, v)| v.trim().to_owned())
     };
     let remaining_zero = h("ratelimit-remaining").is_some_and(|v| v == "0");
+    // Seconds only (the date form gets the default), and never more than
+    // the bound: the number is the peer's.
     let ra = h("retry-after")
         .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs);
+        .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER));
     if r.status == 429 || remaining_zero {
         Some(ra.unwrap_or(DEFAULT_RETRY_AFTER))
     } else {
@@ -430,9 +499,13 @@ impl Net {
     async fn get_body(&self, url: &Url, method: &'static str) -> Result<Vec<u8>, NetError> {
         let host = host_key(url);
         let is_plc = host == self.plc_host;
-        if !is_plc {
-            self.hosts.acquire(&host).await?;
-        }
+        // Held across the request: if this future is dropped at the await
+        // below, the slot is freed with it.
+        let slot = if is_plc {
+            None
+        } else {
+            Some(self.hosts.acquire(&host).await?)
+        };
         let started = Instant::now();
         let r = self.client.get(url).await;
         let elapsed = started.elapsed().as_secs_f64();
@@ -444,22 +517,20 @@ impl Net {
                 .record(elapsed);
         }
         let (result, outcome) = match r {
-            Err(e) => (Err(NetError::Transport(e.to_string())), Err(None)),
+            Err(e) => (Err(NetError::Transport(e.to_string())), SlotOutcome::Failed),
             Ok(resp) => {
                 let ra = retry_after(&resp);
                 if resp.status == 200 {
-                    let outcome = if ra.is_some() { Err(ra) } else { Ok(()) };
+                    let outcome = ra.map_or(SlotOutcome::Healthy, SlotOutcome::RateLimited);
                     (Ok(resp.body), outcome)
                 } else {
                     let name = error_name(&resp.body);
                     // 4xx answers are healthy hosts saying no; only 5xx, 429
                     // and transport errors count toward the breaker.
-                    let outcome = if ra.is_some() {
-                        Err(ra)
-                    } else if resp.status >= 500 {
-                        Err(None)
-                    } else {
-                        Ok(())
+                    let outcome = match ra {
+                        Some(d) => SlotOutcome::RateLimited(d),
+                        None if resp.status >= 500 => SlotOutcome::Failed,
+                        None => SlotOutcome::Healthy,
                     };
                     (
                         Err(NetError::Http {
@@ -471,8 +542,8 @@ impl Net {
                 }
             }
         };
-        if !is_plc {
-            self.hosts.release(&host, outcome);
+        if let Some(slot) = slot {
+            slot.release(outcome);
         }
         if let Err(e) = &result {
             metrics::counter!(m::PDS_ERRORS, "host" => label, "kind" => e.kind()).increment(1);
@@ -503,15 +574,14 @@ mod tests {
     #[tokio::test]
     async fn concurrency_and_breaker() {
         let l = HostLimiter::new(100, 2);
-        l.acquire("h").await.unwrap();
-        l.acquire("h").await.unwrap();
+        let a = l.acquire("h").await.unwrap();
+        let b = l.acquire("h").await.unwrap();
         assert!(!l.has_capacity("h"));
-        l.release("h", Ok(()));
+        a.release(SlotOutcome::Healthy);
         assert!(l.has_capacity("h"));
-        l.release("h", Ok(()));
+        b.release(SlotOutcome::Healthy);
         for _ in 0..BREAKER_FAILURES {
-            l.acquire("h").await.unwrap();
-            l.release("h", Err(None));
+            l.acquire("h").await.unwrap().release(SlotOutcome::Failed);
         }
         assert!(l.cooling("h").is_some_and(|s| s <= 60));
         assert!(matches!(
@@ -523,8 +593,109 @@ mod tests {
     #[tokio::test]
     async fn retry_after_cools_host() {
         let l = HostLimiter::new(100, 2);
-        l.acquire("x").await.unwrap();
-        l.release("x", Err(Some(Duration::from_secs(30))));
+        l.acquire("x")
+            .await
+            .unwrap()
+            .release(SlotOutcome::RateLimited(Duration::from_secs(30)));
         assert!(l.cooling("x").is_some_and(|s| s > 20));
+    }
+
+    fn response(status: u16, headers: &[(&str, &str)]) -> OutboundResponse {
+        OutboundResponse {
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            body: Vec::new(),
+            final_url: Url::parse("https://pds.example/").unwrap(),
+        }
+    }
+
+    #[test]
+    fn retry_after_is_bounded() {
+        let ra = |v: &str| retry_after(&response(429, &[("retry-after", v)]));
+        assert_eq!(ra("30"), Some(Duration::from_secs(30)));
+        assert_eq!(ra("86400"), Some(MAX_RETRY_AFTER));
+        assert_eq!(ra("18446744073709551615"), Some(MAX_RETRY_AFTER));
+        // Not a number of seconds: the default.
+        assert_eq!(ra("99999999999999999999999"), Some(DEFAULT_RETRY_AFTER));
+        assert_eq!(ra("-5"), Some(DEFAULT_RETRY_AFTER));
+        assert_eq!(
+            ra("Wed, 21 Oct 2026 07:28:00 GMT"),
+            Some(DEFAULT_RETRY_AFTER)
+        );
+        assert_eq!(retry_after(&response(200, &[("retry-after", "5")])), None);
+        assert_eq!(
+            retry_after(&response(200, &[("ratelimit-remaining", "0")])),
+            Some(DEFAULT_RETRY_AFTER)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_huge_cooldown_neither_panics_nor_outlasts_the_bound() {
+        let l = HostLimiter::new(100, 2);
+        // What `Retry-After: 18446744073709551615` would ask for, handed
+        // to the limiter unclamped.
+        l.acquire("x")
+            .await
+            .unwrap()
+            .release(SlotOutcome::RateLimited(Duration::from_secs(u64::MAX)));
+        assert!(
+            l.cooling("x")
+                .is_some_and(|s| s <= MAX_RETRY_AFTER.as_secs())
+        );
+        assert!(l.has_capacity("y"));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_slot_is_freed_and_is_not_a_failure() {
+        let l = HostLimiter::new(100, 1);
+        for _ in 0..(BREAKER_FAILURES * 2) {
+            // A request whose future is dropped while it holds the slot.
+            let slot = l.acquire("h").await.unwrap();
+            assert!(!l.has_capacity("h"));
+            drop(slot);
+            assert!(l.has_capacity("h"));
+        }
+        assert_eq!(l.cooling("h"), None);
+        // The same when the holder panics.
+        let r = farsight_core::task::catch(async {
+            let _slot = l.acquire("h").await.unwrap();
+            if std::hint::black_box(true) {
+                panic!("job failed");
+            }
+        })
+        .await;
+        assert!(r.is_err());
+        assert!(l.has_capacity("h"));
+    }
+
+    #[test]
+    fn missing_method_is_told_from_other_failures() {
+        let http = |status: u16, name: &str| NetError::Http {
+            status,
+            name: name.to_owned(),
+        };
+        assert!(http(501, "MethodNotImplemented").method_missing());
+        assert!(http(400, "MethodNotImplemented").method_missing());
+        assert!(http(404, "").method_missing());
+        assert!(http(405, "").method_missing());
+        assert!(http(501, "").method_missing());
+        // A relay that is down, busy or refusing is not one without the
+        // method.
+        assert!(!http(500, "").method_missing());
+        assert!(!http(502, "").method_missing());
+        assert!(!http(429, "").method_missing());
+        assert!(!http(400, "InvalidRequest").method_missing());
+        assert!(!NetError::Transport("connection refused".into()).method_missing());
+        assert!(!NetError::Decode("no repos".into()).method_missing());
+        assert!(
+            !NetError::Cooling {
+                host: "relay".into(),
+                secs: 5
+            }
+            .method_missing()
+        );
     }
 }

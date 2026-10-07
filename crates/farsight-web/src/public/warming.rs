@@ -53,6 +53,23 @@ pub const IN_FLIGHT: usize = 64;
 /// How often an idle or switched-off worker looks at the setting.
 pub const IDLE_POLL: Duration = Duration::from_secs(5);
 
+/// Task name panics of single checks are counted under.
+pub const CHECK_TASK: &str = "handle_warming_check";
+
+/// One check in flight: its DID is marked in the queue and its slot is
+/// held until this is dropped.
+struct Checking {
+    st: Arc<WebState>,
+    raw: String,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for Checking {
+    fn drop(&mut self) {
+        self.st.public.warm.finished(&self.raw);
+    }
+}
+
 /// `farsight_handle_warming_total{outcome}`.
 pub const WARMING: &str = "farsight_handle_warming_total";
 /// `farsight_handle_warming_queue`: DIDs waiting.
@@ -370,11 +387,20 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
         let Ok(slot) = slots.clone().acquire_owned().await else {
             return;
         };
-        let st2 = st.clone();
+        // The DID is marked as being checked until the guard is dropped,
+        // and the slot is held as long: both are given back when the task
+        // ends, also when the check panics.
+        let checking = Checking {
+            st: st.clone(),
+            raw,
+            _slot: slot,
+        };
         tokio::spawn(async move {
-            verify_one(st2.clone(), did).await;
-            st2.public.warm.finished(&raw);
-            drop(slot);
+            if let Err(message) =
+                farsight_core::task::catch(verify_one(checking.st.clone(), did)).await
+            {
+                farsight_core::task::report_panic(CHECK_TASK, &message);
+            }
         });
     }
 }

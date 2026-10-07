@@ -5,7 +5,9 @@
 //! and every remaining row is terminal.
 //!
 //! - Full cycles enumerate `backfill.sweep.source`; `relay_collections`
-//!   falls back to `relay_repos` when the relay lacks it.
+//!   falls back to `relay_repos` when the relay lacks it: the relay is
+//!   probed before every full cycle, and a cycle under way switches when
+//!   a page is answered with "no such method".
 //! - Repair cycles cover every closed, unhealed gap at their start with
 //!   `listRepos` candidates (rev time ≥ `from − repair_slack − lag`, plus
 //!   reactivations); with the relay down they re-list every known DID and
@@ -72,44 +74,53 @@ pub struct Member {
     pub reactivated: bool,
 }
 
-/// Sweep state shared with the dashboard metrics.
+/// `sweep_cycles.source` of a cycle enumerating `listReposByCollection`.
+pub const RELAY_COLLECTIONS: &str = "relay_collections";
+/// `sweep_cycles.source` of a cycle enumerating `listRepos`.
+pub const RELAY_REPOS: &str = "relay_repos";
+/// `sweep_cycles.source` of a cycle enumerating the PLC export.
+pub const PLC: &str = "plc";
+
+/// Sweep state kept between ticks.
 #[derive(Default)]
 pub struct Sweep {
-    /// `relay_collections` unavailable: the sweep uses `relay_repos`.
+    /// The relay was last found without `listReposByCollection`: full
+    /// cycles use `relay_repos`.
     pub fell_back: AtomicBool,
-    checked: AtomicBool,
 }
 
 impl Sweep {
-    /// The source label a new full cycle uses.
+    /// The source label a new full cycle uses. With `relay_collections`
+    /// configured the relay is asked for one repo first, every time: a
+    /// relay without the method gets a `relay_repos` cycle, and one that
+    /// gained it since the last cycle is used with it again. Any other
+    /// failure (the relay is down, or busy) says nothing about the method
+    /// and leaves the configured source; the cycle's pages retry.
     async fn full_source(&self, ctx: &Ctx) -> &'static str {
         match ctx.cfg().backfill.sweep.source {
-            SweepSource::RelayRepos => "relay_repos",
-            SweepSource::Plc => "plc",
+            SweepSource::RelayRepos => RELAY_REPOS,
+            SweepSource::Plc => PLC,
             SweepSource::RelayCollections => {
-                if !self.checked.swap(true, Ordering::Relaxed) {
-                    let relay = ctx.cfg().backfill.relay_url.clone();
-                    let probe = xrpc::list_repos_by_collection(
-                        &ctx.net,
-                        &relay,
-                        Collection::List.nsid(),
-                        None,
-                        1,
-                    )
-                    .await;
-                    let missing = matches!(&probe, Err(e) if e.kind() == "http"
-                        && matches!(e.xrpc_name(), Some("MethodNotImplemented") | None));
-                    if missing {
-                        tracing::warn!(
-                            "relay lacks listReposByCollection; sweep falls back to relay_repos"
-                        );
-                        self.fell_back.store(true, Ordering::Relaxed);
-                    }
+                let relay = ctx.cfg().backfill.relay_url.clone();
+                let probe = xrpc::list_repos_by_collection(
+                    &ctx.net,
+                    &relay,
+                    Collection::List.nsid(),
+                    None,
+                    1,
+                )
+                .await;
+                let missing = matches!(&probe, Err(e) if e.method_missing());
+                if missing {
+                    tracing::warn!(
+                        "relay lacks listReposByCollection; sweep falls back to relay_repos"
+                    );
                 }
-                if self.fell_back.load(Ordering::Relaxed) {
-                    "relay_repos"
+                self.fell_back.store(missing, Ordering::Relaxed);
+                if missing {
+                    RELAY_REPOS
                 } else {
-                    "relay_collections"
+                    RELAY_COLLECTIONS
                 }
             }
         }
@@ -187,7 +198,7 @@ pub async fn tick(ctx: &Ctx, sweep: &Sweep) -> Res<()> {
             // rows never exceed the bound.
             if outstanding < max_out {
                 let room = u32::try_from((max_out - outstanding).min(PAGE)).unwrap_or(1);
-                enumerate_page(ctx, c, room).await?;
+                enumerate_page(ctx, sweep, c, room).await?;
             }
         }
         maybe_complete(ctx, c).await?;
@@ -233,7 +244,7 @@ async fn maybe_start(ctx: &Ctx, sweep: &Sweep, first_applied: DateTime<Utc>) -> 
         if let Some(from) = from {
             let relay = cfg.backfill.relay_url.clone();
             let source = match xrpc::list_repos(&ctx.net, &relay, None, 1).await {
-                Ok(_) => "relay_repos",
+                Ok(_) => RELAY_REPOS,
                 Err(err) => {
                     tracing::warn!(error = %err, "relay unavailable; repair re-lists known DIDs");
                     KNOWN_DIDS
@@ -302,7 +313,7 @@ async fn adopt(ctx: &Ctx, c: &Cycle, first_applied: DateTime<Utc>) -> Res<()> {
     let source = if c.kind == REPAIR {
         let relay = ctx.cfg().backfill.relay_url.clone();
         match xrpc::list_repos(&ctx.net, &relay, None, 1).await {
-            Ok(_) => "relay_repos".to_owned(),
+            Ok(_) => RELAY_REPOS.to_owned(),
             Err(err) => {
                 tracing::warn!(error = %err, "relay unavailable; repair re-lists known DIDs");
                 KNOWN_DIDS.to_owned()
@@ -349,20 +360,38 @@ async fn adopt(ctx: &Ctx, c: &Cycle, first_applied: DateTime<Utc>) -> Res<()> {
     Ok(())
 }
 
-/// Fetches the next page of the cycle's source. Returns the members, the
-/// next checkpoint, and whether enumeration finished.
-async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Res<(Vec<Member>, Option<String>, bool)> {
+/// Why a page of a cycle's source could not be read.
+#[derive(Debug)]
+enum PageError {
+    /// The relay does not have `listReposByCollection`.
+    NoCollectionListing,
+    /// Anything else; the page is retried.
+    Other(String),
+}
+
+impl From<String> for PageError {
+    fn from(s: String) -> PageError {
+        PageError::Other(s)
+    }
+}
+
+/// One page: the members, the next checkpoint, whether enumeration
+/// finished.
+type Page = (Vec<Member>, Option<String>, bool);
+
+/// Fetches the next page of the cycle's source.
+async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
     let cfg = ctx.cfg();
     let relay = cfg.backfill.relay_url.clone();
     let cp = c.checkpoint.clone();
     // Repairs enumerate listRepos whatever the sweep source.
     let source = if c.kind == REPAIR && c.source != KNOWN_DIDS {
-        "relay_repos"
+        RELAY_REPOS
     } else {
         c.source.as_str()
     };
     match source {
-        "relay_collections" => {
+        RELAY_COLLECTIONS => {
             // Checkpoint `<collection index>|<cursor>`.
             let (mut idx, cursor) = match cp.as_deref().and_then(|s| s.split_once('|')) {
                 Some((i, cur)) => (
@@ -377,7 +406,13 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Res<(Vec<Member>, Option<
             let (dids, next) =
                 xrpc::list_repos_by_collection(&ctx.net, &relay, k.nsid(), cursor.as_deref(), room)
                     .await
-                    .map_err(e)?;
+                    .map_err(|err| {
+                        if err.method_missing() {
+                            PageError::NoCollectionListing
+                        } else {
+                            PageError::Other(err.to_string())
+                        }
+                    })?;
             let members = dids
                 .into_iter()
                 .map(|did| Member {
@@ -395,7 +430,7 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Res<(Vec<Member>, Option<
             let done = idx >= SWEPT.len();
             Ok((members, Some(next_cp), done))
         }
-        "relay_repos" => {
+        RELAY_REPOS => {
             let (repos, next) = xrpc::list_repos(&ctx.net, &relay, cp.as_deref(), room)
                 .await
                 .map_err(e)?;
@@ -414,20 +449,23 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Res<(Vec<Member>, Option<
             let done = next.is_none();
             Ok((members, next.or(cp), done))
         }
-        "plc" => {
+        PLC => {
             let ops = xrpc::plc_export(&ctx.net, &cfg.backfill.plc_url, cp.as_deref(), room)
                 .await
                 .map_err(e)?;
             let done = ops.len() < room.min(1000) as usize;
             let next = ops.last().map(|o| o.created_at.clone()).or(cp);
-            let mut members = Vec::with_capacity(ops.len());
+            // The directory decides how many operations a page holds, so
+            // DIDs are told apart with a set, not by searching the page.
+            let mut members = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for op in ops.into_iter().filter(|o| !o.nullified) {
                 if cfg.backfill.plc_seed_from_export {
                     if let Some(p) = &op.pds {
                         ctx.resolver.seed(&op.did, p);
                     }
                 }
-                if !members.iter().any(|m: &Member| m.did == op.did) {
+                if seen.insert(op.did.clone()) {
                     members.push(Member {
                         did: op.did,
                         reactivated: false,
@@ -518,10 +556,31 @@ async fn repair_candidates(ctx: &Ctx, c: &Cycle, repos: Vec<xrpc::ListedRepo>) -
 
 /// Enumerates one page into `cycle_outstanding` and advances the
 /// checkpoint in the same transaction.
-async fn enumerate_page(ctx: &Ctx, c: &Cycle, room: u32) -> Res<()> {
+async fn enumerate_page(ctx: &Ctx, sweep: &Sweep, c: &Cycle, room: u32) -> Res<()> {
     let (members, next, done) = match next_page(ctx, c, room).await {
         Ok(p) => p,
-        Err(err) => {
+        Err(PageError::NoCollectionListing) => {
+            // The relay lost the method, or was never probed with it (a
+            // probe that found it down): the cycle goes on with
+            // `listRepos` from its start. Members already enumerated stay.
+            sqlx::query(
+                "UPDATE sweep_cycles SET source = $2, checkpoint = NULL
+                 WHERE id = $1 AND source = $3 AND enumerated_at IS NULL",
+            )
+            .bind(c.id)
+            .bind(RELAY_REPOS)
+            .bind(RELAY_COLLECTIONS)
+            .execute(&ctx.pool)
+            .await
+            .map_err(e)?;
+            sweep.fell_back.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                cycle = c.id,
+                "relay lacks listReposByCollection; the cycle continues with relay_repos"
+            );
+            return Ok(());
+        }
+        Err(PageError::Other(err)) => {
             tracing::warn!(cycle = c.id, error = %err, "sweep enumeration page failed; retrying");
             return Ok(());
         }

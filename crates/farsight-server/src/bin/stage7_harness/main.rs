@@ -681,6 +681,72 @@ async fn check_modes(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<(), String> {
     Ok(())
 }
 
+/// Loopback mode is for local clients, and outbound requests ignore a
+/// proxy named in the environment. The server trusts loopback as a proxy,
+/// so the harness can present a request as forwarded for a public
+/// address; its environment names a proxy nothing listens on.
+async fn check_local_only(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
+    c.section("2b. loopback mode and the client's address; proxies in the environment");
+    let cfg = format!(
+        "{}\n[proxy]\nmode = \"forwarded\"\ntrusted = [\"127.0.0.0/8\"]\n",
+        ctx.config(HOSTNAME, &format!("admin_ui = true\nadmin_did = \"{D1}\""))
+    );
+    let dead = "http://127.0.0.1:1";
+    let s = Srv::with_config(
+        "local",
+        &cfg,
+        &[
+            ("HTTP_PROXY", dead),
+            ("HTTPS_PROXY", dead),
+            ("ALL_PROXY", dead),
+            ("http_proxy", dead),
+            ("https_proxy", dead),
+            ("all_proxy", dead),
+        ],
+    )
+    .await?;
+    let host = s.loopback();
+    let remote = [("host", host.as_str()), ("x-forwarded-for", "203.0.113.9")];
+    let button =
+        |r: &Resp| r.text.contains("Sign in with ATProto") && r.text.contains("action=\"/enter\"");
+    let http = ctx.fresh();
+    let page = http.get(&format!("{}/enter", s.base), &remote).await?;
+    let local_page = http
+        .get(&format!("{}/enter", s.base), &[("host", host.as_str())])
+        .await?;
+    let _ = ctx.standin.take_events();
+    let posted = http
+        .post_form(&format!("{}/enter", s.base), &remote, &[])
+        .await?;
+    let sent = ctx.standin.take_events().len();
+    c.check(
+        "Host 127.0.0.1 from a client at a public address is not loopback mode: no button, POST /enter is 400, no flow cookie, no request to the account's server",
+        page.status == 200
+            && !button(&page)
+            && posted.status == 400
+            && posted.header("location").is_none()
+            && set_cookie(&posted, "farsight_flow").is_none()
+            && sent == 0,
+        format!(
+            "page {} button {}; POST {} location {:?}; requests the account's server received: {sent}",
+            page.status,
+            button(&page),
+            posted.status,
+            posted.header("location")
+        ),
+    );
+    let signed = ctx.sign_in(&s, &ctx.fresh(), &host).await?;
+    c.check(
+        "the same Host from a local client has the button and a sign-in completes — with HTTP_PROXY, HTTPS_PROXY and ALL_PROXY naming a proxy nothing listens on, so no outbound request went through it",
+        button(&local_page)
+            && signed.status == 200
+            && set_cookie(&signed, "farsight_admin").is_some(),
+        format!("page button {}; sign-in {}", button(&local_page), signed.short()),
+    );
+    ctx.retire(s);
+    Ok(())
+}
+
 async fn check_unhostable(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     let mut detail = Vec::new();
     let mut ok = true;
@@ -1382,11 +1448,15 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             closed.push(format!("{p}: {}", r.status));
         }
     }
+    let dash = http
+        .get(&format!("{}/admin", s.base), &[("cookie", &cookie)])
+        .await?;
+    let csrf = csrf_of(&dash.text).unwrap_or_default();
     let logout = http
         .post_form(
             &format!("{}/admin/logout", s.base),
             &[("cookie", &cookie)],
-            &[],
+            &[("csrf", &csrf)],
         )
         .await?;
     let after = http
@@ -2081,6 +2151,7 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
     // The CLI section restarts A on its directory and retires it.
     check_cli(c, &ctx, a, &admin_cookie).await?;
     check_unhostable(c, &ctx).await?;
+    check_local_only(c, &ctx).await?;
     check_lifetime(c, &ctx, &cfg_a).await?;
     check_gates(c, &ctx).await?;
     check_rates(c, &ctx, &cfg_a).await?;

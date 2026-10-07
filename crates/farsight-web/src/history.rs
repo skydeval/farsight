@@ -275,6 +275,11 @@ fn history_cursor(q: &Params, key: &str) -> Result<Option<HistoryCursor>, BadCur
     let Some((micros, id)) = cursor::micros_id(q.get(key)).map_err(|_| BadCursor)? else {
         return Ok(None);
     };
+    // A cursor is a `removed_at` this server handed out: never before the
+    // epoch, which is also outside what the database stores as a time.
+    if micros < 0 {
+        return Err(BadCursor);
+    }
     let removed_at = DateTime::<Utc>::from_timestamp_micros(micros).ok_or(BadCursor)?;
     Ok(Some(HistoryCursor { removed_at, id }))
 }

@@ -6,6 +6,14 @@
 //! ```
 //!
 //! [`Ingest::start`] spawns both tasks and returns an [`IngestHandle`].
+//!
+//! The reader and the writer are one pipeline: a batch the writer holds
+//! exists nowhere else, and the reader's position is only as good as what
+//! the writer committed. If either of them panics, the other ends with
+//! it, the panic is logged and counted, and [`IngestHandle::failed`]
+//! reports it; the embedding process then exits, and the next start
+//! resumes from the persisted cursor. The counter flusher keeps no state
+//! and is started again in place.
 
 #![warn(missing_docs)]
 
@@ -27,7 +35,7 @@ use farsight_storage::counters::{CounterSink, FLUSH_INTERVAL};
 use farsight_storage::gates::SharedGates;
 use farsight_storage::keys::Limits;
 use sqlx::PgPool;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 pub use reader::Control;
@@ -38,6 +46,15 @@ pub const CHANNEL_CAPACITY: usize = 10_000;
 
 /// Ingest connection pool size (own pool, 4 connections).
 pub const POOL_SIZE: u32 = 4;
+
+/// Task name of the reader (panic metric, [`IngestHandle::failed`]).
+pub const READER_TASK: &str = "ingest_reader";
+/// Task name of the writer.
+pub const WRITER_TASK: &str = "ingest_writer";
+/// Task name of the counter flusher.
+pub const FLUSHER_TASK: &str = "ingest_counter_flush";
+/// The tasks ingest runs.
+pub const TASKS: [&str; 3] = [READER_TASK, WRITER_TASK, FLUSHER_TASK];
 
 /// Fault injection for the harness: events from these DIDs fail every
 /// apply attempt, exercising the poisoned-event path.
@@ -104,8 +121,22 @@ pub struct IngestHandle {
     pub faults: Arc<FaultHook>,
     tasks: Vec<JoinHandle<()>>,
     flusher: JoinHandle<()>,
+    failed: watch::Receiver<Option<&'static str>>,
     pool: PgPool,
     limits: Limits,
+}
+
+/// Runs one half of the pipeline; a panic is reported and published on
+/// `failed` with the task's name.
+async fn pipeline_task(
+    name: &'static str,
+    run: impl std::future::Future<Output = ()>,
+    failed: watch::Sender<Option<&'static str>>,
+) {
+    if let Err(message) = farsight_core::task::catch(run).await {
+        farsight_core::task::report_panic(name, &message);
+        let _ = failed.send(Some(name));
+    }
 }
 
 /// The dashboard / `getStats` firehose fields.
@@ -156,6 +187,24 @@ impl IngestHandle {
         firehose_status(&self.pool, Some(&self.stats)).await
     }
 
+    /// Resolves with the name of the pipeline task that panicked. The
+    /// pipeline is over by then and is not started again in this process:
+    /// the caller exits. Never resolves while ingest runs or after an
+    /// orderly shutdown.
+    pub fn failed(&self) -> impl std::future::Future<Output = &'static str> + Send + 'static {
+        let mut rx = self.failed.clone();
+        async move {
+            loop {
+                if let Some(name) = *rx.borrow_and_update() {
+                    return name;
+                }
+                if rx.changed().await.is_err() {
+                    return std::future::pending().await;
+                }
+            }
+        }
+    }
+
     /// Stops reading, lets the writer drain, waits for both tasks and
     /// flushes the approximate counters one last time.
     pub async fn shutdown(self) {
@@ -194,10 +243,24 @@ impl Ingest {
         let pending = farsight_storage::janitor::accounts_pending_purge(&pool, 1000)
             .await
             .map_err(|e| e.to_string())?;
+        // One account whose purge fails does not keep the process from
+        // starting: the failure is recorded and the purge is taken up
+        // again by the daily task.
         for did in &pending {
-            farsight_storage::janitor::purge_account(&pool, &cfg.limits, &counters, did)
-                .await
-                .map_err(|e| e.to_string())?;
+            if let Err(e) =
+                farsight_storage::janitor::purge_account(&pool, &cfg.limits, &counters, did).await
+            {
+                tracing::error!(%did, error = %e, "purging a deleted account failed");
+                ::metrics::counter!(crate::metrics::STORAGE_ERRORS, "op" => "purge_account")
+                    .increment(1);
+                let _ = farsight_storage::auth::record_op_error(
+                    &pool,
+                    "ingest",
+                    Some(did.as_str()),
+                    &format!("purge_account failed: {e}"),
+                )
+                .await;
+            }
         }
 
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -228,17 +291,28 @@ impl Ingest {
             let counters = counters.clone();
             let pool = pool.clone();
             let limits = cfg.limits.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(FLUSH_INTERVAL);
-                loop {
-                    tick.tick().await;
-                    if let Err(e) = counters.flush(&pool, &limits).await {
-                        tracing::warn!(error = %e, "counter flush failed");
+            tokio::spawn(farsight_core::task::supervise(FLUSHER_TASK, move || {
+                let (counters, pool, limits) = (counters.clone(), pool.clone(), limits.clone());
+                async move {
+                    let mut tick = tokio::time::interval(FLUSH_INTERVAL);
+                    loop {
+                        tick.tick().await;
+                        if let Err(e) = counters.flush(&pool, &limits).await {
+                            tracing::warn!(error = %e, "counter flush failed");
+                        }
                     }
                 }
-            })
+            }))
         };
-        let tasks = vec![tokio::spawn(writer.run(rx)), tokio::spawn(reader.run())];
+        let (failed_tx, failed) = watch::channel(None);
+        let tasks = vec![
+            tokio::spawn(pipeline_task(
+                WRITER_TASK,
+                writer.run(rx),
+                failed_tx.clone(),
+            )),
+            tokio::spawn(pipeline_task(READER_TASK, reader.run(), failed_tx)),
+        ];
         Ok(IngestHandle {
             control: ctl_tx,
             stats,
@@ -247,6 +321,7 @@ impl Ingest {
             faults,
             tasks,
             flusher,
+            failed,
             pool,
             limits: cfg.limits,
         })
