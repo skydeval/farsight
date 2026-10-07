@@ -11,14 +11,18 @@ pub const RATE_LIMITED: &str = "farsight_rate_limited_total";
 pub const COVERAGE_EXCEPTIONS: &str = "farsight_coverage_exceptions";
 /// `farsight_lists{state}`.
 pub const LISTS: &str = "farsight_lists";
+/// `farsight_coverage_snapshot_age_seconds`: time since the coverage
+/// snapshot that responses are composed on was read.
+pub const SNAPSHOT_AGE: &str = "farsight_coverage_snapshot_age_seconds";
 
 /// Every API metric.
-pub const ALL: [&str; 5] = [
+pub const ALL: [&str; 6] = [
     QUERY_REQUESTS,
     QUERY_DURATION,
     RATE_LIMITED,
     COVERAGE_EXCEPTIONS,
     LISTS,
+    SNAPSHOT_AGE,
 ];
 
 /// Counts one rate-limited request of `class`.

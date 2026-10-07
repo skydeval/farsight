@@ -237,12 +237,28 @@ CREATE TABLE firehose_gaps (
   id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   from_at      TIMESTAMPTZ NOT NULL,
   to_at        TIMESTAMPTZ,           -- NULL while the gap is open (an interval spent on v1)
-  cause        SMALLINT NOT NULL,     -- 1 cursor_too_old 2 heuristic 3 failover 4 sync_unavailable
+  cause        SMALLINT NOT NULL,     -- 1 cursor_too_old 2 heuristic 3 failover 4 sync_unavailable 5 seam_unrepaired
   detected_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   healed_at    TIMESTAMPTZ,
   healed_witness TIMESTAMPTZ,
   repair_cycle_id BIGINT,
-  CONSTRAINT firehose_gaps_cause_code CHECK (cause IN (1, 2, 3, 4))
+  CONSTRAINT firehose_gaps_cause_code CHECK (cause IN (1, 2, 3, 4, 5))
+);
+
+-- Seam windows that still have to be read again: one row per resumed
+-- session, deleted when its re-read has been applied.
+CREATE TABLE firehose_seams (
+  id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  source_url   TEXT NOT NULL,
+  protocol     SMALLINT NOT NULL,     -- 1 v1 2 v2
+  trigger      SMALLINT NOT NULL,     -- 1 resume 2 failover 3 clamp_recovery
+  from_at      TIMESTAMPTZ NOT NULL,  -- witness clock
+  to_at        TIMESTAMPTZ,           -- NULL until the session has caught up or ended
+  due_at       TIMESTAMPTZ,           -- the re-read is not started before this
+  attempts     INT NOT NULL DEFAULT 0, -- re-reads that failed
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT firehose_seams_protocol_code CHECK (protocol IN (1, 2)),
+  CONSTRAINT firehose_seams_trigger_code CHECK (trigger IN (1, 2, 3))
 );
 
 -- ---------------------------------------------------------------------

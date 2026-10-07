@@ -633,6 +633,39 @@ async fn mode_a(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
         resume_gaps.is_empty(),
         format!("{resume_gaps:?}"),
     );
+    // The reconnect's seam window: on record from the session's first
+    // event, read again after the delay, and removed only once the re-read
+    // reached its end and was applied.
+    let seams_left = farsight_storage::firehose::pending_seams(&run.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let seam = &cfg.firehose.tuning;
+    let seam_needs =
+        seam.seam_repair_delay.get() + seam.seam_repair_after.get() + Duration::from_secs(60);
+    if total / 2 >= seam_needs {
+        c.check(
+            "3: the reconnect's seam window was read again and its record removed",
+            final_stats.seam_repairs >= 1 && seams_left == 0,
+            format!(
+                "{} seam repairs ({} events), {seams_left} windows still on record",
+                final_stats.seam_repairs, final_stats.seam_repair_events
+            ),
+        );
+    } else {
+        c.unverified(
+            "3: the reconnect's seam window was read again",
+            "the run is too short for the repair delay; use --minutes 6 or more",
+        );
+    }
+    let seam_gaps = gaps
+        .iter()
+        .filter(|g| g.cause == GapCause::SeamUnrepaired)
+        .count();
+    c.check(
+        "3: no seam window was given up as a gap",
+        seam_gaps == 0,
+        format!("{seam_gaps} gaps of cause SeamUnrepaired"),
+    );
     check_no_loss(c, "3", &tapped, &ref_events, &ref_intervals);
     check_model(&run.pool, c, "3", &tapped)
         .await
@@ -934,9 +967,19 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
                         .iter()
                         .filter(|g| !gaps_before.contains(&g.id))
                         .collect();
-                    let expected_cause = GapCause::Heuristic;
+                    // A v1 instance clamps without saying so: the gap is
+                    // found from its first event. A v2 instance refuses
+                    // the cursor or announces the clamp (cursor too old);
+                    // one that does neither is caught like v1.
+                    let on_v2 =
+                        ingest.stats.snapshot().current.map(|(_, p)| p) == Some(Protocol::V2);
+                    let expected_cause: &[GapCause] = if on_v2 {
+                        &[GapCause::CursorTooOld, GapCause::Heuristic]
+                    } else {
+                        &[GapCause::Heuristic]
+                    };
                     let ok = new.iter().any(|g| {
-                        g.cause == expected_cause
+                        expected_cause.contains(&g.cause)
                             && g.from_at.timestamp_micros() == target
                             && g.to_at
                                 .is_some_and(|t| t.timestamp_micros() >= floor_us - 60_000_000)

@@ -297,6 +297,18 @@ CREATE TABLE firehose_gaps (
   healed_witness  TIMESTAMPTZ,
   repair_cycle_id BIGINT
 );
+
+CREATE TABLE firehose_seams (
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  source_url  TEXT NOT NULL,
+  protocol    SMALLINT NOT NULL,
+  trigger     SMALLINT NOT NULL,
+  from_at     TIMESTAMPTZ NOT NULL,
+  to_at       TIMESTAMPTZ,
+  due_at      TIMESTAMPTZ,
+  attempts    INT NOT NULL DEFAULT 0,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
 
 - `firehose_state`: the single row of the current session: which
@@ -305,15 +317,24 @@ CREATE TABLE firehose_gaps (
   event.
 - `firehose_cursors`: one cursor per Jetstream instance, so that a
   failover back to an instance resumes from that instance's own cursor.
-  Within one `source_url` a cursor only moves forward.
+  Within one `source_url` a cursor only moves forward, except that the
+  `seq` of an instance whose sequence started again is dropped.
 - `firehose_clock`: pairs of server commit time and `applied_through`,
   one row per applied batch, thinned to one a minute after 24 hours and
   kept 30 days. It is how a wall-clock moment (the start of a listing)
   is turned into a point on the witness clock.
 - `firehose_gaps`: intervals of the witness clock during which events
   may have been lost. `cause` is 1 `cursor_too_old`, 2 `heuristic`,
-  3 `failover`, 4 `sync_unavailable`; `to_at` is NULL while the gap is
-  open; `healed_*` are set by the repair that covered it.
+  3 `failover`, 4 `sync_unavailable`, 5 `seam_unrepaired`; `to_at` is
+  NULL while the gap is open; `healed_*` are set by the repair that
+  covered it.
+- `firehose_seams`: the seam windows that still have to be read again,
+  one row per resumed session. `protocol` is 1 v1, 2 v2; `trigger` is
+  1 `resume`, 2 `failover`, 3 `clamp_recovery`; `to_at` is NULL until
+  the session has caught up or ended; `due_at` is the time before which
+  the re-read is not started; `attempts` counts the re-reads that
+  failed. A row is deleted when its re-read has been applied, or when
+  it is given up and recorded as a gap.
 
 The stream, its cursors and gap detection are described in
 [firehose](firehose.md); gap repair in [backfill](backfill.md).
@@ -969,7 +990,10 @@ apply rules of their own on top ([web UI](web-ui.md)).
 
 ### Ordering
 
-Account events carry no rev, so status is ordered by time. A status
+Account events carry no rev, so status is ordered by time: the `time`
+of the upstream account event, which is the same on every Jetstream
+instance, or the witness time for an event that has none or whose
+`time` is after its witness time. A status
 change is applied only if the event's time is at or after the stored
 `status_at`; an older event is skipped, and applying an event with an
 equal time again changes nothing. Replays of the stream can therefore

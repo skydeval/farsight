@@ -53,11 +53,24 @@ fn s(v: &Value, k: &str) -> Option<String> {
     v.get(k).and_then(Value::as_str).map(str::to_owned)
 }
 
-/// Decodes a rev (TID) into the stored stamp.
+/// Decodes a rev (TID) into the stored stamp. A rev whose time is past
+/// the clock by more than [`farsight_core::tid::MAX_REV_AHEAD_US`] is
+/// refused: a listing stamped with it would outrank every later write to
+/// the records it stores.
 pub fn rev_stamp(rev: &str) -> Result<Stamp, NetError> {
-    Tid::parse(rev)
-        .map(Stamp::from_tid)
-        .map_err(|e| NetError::Decode(format!("rev {rev:?}: {e}")))
+    rev_stamp_at(rev, chrono::Utc::now().timestamp_micros())
+}
+
+/// [`rev_stamp`] against the clock `now_us` (microseconds since the
+/// epoch).
+pub fn rev_stamp_at(rev: &str, now_us: i64) -> Result<Stamp, NetError> {
+    let tid = Tid::parse(rev).map_err(|e| NetError::Decode(format!("rev {rev:?}: {e}")))?;
+    if tid.is_ahead_of(now_us) {
+        return Err(NetError::Decode(format!(
+            "rev {rev:?} is ahead of the clock"
+        )));
+    }
+    Ok(Stamp::from_tid(tid))
 }
 
 /// `com.atproto.repo.describeRepo`: the repo's collections.
@@ -180,6 +193,9 @@ pub async fn get_record(
 pub struct RepoStatus {
     /// `active`; a response without the field reads as active.
     pub active: bool,
+    /// Whether the response carried `active` as a boolean. Only then has
+    /// the relay said that the account is active.
+    pub stated: bool,
     /// `status` when inactive.
     pub status: Option<String>,
 }
@@ -196,8 +212,10 @@ pub async fn repo_status(net: &Net, relay: &str, did: &Did) -> Result<RepoStatus
             "getRepoStatus",
         )
         .await?;
+    let active = v.get("active").and_then(Value::as_bool);
     Ok(RepoStatus {
-        active: v.get("active").and_then(Value::as_bool).unwrap_or(true),
+        active: active.unwrap_or(true),
+        stated: active.is_some(),
         status: s(&v, "status"),
     })
 }
@@ -396,5 +414,27 @@ mod tests {
             status: 500,
             name: String::new()
         }));
+    }
+
+    #[test]
+    fn a_listing_rev_from_the_future_is_refused() {
+        use farsight_core::tid::MAX_REV_AHEAD_US;
+        let now = 1_800_000_000_000_000u64;
+        let rev = |us: u64| Tid::from_parts(us, 0).unwrap().encode();
+        let at = |us: u64| rev_stamp_at(&rev(us), now as i64);
+        assert_eq!(
+            at(now - 1).unwrap(),
+            Stamp::from_tid(Tid::from_parts(now - 1, 0).unwrap())
+        );
+        assert!(at(now + MAX_REV_AHEAD_US).is_ok());
+        assert!(matches!(
+            at(now + MAX_REV_AHEAD_US + 1),
+            Err(NetError::Decode(_))
+        ));
+        assert!(matches!(at((1 << 53) - 1), Err(NetError::Decode(_))));
+        assert!(matches!(
+            rev_stamp_at("not-a-tid", now as i64),
+            Err(NetError::Decode(_))
+        ));
     }
 }

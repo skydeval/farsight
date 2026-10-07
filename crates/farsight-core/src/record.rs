@@ -382,9 +382,39 @@ pub struct CommitOp {
     pub action: CommitAction,
 }
 
-/// Parses a Jetstream commit object (`{rev, operation, collection, rkey,
-/// record?}`) for repo `did`. The collection must be one of the four.
-pub fn parse_commit(did: &str, commit: &Value) -> Result<CommitOp, RecordError> {
+/// What a commit says apart from its record: whose repository, which
+/// key, at which rev, and the operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitHead {
+    /// The repo (record author).
+    pub author: Did,
+    /// Which of the four indexed collections the record is in.
+    pub collection: Collection,
+    /// The record key.
+    pub rkey: RecordKey,
+    /// Rev of the commit that carried the operation.
+    pub rev: Tid,
+    /// `create`, `update` or `delete`.
+    pub op: Operation,
+}
+
+impl CommitHead {
+    /// The commit operation that does `action` to this key at this rev.
+    pub fn with(self, action: CommitAction) -> CommitOp {
+        CommitOp {
+            author: self.author,
+            collection: self.collection,
+            rkey: self.rkey,
+            rev: self.rev,
+            action,
+        }
+    }
+}
+
+/// Parses everything of a Jetstream commit object but its record
+/// (`{rev, operation, collection, rkey}`) for repo `did`. The collection
+/// must be one of the four.
+pub fn parse_commit_head(did: &str, commit: &Value) -> Result<CommitHead, RecordError> {
     let author = Did::parse(did).map_err(|_| RecordError::RepoDid(did.to_owned()))?;
     let collection_str = str_field(commit, "collection")?;
     let collection =
@@ -400,23 +430,39 @@ pub fn parse_commit(did: &str, commit: &Value) -> Result<CommitOp, RecordError> 
         "delete" => Operation::Delete,
         other => return Err(RecordError::Operation(other.to_owned())),
     };
-    let action = match op {
-        Operation::Delete => CommitAction::Delete,
-        Operation::Create | Operation::Update => {
-            let value = commit.get("record").ok_or(RecordError::Field("record"))?;
-            CommitAction::Upsert {
-                op,
-                record: parse_record(&author, collection, value)?,
-            }
-        }
-    };
-    Ok(CommitOp {
+    Ok(CommitHead {
         author,
         collection,
         rkey,
         rev,
-        action,
+        op,
     })
+}
+
+/// The action of a commit with head `head`: a delete, or the upsert of
+/// `record` (the commit's `record` value; `None` if it has none).
+pub fn commit_action(
+    head: &CommitHead,
+    record: Option<&Value>,
+) -> Result<CommitAction, RecordError> {
+    match head.op {
+        Operation::Delete => Ok(CommitAction::Delete),
+        op @ (Operation::Create | Operation::Update) => {
+            let value = record.ok_or(RecordError::Field("record"))?;
+            Ok(CommitAction::Upsert {
+                op,
+                record: parse_record(&head.author, head.collection, value)?,
+            })
+        }
+    }
+}
+
+/// Parses a Jetstream commit object (`{rev, operation, collection, rkey,
+/// record?}`) for repo `did`. The collection must be one of the four.
+pub fn parse_commit(did: &str, commit: &Value) -> Result<CommitOp, RecordError> {
+    let head = parse_commit_head(did, commit)?;
+    let action = commit_action(&head, commit.get("record"))?;
+    Ok(head.with(action))
 }
 
 #[cfg(test)]

@@ -29,3 +29,9 @@ stops recording.
   disk.
 - The Postgres data lives in the `farsight-pgdata` volume. That volume
   needs the disk space.
+- **The first sweep writes heavily.** While it runs, Postgres can write
+  tens of megabytes a second for days. On a disk shared with other
+  services this slows them down, sometimes badly. Give Farsight a disk
+  of its own if you can. Otherwise lower `backfill.concurrency`, or
+  turn the sweep off while the other services need the disk
+  (`backfill.sweep.enabled`; it resumes where it stopped).

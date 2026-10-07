@@ -30,6 +30,7 @@ pub fn reason_words(r: &str) -> &'static str {
         "sweep_incomplete" => "the first full sweep has not completed",
         "firehose_gap" => "a firehose gap is not repaired yet",
         "firehose_disconnected" => "the firehose is disconnected",
+        "coverage_stale" => "the coverage state could not be read from the database",
         "firehose_lagging" => "the firehose is more than 5 minutes behind",
         "sync_events_unavailable" => "the Jetstream instance is v1 (no #sync events)",
         "storage_refusal" => "the storage budget is refusing writes",

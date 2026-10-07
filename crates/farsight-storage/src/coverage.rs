@@ -33,6 +33,10 @@ pub const COVERAGE_CHANNEL: &str = "farsight_coverage";
 /// asks for it sooner.
 pub const SNAPSHOT_REFRESH: Duration = Duration::from_secs(10);
 
+/// How old a snapshot may be before it is served as stale: three periodic
+/// reads in a row failed.
+pub const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(30);
+
 /// The latest completed full sweep cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
@@ -89,6 +93,11 @@ pub struct PendingEffects {
 pub struct GlobalSnapshot {
     /// Database time of the read.
     pub read_at: DateTime<Utc>,
+    /// The snapshot is older than [`SNAPSHOT_MAX_AGE`] and could not be
+    /// read again. Set by whoever holds it; a fresh read is never stale.
+    /// What a stale snapshot says about the stream is no longer known to
+    /// hold, so it counts as the synthetic gap.
+    pub stale: bool,
     /// Firehose state, including `applied_through`.
     pub firehose: FirehoseState,
     /// Latest completed full baseline.
@@ -153,6 +162,7 @@ pub async fn read_snapshot(pool: &PgPool, limits: &Limits) -> Result<GlobalSnaps
     tx.commit().await?;
     Ok(GlobalSnapshot {
         read_at,
+        stale: false,
         firehose: fh,
         baseline: baseline.map(|(cycle_id, collections, s_c, completed_witness)| Baseline {
             cycle_id,
@@ -300,14 +310,31 @@ pub fn pending_effects(lists: &[PendingList], per_owner_key: usize) -> PendingEf
 
 impl GlobalSnapshot {
     /// Whether the synthetic gap `[applied_through, ∞)` exists: the stream
-    /// is disconnected or lags more than `synthetic_gap_lag`.
+    /// is disconnected or lags more than `synthetic_gap_lag`, or the
+    /// snapshot itself is stale.
     pub fn synthetic_gap(&self, synthetic_gap_lag: Duration) -> bool {
         match self.firehose.applied_through {
             None => true,
             Some(a) => {
-                !self.firehose.connected
+                self.stale
+                    || !self.firehose.connected
                     || (self.read_at - a).to_std().unwrap_or(Duration::ZERO) > synthetic_gap_lag
             }
+        }
+    }
+
+    /// The reason the synthetic gap is reported with, if it exists: the
+    /// first that applies of `firehose_disconnected`, `coverage_stale`
+    /// and `firehose_lagging`.
+    pub fn synthetic_gap_reason(&self, synthetic_gap_lag: Duration) -> Option<&'static str> {
+        if self.firehose.applied_through.is_none() || !self.firehose.connected {
+            Some("firehose_disconnected")
+        } else if self.stale {
+            Some("coverage_stale")
+        } else if self.synthetic_gap(synthetic_gap_lag) {
+            Some("firehose_lagging")
+        } else {
+            None
         }
     }
 
@@ -382,11 +409,7 @@ pub fn network_scope(s: &GlobalSnapshot, k: Collection, synthetic_gap_lag: Durat
     if baseline.is_none() {
         reasons.push("sweep_incomplete");
     }
-    if s.firehose.applied_through.is_none() || !s.firehose.connected {
-        reasons.push("firehose_disconnected");
-    } else if s.synthetic_gap(synthetic_gap_lag) {
-        reasons.push("firehose_lagging");
-    }
+    reasons.extend(s.synthetic_gap_reason(synthetic_gap_lag));
     // `covered(S_C)` requires S_C defined.
     if baseline.is_some_and(|b| b.s_c.is_none()) {
         reasons.push("sweep_incomplete");
@@ -511,6 +534,7 @@ mod tests {
     fn snap(applied: Option<i64>, connected: bool, gaps: Vec<Gap>) -> GlobalSnapshot {
         GlobalSnapshot {
             read_at: t(1000),
+            stale: false,
             firehose: FirehoseState {
                 applied_through: applied.map(t),
                 connected,
@@ -562,6 +586,31 @@ mod tests {
         // Open gap (v1 interval) covers everything after its start.
         let s = snap(Some(999), true, vec![gap(200, None, None)]);
         assert!(!s.covered(Some(t(900)), LAG));
+    }
+
+    #[test]
+    fn a_stale_snapshot_claims_nothing_about_the_stream() {
+        // Connected, caught up and without gaps when it was read.
+        let mut s = snap(Some(999), true, vec![]);
+        assert!(s.covered(Some(t(100)), LAG));
+        assert_eq!(s.synthetic_gap_reason(LAG), None);
+        s.stale = true;
+        assert!(s.synthetic_gap(LAG));
+        assert!(!s.covered(Some(t(100)), LAG));
+        assert!(!s.covered(Some(t(999)), LAG));
+        assert_eq!(s.synthetic_gap_reason(LAG), Some("coverage_stale"));
+        let n = network_scope(&s, Collection::Block, LAG);
+        assert_eq!(
+            (n.level, n.reasons),
+            (Level::Partial, vec!["coverage_stale"])
+        );
+        // What the snapshot already knew to be wrong is still said first.
+        s.firehose.connected = false;
+        assert_eq!(s.synthetic_gap_reason(LAG), Some("firehose_disconnected"));
+        let mut s = snap(Some(600), true, vec![]);
+        assert_eq!(s.synthetic_gap_reason(LAG), Some("firehose_lagging"));
+        s.stale = true;
+        assert_eq!(s.synthetic_gap_reason(LAG), Some("coverage_stale"));
     }
 
     #[test]

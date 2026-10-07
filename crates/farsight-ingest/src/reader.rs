@@ -7,19 +7,20 @@
 #[cfg(feature = "harness")]
 use farsight_storage::codes::sql::PROTOCOL_V2;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use farsight_storage::codes::GapCause;
+use farsight_storage::codes::SeamTrigger;
 use farsight_storage::firehose;
 use sqlx::PgPool;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::conn::{self, ConnectError, Session};
+use crate::conn::{self, ConnectError, ReadError, Session};
 use crate::frame::{Body, Frame, InEvent, Protocol, now_us};
 use crate::lag::LagTracker;
 use crate::metrics as m;
-use crate::resume::{self, Cursor, GapRule, Persisted, Plan, Tuning};
+use crate::resume::{self, Cursor, GapRule, Persisted, Tuning};
+use crate::seam;
 use crate::stats::IngestStats;
 use crate::writer::Item;
 
@@ -34,10 +35,6 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 pub const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 /// Most times the stall timeout is doubled for sessions that stay silent.
 pub const PATIENCE_DOUBLINGS: u32 = 4;
-/// Most events one seam repair collects before it applies what it has.
-pub const SEAM_REPAIR_MAX_EVENTS: usize = 500_000;
-/// Longest one seam repair reads for.
-pub const SEAM_REPAIR_MAX_READ: Duration = Duration::from_secs(600);
 
 /// How an attempt to read from an instance ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +146,7 @@ impl Reconnects {
 /// replay of the same window returns them. The repair re-reads the window
 /// from the session's connect to the moment it caught up to live, never the
 /// whole resumed range (after a long rewind that would be hours of events).
+/// The windows and their re-reads are in [`crate::seam`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeamRepair {
     /// Window start, before the connect (`seam_repair_before`).
@@ -158,7 +156,7 @@ pub struct SeamRepair {
     /// Delay between catching up and the re-read (`seam_repair_delay`).
     pub delay: Duration,
     /// Caught up once an event's witness time is within this much of wall
-    /// time (`seam_repair_catchup_margin`).
+    /// time (`seam_repair_catchup_margin`), or is past the connect.
     pub catchup_margin: Duration,
 }
 
@@ -228,16 +226,27 @@ pub struct Reader {
     /// Harness: rewind requested by [`Control::KillAndRewind`].
     #[cfg(feature = "harness")]
     pub rewind: Option<i64>,
-    /// Pending seam repairs; aborted when the reader goes away.
+    /// The seam repair task; aborted when the reader goes away.
     pub repairs: Repairs,
     /// Events injected while the pipeline was full, sent next.
     pub pending_inject: Vec<InEvent>,
+    /// Set once an instance stopped accepting the bundled dictionary:
+    /// frames are then requested uncompressed. Shared with the seam
+    /// repair task.
+    pub plain: Arc<AtomicBool>,
 }
 
-/// Seam-repair tasks, aborted on drop (they hold a sender to the writer,
-/// which would otherwise keep the pipeline alive after shutdown).
+/// The seam repair task, aborted on drop (it holds a sender to the
+/// writer, which would otherwise keep the pipeline alive after shutdown).
 #[derive(Debug, Default)]
 pub struct Repairs(Vec<tokio::task::JoinHandle<()>>);
+
+impl Repairs {
+    /// Holds `task` until the reader goes away.
+    pub fn hold(task: tokio::task::JoinHandle<()>) -> Repairs {
+        Repairs(vec![task])
+    }
+}
 
 impl Drop for Repairs {
     fn drop(&mut self) {
@@ -289,41 +298,6 @@ impl ReconnectReason {
     }
 }
 
-/// What a seam repair follows (the `trigger` label of
-/// `farsight_firehose_seam_repairs_total`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SeamTrigger {
-    /// A resume that recorded a gap.
-    ClampRecovery,
-    /// A resume on another instance.
-    Failover,
-    /// A resume on the same instance.
-    Resume,
-}
-
-impl SeamTrigger {
-    /// The `trigger` label of `farsight_firehose_seam_repairs_total`.
-    pub fn label(self) -> &'static str {
-        match self {
-            SeamTrigger::ClampRecovery => "clamp_recovery",
-            SeamTrigger::Failover => "failover",
-            SeamTrigger::Resume => "resume",
-        }
-    }
-
-    /// The trigger for a resume: `gap` if its first event recorded one,
-    /// `failover` if it is on another instance than the session before.
-    pub fn of(gap: bool, failover: bool) -> SeamTrigger {
-        if gap {
-            SeamTrigger::ClampRecovery
-        } else if failover {
-            SeamTrigger::Failover
-        } else {
-            SeamTrigger::Resume
-        }
-    }
-}
-
 /// Jetstream `#info` name: the cursor asked for was older than what the
 /// instance keeps, and it resumed from its floor.
 const INFO_OUTDATED_CURSOR: &str = "OutdatedCursor";
@@ -331,6 +305,18 @@ const INFO_OUTDATED_CURSOR: &str = "OutdatedCursor";
 enum End {
     Reconnect(ReconnectReason),
     Shutdown,
+}
+
+/// What a session has delivered so far.
+#[derive(Debug, Clone, Copy, Default)]
+struct Seen {
+    /// Whether it delivered an event.
+    delivered: bool,
+    /// Stream position of the last delivered event.
+    position_us: Option<i64>,
+    /// Whether the session's seam window is on record and still open:
+    /// the session has not caught up with the live tail yet.
+    seam_open: bool,
 }
 
 /// Which instance the reader is on, and how its attempts have gone.
@@ -362,8 +348,9 @@ impl Reader {
     /// The resume inputs for instance `url`: that instance's own cursor
     /// from `firehose_cursors` if it has one — so a failback resumes
     /// exactly where the instance left off — with the global
-    /// running-max `applied_through` as the gap reference. An instance
-    /// without a cursor is planned as a failover (timestamp rewind).
+    /// running-max `applied_through` as the gap reference, and the
+    /// instance that position was last read from. An instance without a
+    /// cursor is planned as a failover (timestamp rewind).
     async fn persisted(&self, url: &str) -> Persisted {
         let mut backoff = Duration::from_millis(200);
         let to_proto = |p: farsight_storage::codes::Protocol| match p {
@@ -383,13 +370,15 @@ impl Reader {
                             cursor_seq: c.cursor_seq,
                             cursor_us: c.cursor_us,
                             applied_through_us,
+                            applied_from: s.source_url,
                         },
                         _ => Persisted {
-                            source_url: s.source_url.filter(|u| u != url),
+                            source_url: None,
                             protocol: s.protocol.map(to_proto),
                             cursor_seq: None,
                             cursor_us: None,
                             applied_through_us,
+                            applied_from: s.source_url,
                         },
                     };
                 }
@@ -411,12 +400,12 @@ impl Reader {
     ) -> Result<(Session, GapRule, bool), ConnectError> {
         let p = self.persisted(url).await;
         let t = &self.cfg.tuning;
-        let mut compress = self.cfg.compress;
+        let mut compress = self.cfg.compress && !self.plain.load(Ordering::Relaxed);
         let mut protocols = vec![Protocol::V2, Protocol::V1];
         while let Some(proto) = protocols.first().copied() {
-            let Plan { cursor, gap } = resume::plan(&p, url, proto, lag, t);
-            match conn::connect(url, proto, cursor, compress).await {
-                Ok(s) => return Ok((s, gap, p.applied_through_us.is_some())),
+            let plan = resume::plan(&p, url, proto, lag, t, now_us());
+            match conn::connect(url, proto, plan.cursor, compress).await {
+                Ok(s) => return Ok((s, plan.gap, p.applied_through_us.is_some())),
                 Err(ConnectError::NotOffered(code)) if proto == Protocol::V2 => {
                     tracing::debug!(url, code, "v2 not offered; falling back to v1");
                     protocols.remove(0);
@@ -426,22 +415,16 @@ impl Reader {
                     // uncompressed rather than not at all.
                     tracing::warn!(url, %msg, "zstd dictionary retired upstream; continuing uncompressed");
                     compress = false;
+                    self.plain.store(true, Ordering::Relaxed);
                 }
                 Err(ConnectError::CursorTooOld(msg)) => {
-                    // Gap [applied_through, first live event], resume
-                    // at the live tail.
+                    // Resume at the live tail, with the gap from where
+                    // the plan says a loss on this instance starts to
+                    // the first live event.
                     tracing::warn!(url, %msg, "CursorTooOld; resuming at the live tail");
                     ReconnectReason::CursorTooOld.count();
-                    let from = p.applied_through_us.unwrap_or(0);
                     let s = conn::connect(url, proto, Cursor::Live, compress).await?;
-                    return Ok((
-                        s,
-                        GapRule::Always {
-                            from_us: from,
-                            cause: GapCause::CursorTooOld,
-                        },
-                        p.applied_through_us.is_some(),
-                    ));
+                    return Ok((s, plan.refused(), p.applied_through_us.is_some()));
                 }
                 Err(e) => return Err(e),
             }
@@ -542,10 +525,27 @@ impl Reader {
             }
             let started = Instant::now();
             let stall = patience(self.cfg.stall_timeout, silent_stalls);
-            let (end, delivered) = self
-                .read_session(&mut session, rule, prior, failover, &mut at.lag, stall)
+            let mut seen = Seen::default();
+            let end = self
+                .read_session(
+                    &mut session,
+                    rule,
+                    prior,
+                    failover,
+                    &mut at.lag,
+                    stall,
+                    &mut seen,
+                )
                 .await;
+            let delivered = seen.delivered;
             let lasted = started.elapsed();
+            // A session that ends before it caught up leaves its seam
+            // window open: it is closed where the session got to.
+            if let (true, Some(through_us)) = (seen.seam_open, seen.position_us)
+                && self.tx.send(Item::SeamClose { through_us }).await.is_err()
+            {
+                return;
+            }
             if delivered {
                 silent_stalls = 0;
             } else if matches!(end, End::Reconnect(ReconnectReason::Stall)) {
@@ -598,103 +598,6 @@ impl Reader {
         next.wait
     }
 
-    /// Re-reads `[connect − seam_repair_before, caught up +
-    /// seam_repair_after]` once, `seam_repair_delay` after catching up,
-    /// through `apply` without position state (LWW makes the duplicates
-    /// stale no-ops), to recover events the instance dropped at the
-    /// replay-to-live seam.
-    fn spawn_seam_repair(
-        &mut self,
-        url: &str,
-        protocol: Protocol,
-        connect_us: i64,
-        caught_up_us: i64,
-        trigger: SeamTrigger,
-    ) {
-        self.repairs.0.retain(|h| !h.is_finished());
-        let url = url.to_owned();
-        let tx = self.tx.clone();
-        let stats = self.stats.clone();
-        let compress = self.cfg.compress;
-        #[cfg(feature = "harness")]
-        let tap = self.tap.clone();
-        // The lossy hand-over lies between the session's connect (where the
-        // instance fixes the end of its replay) and the moment the session
-        // caught up to live. For an ordinary resume the two coincide; after
-        // a long replay they can be minutes apart. Read
-        // [connect − before, caught up + after] with a timestamp cursor (both
-        // protocols accept µs).
-        let cfg = self.cfg.seam;
-        let until = caught_up_us.saturating_add(resume::us(cfg.after));
-        let cursor = Cursor::TimeUs(connect_us.saturating_sub(resume::us(cfg.before)));
-        tracing::info!(
-            connect_us,
-            caught_up_us,
-            trigger = trigger.label(),
-            "seam repair scheduled"
-        );
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(cfg.delay).await;
-            let mut s = match conn::connect(&url, protocol, cursor, compress).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "seam repair: connect failed");
-                    return;
-                }
-            };
-            let mut events = Vec::new();
-            let read_started = Instant::now();
-            loop {
-                // The window ends where the instance says it does. One
-                // that never reaches the end is read up to these bounds.
-                if events.len() >= SEAM_REPAIR_MAX_EVENTS
-                    || read_started.elapsed() >= SEAM_REPAIR_MAX_READ
-                {
-                    tracing::warn!(
-                        events = events.len(),
-                        "seam repair: window not finished within its bounds; applying what was read"
-                    );
-                    break;
-                }
-                match tokio::time::timeout(Duration::from_secs(30), s.next_frame()).await {
-                    Ok(Some(Ok(Frame::Event(ev)))) => {
-                        let past = ev.witness_us > until;
-                        events.push(ev);
-                        if past {
-                            break;
-                        }
-                    }
-                    Ok(Some(Ok(_))) => {}
-                    _ => break,
-                }
-            }
-            let n = events.len() as u64;
-            // A repair never advances the cursor (see `Item::Repair`).
-            #[cfg(feature = "harness")]
-            let copy = events.clone();
-            if tx.send(Item::Repair(events)).await.is_ok() {
-                // Tapped only once delivered (see read_session).
-                #[cfg(feature = "harness")]
-                if let Some(tap) = &tap {
-                    for ev in copy {
-                        let _ = tap.send(ev);
-                    }
-                }
-            }
-            s.close().await;
-            stats.seam_repairs.fetch_add(1, Ordering::Relaxed);
-            stats.seam_repair_events.fetch_add(n, Ordering::Relaxed);
-            metrics::counter!(m::SEAM_REPAIRS, "trigger" => trigger.label()).increment(1);
-            metrics::counter!(m::SEAM_REPAIR_EVENTS).increment(n);
-            tracing::info!(
-                events = n,
-                trigger = trigger.label(),
-                "seam repair replayed"
-            );
-        });
-        self.repairs.0.push(handle);
-    }
-
     async fn sleep_or_shutdown(&mut self, d: Duration) -> bool {
         tokio::select! {
             _ = tokio::time::sleep(d) => false,
@@ -702,8 +605,9 @@ impl Reader {
         }
     }
 
-    /// Reads one session to its end. Returns why it ended and whether it
-    /// delivered an event.
+    /// Reads one session to its end. Returns why it ended; `seen` holds
+    /// what it delivered.
+    #[allow(clippy::too_many_arguments)]
     async fn read_session(
         &mut self,
         session: &mut Session,
@@ -712,47 +616,58 @@ impl Reader {
         failover: bool,
         lag: &mut LagTracker,
         stall: Duration,
-    ) -> (End, bool) {
-        let mut first = true;
+        seen: &mut Seen,
+    ) -> End {
         let mut clamped_notice = false;
         let mut since_gauge = 0u32;
         // The seam is where the replay hands over to the live tail: when
         // the session catches up, which for a long replay is long after the
-        // resume. The repair is anchored there.
+        // resume. The window to read again starts before the connect.
         let connect_us = now_us();
-        let mut seam_trigger: Option<SeamTrigger> = None;
-        // Stream position of the last delivered event: injected events are
-        // re-stamped to it, so a synthetic event never carries the cursor
-        // past a replay still in progress.
-        let mut position_us: Option<i64> = None;
         loop {
             let frame = tokio::select! {
                 c = self.control.recv() => match c {
-                    Some(Control::KillSocket) => return (End::Reconnect(ReconnectReason::Kill), !first),
+                    Some(Control::KillSocket) => return End::Reconnect(ReconnectReason::Kill),
                     #[cfg(feature = "harness")]
                     Some(Control::KillAndRewind { us }) => {
                         self.rewind = Some(us);
-                        return (End::Reconnect(ReconnectReason::Kill), !first);
+                        return End::Reconnect(ReconnectReason::Kill);
                     }
                     Some(Control::Inject(evs)) => {
                         for ev in evs {
-                            let ev = at_position(ev, position_us);
+                            // Injected events are re-stamped to the stream
+                            // position, so a synthetic event never carries
+                            // the cursor past a replay still in progress.
+                            let ev = at_position(ev, seen.position_us);
                             if self.tx.send(Item::Event(ev)).await.is_err() {
-                                return (End::Shutdown, !first);
+                                return End::Shutdown;
                             }
                         }
                         continue;
                     }
-                    Some(Control::Shutdown) | None => return (End::Shutdown, !first),
+                    Some(Control::Shutdown) | None => return End::Shutdown,
                 },
                 f = tokio::time::timeout(stall, session.next_frame()) => f,
             };
             let frame = match frame {
-                Err(_) => return (End::Reconnect(ReconnectReason::Stall), !first),
-                Ok(None) => return (End::Reconnect(ReconnectReason::Closed), !first),
+                Err(_) => return End::Reconnect(ReconnectReason::Stall),
+                Ok(None) => return End::Reconnect(ReconnectReason::Closed),
                 Ok(Some(Err(e))) => {
                     tracing::warn!(error = %e, "read error");
-                    return (End::Reconnect(ReconnectReason::Error), !first);
+                    // Frames the bundled dictionary cannot expand: the
+                    // instance changed it. A v2 instance says so at the
+                    // handshake; a v1 instance does not, and is read
+                    // uncompressed from the next session on.
+                    if session.protocol == Protocol::V1
+                        && matches!(e, ReadError::Decompress(_))
+                        && !self.plain.swap(true, Ordering::Relaxed)
+                    {
+                        tracing::warn!(
+                            "frames cannot be decompressed with the bundled dictionary; \
+                             continuing uncompressed"
+                        );
+                    }
+                    return End::Reconnect(ReconnectReason::Error);
                 }
                 Ok(Some(Ok(f))) => f,
             };
@@ -766,24 +681,14 @@ impl Reader {
                 }
                 Frame::Error { error, message } => {
                     tracing::warn!(%error, message = ?message, "jetstream error frame");
-                    return (End::Reconnect(ReconnectReason::ServerError), !first);
+                    return End::Reconnect(ReconnectReason::ServerError);
                 }
                 Frame::Event(ev) => ev,
             };
-            if first {
-                first = false;
-                let gap = resume::gap_for_first_event(
-                    rule,
-                    ev.witness_us,
-                    clamped_notice,
-                    &self.cfg.tuning,
-                );
-                // After any resume with a prior position (skipped only
-                // on the first-ever start).
-                if prior {
-                    seam_trigger = Some(SeamTrigger::of(gap.is_some(), failover));
-                }
-                if let Some((from_us, to_us, cause)) = gap {
+            if !seen.delivered {
+                seen.delivered = true;
+                let resumed = resume::first_event(rule, ev.seq, ev.witness_us, clamped_notice);
+                if let Some((from_us, to_us, cause)) = resumed.gap {
                     tracing::warn!(from_us, to_us, ?cause, "resume gap");
                     if self
                         .tx
@@ -795,8 +700,36 @@ impl Reader {
                         .await
                         .is_err()
                     {
-                        return (End::Shutdown, !first);
+                        return End::Shutdown;
                     }
+                }
+                if resumed.sequence_restarted {
+                    tracing::warn!(
+                        url = %session.url_base,
+                        seq = ?ev.seq,
+                        "the instance's sequence started again; its stored cursor is dropped"
+                    );
+                    let url = session.url_base.clone();
+                    if self.tx.send(Item::ForgetSeq { url }).await.is_err() {
+                        return End::Shutdown;
+                    }
+                }
+                // After any resume with a prior position (skipped only on
+                // the first-ever start), the seam window goes on record
+                // ahead of the session's first event.
+                if prior {
+                    let trigger = SeamTrigger::of(resumed.gap.is_some(), failover);
+                    let from_us = connect_us.saturating_sub(resume::us(self.cfg.seam.before));
+                    let open = Item::SeamOpen {
+                        url: session.url_base.clone(),
+                        protocol: session.protocol,
+                        trigger,
+                        from_us,
+                    };
+                    if self.tx.send(open).await.is_err() {
+                        return End::Shutdown;
+                    }
+                    seen.seam_open = true;
                 }
             }
             if let Body::Commit(op) = &ev.body {
@@ -813,25 +746,21 @@ impl Reader {
                         .store((s * 1000.0) as i64, Ordering::Relaxed);
                 }
             }
-            if let Some(trigger) = seam_trigger {
+            if seen.seam_open {
                 let now = now_us();
                 let margin = resume::us(self.cfg.seam.catchup_margin);
-                if now.saturating_sub(ev.witness_us) <= margin {
-                    seam_trigger = None;
-                    tracing::warn!(
+                if seam::caught_up(ev.witness_us, now, connect_us, margin) {
+                    seen.seam_open = false;
+                    let through_us = now.max(ev.witness_us);
+                    tracing::info!(
                         connect_us,
-                        caught_up_us = now,
+                        caught_up_us = through_us,
                         lag_secs = (now - connect_us) / 1_000_000,
-                        trigger = trigger.label(),
-                        "session caught up; seam repair scheduled"
+                        "session caught up; its seam window is closed"
                     );
-                    self.spawn_seam_repair(
-                        &session.url_base,
-                        session.protocol,
-                        connect_us,
-                        now,
-                        trigger,
-                    );
+                    if self.tx.send(Item::SeamClose { through_us }).await.is_err() {
+                        return End::Shutdown;
+                    }
                 }
             }
             // Stay responsive to commands while the channel is full
@@ -848,19 +777,19 @@ impl Reader {
                 tokio::select! {
                     r = &mut send => {
                         if r.is_err() {
-                            return (End::Shutdown, !first);
+                            return End::Shutdown;
                         }
                         break;
                     }
                     c = self.control.recv() => match c {
-                        Some(Control::KillSocket) => return (End::Reconnect(ReconnectReason::Kill), !first),
+                        Some(Control::KillSocket) => return End::Reconnect(ReconnectReason::Kill),
                         #[cfg(feature = "harness")]
                         Some(Control::KillAndRewind { us }) => {
                             self.rewind = Some(us);
-                            return (End::Reconnect(ReconnectReason::Kill), !first);
+                            return End::Reconnect(ReconnectReason::Kill);
                         }
                         Some(Control::Inject(evs)) => self.pending_inject.extend(evs),
-                        Some(Control::Shutdown) | None => return (End::Shutdown, !first),
+                        Some(Control::Shutdown) | None => return End::Shutdown,
                     },
                 }
             }
@@ -870,11 +799,11 @@ impl Reader {
             if let Some(tap) = &self.tap {
                 let _ = tap.send(tapped);
             }
-            position_us = Some(witness_us);
+            seen.position_us = Some(witness_us);
             for ev in std::mem::take(&mut self.pending_inject) {
-                let ev = at_position(ev, position_us);
+                let ev = at_position(ev, seen.position_us);
                 if self.tx.send(Item::Event(ev)).await.is_err() {
-                    return (End::Shutdown, !first);
+                    return End::Shutdown;
                 }
             }
         }
@@ -1013,6 +942,7 @@ mod tests {
         for (r, label) in reasons {
             assert_eq!(r.label(), label);
         }
+        use farsight_storage::codes::SeamTrigger;
         assert_eq!(SeamTrigger::of(true, false).label(), "clamp_recovery");
         assert_eq!(SeamTrigger::of(true, true).label(), "clamp_recovery");
         assert_eq!(SeamTrigger::of(false, true).label(), "failover");

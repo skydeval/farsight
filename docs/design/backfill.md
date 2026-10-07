@@ -91,7 +91,14 @@ For a DID `D`:
    status (`deactivated`, `takendown`, `suspended`, `deleted`), the
    relay's `com.atproto.sync.getRepoStatus` is asked first. If it
    confirms, the job ends **inactive** without reading anything. If it
-   contradicts, the status is set back to active and the job goes on.
+   says the account is active, the status is set back to active and
+   the job goes on; if it says the account is inactive with a status
+   that hides nothing (`throttled`, `desynchronized`), that status is
+   stored and the job goes on. Only the relay's own answer lifts a
+   hidden status. When the relay gives none (an error, a rate limit, a
+   timeout, an answer without `active`), the account stays hidden,
+   nothing is read, and the job **fails** and is retried like any
+   other failure.
 2. **Resume or start.** If `backfill_state.current_run_id` names a run
    whose cursor rows carry a stamp read less than 72 hours ago, the
    job re-attaches to that run: same stamp, same cursors. Otherwise it
@@ -106,7 +113,9 @@ For a DID `D`:
    ends the job **inactive**. A DID that does not resolve is a failure.
 4. **Stamp early.** If `D` already holds stored rows, read
    `com.atproto.sync.getLatestCommit` and keep its rev as the stamp
-   `R`, with `stamp_read_at` from the database clock, before anything
+   `R` (a rev whose time is more than 5 minutes ahead of the clock is
+   refused and fails the job, since records stored with it would win
+   over every later write), with `stamp_read_at` from the database clock, before anything
    else is read. Otherwise the stamp is deferred.
 5. **`describeRepo`.** The present set `P` is the repo's collections
    among the four; `listitem` stays in `P` only if `D` owns a tracked

@@ -248,7 +248,7 @@ endpoint. An instance that offers only v1 works, but caps coverage at
 
 | Key | Default | Meaning |
 |---|---|---|
-| `gap_threshold` | `"300s"` | On a resume, a first event later than the requested cursor by more than this counts as a clamp (the instance no longer had the position) and opens a gap. |
+| `gap_threshold` | `"300s"` | On a failover, a first event later than the requested cursor by more than this counts as a clamp (the instance no longer had the position) and opens a gap. On a resume by `seq`, a first event later than the stored cursor by more than this means the stream did not continue, and opens a gap too. |
 | `failover_rewind_min` | `"10m"` | Smallest rewind on failover: the new instance is asked for the applied position minus the larger of this and its lag plus 5 minutes. |
 | `failover_max_lag` | `"30m"` | Largest lag of the new instance for which such a rewind is trusted. |
 | `synthetic_gap_lag` | `"5m"` | Applied-through lag beyond which coverage treats the stream as behind, as it does while disconnected. |
@@ -256,7 +256,7 @@ endpoint. An instance that offers only v1 works, but caps coverage at
 | `seam_repair_before` | `"150s"` | A seam repair's window starts this long before the session's connect. |
 | `seam_repair_after` | `"30s"` | And ends this long after the session caught up. |
 | `seam_repair_delay` | `"60s"` | Wait between catching up and the seam repair. |
-| `seam_repair_catchup_margin` | `"5s"` | A session has caught up once an event's witness time is within this of wall time. |
+| `seam_repair_catchup_margin` | `"5s"` | A session has caught up once an event's witness time is within this of wall time, or is later than the session's connect. |
 
 The resume plan, failover and seam repair are explained in
 [firehose.md](firehose.md#cursors-reconnects-and-gaps).
@@ -584,7 +584,7 @@ that can reach the network only through a proxy cannot run.
 
 | Path | Answer |
 |---|---|
-| `/health` | `200` if and only if the firehose is connected and `SELECT 1` answers within 1 second; otherwise `503`. In setup mode `503 {"status":"setup"}`. |
+| `/health` | `200` if and only if `SELECT 1` answers within 1 second, the firehose is connected, and `applied_through` is at most `firehose.tuning.synthetic_gap_lag` behind; otherwise `503`. In setup mode `503 {"status":"setup"}`. |
 | `/livez` | `200 {"status":"ok"}` whenever the process serves HTTP. |
 
 ```json
@@ -594,7 +594,10 @@ that can reach the network only through a proxy cannot run.
 ```
 
 `status` is `ok` or `unhealthy`; `db` is `ok` or `error`; `lagSeconds`
-is null before the first applied event. Both answers are
+is null before the first applied event, which is not a lag. The lag
+is part of the verdict because the connected flag alone stays true
+while the writer is held on one batch; coverage reports
+`firehose_lagging` past the same bound. Both answers are
 `Cache-Control: no-store`.
 
 Use `/health` to *report* and `/livez` to *restart*. A Jetstream
@@ -620,7 +623,7 @@ of the API contract.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `farsight_task_panics_total` | counter | `task`: the task that panicked ([When a task panics](#when-a-task-panics)). Server: `ingest_reader`, `ingest_writer`, `ingest_counter_flush`, `counter_flush`, `coverage_snapshot`, `housekeeping`, `periodic_scheduler`, `metrics_listener`, `handle_warming`, `handle_warming_check`, `handle_pass`, `handle_pass_check`, `top_lists`, `sort_index_builder`, and the names of the periodic tasks. Backfill: `backfill_scheduler`, `backfill_job`, `backfill_sweep`, `backfill_feeder`, `backfill_budget_monitor`, `backfill_pending_timeouts`, `backfill_gauges`, `backfill_counter_flush`, `backfill_metrics_listener`. |
+| `farsight_task_panics_total` | counter | `task`: the task that panicked ([When a task panics](#when-a-task-panics)). Server: `ingest_reader`, `ingest_writer`, `ingest_counter_flush`, `ingest_seam_repair`, `ingest_gauges`, `counter_flush`, `coverage_snapshot`, `housekeeping`, `periodic_scheduler`, `metrics_listener`, `handle_warming`, `handle_warming_check`, `handle_pass`, `handle_pass_check`, `top_lists`, `sort_index_builder`, and the names of the periodic tasks. Backfill: `backfill_scheduler`, `backfill_job`, `backfill_sweep`, `backfill_feeder`, `backfill_budget_monitor`, `backfill_pending_timeouts`, `backfill_gauges`, `backfill_counter_flush`, `backfill_metrics_listener`. |
 
 ### Firehose and ingest (server)
 
@@ -633,11 +636,12 @@ of the API contract.
 | `farsight_firehose_reconnects_total` | counter | `reason` (`connect_error`, `stall`, `closed`, `error`, `server_error`, `kill`, `failover`, `cursor_too_old`) |
 | `farsight_firehose_seam_repairs_total` | counter | `trigger` (`resume`, `failover`, `clamp_recovery`) |
 | `farsight_firehose_seam_repair_events_total` | counter | |
+| `farsight_firehose_pending_seams` | gauge | |
 | `farsight_firehose_open_gaps` | gauge | |
 | `farsight_ingest_batch_seconds` | histogram | |
 | `farsight_ingest_buffer_depth` | gauge | |
 | `farsight_ingest_dropped_total` | counter | `reason` (`invalid`, `foreign_listitem`, `poisoned`) |
-| `farsight_ingest_storage_errors_total` | counter | `op` (`mark_connected`, `set_connected`, `record_gap`, `read_state`, `open_sync_unavailable`, `close_sync_unavailable`, `purge_account`, `record_poisoned`): storage calls of the ingest writer that failed permanently and were given up ([firehose.md](firehose.md#storage-calls-outside-a-batch)) |
+| `farsight_ingest_storage_errors_total` | counter | `op` (`mark_connected`, `set_connected`, `record_gap`, `read_state`, `open_sync_unavailable`, `close_sync_unavailable`, `purge_account`, `record_poisoned`, `open_seam`, `close_seams`, `finish_seams`, `forget_instance_seq`): storage calls of the ingest writer that failed permanently and were given up ([firehose.md](firehose.md#storage-calls-outside-a-batch)) |
 
 ### API (server)
 
@@ -648,6 +652,7 @@ of the API contract.
 | `farsight_rate_limited_total` | counter | `class` (`anon_read`, `key_read`, `admin_backfill`, `key_backfill`, `ui_lookup`, `ui_login`, `ui_login_start`, `public_ui`, `public_ui_handle`, `public_ui_card`, `public_ui_card_budget`) |
 | `farsight_coverage_exceptions` | gauge | `kind` (the nine counters of `freshness.coverage.exceptions`, by their field names, such as `unreachableRepos`) |
 | `farsight_lists` | gauge | `state` (the nine tracking states of [list-indexing.md](list-indexing.md#list-state)) |
+| `farsight_coverage_snapshot_age_seconds` | gauge | Time since the coverage snapshot in use was read; past 30 s responses carry `coverage_stale` ([coverage.md](coverage.md#the-global-snapshot)) |
 
 The admin dashboard also shows, per endpoint and since the process
 started, the requests, the errors (status 400 and above other than

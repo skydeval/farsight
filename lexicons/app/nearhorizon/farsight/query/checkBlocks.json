@@ -155,6 +155,7 @@
               "sweep_incomplete",
               "firehose_gap",
               "firehose_disconnected",
+              "coverage_stale",
               "firehose_lagging",
               "sync_events_unavailable",
               "storage_refusal",

@@ -9,13 +9,16 @@
 //!   it is undefined (`None`) before the first batch.
 //! - Gaps are stored on the witness clock. The v1 interval is one open
 //!   `sync_unavailable` gap per v1 session.
+//! - A seam window (`firehose_seams`) is stored when a resumed session
+//!   delivers its first event and deleted when its re-read has been
+//!   applied. One whose re-read keeps failing becomes a gap.
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgExecutor, PgPool};
 
-use crate::codes::{GapCause, Protocol};
+use crate::codes::{GapCause, Protocol, SeamTrigger};
 use crate::error::Result;
-use crate::ids::{CycleId, GapId};
+use crate::ids::{CycleId, GapId, SeamId};
 use crate::txn::Txn;
 
 /// What an ingest batch persists alongside its writes.
@@ -159,6 +162,25 @@ pub async fn mark_connected(pool: &PgPool, source_url: &str, protocol: Protocol)
     .bind(protocol.code())
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Forgets the `seq` stored for instance `source_url`: the instance's
+/// sequence started again, so the stored number names nothing in it. The
+/// cursor is kept as a running maximum, which a lower `seq` could never
+/// replace; the next batch from the instance stores its own. The
+/// timestamp form of the cursor still holds and is kept.
+pub async fn forget_instance_seq(pool: &PgPool, source_url: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE firehose_cursors SET cursor_seq = NULL WHERE source_url = $1")
+        .bind(source_url)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE firehose_state SET cursor_seq = NULL WHERE id = 1 AND source_url = $1")
+        .bind(source_url)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -436,4 +458,167 @@ pub async fn all_gaps<'e>(ex: impl PgExecutor<'e>) -> Result<Vec<Gap>> {
     .fetch_all(ex)
     .await?;
     Ok(rows.into_iter().map(gap_from_row).collect())
+}
+
+/// A `firehose_seams` row whose window is closed: a stretch of one
+/// instance's stream to read again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seam {
+    /// `firehose_seams.id`.
+    pub id: SeamId,
+    /// The instance the window is read from.
+    pub source_url: String,
+    /// The protocol the resumed session spoke.
+    pub protocol: Protocol,
+    /// What kind of resume the window follows.
+    pub trigger: SeamTrigger,
+    /// Start of the window (witness clock).
+    pub from_at: DateTime<Utc>,
+    /// End of the window (witness clock).
+    pub to_at: DateTime<Utc>,
+    /// Re-reads of it that failed.
+    pub attempts: i32,
+}
+
+/// Stores the seam window of a session resumed on `source_url`, open
+/// (without an end) until [`close_seams`] is told how far the session
+/// got. Written before the session's first event is applied, so a stop at
+/// any later point leaves the window on record.
+pub async fn open_seam(
+    pool: &PgPool,
+    source_url: &str,
+    protocol: Protocol,
+    trigger: SeamTrigger,
+    from: DateTime<Utc>,
+) -> Result<SeamId> {
+    Ok(sqlx::query_scalar(
+        "INSERT INTO firehose_seams (source_url, protocol, trigger, from_at)
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(source_url)
+    .bind(protocol.code())
+    .bind(trigger.code())
+    .bind(from)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Closes every open seam window at `through` (witness clock), the point
+/// its session reached: the window ends `after` later and its re-read is
+/// due `delay` from now. A window whose session never reached its start
+/// had no hand-over from replay to the live tail and is deleted. Returns
+/// the number of windows closed.
+pub async fn close_seams(
+    pool: &PgPool,
+    through: DateTime<Utc>,
+    after: std::time::Duration,
+    delay: std::time::Duration,
+) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM firehose_seams WHERE to_at IS NULL AND from_at > $1")
+        .bind(through)
+        .execute(&mut *tx)
+        .await?;
+    let n = sqlx::query(
+        "UPDATE firehose_seams
+         SET to_at = $1 + $2 * interval '1 second',
+             due_at = clock_timestamp() + $3 * interval '1 second'
+         WHERE to_at IS NULL",
+    )
+    .bind(through)
+    .bind(after.as_secs_f64())
+    .bind(delay.as_secs_f64())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(n)
+}
+
+type SeamRow = (SeamId, String, i16, i16, DateTime<Utc>, DateTime<Utc>, i32);
+
+/// The closed seam windows whose re-read is due, oldest first.
+pub async fn due_seams<'e>(ex: impl PgExecutor<'e>) -> Result<Vec<Seam>> {
+    let rows: Vec<SeamRow> = sqlx::query_as(
+        "SELECT id, source_url, protocol, trigger, from_at, to_at, attempts
+         FROM firehose_seams
+         WHERE to_at IS NOT NULL AND due_at <= clock_timestamp()
+         ORDER BY from_at, id",
+    )
+    .fetch_all(ex)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| Seam {
+            id: r.0,
+            source_url: r.1,
+            protocol: Protocol::from_code(r.2).unwrap_or(Protocol::V2),
+            trigger: SeamTrigger::from_code(r.3).unwrap_or(SeamTrigger::Resume),
+            from_at: r.4,
+            to_at: r.5,
+            attempts: r.6,
+        })
+        .collect())
+}
+
+/// The number of seam windows on record, open or closed.
+pub async fn pending_seams<'e>(ex: impl PgExecutor<'e>) -> Result<i64> {
+    Ok(sqlx::query_scalar("SELECT count(*) FROM firehose_seams")
+        .fetch_one(ex)
+        .await?)
+}
+
+/// Deletes seam windows whose re-read has been applied.
+pub async fn finish_seams(pool: &PgPool, ids: &[SeamId]) -> Result<u64> {
+    Ok(sqlx::query("DELETE FROM firehose_seams WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
+
+/// Puts the re-read of seam windows off by `retry_in`. `failed` counts
+/// the attempt against them; a re-read that ended without an answer
+/// either way is put off without being counted.
+pub async fn defer_seams(
+    pool: &PgPool,
+    ids: &[SeamId],
+    retry_in: std::time::Duration,
+    failed: bool,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE firehose_seams
+         SET due_at = clock_timestamp() + $2 * interval '1 second',
+             attempts = attempts + $3
+         WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .bind(retry_in.as_secs_f64())
+    .bind(i32::from(failed))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Gives up on seam windows: each becomes a closed gap of cause
+/// [`GapCause::SeamUnrepaired`] over its window and its row is deleted,
+/// in one transaction. Returns the gaps recorded.
+pub async fn abandon_seams(pool: &PgPool, ids: &[SeamId]) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let n = sqlx::query(
+        "WITH gone AS (DELETE FROM firehose_seams WHERE id = ANY($1) AND to_at IS NOT NULL
+                       RETURNING from_at, to_at)
+         INSERT INTO firehose_gaps (from_at, to_at, cause)
+         SELECT from_at, to_at, $2 FROM gone",
+    )
+    .bind(ids)
+    .bind(GapCause::SeamUnrepaired.code())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query("SELECT pg_notify('farsight_coverage', '')")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(n)
 }

@@ -1715,18 +1715,24 @@ async fn phase_coverage(
     // firehose_disconnected / firehose_lagging / sync_events_unavailable
     paused.store(true, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    for (name, sql) in [
+    // `/health` follows the same state: connected is not enough, a stream
+    // that has applied nothing for longer than `synthetic_gap_lag` is not
+    // healthy either.
+    for (name, sql, health) in [
         (
             "firehose_disconnected",
             "UPDATE firehose_state SET connected = false, applied_through = now()",
+            503,
         ),
         (
             "firehose_lagging",
             "UPDATE firehose_state SET connected = true, applied_through = now() - interval '10 minutes'",
+            503,
         ),
         (
             "sync_events_unavailable",
             "UPDATE firehose_state SET connected = true, applied_through = now(), protocol = 1",
+            200,
         ),
     ] {
         seed::exec(&pool, sql).await?;
@@ -1734,6 +1740,13 @@ async fn phase_coverage(
         let (cv, r) = v.cov("query.getIncomingBlocks", &xq).await?;
         let (ok, d) = partial_case(name, &cv, &r);
         c.check(format!("partial + {name}"), ok, d);
+        let h = v.ctx.http.get(&format!("{}/health", v.base), &[]).await?;
+        c.check(
+            format!("/health with {name}: {health}"),
+            i64::from(h.status) == health
+                && h.body["status"] == if health == 200 { "ok" } else { "unhealthy" },
+            h.short(),
+        );
     }
     paused.store(false, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -1794,6 +1807,45 @@ async fn phase_coverage(
     c.check(
         "getListMembers(ready, covered fetch): complete, no reasons",
         level(&cv) == "complete" && reasons(&cv).is_empty(),
+        r.short(),
+    );
+    // A hidden owner hides its list: never `ready` with no members, which
+    // would read as a list known to be empty, and none of its facts.
+    let shown = r.body.clone();
+    for status in [1, 2, 3, 4] {
+        seed::exec(
+            &pool,
+            &format!("UPDATE actors SET status = {status} WHERE id = {p}"),
+        )
+        .await?;
+        let (cv, r) = v.cov("query.getListMembers", &list_q("ready")).await?;
+        let b = &r.body;
+        c.check(
+            format!("getListMembers(ready, owner status {status}): unavailable, no members, no facts, list_unavailable"),
+            b["state"] == "unavailable"
+                && b["members"].as_array().is_some_and(Vec::is_empty)
+                && b.get("name").is_none()
+                && b.get("purpose").is_none()
+                && b["listblockCount"] == 0
+                && b["capped"] == false
+                && b.get("cursor").is_none()
+                && reasons(&cv).contains("list_unavailable"),
+            r.short(),
+        );
+    }
+    seed::exec(
+        &pool,
+        &format!("UPDATE actors SET status = 0 WHERE id = {p}"),
+    )
+    .await?;
+    let (_, r) = v.cov("query.getListMembers", &list_q("ready")).await?;
+    c.check(
+        "getListMembers(ready, owner shown again): as before",
+        r.body["state"] == "ready"
+            && r.body["name"] == shown["name"]
+            && r.body["purpose"] == shown["purpose"]
+            && r.body["listblockCount"] == shown["listblockCount"]
+            && r.body["members"] == shown["members"],
         r.short(),
     );
 

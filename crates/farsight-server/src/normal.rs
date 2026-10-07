@@ -342,7 +342,13 @@ pub async fn run(
     let app = Router::new()
         .merge(farsight_api::router(api.clone()))
         .merge(farsight_web::pages::router(web.clone()))
-        .route("/health", get(health::health).with_state(api_pool.clone()))
+        .route(
+            "/health",
+            get(health::health).with_state(health::HealthState {
+                pool: api_pool.clone(),
+                config: config.clone(),
+            }),
+        )
         .route("/livez", get(health::livez))
         // One answer for every path that does not exist, and for the
         // routes of a feature that is switched off.

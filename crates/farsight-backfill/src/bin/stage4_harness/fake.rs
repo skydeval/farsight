@@ -3,7 +3,7 @@
 //! checks script. Every request is logged so checks can assert what the
 //! backfill actually asked for.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use axum::Json;
@@ -36,6 +36,9 @@ pub struct World {
     pub plc: HashMap<String, String>,
     /// Relay `getRepoStatus` overrides: DID → (active, status).
     pub status: HashMap<String, (bool, Option<String>)>,
+    /// Relay `getRepoStatus` failures: for these DIDs the relay answers
+    /// 500 instead of a status.
+    pub status_down: HashSet<String>,
     /// Relay `listReposByCollection`: collection → DIDs (sorted).
     pub by_collection: BTreeMap<String, BTreeSet<String>>,
     /// Relay `listRepos`: `(did, rev, active)`, in order.
@@ -83,6 +86,9 @@ async fn xrpc(State(s): State<Shared>, Path(method): Path<String>, Query(q): Q) 
     world.hits.push((short.clone(), did.clone(), coll.clone()));
     match short.as_str() {
         "getRepoStatus" => {
+            if world.status_down.contains(&did) {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError");
+            }
             if let Some((active, status)) = world.status.get(&did).cloned() {
                 return Json(json!({"did": did, "active": active, "status": status}))
                     .into_response();

@@ -66,7 +66,9 @@ config keys use one double underscore per level, for example
 
 ## Health checks
 
-`/health` returns 200 when the firehose is connected and the database
-answers within a second (compose uses it as a status check); `/livez`
+`/health` returns 200 when the database answers within a second, the
+firehose is connected and what it has applied is at most
+`firehose.tuning.synthetic_gap_lag` (5 minutes) behind (compose uses
+it as a status check); `/livez`
 returns 200 while the process serves HTTP and is the right probe for
 orchestrators that restart unhealthy containers.

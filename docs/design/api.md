@@ -33,7 +33,8 @@ right.
   unless `includeInactive=true`. Any other status, including unknown
   values, `throttled` and `desynchronized`, is shown. List membership
   is authored by the list's owner, so a hidden owner hides its lists
-  in `getListsNaming`, `getIncomingListBlocks` and `checkBlocks`.
+  in `getListsNaming`, `getIncomingListBlocks` and `checkBlocks`, and
+  `getListMembers` reports such a list as `unavailable`.
 - **Freshness.** Every read response carries a `freshness` object
   saying how current the answer is and what Farsight can claim about
   its completeness. It is described in [coverage.md](coverage.md).
@@ -221,11 +222,18 @@ member (by Farsight's own actor id), then listitem record key.
 | `ready` | Admitted, and a fetch of the owner's repository has completed. | yes |
 | `retained` | Was `ready` and lost its last counted listblock; kept for a grace period (`limits.list_grace`). | yes |
 | `pending` | Admitted; the fetch has not completed yet. | no |
-| `unavailable` | The fetch failed through its retries, the list stayed `pending` longer than `limits.pending_max_age`, or the owner is inactive. Farsight keeps retrying. | no |
+| `unavailable` | The fetch failed through its retries, the list stayed `pending` longer than `limits.pending_max_age`, or the owner is inactive or hidden. Farsight keeps retrying. | no |
 | `deferred` | Counted listblocks exist, but a gate refused the admission: the storage budget or ceiling, a host or author cap, or the owner's daily re-admission allowance. | no |
 | `untracked` | No counted listblock points at it. Also reported for a list Farsight has never seen. | no |
 | `missing` | Counted listblocks exist, but the list record was not found; Farsight keeps retrying. | no |
 | `dead` | The list record is known to be deleted, or was not found through all retries. | no |
+
+A list whose owner is hidden is reported as `unavailable` whatever
+state Farsight holds it in, with the reason `list_unavailable`, an
+empty `members` array, no `purpose` and no `name`, `capped` false and
+`listblockCount` 0. It is never reported as `ready` with no members,
+which would read as a list known to be empty. The stored state is
+reported again when the owner becomes active.
 
 A list whose items are being purged is reported as `pending` if the
 purge will end in a re-admission, else as `untracked`. The states and

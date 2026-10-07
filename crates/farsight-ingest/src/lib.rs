@@ -6,14 +6,18 @@
 //! ```
 //!
 //! [`Ingest::start`] spawns both tasks and returns an [`IngestHandle`].
+//! Beside them run the seam repair task ([`seam`]), which reads the
+//! recorded seam windows again and feeds the same writer, and a task
+//! that keeps the gauges ([`gauges`]).
 //!
 //! The reader and the writer are one pipeline: a batch the writer holds
 //! exists nowhere else, and the reader's position is only as good as what
 //! the writer committed. If either of them panics, the other ends with
 //! it, the panic is logged and counted, and [`IngestHandle::failed`]
 //! reports it; the embedding process then exits, and the next start
-//! resumes from the persisted cursor. The counter flusher keeps no state
-//! and is started again in place.
+//! resumes from the persisted cursor. The counter flusher, the seam
+//! repair task and the gauge task keep no state of their own and are
+//! started again in place.
 
 #![warn(missing_docs)]
 
@@ -24,6 +28,7 @@ pub mod lag;
 pub mod metrics;
 pub mod reader;
 pub mod resume;
+pub mod seam;
 pub mod stats;
 pub mod writer;
 
@@ -53,8 +58,23 @@ pub const READER_TASK: &str = "ingest_reader";
 pub const WRITER_TASK: &str = "ingest_writer";
 /// Task name of the counter flusher.
 pub const FLUSHER_TASK: &str = "ingest_counter_flush";
+/// Task name of the seam repair task.
+pub const SEAM_TASK: &str = "ingest_seam_repair";
+/// Task name of the gauge task.
+pub const GAUGES_TASK: &str = "ingest_gauges";
 /// The tasks ingest runs.
-pub const TASKS: [&str; 3] = [READER_TASK, WRITER_TASK, FLUSHER_TASK];
+pub const TASKS: [&str; 5] = [
+    READER_TASK,
+    WRITER_TASK,
+    FLUSHER_TASK,
+    SEAM_TASK,
+    GAUGES_TASK,
+];
+
+/// How often the gauge task sets the gauges.
+pub const GAUGE_PERIOD: Duration = Duration::from_secs(1);
+/// Longest the gauge task waits for one read of the database.
+pub const GAUGE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Fault injection for the harness: events from these DIDs fail every
 /// apply attempt, exercising the poisoned-event path.
@@ -125,6 +145,7 @@ pub struct IngestHandle {
     pub faults: Arc<FaultHook>,
     tasks: Vec<JoinHandle<()>>,
     flusher: JoinHandle<()>,
+    gauges: JoinHandle<()>,
     failed: watch::Receiver<Option<&'static str>>,
     pool: PgPool,
     limits: Limits,
@@ -140,6 +161,48 @@ async fn pipeline_task(
     if let Err(message) = farsight_core::task::catch(run).await {
         farsight_core::task::report_panic(name, &message);
         let _ = failed.send(Some(name));
+    }
+}
+
+/// `now − applied`, in seconds, never negative.
+pub fn lag_seconds(
+    now: chrono::DateTime<chrono::Utc>,
+    applied: chrono::DateTime<chrono::Utc>,
+) -> f64 {
+    ((now - applied).num_milliseconds() as f64 / 1000.0).max(0.0)
+}
+
+/// Keeps the firehose gauges: the lag, the open gaps, the seam windows
+/// waiting for their re-read and the depth of the channel.
+///
+/// It runs beside the writer rather than in it, so the gauges go on while
+/// the writer is held on one batch, which is when they matter. The lag is
+/// measured from the last `applied_through` this task could read: while
+/// the database does not answer it keeps growing with the clock.
+pub async fn gauges(pool: PgPool, tx: mpsc::WeakSender<writer::Item>) {
+    use crate::metrics as m;
+    let mut applied = None;
+    let mut tick = tokio::time::interval(GAUGE_PERIOD);
+    loop {
+        tick.tick().await;
+        if let Some(tx) = tx.upgrade() {
+            let depth = tx.max_capacity().saturating_sub(tx.capacity());
+            ::metrics::gauge!(m::BUFFER_DEPTH).set(depth as f64);
+        }
+        let read = async {
+            let state = farsight_storage::firehose::read_state(&pool).await?;
+            let gaps = farsight_storage::firehose::unhealed_gaps(&pool).await?;
+            let seams = farsight_storage::firehose::pending_seams(&pool).await?;
+            Ok::<_, farsight_storage::StorageError>((state, gaps.len(), seams))
+        };
+        if let Ok(Ok((state, gaps, seams))) = tokio::time::timeout(GAUGE_READ_TIMEOUT, read).await {
+            applied = state.applied_through.or(applied);
+            ::metrics::gauge!(m::OPEN_GAPS).set(gaps as f64);
+            ::metrics::gauge!(m::PENDING_SEAMS).set(seams as f64);
+        }
+        if let Some(a) = applied {
+            ::metrics::gauge!(m::LAG).set(lag_seconds(chrono::Utc::now(), a));
+        }
     }
 }
 
@@ -174,9 +237,7 @@ pub async fn firehose_status(
             farsight_storage::codes::Protocol::V1 => frame::Protocol::V1,
             farsight_storage::codes::Protocol::V2 => frame::Protocol::V2,
         }),
-        lag_seconds: st
-            .applied_through
-            .map(|a| ((now - a).num_milliseconds() as f64 / 1000.0).max(0.0)),
+        lag_seconds: st.applied_through.map(|a| lag_seconds(now, a)),
         source_lag_seconds: stats.and_then(|s| {
             let ms = s.source_lag_ms.load(std::sync::atomic::Ordering::Relaxed);
             (ms >= 0).then(|| ms as f64 / 1000.0)
@@ -217,6 +278,7 @@ impl IngestHandle {
             let _ = tokio::time::timeout(Duration::from_secs(30), t).await;
         }
         self.flusher.abort();
+        self.gauges.abort();
         if let Err(e) = self.counters.flush(&self.pool, &self.limits).await {
             tracing::warn!(error = %e, "final counter flush failed");
         }
@@ -227,9 +289,10 @@ impl IngestHandle {
 pub struct Ingest;
 
 impl Ingest {
-    /// Starts the reader, the writer and the counter flusher. `pool` should
-    /// be the dedicated 4-connection ingest pool. Accounts left half-purged
-    /// by a crash are purged first.
+    /// Starts the reader, the writer, the seam repair task, the gauge task
+    /// and the counter flusher. `pool` should be the dedicated
+    /// 4-connection ingest pool. Accounts left half-purged by a crash are
+    /// purged first, and seam windows left open by one are closed.
     pub async fn start(cfg: IngestConfig, pool: PgPool) -> Result<IngestHandle, String> {
         if cfg.reader.urls.is_empty() {
             return Err("firehose.urls is empty".into());
@@ -267,14 +330,46 @@ impl Ingest {
             }
         }
 
+        // A seam window still open belongs to a session that did not live
+        // to close it: it ends where the stream got to.
+        let state = farsight_storage::firehose::read_state(&pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(through) = state.applied_through {
+            let seam = &cfg.reader.seam;
+            farsight_storage::firehose::close_seams(&pool, through, seam.after, seam.delay)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (ctl_tx, ctl_rx) = mpsc::channel(64);
+        let plain = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let repairer = seam::Repairer {
+            pool: pool.clone(),
+            tx: tx.clone(),
+            stall_timeout: cfg.reader.stall_timeout,
+            plain: plain.clone(),
+            #[cfg(feature = "harness")]
+            tap: cfg.tap.clone(),
+        };
+        let repairs = reader::Repairs::hold(tokio::spawn(farsight_core::task::supervise(
+            SEAM_TASK,
+            move || repairer.clone().run(),
+        )));
+        let gauges = {
+            let (pool, tx) = (pool.clone(), tx.downgrade());
+            tokio::spawn(farsight_core::task::supervise(GAUGES_TASK, move || {
+                gauges(pool.clone(), tx.clone())
+            }))
+        };
         let writer = writer::Writer {
             pool: pool.clone(),
             limits: cfg.limits.clone(),
             gates: cfg.gates.clone(),
             counters: counters.clone(),
             stats: stats.clone(),
+            seam: cfg.reader.seam,
             #[cfg(feature = "harness")]
             faults: faults.clone(),
         };
@@ -288,8 +383,9 @@ impl Ingest {
             tap: cfg.tap.clone(),
             #[cfg(feature = "harness")]
             rewind: None,
-            repairs: reader::Repairs::default(),
+            repairs,
             pending_inject: Vec::new(),
+            plain,
         };
         let flusher = {
             let counters = counters.clone();
@@ -325,9 +421,24 @@ impl Ingest {
             faults,
             tasks,
             flusher,
+            gauges,
             failed,
             pool,
             limits: cfg.limits,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_lag_is_measured_from_the_last_position_and_never_negative() {
+        let t = |s: i64| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0).unwrap();
+        assert_eq!(lag_seconds(t(1_000), t(1_000)), 0.0);
+        assert_eq!(lag_seconds(t(1_090), t(1_000)), 90.0);
+        // A position ahead of the clock is no lag.
+        assert_eq!(lag_seconds(t(1_000), t(1_200)), 0.0);
     }
 }

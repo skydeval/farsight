@@ -260,6 +260,8 @@ code_enum! {
         Failover = 3,
         /// An interval spent on v1 (no `#sync`).
         SyncUnavailable = 4,
+        /// A seam window whose re-read could not be finished.
+        SeamUnrepaired = 5,
     }
 }
 
@@ -271,6 +273,43 @@ impl GapCause {
             GapCause::Heuristic => "Heuristic",
             GapCause::Failover => "Failover",
             GapCause::SyncUnavailable => "SyncUnavailable",
+            GapCause::SeamUnrepaired => "SeamUnrepaired",
+        }
+    }
+}
+
+code_enum! {
+    /// `firehose_seams.trigger`: what kind of resume a seam window
+    /// follows.
+    SeamTrigger {
+        /// A resume on the same instance.
+        Resume = 1,
+        /// A resume on another instance.
+        Failover = 2,
+        /// A resume that recorded a gap.
+        ClampRecovery = 3,
+    }
+}
+
+impl SeamTrigger {
+    /// The `trigger` label of `farsight_firehose_seam_repairs_total`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            SeamTrigger::Resume => "resume",
+            SeamTrigger::Failover => "failover",
+            SeamTrigger::ClampRecovery => "clamp_recovery",
+        }
+    }
+
+    /// The trigger for a resume: `gap` if its first event recorded one,
+    /// `failover` if it is on another instance than the session before.
+    pub const fn of(gap: bool, failover: bool) -> SeamTrigger {
+        if gap {
+            SeamTrigger::ClampRecovery
+        } else if failover {
+            SeamTrigger::Failover
+        } else {
+            SeamTrigger::Resume
         }
     }
 }
@@ -954,6 +993,17 @@ mod tests {
                 (G::Heuristic, 2),
                 (G::Failover, 3),
                 (G::SyncUnavailable, 4),
+                (G::SeamUnrepaired, 5),
+            ],
+        );
+        pin(
+            SeamTrigger::ALL,
+            SeamTrigger::code,
+            SeamTrigger::from_code,
+            &[
+                (SeamTrigger::Resume, 1),
+                (SeamTrigger::Failover, 2),
+                (SeamTrigger::ClampRecovery, 3),
             ],
         );
         pin(
@@ -1076,6 +1126,7 @@ mod tests {
             (GapCause::Heuristic, "Heuristic"),
             (GapCause::Failover, "Failover"),
             (GapCause::SyncUnavailable, "SyncUnavailable"),
+            (GapCause::SeamUnrepaired, "SeamUnrepaired"),
         ] {
             assert_eq!(c.api_name(), name);
             // The name is the variant's, as `getStats` has always shown it.
@@ -1429,6 +1480,14 @@ mod tests {
                 one_of("protocol", of!(Protocol)),
             ),
             ("firehose_gaps_cause_code", one_of("cause", of!(GapCause))),
+            (
+                "firehose_seams_protocol_code",
+                one_of("protocol", of!(Protocol)),
+            ),
+            (
+                "firehose_seams_trigger_code",
+                one_of("trigger", of!(SeamTrigger)),
+            ),
             (
                 "backfill_state_state_code",
                 one_of("state", of!(BackfillState)),

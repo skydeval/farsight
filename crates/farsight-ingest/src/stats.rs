@@ -28,7 +28,8 @@ pub struct IngestStats {
     pub reconnects: AtomicU64,
     /// Transient storage failures retried.
     pub transient_retries: AtomicU64,
-    /// Seam repairs completed (see `reader::SEAM_DELAY`).
+    /// Seam repairs applied: re-reads that reached the end of their
+    /// window (see [`crate::seam`]).
     pub seam_repairs: AtomicU64,
     /// Events re-read by seam repairs.
     pub seam_repair_events: AtomicU64,

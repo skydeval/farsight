@@ -210,9 +210,11 @@ impl Default for FirehoseConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FirehoseTuning {
-    /// On a resume, a first event later than the requested cursor by more
-    /// than this counts as a clamp (the instance no longer had the
-    /// position) and opens a gap.
+    /// On a failover, a first event later than the requested cursor by
+    /// more than this counts as a clamp (the instance no longer had the
+    /// position) and opens a gap. On a resume by `seq`, a first event
+    /// later than the stored cursor by more than this means the stream
+    /// did not continue, and opens a gap too.
     pub gap_threshold: ConfigDuration,
     /// Smallest rewind on failover: the new instance is asked for the
     /// applied position minus the larger of this and its lag plus 5
@@ -232,7 +234,7 @@ pub struct FirehoseTuning {
     /// Delay between catching up and the seam repair.
     pub seam_repair_delay: ConfigDuration,
     /// A session has caught up once an event's witness time is within this
-    /// much of wall time.
+    /// much of wall time, or is later than the session's connect.
     pub seam_repair_catchup_margin: ConfigDuration,
 }
 

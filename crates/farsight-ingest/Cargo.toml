@@ -24,7 +24,7 @@ farsight-storage = { path = "../farsight-storage" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 sqlx.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }

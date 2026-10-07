@@ -102,6 +102,12 @@ id_type!(
 );
 
 id_type!(
+    /// `firehose_seams.id`: one seam window waiting to be read again.
+    SeamId,
+    i64
+);
+
+id_type!(
     /// `backfill_queue.id`: one waiting job. The row is deleted when the
     /// job is picked, so the id lives only as long as the wait.
     QueueId,

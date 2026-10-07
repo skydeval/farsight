@@ -3,17 +3,17 @@
 //! in one transaction with the cursor, `applied_through` and the
 //! `firehose_clock` row, and handles poisoned events.
 //!
-//! Storage calls outside the batch (session and gap bookkeeping, account
-//! purges, the record of a poisoned event) go through
+//! Storage calls outside the batch (session, gap and seam bookkeeping,
+//! account purges, the record of a poisoned event) go through
 //! [`Writer::call_or_record`]: a transient error (the database is away)
 //! is retried until it passes; any other error is tried
 //! [`PERMANENT_ATTEMPTS`] times, then recorded as an operational error
 //! and counted, and the writer goes on. Nothing the writer does waits
 //! for ever on a call that cannot succeed.
 //!
-//! Ordering: every non-event item (session start, gap, disconnect,
-//! barrier) first flushes the events before it, so gaps and the connected
-//! flag are recorded in stream order.
+//! Ordering: every non-event item (session start, gap, seam window,
+//! disconnect, barrier) first flushes the events before it, so gaps, seam
+//! windows and the connected flag are recorded in stream order.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -23,11 +23,12 @@ use chrono::{DateTime, Utc};
 use farsight_core::record::{CommitAction, CommitOp, Operation};
 use farsight_core::{Collection, Did};
 use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Write, WriteAction};
-use farsight_storage::codes::GapCause;
+use farsight_storage::codes::{GapCause, SeamTrigger};
 use farsight_storage::counters::CounterSink;
 use farsight_storage::error::StorageError;
 use farsight_storage::firehose::{self, FirehoseProgress};
 use farsight_storage::gates::SharedGates;
+use farsight_storage::ids::SeamId;
 use farsight_storage::janitor;
 use farsight_storage::keys::Limits;
 use farsight_storage::repo_events::{RepoEvent, record_poisoned};
@@ -37,6 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::frame::{Body, InEvent, Protocol};
 use crate::metrics as m;
+use crate::reader::SeamRepair;
 use crate::stats::IngestStats;
 
 /// Most events in one batch, which is one transaction.
@@ -76,12 +78,50 @@ pub fn retry_decision(transient: bool, failed: u32) -> Retry {
 pub enum Item {
     /// An event of the live session.
     Event(InEvent),
-    /// Events re-read by a seam repair. Applied like any other event but
-    /// never advance the cursor, `applied_through` or the clock: the live
-    /// session may still be catching up behind them (a resume after an
-    /// outage), and a cursor moved past un-replayed data would make the
-    /// next reconnect skip it.
+    /// Events re-read by a seam repair, at most [`BATCH_MAX`] of them.
+    /// Applied like any other event but never advance the cursor,
+    /// `applied_through` or the clock: the live session may still be
+    /// catching up behind them (a resume after an outage), and a cursor
+    /// moved past un-replayed data would make the next reconnect skip it.
     Repair(Vec<InEvent>),
+    /// The seam window of a session resumed on `url`, to put on record
+    /// before the session's first event is applied.
+    SeamOpen {
+        /// Instance URL (as configured).
+        url: String,
+        /// The protocol the session speaks.
+        protocol: Protocol,
+        /// What kind of resume it was.
+        trigger: SeamTrigger,
+        /// Start of the window, witness µs.
+        from_us: i64,
+    },
+    /// The session with an open seam window got as far as `through_us`
+    /// (witness µs): it caught up with the live tail there, or ended.
+    SeamClose {
+        /// Where the session got to.
+        through_us: i64,
+    },
+    /// The re-read of these seam windows reached their end, and its
+    /// events were sent ahead of this.
+    SeamsRepaired {
+        /// The `firehose_seams` rows the read covered.
+        ids: Vec<SeamId>,
+        /// The trigger the repair is counted under.
+        trigger: SeamTrigger,
+        /// Events the read handed over.
+        events: u64,
+        /// Told once the writer has dealt with the windows, so the repair
+        /// task does not take them up again while they wait in the
+        /// channel.
+        done: oneshot::Sender<()>,
+    },
+    /// The instance `url` answered a `seq` resume from a sequence that
+    /// started again: forget the `seq` stored for it.
+    ForgetSeq {
+        /// Instance URL (as configured).
+        url: String,
+    },
     /// A session to `url` speaking `protocol` started.
     Session {
         /// Instance URL (as configured).
@@ -123,6 +163,9 @@ pub struct Writer {
     pub counters: Arc<CounterSink>,
     /// Counters shared with the reader and the embedding process.
     pub stats: Arc<IngestStats>,
+    /// Seam repair settings: how far past the point a session reached
+    /// its window ends, and how long after that it is read again.
+    pub seam: SeamRepair,
     /// Fault injection (harness only).
     #[cfg(feature = "harness")]
     pub faults: Arc<crate::FaultHook>,
@@ -199,9 +242,11 @@ fn to_repo_event(ev: &InEvent) -> Option<RepoEvent> {
             did,
             active,
             status,
+            time_us,
         } => Some(RepoEvent::Account {
             did: did.clone(),
             witness,
+            time: time_us.and_then(DateTime::<Utc>::from_timestamp_micros),
             active: *active,
             status: status.clone(),
         }),
@@ -213,10 +258,23 @@ fn to_repo_event(ev: &InEvent) -> Option<RepoEvent> {
     }
 }
 
+/// The write an event stands for, if it is one: a commit's own, or the
+/// delete applied in place of a record that was rejected.
+fn event_write(ev: &InEvent) -> Option<&CommitOp> {
+    match &ev.body {
+        Body::Commit(op) => Some(op),
+        Body::Rejected { removes, .. } => removes.as_deref(),
+        _ => None,
+    }
+}
+
 /// The DID an event concerns (for poison bookkeeping).
 fn event_did(ev: &InEvent) -> Option<&Did> {
     match &ev.body {
         Body::Commit(op) => Some(&op.author),
+        Body::Rejected {
+            removes: Some(op), ..
+        } => Some(&op.author),
         Body::Identity(d) | Body::Sync(d) => Some(d),
         Body::Account { did, .. } => Some(did),
         _ => None,
@@ -236,17 +294,8 @@ impl Writer {
     pub async fn run(self, mut rx: mpsc::Receiver<Item>) {
         let mut session: Option<SessionState> = None;
         let mut buf: Vec<InEvent> = Vec::with_capacity(BATCH_MAX);
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
-            metrics::gauge!(m::BUFFER_DEPTH).set(rx.len() as f64);
-            let item = tokio::select! {
-                it = rx.recv() => it,
-                _ = tick.tick() => {
-                    self.refresh_gauges().await;
-                    continue;
-                }
-            };
-            let Some(item) = item else {
+            let Some(item) = rx.recv().await else {
                 self.flush(&mut buf, &mut session).await;
                 return;
             };
@@ -289,6 +338,71 @@ impl Writer {
                     let mut b = chunk.to_vec();
                     self.flush_events(&mut b, session, false).await;
                 }
+            }
+            Item::SeamOpen {
+                url,
+                protocol,
+                trigger,
+                from_us,
+            } => {
+                let opened = self
+                    .call_or_record("open_seam", None, || {
+                        firehose::open_seam(
+                            &self.pool,
+                            &url,
+                            protocol.storage(),
+                            trigger,
+                            dt(from_us),
+                        )
+                    })
+                    .await;
+                // Like a gap: the window is what is known to need a second
+                // read, and the session is not applied without it on record.
+                Self::gap_written("open_seam", opened.is_some());
+            }
+            Item::SeamClose { through_us } => {
+                // Given up, the window stays open; the next session that
+                // ends or catches up closes it, and so does the next start.
+                self.call_or_record("close_seams", None, || {
+                    firehose::close_seams(
+                        &self.pool,
+                        dt(through_us),
+                        self.seam.after,
+                        self.seam.delay,
+                    )
+                })
+                .await;
+            }
+            Item::SeamsRepaired {
+                ids,
+                trigger,
+                events,
+                done,
+            } => {
+                // Given up, the rows stay and the window is read again.
+                let finished = self
+                    .call_or_record("finish_seams", None, || {
+                        firehose::finish_seams(&self.pool, &ids)
+                    })
+                    .await;
+                if finished.is_some() {
+                    self.stats.seam_repairs.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .seam_repair_events
+                        .fetch_add(events, Ordering::Relaxed);
+                    metrics::counter!(m::SEAM_REPAIRS, "trigger" => trigger.label()).increment(1);
+                    tracing::info!(events, trigger = trigger.label(), "seam repair applied");
+                }
+                let _ = done.send(());
+            }
+            Item::ForgetSeq { url } => {
+                // Given up, the stored `seq` stays; the next resume on the
+                // instance finds its sequence started again once more and
+                // records the gap again.
+                self.call_or_record("forget_instance_seq", None, || {
+                    firehose::forget_instance_seq(&self.pool, &url)
+                })
+                .await;
             }
             Item::Session { url, protocol } => {
                 let u = url.clone();
@@ -335,13 +449,15 @@ impl Writer {
 
     /// A gap that cannot be written must not be passed over: coverage is
     /// claimed from the recorded gaps, so going on would claim more than
-    /// was witnessed. The writer stops instead (a panic here ends the
-    /// process, as any writer panic does), and the next start resumes
-    /// from the persisted cursor and meets the same gap again.
+    /// was witnessed. The same holds for a seam window, which is what is
+    /// known to need a second read. The writer stops instead (a panic
+    /// here ends the process, as any writer panic does), and the next
+    /// start resumes from the persisted cursor and meets the same gap or
+    /// seam again.
     fn gap_written(op: &'static str, written: bool) {
         assert!(
             written,
-            "{op} failed permanently: a firehose gap could not be recorded"
+            "{op} failed permanently: what the stream may have lost could not be recorded"
         );
     }
 
@@ -405,13 +521,10 @@ impl Writer {
         }
     }
 
+    /// Sets the gap gauge right after a gap was recorded. The gauges are
+    /// otherwise kept by a task of their own ([`crate::gauges`]), which
+    /// goes on while the writer is held on one batch.
     async fn refresh_gauges(&self) {
-        if let Ok(st) = firehose::read_state(&self.pool).await
-            && let Some(a) = st.applied_through
-        {
-            let lag = (Utc::now() - a).num_microseconds().unwrap_or(0) as f64 / 1e6;
-            metrics::gauge!(m::LAG).set(lag.max(0.0));
-        }
         if let Ok(gaps) = firehose::unhealed_gaps(&self.pool).await {
             metrics::gauge!(m::OPEN_GAPS).set(gaps.len() as f64);
         }
@@ -434,13 +547,39 @@ impl Writer {
             return;
         }
         let events = std::mem::take(buf);
-        let Some(s) = session.as_mut() else {
-            tracing::error!("events without a session; dropping {}", events.len());
-            return;
-        };
         let started = Instant::now();
         let first_us = events[0].witness_us;
-        if live && s.open_v1_gap {
+        let last_us = events
+            .iter()
+            .map(|e| e.witness_us)
+            .max()
+            .unwrap_or(first_us);
+        // Only a live batch needs the session: it carries the session's
+        // URL and protocol with its position. Re-read events are applied
+        // whether or not a session has started.
+        let progress = if live {
+            let Some(s) = session.as_mut() else {
+                tracing::error!("events without a session; dropping {}", events.len());
+                return;
+            };
+            self.v1_interval(s, first_us).await;
+            Some(FirehoseProgress {
+                source_url: s.url.clone(),
+                protocol: s.protocol.storage(),
+                cursor_seq: events.iter().filter_map(|e| e.seq).max(),
+                cursor_us: Some(last_us),
+                applied_through: dt(last_us),
+            })
+        } else {
+            None
+        };
+        self.apply_events(events, progress, started, last_us).await;
+    }
+
+    /// Opens the v1 interval at the first batch of a v1 session and closes
+    /// it at the first batch of a v2 session.
+    async fn v1_interval(&self, s: &mut SessionState, first_us: i64) {
+        if s.open_v1_gap {
             let from = self
                 .call_or_record("read_state", None, || firehose::read_state(&self.pool))
                 .await
@@ -454,7 +593,7 @@ impl Writer {
             Self::gap_written("open_sync_unavailable", opened.is_some());
             s.open_v1_gap = false;
         }
-        if live && s.close_v1_gap {
+        if s.close_v1_gap {
             let closed = self
                 .call_or_record("close_sync_unavailable", None, || {
                     firehose::close_sync_unavailable(&self.pool, dt(first_us))
@@ -463,18 +602,19 @@ impl Writer {
             Self::gap_written("close_sync_unavailable", closed.is_some());
             s.close_v1_gap = false;
         }
+    }
 
-        let progress = FirehoseProgress {
-            source_url: s.url.clone(),
-            protocol: s.protocol.storage(),
-            cursor_seq: events.iter().filter_map(|e| e.seq).max(),
-            cursor_us: events.iter().map(|e| e.witness_us).max(),
-            applied_through: dt(events
-                .iter()
-                .map(|e| e.witness_us)
-                .max()
-                .unwrap_or(first_us)),
-        };
+    /// Applies `events` as one batch, with `progress` if it is a live one,
+    /// and counts what happened. `last_us` is the latest witness time
+    /// among them.
+    async fn apply_events(
+        &self,
+        events: Vec<InEvent>,
+        progress: Option<FirehoseProgress>,
+        started: Instant,
+        last_us: i64,
+    ) {
+        let live = progress.is_some();
         let mut batch = Batch::new(Origin::Firehose);
         let mut labels: Vec<(Collection, &'static str)> = Vec::new();
         for ev in &events {
@@ -484,13 +624,22 @@ impl Writer {
                     labels.push((op.collection, op_label(op)));
                 }
                 Body::Rejected {
-                    reason, collection, ..
+                    reason,
+                    collection,
+                    removes,
+                    ..
                 } => {
                     metrics::counter!(m::DROPPED, "reason" => reason.label()).increment(1);
                     let c = collection.map(|c| c.nsid()).unwrap_or("unknown");
                     metrics::counter!(m::EVENTS, "collection" => c, "op" => "unknown", "outcome" => "dropped")
                         .increment(1);
                     self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    // The record is dropped, and the version it replaced
+                    // with it: at this rev the key holds nothing indexed.
+                    if let Some(op) = removes {
+                        batch.writes.push(to_write(op, ev.witness_us));
+                        labels.push((op.collection, op_label(op)));
+                    }
                 }
                 _ => {
                     if let Some(re) = to_repo_event(ev) {
@@ -499,9 +648,7 @@ impl Writer {
                 }
             }
         }
-        if live {
-            batch.firehose = Some(progress);
-        }
+        batch.firehose = progress;
 
         let n_writes = batch.writes.len();
         let n_events = batch.events.len();
@@ -531,15 +678,7 @@ impl Writer {
             .writes_applied
             .fetch_add(report.applied, Ordering::Relaxed);
         metrics::histogram!(m::BATCH_SECONDS).record(started.elapsed().as_secs_f64());
-        let lag = (Utc::now()
-            - dt(events
-                .iter()
-                .map(|e| e.witness_us)
-                .max()
-                .unwrap_or(first_us)))
-        .num_microseconds()
-        .unwrap_or(0) as f64
-            / 1e6;
+        let lag = (Utc::now() - dt(last_us)).num_microseconds().unwrap_or(0) as f64 / 1e6;
         if live {
             metrics::gauge!(m::LAG).set(lag.max(0.0));
         }
@@ -639,8 +778,9 @@ impl Writer {
         let mut event_iter = batch.events.iter();
         for ev in events {
             let mut single = Batch::new(Origin::Firehose);
+            let is_write = event_write(ev).is_some();
             match &ev.body {
-                Body::Commit(_) => {
+                _ if is_write => {
                     if let Some(w) = write_iter.next() {
                         single.writes.push(w.clone());
                     }
@@ -692,7 +832,7 @@ impl Writer {
                 }
                 metrics::counter!(m::DROPPED, "reason" => "poisoned").increment(1);
                 self.stats.poisoned.fetch_add(1, Ordering::Relaxed);
-                if matches!(ev.body, Body::Commit(_)) {
+                if is_write {
                     merged
                         .write_outcomes
                         .push(farsight_storage::txn::WriteOutcome::Refused);
@@ -733,6 +873,41 @@ mod tests {
         assert_eq!(retry_decision(false, PERMANENT_ATTEMPTS - 1), Retry::Again);
         assert_eq!(retry_decision(false, PERMANENT_ATTEMPTS), Retry::GiveUp);
         assert_eq!(retry_decision(false, PERMANENT_ATTEMPTS + 1), Retry::GiveUp);
+    }
+
+    #[test]
+    fn a_rejected_record_is_applied_as_the_delete_in_its_place() {
+        use farsight_core::{RecordKey, Tid};
+        let author = Did::parse("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let delete = CommitOp {
+            author: author.clone(),
+            collection: Collection::ListItem,
+            rkey: RecordKey::parse("3l3qo2vuowo2b").unwrap(),
+            rev: Tid::parse("3l3qo2vutsw2b").unwrap(),
+            action: CommitAction::Delete,
+        };
+        let rejected = |removes: Option<Box<CommitOp>>| InEvent {
+            seq: None,
+            witness_us: 7,
+            body: Body::Rejected {
+                reason: crate::frame::DropReason::Invalid,
+                collection: Some(Collection::ListItem),
+                detail: "invalid subject DID".into(),
+                removes,
+            },
+        };
+        // Key and rev are valid: the version stored under the key goes.
+        let ev = rejected(Some(Box::new(delete.clone())));
+        let op = event_write(&ev).expect("a write");
+        assert_eq!(event_did(&ev), Some(&author));
+        let w = to_write(op, ev.witness_us);
+        assert_eq!(w.action, WriteAction::Delete);
+        assert_eq!((w.author, w.collection), (author, Collection::ListItem));
+        assert_eq!(w.stamp, farsight_storage::ids::Stamp::from_tid(delete.rev));
+        assert_eq!(op_label(op), "delete");
+        // Nothing to order a delete by: only dropped.
+        let ev = rejected(None);
+        assert_eq!((event_write(&ev), event_did(&ev)), (None, None));
     }
 
     #[test]

@@ -1078,6 +1078,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         vec![E::Account {
             did: o.clone(),
             witness: w,
+            time: None,
             active: false,
             status: Some("deactivated".into()),
         }],
@@ -1100,6 +1101,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         vec![E::Account {
             did: o.clone(),
             witness: w,
+            time: None,
             active: true,
             status: None,
         }],
@@ -1129,6 +1131,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         vec![E::Account {
             did: o.clone(),
             witness: older,
+            time: None,
             active: false,
             status: Some("takendown".into()),
         }],
@@ -1148,6 +1151,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         vec![E::Account {
             did: d.clone(),
             witness: w,
+            time: None,
             active: false,
             status: Some("desynchronized".into()),
         }],
@@ -1174,12 +1178,14 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
             E::Account {
                 did: u.clone(),
                 witness: w,
+                time: None,
                 active: true,
                 status: None,
             },
             E::Account {
                 did: gone.clone(),
                 witness: w,
+                time: None,
                 active: false,
                 status: Some("takendown".into()),
             },
@@ -1315,6 +1321,7 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         vec![E::Account {
             did: o.clone(),
             witness: w,
+            time: None,
             active: false,
             status: Some("deleted".into()),
         }],
@@ -1385,6 +1392,117 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
             && env.debt(&p, DebtReason::Resync.code()).await?.is_none(),
         "",
     );
+    // Account events are ordered by the upstream event's own time, which
+    // is the same on every instance, not by when an instance witnessed
+    // them.
+    let acct = plc("evordered", 1);
+    let victim = plc("evordered", 2);
+    env.firehose(vec![block(&acct, "b", &victim, rev(40))])
+        .await?;
+    let t = |secs: i64| w + chrono::Duration::seconds(secs);
+    let account = |witness, time, active: bool| E::Account {
+        did: acct.clone(),
+        witness,
+        time,
+        active,
+        status: (!active).then(|| "deactivated".to_owned()),
+    };
+    // Instance A, 30 s behind, witnesses the deactivation of t = 70 at 100.
+    events_batch(env, vec![account(t(100), Some(t(70)), false)]).await?;
+    // After a failover instance B delivers the reactivation of t = 80,
+    // which it witnessed at 91.
+    let r = events_batch(env, vec![account(t(91), Some(t(80)), true)]).await?;
+    c.check(
+        "account events: a later event witnessed earlier on another instance is applied",
+        status_of(env, &acct).await? == Some(st::Active.code()) && r.stale_repo_events == 0,
+        format!("status {:?}", status_of(env, &acct).await?),
+    );
+    // The replay of the older event is stale, whenever it is witnessed.
+    let r = events_batch(env, vec![account(t(500), Some(t(70)), false)]).await?;
+    c.check(
+        "account events: an older event replayed later is stale",
+        status_of(env, &acct).await? == Some(st::Active.code()) && r.stale_repo_events == 1,
+        format!("status {:?}", status_of(env, &acct).await?),
+    );
+    // A time after the witness time is not believed: the event is ordered
+    // by its witness time, and a later event is not shut out by it.
+    events_batch(env, vec![account(t(600), Some(t(900_000)), false)]).await?;
+    let stored: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT status_at FROM actors WHERE did = $1")
+            .bind(acct.as_str())
+            .fetch_one(&env.pool)
+            .await?;
+    events_batch(env, vec![account(t(700), Some(t(650)), true)]).await?;
+    c.check(
+        "account events: a time from the future cannot pin a status",
+        stored == Some(t(600)) && status_of(env, &acct).await? == Some(st::Active.code()),
+        format!(
+            "status_at {stored:?}, status {:?}",
+            status_of(env, &acct).await?
+        ),
+    );
+
+    // A deleted and purged account: the replay of what it wrote before the
+    // deletion stores nothing; what is witnessed after it is applied.
+    let gone = plc("evdeleted", 1);
+    let mut before = block(&gone, "b1", &victim, rev(50));
+    before.witness = Some(t(10));
+    env.firehose(vec![before.clone()]).await?;
+    let r = events_batch(
+        env,
+        vec![E::Account {
+            did: gone.clone(),
+            witness: t(20),
+            time: None,
+            active: false,
+            status: Some("deleted".into()),
+        }],
+    )
+    .await?;
+    c.eq(
+        "deleted account: reported for purge",
+        r.deleted_accounts.clone(),
+        vec![gone.clone()],
+    );
+    janitor::purge_account(&env.pool, &env.limits, &env.counters, &gone).await?;
+    let rows = |env: &Env| {
+        let pool = env.pool.clone();
+        let gone = gone.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM blocks b JOIN actors a ON a.id = b.author_id WHERE a.did = $1",
+            )
+            .bind(gone.as_str())
+            .fetch_one(&pool)
+            .await
+        }
+    };
+    c.eq("deleted account: purged", rows(env).await?, 0);
+    let r = env.firehose(vec![before]).await?;
+    c.check(
+        "deleted account: a replayed write from before the deletion is stale and stores nothing",
+        r.stale == 1 && r.applied == 0 && rows(env).await? == 0,
+        format!(
+            "stale {} applied {} rows {}",
+            r.stale,
+            r.applied,
+            rows(env).await?
+        ),
+    );
+    c.eq(
+        "deleted account: nothing left for the purge task to take up",
+        janitor::accounts_pending_purge(&env.pool, 10).await?.len(),
+        0,
+    );
+    let mut later = block(&gone, "b2", &victim, rev(51));
+    later.witness = Some(t(30));
+    let r = env.firehose(vec![later]).await?;
+    c.check(
+        "deleted account: a write witnessed after the deletion is applied",
+        r.applied == 1 && rows(env).await? == 1,
+        format!("applied {} rows {}", r.applied, rows(env).await?),
+    );
+    janitor::purge_account(&env.pool, &env.limits, &env.counters, &gone).await?;
     consistency(env, c, "after repo events").await?;
     Ok(())
 }
@@ -1447,6 +1565,169 @@ pub async fn s11_instance_cursors(env: &mut Env, c: &mut Checks) -> Result<()> {
         firehose::instance_cursor(&env.pool, "wss://c.test").await?,
         None,
     );
+
+    // A's sequence starts again: the stored seq, which a lower one could
+    // never replace, is forgotten; the timestamp form stays, and so does
+    // every other instance's cursor.
+    firehose::forget_instance_seq(&env.pool, a).await?;
+    let ca = firehose::instance_cursor(&env.pool, a).await?;
+    c.eq(
+        "a restarted sequence: A's seq forgotten, its timestamp cursor kept",
+        ca.map(|x| (x.cursor_seq, x.cursor_us)),
+        Some((None, Some(base + 1_000))),
+    );
+    c.eq(
+        "a restarted sequence: B's cursor untouched",
+        firehose::instance_cursor(&env.pool, b)
+            .await?
+            .and_then(|x| x.cursor_seq),
+        Some(7),
+    );
+    firehose_batch(env, vec![], p(a, 3, base + 3_000)).await?;
+    let st = firehose::read_state(&env.pool).await?;
+    c.eq(
+        "a restarted sequence: the next batch stores the new, lower seq",
+        (
+            firehose::instance_cursor(&env.pool, a)
+                .await?
+                .and_then(|x| x.cursor_seq),
+            st.source_url.as_deref(),
+            st.cursor_seq,
+        ),
+        (Some(3), Some(a), Some(3)),
+    );
+    Ok(())
+}
+
+/// Stream 13: seam windows in `firehose_seams`, from the resume that
+/// opens one to the re-read that removes it or the gap it becomes.
+pub async fn s13_seam_windows(env: &mut Env, c: &mut Checks) -> Result<()> {
+    use farsight_storage::codes::SeamTrigger;
+    let a = "wss://a.jetstream.test";
+    let now = now_micros();
+    let at = |secs: i64| now + chrono::Duration::seconds(secs);
+    let (after, none) = (Duration::from_secs(30), Duration::ZERO);
+    let gaps_before = firehose::all_gaps(&env.pool).await?.len();
+    c.eq(
+        "no seam window before a resume",
+        firehose::pending_seams(&env.pool).await?,
+        0,
+    );
+
+    // A resumed session: its window is on record, open, from its first
+    // event on, and is not due while it is open.
+    let reached =
+        firehose::open_seam(&env.pool, a, Protocol::V2, SeamTrigger::Resume, at(-150)).await?;
+    c.eq(
+        "an open window is on record and not due",
+        (
+            firehose::pending_seams(&env.pool).await?,
+            firehose::due_seams(&env.pool).await?.len(),
+        ),
+        (1, 0),
+    );
+    // A second session that ended before it reached its window: there was
+    // no hand-over to the live tail, so nothing to read again.
+    firehose::open_seam(&env.pool, a, Protocol::V2, SeamTrigger::Failover, at(900)).await?;
+    let closed = firehose::close_seams(&env.pool, at(0), after, none).await?;
+    let due = firehose::due_seams(&env.pool).await?;
+    c.check(
+        "closing: the window the session reached ends `after` past that point; the one it never reached is dropped",
+        closed == 1
+            && due.len() == 1
+            && due[0].id == reached
+            && due[0].from_at == at(-150)
+            && due[0].to_at == at(30)
+            && due[0].attempts == 0
+            && due[0].trigger == SeamTrigger::Resume,
+        format!("closed {closed}, due {due:?}"),
+    );
+    c.eq(
+        "closing again changes nothing",
+        (
+            firehose::close_seams(&env.pool, at(500), after, none).await?,
+            firehose::due_seams(&env.pool).await?,
+        ),
+        (0, due.clone()),
+    );
+
+    // A read that did not finish puts the window off: counted if it
+    // failed, not if it only went silent. The window stays on record.
+    firehose::defer_seams(&env.pool, &[reached], Duration::from_secs(600), false).await?;
+    c.eq(
+        "put off: not due, still on record",
+        (
+            firehose::due_seams(&env.pool).await?.len(),
+            firehose::pending_seams(&env.pool).await?,
+        ),
+        (0, 1),
+    );
+    firehose::defer_seams(&env.pool, &[reached], none, true).await?;
+    let due = firehose::due_seams(&env.pool).await?;
+    c.eq(
+        "only a failed read is counted",
+        due.iter().map(|s| s.attempts).collect::<Vec<_>>(),
+        vec![1],
+    );
+    c.eq(
+        "a window being read again is not a gap",
+        firehose::all_gaps(&env.pool).await?.len(),
+        gaps_before,
+    );
+
+    // A finished read removes its window and records no gap.
+    let done = firehose::open_seam(
+        &env.pool,
+        a,
+        Protocol::V1,
+        SeamTrigger::ClampRecovery,
+        at(-90),
+    )
+    .await?;
+    firehose::close_seams(&env.pool, at(-60), after, none).await?;
+    c.eq(
+        "a finished re-read removes its window",
+        firehose::finish_seams(&env.pool, &[done]).await?,
+        1,
+    );
+    c.eq(
+        "the other window is still waiting",
+        firehose::due_seams(&env.pool)
+            .await?
+            .iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>(),
+        vec![reached],
+    );
+
+    // Given up: the window becomes a closed, unhealed gap over itself.
+    let mut listener = PgListener::connect_with(&env.pool).await?;
+    listener.listen(COVERAGE_CHANNEL).await?;
+    let recorded = firehose::abandon_seams(&env.pool, &[reached]).await?;
+    let new: Vec<_> = firehose::unhealed_gaps(&env.pool)
+        .await?
+        .into_iter()
+        .filter(|g| g.cause == GapCause::SeamUnrepaired)
+        .collect();
+    c.check(
+        "a window given up is recorded as a gap over the window, and removed",
+        recorded == 1
+            && new.len() == 1
+            && new[0].from_at == at(-150)
+            && new[0].to_at == Some(at(30))
+            && firehose::pending_seams(&env.pool).await? == 0,
+        format!("recorded {recorded}, gaps {new:?}"),
+    );
+    c.check(
+        "NOTIFY on the gap of an unrepaired seam",
+        expect_notify(&mut listener).await,
+        "",
+    );
+    c.eq(
+        "giving up twice records one gap",
+        firehose::abandon_seams(&env.pool, &[reached]).await?,
+        0,
+    );
     Ok(())
 }
 
@@ -1495,6 +1776,7 @@ pub async fn s12_reactivation_lock(env: &mut Env, c: &mut Checks) -> Result<()> 
         vec![E::Account {
             did: o.clone(),
             witness: w,
+            time: None,
             active: false,
             status: Some("deactivated".into()),
         }],
@@ -1516,6 +1798,7 @@ pub async fn s12_reactivation_lock(env: &mut Env, c: &mut Checks) -> Result<()> 
     batch.events.push(E::Account {
         did: o.clone(),
         witness: w + chrono::Duration::seconds(1),
+        time: None,
         active: true,
         status: None,
     });

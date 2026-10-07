@@ -115,6 +115,11 @@ fn streams() -> Vec<Stream> {
             name: "reactivation: OA only under the list lock",
             run: stream!(streams_more::s12_reactivation_lock),
         },
+        Stream {
+            n: 13,
+            name: "seam windows: recorded, read again, or recorded as a gap",
+            run: stream!(streams_more::s13_seam_windows),
+        },
     ]
 }
 

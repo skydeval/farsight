@@ -120,12 +120,13 @@ arrives through the firehose. It persists across a resume of the work.
 `firehose_gaps`) or the **synthetic gap**
 `[firehoseAppliedThrough, ∞)`, which exists while the stream is
 disconnected, has applied nothing yet, or lags by more than
-`firehose.tuning.synthetic_gap_lag` (5 min). A recorded gap without an
-end overlaps everything after its start.
+`firehose.tuning.synthetic_gap_lag` (5 min), and while the snapshot
+that says so is stale (below). A recorded gap without an end overlaps
+everything after its start.
 
 When `covered(t)` fails, the reason reported is the first that
-applies: `firehose_disconnected`, then `firehose_lagging`, then
-`firehose_gap`.
+applies: `firehose_disconnected`, then `coverage_stale`, then
+`firehose_lagging`, then `firehose_gap`.
 
 ## The global snapshot
 
@@ -140,7 +141,15 @@ The snapshot is read in one `REPEATABLE READ, READ ONLY` transaction,
 so its inputs are mutually consistent. It is refreshed on
 `NOTIFY farsight_coverage`, and re-read in full every 10 s and on
 every `LISTEN` reconnect, so a lost notification can delay a change
-and never falsify a claim. The notification is sent by every ingest
+and never falsify a claim.
+
+**A snapshot that cannot be read again goes stale.** When every read
+has failed for 30 s (the database does not answer, or its pool is
+exhausted), the snapshot still held describes a stream that may have
+stopped since. From then on it counts as the synthetic gap: no scope
+is `complete`, and the reason is `coverage_stale`, until a read
+succeeds. `farsight_coverage_snapshot_age_seconds` is the time since
+the snapshot in use was read. The notification is sent by every ingest
 batch commit and by every change of tracking state from either
 process: list transitions, purges, debt inserts and deletes, gap and
 cycle changes.
@@ -174,13 +183,14 @@ names what a `complete` scope leaves out. The last use matters: a
 | `sweep_incomplete` | No completed full sweep covers the collection. In `checkBlocks`, also when the network-wide claim cannot be made and the actor has no clean listing that is covered. | The first full sweep completes; for the `checkBlocks` case, a listing of the actor ends clean. |
 | `firehose_gap` | An unhealed recorded gap overlaps the interval from the scope's coverage point to `firehoseAppliedThrough`. | A repair cycle or a later full sweep heals the gap. |
 | `firehose_disconnected` | The stream is not connected, or no batch has been applied yet. | The stream resumes. If events were lost, a gap is recorded and `firehose_gap` follows. |
+| `coverage_stale` | The coverage snapshot is more than 30 s old and could not be read again, so what it says about the stream is not known to hold. | The snapshot is read again. |
 | `firehose_lagging` | The stream is connected but `firehoseAppliedThrough` is more than `firehose.tuning.synthetic_gap_lag` behind. | The stream catches up. |
 | `sync_events_unavailable` | The firehose runs on Jetstream v1, which carries no `#sync` events, or the interval spent on v1 is still open. | A v2 session takes over. The interval then becomes a closed gap and `firehose_gap` follows until it is repaired. |
 | `storage_refusal` | The storage budget or the hard ceiling is refusing writes globally (an open row of `storage_refusals`). | The gate reopens. The authors refused meanwhile stay counted in `refusedAuthors` until re-listed. |
 | `list_pending` | A list relevant to the response is `pending` or about to be re-admitted. Either the level is `partial`, or `indexedAt` is lowered to before the list's listblocks (see [Pending lists](#pending-lists)). | The list is promoted to `ready`, or leaves `pending` otherwise. |
 | `list_pending_historical` | A pending list that takes effect has a listblock whose witness time is unknown. Level `partial`. | As `list_pending`. |
 | `list_capped` | The stored item set of a list is cut by a cap. On `getListMembers` it accompanies the level; in `checkBlocks` it makes the actor side or the pair `partial`. | A refresh run after the cap cleared stores all items. |
-| `list_unavailable` | A list is in state `unavailable`. | A run promotes the list. |
+| `list_unavailable` | A list is in state `unavailable`. On `getListMembers`, also a list whose owner is hidden. | A run promotes the list; the owner becomes active again. |
 | `list_missing` | A list is in state `missing`; on `getListMembers`, also `dead`. | The record is found, or the listblocks on it go away. |
 | `list_deferred` | A list is in state `deferred`. | The gate reopens and the list is admitted. |
 | `list_not_tracked` | `getListMembers` on a list that no counted listblock targets. Farsight holds no items for it by design. | A listblock on the list admits it. |
@@ -436,10 +446,11 @@ lost. Gaps are rows of `firehose_gaps` with a cause:
 
 | Cause | Code | Recorded when |
 |---|---|---|
-| `cursor_too_old` | 1 | A v2 Jetstream answers a resume with `CursorTooOld`: the gap runs from `applied_through` to the first live event. |
-| `heuristic` | 2 | A v1 Jetstream silently clamped the cursor: the first event lies more than `firehose.tuning.gap_threshold` (300 s) after the cursor. |
-| `failover` | 3 | A change of Jetstream instance without a safe rewind. |
+| `cursor_too_old` | 1 | A Jetstream refuses the cursor of a resume with `CursorTooOld`, or announces with `#info OutdatedCursor` that it resumed later than asked. |
+| `heuristic` | 2 | A resume on an instance with its own cursor did not continue where it left off, as far as its first event shows: a timestamp resume whose first event is later than the stored cursor, or a `seq` resume answered with a lower `seq` or with a first event more than `firehose.tuning.gap_threshold` (300 s) after the stored cursor. |
+| `failover` | 3 | A change of Jetstream instance that was clamped, or had no safe rewind. |
 | `sync_unavailable` | 4 | An interval spent on a v1 Jetstream. |
+| `seam_unrepaired` | 5 | The re-read of a seam window failed 5 times: the gap is the window. |
 
 A disconnected or lagging stream needs no row: it is the synthetic gap
 of the [gap predicate](#the-gap-predicate), and it ends by itself when
@@ -544,7 +555,7 @@ are `unreachableRepos`. The sweep is described in
   wait: `list_pending` normally clears quickly (and within
   `limits.pending_max_age` at the latest),
   `firehose_disconnected` and `firehose_lagging` when the stream
-  recovers, `firehose_gap` after a repair, `sweep_incomplete` once per
+  recovers, `coverage_stale` when Farsight reaches its database again, `firehose_gap` after a repair, `sweep_incomplete` once per
   instance. Ignore codes you do not know; the enum is open. A
   `complete` response may carry reasons that name an exclusion
   (`list_unavailable`, `list_capped`, `list_not_tracked` and the like)

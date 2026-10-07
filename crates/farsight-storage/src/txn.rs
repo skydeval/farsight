@@ -84,6 +84,9 @@ pub struct AuthorInfo {
     pub mask: i16,
     /// `actors.status`, as read with the row.
     pub status: ActorStatus,
+    /// `actors.status_at`: the time of the account event that set the
+    /// status, if one did.
+    pub status_at: Option<DateTime<Utc>>,
 }
 
 impl AuthorInfo {
@@ -344,14 +347,15 @@ impl<'c> Txn<'c> {
         }
         let row: Option<AuthorRow> = sqlx::query_as(
             "SELECT a.id, a.admission_key, a.resolve_failures, a.pds_host_id IS NOT NULL,
-                        h.cap_key, h.ip_bucket, COALESCE(h.large, false), a.status
+                        h.cap_key, h.ip_bucket, COALESCE(h.large, false), a.status,
+                        a.status_at
                  FROM actors a LEFT JOIN pds_hosts h ON h.id = a.pds_host_id
                  WHERE a.did = $1",
         )
         .bind(did.as_str())
         .fetch_optional(&mut *self.conn)
         .await?;
-        let (id, facts, status) = match row {
+        let (id, facts, status, status_at) = match row {
             Some((
                 id,
                 admission_key,
@@ -361,6 +365,7 @@ impl<'c> Txn<'c> {
                 ip_bucket,
                 large,
                 status,
+                status_at,
             )) => (
                 id,
                 HostFacts {
@@ -372,6 +377,7 @@ impl<'c> Txn<'c> {
                     resolved,
                 },
                 status,
+                status_at,
             ),
             None => {
                 let facts = HostFacts::default();
@@ -382,7 +388,7 @@ impl<'c> Txn<'c> {
                 let id = self.insert_actor(did).await?;
                 self.deltas.host(&buckets, CapKind::Interned, 1);
                 self.report.new_authors.push(id);
-                (id, facts, crate::codes::ActorStatus::Active)
+                (id, facts, crate::codes::ActorStatus::Active, None)
             }
         };
         let key = keys::admission_key(did, &facts);
@@ -397,6 +403,7 @@ impl<'c> Txn<'c> {
             large,
             mask,
             status,
+            status_at,
         };
         self.authors.insert(did.clone(), info.clone());
         Ok(info)
@@ -718,6 +725,7 @@ type AuthorRow = (
     Option<String>,
     bool,
     ActorStatus,
+    Option<DateTime<Utc>>,
 );
 
 /// The LWW upsert rule: apply iff `w` beats the stored row's rev and

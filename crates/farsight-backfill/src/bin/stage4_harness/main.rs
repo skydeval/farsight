@@ -590,6 +590,71 @@ async fn check_outcomes(h: &H, c: &mut Checks) -> Res<()> {
         r.outcome == Outcome::Inactive && row == (Some(3), true) && status != 0 && before == 2 && after == 0 && member == 0,
         format!("outcome {:?}, row {row:?}, status {status}, blocks {before}→{after}, outstanding {member}", r.outcome),
     );
+    // E: an account held as taken down, and a relay that gives no answer.
+    // Only the relay's own answer lifts a hidden status: the account stays
+    // hidden, its repository is not listed, and the job fails to be tried
+    // again.
+    let ee = did("rpe", 1);
+    // One block stored through the firehose, which the repository does
+    // not hold: a listing removes it, so its absence shows a listing ran.
+    h.fh(&ee, Collection::Block, &tid_now(), block_v(&did("sub", 49)))
+        .await?;
+    h.put_repo(
+        &ee,
+        (1..=2)
+            .map(|i| (Collection::Block, tid_now(), block_v(&did("sub", 40 + i))))
+            .collect(),
+    );
+    let mut taken = Batch::new(Origin::Firehose);
+    taken.events.push(RepoEvent::Account {
+        did: Did::parse(&ee).map_err(e)?,
+        witness: Utc::now(),
+        time: None,
+        active: false,
+        status: Some("takendown".into()),
+    });
+    h.apply(&taken).await?;
+    let status_sql = format!("SELECT status::BIGINT FROM actors WHERE did = '{ee}'");
+    w(&h.world).status_down.insert(ee.clone());
+    let asked_before = h.hits("describeRepo", &ee, "") + h.hits("listRecords", &ee, "");
+    let r = h.job(&ee, 1, "token:1").await?;
+    let asked = h.hits("describeRepo", &ee, "") + h.hits("listRecords", &ee, "");
+    let status = h.i64(&status_sql).await?;
+    let stored = h
+        .i64(&format!(
+            "SELECT count(*) FROM blocks b JOIN actors x ON x.id = b.author_id WHERE x.did = '{ee}'"
+        ))
+        .await?;
+    c.check(
+        "hidden account, relay gives no answer: still hidden, repository not listed, job failed (not terminal)",
+        matches!(r.outcome, Outcome::Failed { terminal: false, .. })
+            && status == 2
+            && asked == asked_before
+            && stored == 1
+            && h.hits("getRepoStatus", &ee, "") == 1,
+        format!(
+            "outcome {:?}, status {status}, PDS requests {asked_before}→{asked}, relay asked {}",
+            r.outcome,
+            h.hits("getRepoStatus", &ee, "")
+        ),
+    );
+    // The relay answers again and says the account is active: the status
+    // is lifted and the repository listed.
+    w(&h.world).status_down.remove(&ee);
+    let r = h.job(&ee, 1, "token:1").await?;
+    let status = h.i64(&status_sql).await?;
+    let blocks = h
+        .i64(&format!(
+            "SELECT count(*) FROM blocks b JOIN actors x ON x.id = b.author_id WHERE x.did = '{ee}'"
+        ))
+        .await?;
+    c.check(
+        "hidden account, relay says active: status lifted, repository listed",
+        matches!(r.outcome, Outcome::Clean | Outcome::CompleteWithDebts)
+            && status == 0
+            && blocks == 2,
+        format!("outcome {:?}, status {status}, blocks {blocks}", r.outcome),
+    );
     // D: failed — the PDS is unreachable.
     w(&h.world)
         .plc
@@ -1482,6 +1547,7 @@ async fn check_repair(h: &H, c: &mut Checks) -> Res<()> {
     b.events.push(RepoEvent::Account {
         did: Did::parse(&back).map_err(e)?,
         witness: Utc::now(),
+        time: None,
         active: false,
         status: Some("deactivated".into()),
     });

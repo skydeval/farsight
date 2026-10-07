@@ -77,8 +77,14 @@ impl Model {
 
     pub fn apply_events(&mut self, events: &[InEvent]) {
         for ev in events {
-            if let Body::Commit(op) = &ev.body {
-                self.apply(op);
+            match &ev.body {
+                Body::Commit(op) => self.apply(op),
+                // A create or update whose record was rejected stands for
+                // the delete of the version under its key.
+                Body::Rejected {
+                    removes: Some(op), ..
+                } => self.apply(op),
+                _ => {}
             }
         }
     }

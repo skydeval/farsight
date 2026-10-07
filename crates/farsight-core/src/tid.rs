@@ -17,6 +17,12 @@ const ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
 /// Length of a TID string.
 pub const TID_LEN: usize = 13;
 
+/// How far past the clock the time inside a commit rev may lie, in
+/// microseconds. Writes are ordered by rev and the highest one wins, so a
+/// rev from far in the future would outrank every later change to its
+/// record, its deletion included.
+pub const MAX_REV_AHEAD_US: u64 = 5 * 60 * 1_000_000;
+
 /// Why a string is not a TID.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("not a TID: {0}")]
@@ -76,6 +82,14 @@ impl Tid {
     /// Microseconds since the Unix epoch encoded in the TID.
     pub fn micros(self) -> u64 {
         (self.0 as u64) >> 10
+    }
+
+    /// Whether the time inside the TID is more than [`MAX_REV_AHEAD_US`]
+    /// past `now_us` (microseconds since the epoch; a negative clock reads
+    /// as the epoch).
+    pub fn is_ahead_of(self, now_us: i64) -> bool {
+        let now = u64::try_from(now_us).unwrap_or(0);
+        self.micros() > now.saturating_add(MAX_REV_AHEAD_US)
     }
 
     /// Encodes back to the 13-character string.
@@ -140,6 +154,21 @@ mod tests {
         assert_eq!(Tid::parse(&t.encode()).unwrap(), t);
         assert!(Tid::from_parts(1 << 53, 0).is_none());
         assert!(Tid::from_parts(0, 1024).is_none());
+    }
+
+    #[test]
+    fn a_rev_is_ahead_only_past_the_allowance() {
+        let now = 1_700_000_000_000_000u64;
+        let at = |us: u64| Tid::from_parts(us, 0).unwrap();
+        assert!(!at(0).is_ahead_of(now as i64));
+        assert!(!at(now).is_ahead_of(now as i64));
+        assert!(!at(now + MAX_REV_AHEAD_US).is_ahead_of(now as i64));
+        assert!(at(now + MAX_REV_AHEAD_US + 1).is_ahead_of(now as i64));
+        assert!(at((1 << 53) - 1).is_ahead_of(now as i64));
+        // A clock before the epoch reads as the epoch.
+        assert!(!at(MAX_REV_AHEAD_US).is_ahead_of(-5));
+        assert!(at(MAX_REV_AHEAD_US + 1).is_ahead_of(i64::MIN));
+        assert!(!at((1 << 53) - 1).is_ahead_of(i64::MAX));
     }
 
     #[test]

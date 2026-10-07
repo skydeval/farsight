@@ -54,6 +54,91 @@ database schema; each entry says so where it does.
 - Sweep: a cycle's "failed for good" and "done" figures could come out
   one short for an account whose job was cut off at shutdown. The
   account and the figure now change together.
+- Backfill: an account held as taken down, suspended, deactivated or
+  deleted was made active again, and its rows shown, whenever the relay
+  failed to answer `getRepoStatus` (an error, a rate limit, a timeout).
+  Only the relay's own answer that the account is active lifts the
+  status now; without one the account stays hidden and the job fails
+  and is retried.
+- Firehose: one record nested deeper than the JSON parser allows made
+  its whole frame undecodable, and ingest stood still on it on every
+  instance. A frame is now read one level at a time: a record that
+  cannot be parsed is a rejected commit, counted in
+  `farsight_ingest_dropped_total{reason="invalid"}`, and the stream
+  moves on.
+- Firehose: a v2 instance that announced with `#info OutdatedCursor`
+  that it resumed later than the stored `seq` lost the stretch in
+  between without a gap. An announced clamp now records a gap on every
+  kind of resume.
+- Firehose: an instance whose `seq` numbering started again was asked
+  for a `seq` it no longer had on every reconnect. A first event with a
+  lower `seq` than asked for now records a gap and drops the stored
+  `seq`; a first event more than `gap_threshold` after the stored
+  cursor records a gap too.
+- Firehose: a v1 resume that the instance clamped by less than 5
+  minutes lost up to 3 minutes without a gap. A resume by timestamp on
+  an instance with its own cursor now records a gap whenever the first
+  event is later than the stored cursor.
+- Firehose: a witness time up to 24 hours ahead of the clock was
+  accepted, which could put a failover cursor in the future and make
+  its gap empty. The allowance is 5 minutes, a failover is planned from
+  the clock when the position is ahead of it, and a gap that has to be
+  recorded is never empty.
+- Firehose: a refused cursor (`CursorTooOld`) on a failover, or on a
+  return to an instance while the position came from another, started
+  its gap at `applied_through`. It starts 30 minutes earlier, like
+  every other gap between two instances.
+- Firehose: on v1, an instance that changed its compression dictionary
+  was reconnected to without end. After the first frame that cannot be
+  decompressed the sessions are opened uncompressed.
+- Firehose: a seam repair that could not connect, broke off, went
+  silent or was lost in a restart was passed over as if it had run.
+  Seam windows are now stored (`firehose_seams`) from the first event
+  of the resumed session and removed only when their re-read reached
+  the end of the window and was applied. A re-read that fails is tried
+  again; after 5 failures the window is recorded as a gap of the new
+  cause `SeamUnrepaired`. A session on an instance that stays more than
+  5 seconds behind the clock now gets its repair too. The new gauge
+  `farsight_firehose_pending_seams` shows the windows waiting.
+- Firehose: a seam repair held up to 500,000 events in memory and
+  handed them over at once, and reconnects in quick succession each
+  read their own overlapping window. Events are handed over in batches
+  of 500 as they are read, and the due windows of one instance are read
+  in one pass.
+- Firehose: account events were ordered by the time an instance
+  witnessed them, so after a failover an older status could replace a
+  newer one, or a newer one be dropped, and an account stay hidden or
+  shown wrongly. They are ordered by the upstream event's own time.
+- Firehose: an update that turned a valid block, listblock or listitem
+  into one Farsight rejects (a listitem moved to another account's
+  list, a subject that is not a DID) left the previous version in the
+  index. The rejected create or update now removes the version stored
+  under its key.
+- Firehose and backfill: a commit rev or a repository's latest rev from
+  the future was accepted, which made the record undeletable and every
+  later listing look diverged. A rev more than 5 minutes ahead of the
+  clock is refused: the commit is dropped as `invalid`, and a listing
+  with such a stamp fails.
+- Firehose: rows of a deleted and purged account could be stored again
+  by a replay of the stream and stay until the daily purge. A commit of
+  a deleted account witnessed no later than its deletion stores
+  nothing.
+- API: `query.getListMembers` answered `ready`, no members and
+  `complete` for a list whose owner is deactivated, taken down,
+  suspended or deleted, with the list's name and purpose. Such a list
+  is now reported as `unavailable` with the reason `list_unavailable`,
+  without `name` and `purpose` and with `listblockCount` 0.
+- API: when Farsight could not read its coverage state from the
+  database, answers kept the last one indefinitely, `complete` and
+  `firehoseConnected: true` included. A coverage snapshot older than 30
+  seconds now makes every answer `partial` with the new reason
+  `coverage_stale`; its age is the new gauge
+  `farsight_coverage_snapshot_age_seconds`.
+- `/health` stayed `200` while the firehose was connected but nothing
+  was being applied. It is `503` once `applied_through` is more than
+  `firehose.tuning.synthetic_gap_lag` behind, and
+  `farsight_firehose_lag_seconds` keeps growing in that state instead
+  of holding its last value.
 - Firehose: an instance that replayed a stretch too slowly to send an
   event within `stall_timeout` was dropped and resumed at the same
   point without end, and ingest stood still. Each session that stalls

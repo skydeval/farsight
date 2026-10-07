@@ -1491,9 +1491,10 @@ pub async fn list(
 
     // Called for the list's state and its freshness; the rows are read
     // below.
-    let listing = handlers::get_list_members(api, &freshness_params(&[("list", uri.as_str())]))
-        .await?
-        .body;
+    let listing =
+        handlers::get_list_members_any_owner(api, &freshness_params(&[("list", uri.as_str())]))
+            .await?
+            .body;
     let (state, show_members) = state_words(listing["state"].as_str().unwrap_or(""));
     let taken_down = paging::taken_down(q);
     let filter = row_filter(&withheld, taken_down, None);

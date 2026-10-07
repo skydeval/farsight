@@ -35,7 +35,7 @@ use farsight_core::{
 };
 use sqlx::PgPool;
 
-use crate::codes::{CapType, DebtReason, RecordState, RequesterKey, TrackState};
+use crate::codes::{ActorStatus, CapType, DebtReason, RecordState, RequesterKey, TrackState};
 use crate::counters::{CounterSink, stat};
 use crate::error::{Result, StorageError};
 use crate::firehose::FirehoseProgress;
@@ -482,8 +482,28 @@ fn cause_for(author: &AuthorInfo, origin: &Origin) -> Cause {
     }
 }
 
+/// Whether a firehose write is a replay of what an account wrote before
+/// it was deleted: the account is `deleted` and the write was witnessed
+/// no later than the event that deleted it. The purge removes the
+/// account's rows and tombstones, so nothing stored would turn such a
+/// write away, and a replay would put the rows back.
+pub fn replays_deleted_account(
+    status: ActorStatus,
+    status_at: Option<DateTime<Utc>>,
+    witness: Option<DateTime<Utc>>,
+) -> bool {
+    status == ActorStatus::Deleted
+        && matches!((witness, status_at), (Some(seen), Some(deleted)) if seen <= deleted)
+}
+
 async fn apply_write(t: &mut Txn<'_>, origin: &Origin, w: &Write) -> Result<()> {
     let author = t.author(&w.author).await?;
+    if *origin == Origin::Firehose
+        && replays_deleted_account(author.status, author.status_at, w.witness)
+    {
+        t.report.stale += 1;
+        return Ok(());
+    }
     if let WriteAction::Upsert(record) = &w.action
         && record.collection() != w.collection
     {
@@ -1770,6 +1790,25 @@ mod tests {
         assert!(!would_admit(S::Retained, R::Present, 0, None));
         assert!(!would_admit(S::Ready, R::Present, 3, None));
         assert!(!would_admit(S::Untracked, R::Present, 2, None));
+    }
+
+    #[test]
+    fn a_write_from_before_an_account_was_deleted_is_a_replay() {
+        let t = |s: i64| DateTime::<Utc>::from_timestamp(s, 0);
+        let deleted = ActorStatus::Deleted;
+        assert!(replays_deleted_account(deleted, t(150), t(100)));
+        assert!(replays_deleted_account(deleted, t(150), t(150)));
+        // Witnessed after the deletion: the account wrote again.
+        assert!(!replays_deleted_account(deleted, t(150), t(151)));
+        // Only a deleted account, and only with both times known.
+        for status in ActorStatus::ALL {
+            assert_eq!(
+                replays_deleted_account(*status, t(150), t(100)),
+                *status == deleted
+            );
+        }
+        assert!(!replays_deleted_account(deleted, None, t(100)));
+        assert!(!replays_deleted_account(deleted, t(150), None));
     }
 
     #[test]

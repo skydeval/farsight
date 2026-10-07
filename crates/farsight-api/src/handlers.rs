@@ -324,12 +324,58 @@ fn on_v2(s: &GlobalSnapshot) -> bool {
         })
 }
 
-/// List scope: the coverage of one list's membership, from its tracking
-/// state. `info` is `None` for a list Farsight has no row for. A `ready`
-/// or `retained` list is complete since its fetch, unless the firehose
-/// has not covered the time since or the session lacks sync events; a
-/// list that is not tracked falls back to network scope for `listblock`.
-pub fn list_scope(v: &View<'_>, info: Option<&ListInfo>) -> Cov {
+/// What `getListMembers` says of a list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListReport {
+    /// The `state` reported.
+    pub state: TrackState,
+    /// Whether members are returned.
+    pub serves: bool,
+    /// Whether the list's own facts (`purpose`, `name`, `capped`,
+    /// `listblockCount`) are reported.
+    pub facts: bool,
+}
+
+/// Decides what `getListMembers` says of the list `info` (`None` for a
+/// list Farsight has no row for).
+///
+/// A list is authored by its owner, so a hidden owner hides it: the list
+/// is reported `unavailable`, the state of a list whose owner is
+/// inactive, with no members and none of its facts. Reporting its stored
+/// state instead would present a `ready` list with an empty membership,
+/// which reads as a list known to be empty. `any_owner` is for a caller
+/// that applies its own rule to hidden owners and wants the stored state.
+pub fn list_report(info: Option<&ListInfo>, any_owner: bool) -> ListReport {
+    let Some(info) = info else {
+        return ListReport {
+            state: TrackState::Untracked,
+            serves: false,
+            facts: false,
+        };
+    };
+    let hidden = info.owner_status.is_hidden();
+    if hidden && !any_owner {
+        return ListReport {
+            state: TrackState::Unavailable,
+            serves: false,
+            facts: false,
+        };
+    }
+    let state = info.reported_state();
+    ListReport {
+        state,
+        serves: matches!(state, TrackState::Ready | TrackState::Retained) && !hidden,
+        facts: true,
+    }
+}
+
+/// List scope: the coverage of one list's membership, from the state it
+/// is reported in ([`list_report`]). `info` is `None` for a list Farsight
+/// has no row for. A `ready` or `retained` list is complete since its
+/// fetch, unless the firehose has not covered the time since or the
+/// session lacks sync events; a list that is not tracked falls back to
+/// network scope for `listblock`.
+pub fn list_scope(v: &View<'_>, info: Option<&ListInfo>, state: TrackState) -> Cov {
     let a = v.applied_through();
     let base = |level| Cov {
         level,
@@ -337,10 +383,8 @@ pub fn list_scope(v: &View<'_>, info: Option<&ListInfo>) -> Cov {
         reasons: BTreeSet::new(),
         indexed_at: a,
     };
-    let state = info.map_or(TrackState::Untracked, ListInfo::reported_state);
-    match state {
-        TrackState::Ready | TrackState::Retained => {
-            let info = info.expect("ready lists exist");
+    match (state, info) {
+        (TrackState::Ready | TrackState::Retained, Some(info)) => {
             let mut c = base(Level::Complete);
             c.complete_since = info.fetched_witness;
             if !v.covered(info.fetched_witness) {
@@ -354,27 +398,30 @@ pub fn list_scope(v: &View<'_>, info: Option<&ListInfo>) -> Cov {
             }
             c
         }
-        TrackState::Pending => {
+        (TrackState::Pending, _) => {
             let mut c = base(Level::Complete);
             c.partial("list_pending");
             c
         }
-        TrackState::Unavailable => {
+        (TrackState::Unavailable, _) => {
             let mut c = base(Level::Complete);
             c.note("list_unavailable");
             c
         }
-        TrackState::Missing | TrackState::Dead => {
+        (TrackState::Missing | TrackState::Dead, _) => {
             let mut c = base(Level::Complete);
             c.note("list_missing");
             c
         }
-        TrackState::Deferred => {
+        (TrackState::Deferred, _) => {
             let mut c = base(Level::Complete);
             c.note("list_deferred");
             c
         }
-        TrackState::Untracked | TrackState::Purging => {
+        // A served state without a row does not occur; it claims no more
+        // than a list that is not tracked.
+        (TrackState::Untracked | TrackState::Purging, _)
+        | (TrackState::Ready | TrackState::Retained, None) => {
             let mut n = v.network(Collection::ListBlock);
             n.note("list_not_tracked");
             n
@@ -384,6 +431,21 @@ pub fn list_scope(v: &View<'_>, info: Option<&ListInfo>) -> Cov {
 
 /// `query.getListMembers`.
 pub async fn get_list_members(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcError> {
+    list_members(st, p, false).await
+}
+
+/// [`get_list_members`] for the pages of the web UI, which decide for
+/// themselves what to show of a list whose owner is hidden: such a list
+/// keeps its stored state and its facts here, and still returns no
+/// members.
+pub async fn get_list_members_any_owner(
+    st: &Arc<ApiState>,
+    p: &Params,
+) -> Result<Reply, XrpcError> {
+    list_members(st, p, true).await
+}
+
+async fn list_members(st: &Arc<ApiState>, p: &Params, any_owner: bool) -> Result<Reply, XrpcError> {
     let raw = p
         .get("list")
         .ok_or_else(|| XrpcError::invalid("missing required parameter `list`"))?;
@@ -400,12 +462,9 @@ pub async fn get_list_members(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
     let mut tx = st.read_tx().await?;
     harness_sleep(&mut tx, p).await?;
     let info = queries::list_info(&mut tx, &list.authority, list.rkey.as_str()).await?;
-    let state = info
-        .as_ref()
-        .map_or(TrackState::Untracked, ListInfo::reported_state);
-    let serves = matches!(state, TrackState::Ready | TrackState::Retained)
-        && info.as_ref().is_some_and(|i| !i.owner_status.is_hidden());
-    let members = match (&info, serves) {
+    let report = list_report(info.as_ref(), any_owner);
+    let state = report.state;
+    let members = match (&info, report.serves) {
         (Some(i), true) => {
             queries::list_members(
                 &mut tx,
@@ -418,15 +477,14 @@ pub async fn get_list_members(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
         _ => Vec::new(),
     };
     tx.rollback().await?;
-    let cov = list_scope(&v, info.as_ref());
+    let cov = list_scope(&v, info.as_ref(), state);
+    // The list's own facts, unless its owner hides it.
+    let facts = info.as_ref().filter(|_| report.facts);
     let mut body = Map::new();
     body.insert("list".into(), json!(raw));
     body.insert("state".into(), json!(state.api_name()));
-    body.insert(
-        "capped".into(),
-        json!(info.as_ref().is_some_and(|i| i.capped)),
-    );
-    if let Some(i) = &info {
+    body.insert("capped".into(), json!(facts.is_some_and(|i| i.capped)));
+    if let Some(i) = facts {
         if i.record_state == RecordState::Present {
             body.insert("purpose".into(), json!(purpose_name(i.purpose)));
         }
@@ -434,7 +492,7 @@ pub async fn get_list_members(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
     }
     body.insert(
         "listblockCount".into(),
-        json!(info.as_ref().map_or(0, |i| i.listblock_count)),
+        json!(facts.map_or(0, |i| i.listblock_count)),
     );
     let owner = list.authority.as_str().to_owned();
     body.insert(
@@ -775,4 +833,72 @@ pub async fn get_stats(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcErro
         "detail": detail,
     });
     Ok(Reply::ok(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(track_state: TrackState, owner_status: ActorStatus) -> ListInfo {
+        ListInfo {
+            id: ListId::new(1),
+            owner_did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            owner_status,
+            rkey: "3k2abc".into(),
+            record_state: RecordState::Present,
+            purpose: Some(ListPurpose::Mod),
+            name: Some("a list".into()),
+            listblock_count: 7,
+            track_state,
+            capped: false,
+            item_count: 3,
+            fetched_witness: None,
+            purge_then: None,
+            admitted_at: None,
+        }
+    }
+
+    #[test]
+    fn a_hidden_owner_hides_the_list() {
+        for status in ActorStatus::ALL {
+            for state in TrackState::ALL {
+                let i = info(*state, *status);
+                let r = list_report(Some(&i), false);
+                if status.is_hidden() {
+                    // Never `ready` with no members, which would read as
+                    // a list known to be empty; and none of its facts.
+                    assert_eq!(
+                        r,
+                        ListReport {
+                            state: TrackState::Unavailable,
+                            serves: false,
+                            facts: false
+                        },
+                        "{status:?} {state:?}"
+                    );
+                } else {
+                    assert_eq!(r.state, i.reported_state());
+                    assert!(r.facts);
+                    assert_eq!(
+                        r.serves,
+                        matches!(state, TrackState::Ready | TrackState::Retained)
+                    );
+                }
+                // A page that applies its own rule gets the stored state,
+                // and members only where the API would serve them.
+                let own = list_report(Some(&i), true);
+                assert_eq!(own.state, i.reported_state());
+                assert!(own.facts);
+                assert_eq!(own.serves, r.serves);
+            }
+        }
+        assert_eq!(
+            list_report(None, false),
+            ListReport {
+                state: TrackState::Untracked,
+                serves: false,
+                facts: false
+            }
+        );
+    }
 }

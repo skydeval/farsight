@@ -469,6 +469,7 @@ pub async fn apply_status(
     b.events.push(RepoEvent::Account {
         did: did.clone(),
         witness: Utc::now(),
+        time: None,
         active,
         status,
     });
@@ -479,27 +480,56 @@ pub async fn apply_status(
     Ok(())
 }
 
-/// The repo-level error rule after re-resolution failed to help: the
-/// relay's `getRepoStatus` decides between **inactive** and **failed**.
-async fn relay_verdict(ctx: &Ctx, did: &Did, cost: &mut u64) -> Option<Outcome> {
-    let relay = ctx.cfg().backfill.relay_url.clone();
-    *cost += 1;
-    match xrpc::repo_status(&ctx.net, &relay, did).await {
-        Ok(s) if !s.active => {
+/// What the relay's `getRepoStatus` says of an account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayVerdict {
+    /// Inactive with a status that hides the account's rows.
+    Hidden(Option<String>),
+    /// Inactive with a status that hides nothing (`throttled`,
+    /// `desynchronized`, anything unknown).
+    Shown(Option<String>),
+    /// The relay stated that the account is active.
+    Active,
+    /// The relay gave no answer to act on: an error, a cooling host, a
+    /// timeout, or a response that does not say whether the account is
+    /// active.
+    Unknown(String),
+}
+
+/// Reads the relay's answer. Only an answer is a verdict: an error says
+/// nothing about the account, so it neither confirms nor lifts a status.
+pub fn relay_verdict_of(answer: &Result<xrpc::RepoStatus, crate::net::NetError>) -> RelayVerdict {
+    match answer {
+        Err(e) => RelayVerdict::Unknown(e.to_string()),
+        Ok(s) if !s.stated => RelayVerdict::Unknown("the relay's answer has no `active`".into()),
+        Ok(s) if s.active => RelayVerdict::Active,
+        Ok(s) => {
             let hidden = s
                 .status
                 .as_deref()
                 .is_some_and(|st| ActorStatus::from_upstream(Some(st)).is_hidden());
             if hidden {
-                if let Err(e) = apply_status(ctx, did, false, s.status.clone()).await {
-                    tracing::warn!(did = %did, error = ?e, "recording relay status failed");
-                }
-                Some(Outcome::Inactive)
+                RelayVerdict::Hidden(s.status.clone())
             } else {
-                None
+                RelayVerdict::Shown(s.status.clone())
             }
         }
-        _ => None,
+    }
+}
+
+/// Asks the relay for the account's status (one request, added to
+/// `cost`).
+async fn relay_verdict(ctx: &Ctx, did: &Did, cost: &mut u64) -> RelayVerdict {
+    let relay = ctx.cfg().backfill.relay_url.clone();
+    *cost += 1;
+    relay_verdict_of(&xrpc::repo_status(&ctx.net, &relay, did).await)
+}
+
+/// Records a hidden status the relay reported. A failure to record it is
+/// logged; the job's outcome is **inactive** either way.
+async fn record_hidden(ctx: &Ctx, did: &Did, status: Option<String>) {
+    if let Err(e) = apply_status(ctx, did, false, status).await {
+        tracing::warn!(did = %did, error = ?e, "recording relay status failed");
     }
 }
 
@@ -531,13 +561,19 @@ pub async fn run(ctx: &Ctx, req: &JobReq) -> JobResult {
                 cost,
             };
         }
+        // The repo-level error rule after re-resolution failed to help:
+        // the relay decides between **inactive** and **failed**.
         Err((Stop::RepoLevel(e), s)) => {
-            let o = relay_verdict(ctx, &req.did, &mut cost)
-                .await
-                .unwrap_or(Outcome::Failed {
+            let o = match relay_verdict(ctx, &req.did, &mut cost).await {
+                RelayVerdict::Hidden(status) => {
+                    record_hidden(ctx, &req.did, status).await;
+                    Outcome::Inactive
+                }
+                _ => Outcome::Failed {
                     error: e.to_string(),
                     terminal: false,
-                });
+                },
+            };
             (o, s)
         }
         Err((Stop::Failed(e), s)) => (
@@ -594,7 +630,9 @@ async fn attempt(
     let did = &req.did;
     let e = |s: Stop| (s, None);
     // An actor already known as hidden: the relay confirms (inactive) or
-    // contradicts it (the status is updated and the repo listed).
+    // contradicts it (the status is updated and the repo listed). Only
+    // the relay's own answer lifts the status. Without one the account
+    // stays hidden and the job fails, to be tried again.
     let status: Option<ActorStatus> =
         sqlx::query_scalar("SELECT status FROM actors WHERE did = $1")
             .bind(did.as_str())
@@ -602,10 +640,21 @@ async fn attempt(
             .await
             .map_err(|x| e(x.into()))?;
     if status.is_some_and(ActorStatus::is_hidden) {
-        if let Some(o) = relay_verdict(ctx, did, cost).await {
-            return Ok((o, None));
+        match relay_verdict(ctx, did, cost).await {
+            RelayVerdict::Hidden(status) => {
+                record_hidden(ctx, did, status).await;
+                return Ok((Outcome::Inactive, None));
+            }
+            RelayVerdict::Active => apply_status(ctx, did, true, None).await.map_err(e)?,
+            RelayVerdict::Shown(status) => {
+                apply_status(ctx, did, false, status).await.map_err(e)?
+            }
+            RelayVerdict::Unknown(why) => {
+                return Err(e(Stop::Failed(format!(
+                    "relay status of a hidden account: {why}"
+                ))));
+            }
         }
-        apply_status(ctx, did, true, None).await.map_err(e)?;
     }
     // Resume this DID's own run if it is fresh (< 72 h).
     let resume: Option<(RepoRunId, Stamp, DateTime<Utc>, bool)> = sqlx::query_as(&format!(
@@ -814,4 +863,69 @@ async fn list_repo(
         return Ok(Outcome::CompleteWithDebts);
     }
     Ok(Outcome::Clean)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(active: bool, stated: bool, status: Option<&str>) -> xrpc::RepoStatus {
+        xrpc::RepoStatus {
+            active,
+            stated,
+            status: status.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn only_the_relays_own_answer_is_a_verdict() {
+        // Every way of not answering: none of them lifts a hidden status.
+        let errors = [
+            NetError::Http {
+                status: 500,
+                name: String::new(),
+            },
+            NetError::Http {
+                status: 429,
+                name: "RateLimitExceeded".into(),
+            },
+            NetError::Http {
+                status: 400,
+                name: "RepoNotFound".into(),
+            },
+            NetError::Cooling {
+                host: "relay.example".into(),
+                secs: 30,
+            },
+            NetError::Transport("timed out".into()),
+            NetError::Decode("not JSON".into()),
+        ];
+        for e in errors {
+            assert!(
+                matches!(relay_verdict_of(&Err(e.clone())), RelayVerdict::Unknown(_)),
+                "{e}"
+            );
+        }
+        // An answer that does not say whether the account is active.
+        assert!(matches!(
+            relay_verdict_of(&Ok(answer(true, false, None))),
+            RelayVerdict::Unknown(_)
+        ));
+        assert_eq!(
+            relay_verdict_of(&Ok(answer(true, true, None))),
+            RelayVerdict::Active
+        );
+        for status in ["deactivated", "takendown", "suspended", "deleted"] {
+            assert_eq!(
+                relay_verdict_of(&Ok(answer(false, true, Some(status)))),
+                RelayVerdict::Hidden(Some(status.to_owned()))
+            );
+        }
+        for status in [Some("throttled"), Some("desynchronized"), Some("new"), None] {
+            assert_eq!(
+                relay_verdict_of(&Ok(answer(false, true, status))),
+                RelayVerdict::Shown(status.map(str::to_owned))
+            );
+        }
+    }
 }

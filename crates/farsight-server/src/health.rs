@@ -1,10 +1,12 @@
 //! `/health` and `/livez` (see `docs/design/operations.md`).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use farsight_api::config_store::ConfigStore;
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -30,19 +32,40 @@ pub async fn setup_health() -> Response {
     )
 }
 
-/// `/health` in normal mode: 200 iff the firehose is connected and
-/// `SELECT 1` answers within 1 s; else 503.
-pub async fn health(State(pool): State<PgPool>) -> Response {
+/// What `/health` in normal mode reads.
+#[derive(Clone)]
+pub struct HealthState {
+    /// The pool the checks run on.
+    pub pool: PgPool,
+    /// The live configuration (`firehose.tuning.synthetic_gap_lag`).
+    pub config: Arc<ConfigStore>,
+}
+
+/// Whether the instance is healthy: the database answers, the firehose is
+/// connected, and what was applied is not further behind than
+/// `max_lag`. `lag` is `None` before the first applied event, which is
+/// not a lag. The connected flag alone would stay true while the writer
+/// is held on one batch; coverage reports `firehose_lagging` past the
+/// same bound.
+pub fn healthy(db_ok: bool, connected: bool, lag: Option<f64>, max_lag: Duration) -> bool {
+    db_ok && connected && lag.is_none_or(|l| l <= max_lag.as_secs_f64())
+}
+
+/// `/health` in normal mode: 200 iff `SELECT 1` answers within 1 s, the
+/// firehose is connected and `applied_through` is at most
+/// `firehose.tuning.synthetic_gap_lag` behind; else 503.
+pub async fn health(State(st): State<HealthState>) -> Response {
+    let pool = &st.pool;
     let db_ok = tokio::time::timeout(
         Duration::from_secs(1),
-        sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&pool),
+        sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool),
     )
     .await
     .is_ok_and(|r| r.is_ok());
     let fh = if db_ok {
         tokio::time::timeout(
             Duration::from_secs(1),
-            farsight_storage::firehose::read_state(&pool),
+            farsight_storage::firehose::read_state(pool),
         )
         .await
         .ok()
@@ -55,7 +78,15 @@ pub async fn health(State(pool): State<PgPool>) -> Response {
         .as_ref()
         .and_then(|s| s.applied_through)
         .map(|a| ((chrono::Utc::now() - a).num_milliseconds() as f64 / 1000.0).max(0.0));
-    let ok = db_ok && connected;
+    let max_lag = st
+        .config
+        .current()
+        .config
+        .firehose
+        .tuning
+        .synthetic_gap_lag
+        .get();
+    let ok = healthy(db_ok, connected, lag, max_lag);
     let body = json!({
         "status": if ok { "ok" } else { "unhealthy" },
         "firehose": { "connected": connected, "lagSeconds": lag },
@@ -67,4 +98,24 @@ pub async fn health(State(pool): State<PgPool>) -> Response {
         StatusCode::SERVICE_UNAVAILABLE
     };
     no_store((status, axum::Json(body)).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_connected_stream_that_falls_behind_is_not_healthy() {
+        let max = Duration::from_secs(300);
+        assert!(healthy(true, true, Some(1.4), max));
+        assert!(healthy(true, true, Some(300.0), max));
+        // Connected, and nothing applied for longer than coverage allows.
+        assert!(!healthy(true, true, Some(300.5), max));
+        assert!(!healthy(true, true, Some(86_400.0), max));
+        // Connected before the first event: nothing to be behind.
+        assert!(healthy(true, true, None, max));
+        assert!(!healthy(true, false, Some(1.0), max));
+        assert!(!healthy(false, true, Some(1.0), max));
+        assert!(!healthy(false, false, None, max));
+    }
 }

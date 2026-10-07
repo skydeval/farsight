@@ -18,9 +18,11 @@ Farsight subscribes to four collections and nothing else:
 `app.bsky.graph.block`, `app.bsky.graph.listblock`,
 `app.bsky.graph.list` and `app.bsky.graph.listitem`. `identity` and
 `account` events arrive whatever the filter is. Frames are requested
-zstd-compressed with the dictionary bundled in the binary; if an
+zstd-compressed with the dictionary bundled in the binary. If an
 instance has retired that dictionary, the session continues
-uncompressed.
+uncompressed: a v2 instance says so at the handshake, and on v1 the
+first frame that the dictionary cannot expand ends the session and
+every later one is opened uncompressed.
 
 ### v1 and v2
 
@@ -33,7 +35,7 @@ Jetstream has two protocols, and Farsight speaks both.
 | Cursor | `time_us`, microseconds | `seq`, a sequence number local to the instance; a timestamp is accepted too |
 | Witness time of an event | `time_us` | `witnessedAt` (or `time` on older servers) |
 | `#sync` events | no | yes |
-| Cursor older than retention | clamped silently | refused with `CursorTooOld`, or announced with `#info OutdatedCursor` |
+| Cursor older than retention | clamped silently | refused with `CursorTooOld`, or announced with `#info OutdatedCursor`; either way a gap is recorded |
 
 On every connect Farsight tries v2 first. An instance that answers the
 v2 handshake with 404 does not offer it, and the session falls back to
@@ -80,12 +82,20 @@ reader ─► bounded channel (10,000 events) ─► single writer ─► Postgr
 - **The reader** owns the websocket connection: protocol detection, resume,
   stall detection, gap detection, failover. It decodes and validates
   each event before queueing it. An event's position is validated
-  with it: a witness time before the epoch or more than 24 hours ahead
-  of the server's clock, or a `seq` that is negative or the largest
-  value, is not an event. The frame is refused like one that cannot be
-  decoded and the session ends, so a position an instance made up is
-  never stored as the cursor or as `applied_through`. A websocket
-  message, compressed or not, may be at most 16 MiB.
+  with it: a witness time before the epoch or more than 5 minutes
+  ahead of the server's clock, or a `seq` that is negative or the
+  largest value, is not an event. The frame is refused like one that
+  cannot be decoded and the session ends, so a position an instance
+  made up is never stored as the cursor or as `applied_through`. Resume
+  cursors, failover gaps and the lag that coverage reports are all
+  measured from `applied_through`, which is why the allowance is small.
+  A websocket message, compressed or not, may be at most 16 MiB.
+- A frame is read one level at a time. Only its envelope and its
+  position have to be readable for it to be an event. The `record`
+  inside a commit is whatever its author wrote and is parsed on its
+  own: a record that cannot be parsed, for instance one nested deeper
+  than the JSON parser goes, makes that commit a rejected one (below)
+  and never ends the session.
 - **The channel** is bounded. When it is full the reader stops
   reading, and TCP pushes back on the instance. A connection the
   instance drops for that is resumed from the persisted cursor.
@@ -119,10 +129,23 @@ A commit is dropped before it is applied, and counted in
 
 | Reason | Cause |
 |---|---|
-| `invalid` | malformed DID, a rev that is not a TID, a record that does not parse |
+| `invalid` | malformed DID, a rev that is not a TID or whose time is more than 5 minutes ahead of the server's clock, a record that does not parse |
 | `foreign_listitem` | a listitem naming a list in another repository; only the list's owner can add members |
 
 Its position in the stream still counts, so the cursor moves past it.
+
+**A rejected record removes the version it replaced.** When a create
+or an update is rejected for its record alone, and its repository,
+record key and rev are valid, the repository holds nothing Farsight
+indexes under that key at that rev. The commit is applied as a
+last-write-wins delete of the key, tombstone included, so an earlier
+valid version does not stay in the index. It is counted both as
+dropped and as a `delete` in `farsight_firehose_events_total`. A
+commit rejected for its DID, key, rev or operation changes nothing.
+
+A rev from the future is refused whole because writes are ordered by
+rev: one stored with a rev far ahead would win over every later change
+to its record, its deletion included.
 
 ### Poisoned events
 
@@ -149,8 +172,8 @@ and what it would have changed is recovered by reading the repository.
 ### Storage calls outside a batch
 
 The writer also writes what is not an event: the connected flag, gaps,
-the purge of an account that became `deleted`, the record of a
-poisoned event. These follow the same rule about errors. A transient
+seam windows, the purge of an account that became `deleted`, the
+record of a poisoned event. These follow the same rule about errors. A transient
 one is retried until it passes. Any other error is tried 3 times;
 then the call is given up, logged, recorded in `op_errors` (with the
 DID, when it concerns one account) and counted in
@@ -163,7 +186,10 @@ What going on leaves behind:
 |---|---|
 | `purge_account` | The account is `deleted` and its rows are still stored. They are withheld by the status; the purge is taken up again by the daily `account_purges` task and at the next start. |
 | `record_poisoned` | The event has no `resync` debt. The operational error names its DID; `admin.requestBackfill` re-reads the repository. |
-| `record_gap`, `open_sync_unavailable`, `close_sync_unavailable` | Nothing: these are not passed over. Coverage is claimed from the recorded gaps, so a gap that cannot be written stops the writer, which ends the process (see below); the next start resumes from the stored cursor and meets the gap again. |
+| `record_gap`, `open_sync_unavailable`, `close_sync_unavailable`, `open_seam` | Nothing: these are not passed over. Coverage is claimed from the recorded gaps, and a seam window is what is known to need a second read, so one that cannot be written stops the writer, which ends the process (see below); the next start resumes from the stored cursor and meets the gap or the seam again. |
+| `close_seams` | The seam window stays open. The next session that catches up or ends closes it, and so does the next start. |
+| `finish_seams` | The seam window stays on record and is read again. |
+| `forget_instance_seq` | The instance's stored `seq` stays. The next resume on it finds the sequence started again once more and records the gap again. |
 | `mark_connected`, `set_connected`, `read_state` | The connected flag keeps its last value until the next session change. |
 
 ### A panic in the reader or the writer
@@ -200,6 +226,11 @@ previous instance's row stays, so a later return to it resumes from
 that instance's own cursor, exact by `seq` on v2, rather than by
 timestamp. An instance with no row is resumed as a failover.
 
+The one case in which a cursor is lowered: an instance that answers a
+`seq` resume with a lower `seq` has started its sequence again, and
+the number stored for it names nothing in the new one. The stored
+`seq` is dropped, and the next batch from the instance stores its own.
+
 ### Resume plan
 
 Before every connect the reader waits until the writer has flushed
@@ -208,10 +239,17 @@ everything already read, then reads the persisted state and decides:
 | Situation | Cursor sent | Gap rule |
 |---|---|---|
 | First start, nothing applied yet | none (live tail) | none |
-| Same instance, v2 after v2 | `seq + 1`, exact | none; if refused with `CursorTooOld`, connect at the live tail and record a gap |
-| Same instance, v1 (or v2 after v1) | `cursor_us − 120 s` | gap if the cursor was clamped |
-| Other instance, lag of the previous one known and at most `failover_max_lag` | `applied_through − max(failover_rewind_min, lag + 5 min)` | gap if the cursor was clamped |
-| Other instance, lag unknown or too large | `applied_through − 30 min` | always a gap |
+| Instance with its own cursor, v2 after v2 | `seq + 1`, exact | gap if the instance announces a clamp, answers with a lower `seq`, or its first event is more than `gap_threshold` after the stored cursor |
+| Instance with its own cursor, v1 (or v2 after v1) | `cursor_us − 120 s` | gap if a clamp is announced or the first event is later than the stored cursor |
+| Instance without a cursor, lag of the previous one known and at most `failover_max_lag` | `applied_through − max(failover_rewind_min, lag + 5 min)` | gap if a clamp is announced or the first event is more than `gap_threshold` after the cursor |
+| Instance without a cursor, lag unknown or too large | `applied_through − 30 min` | always a gap |
+
+An instance that refuses the cursor with `CursorTooOld` is read from
+the live tail, and a gap is always recorded.
+
+Where `applied_through` is used to compute a position for another
+instance it is taken as at most the current time, so a witness clock
+that ran ahead cannot place a cursor in the future.
 
 Replaying events that were already applied is harmless: every write
 is last-write-wins by rev (see [storage.md](storage.md)), so a
@@ -273,21 +311,40 @@ recorded regardless.
 
 A gap is an interval of witness time in which events may have been
 missed. It is detected when the first event of a resumed session
-arrives:
+arrives, and it runs from a start that depends on the instance to that
+first event.
 
-- **`CursorTooOld`** (v2, same instance). The gap is
-  `[applied_through, first live event]`.
-- **Clamp.** The instance replayed from later than asked. This is
-  taken to have happened when the instance said so (`#info
-  OutdatedCursor`) or when the first event's witness time is more
-  than `firehose.tuning.gap_threshold` (300 s) after the requested
-  cursor. A gap is recorded only when that first event lies **after**
-  the gap's start; if the instance replayed from an older point than
-  Farsight's position, nothing was skipped. On the same instance the
-  gap starts at `applied_through`; on a failover it starts at
-  `applied_through − 30 min`.
-- **Failover without a safe rewind.** Always
-  `[applied_through − 30 min, first event]`.
+**Where a gap starts.** At `applied_through` when the last applied
+batch came from the instance being resumed. At
+`applied_through − 30 min` otherwise, which covers a failover and also
+a return to an instance while the position came from another: two
+instances are not equally far behind the network.
+
+**When a gap is recorded:**
+
+- **Refused cursor** (`CursorTooOld`). Always.
+- **Announced clamp** (`#info OutdatedCursor`). On every kind of
+  resume, `seq` or timestamp.
+- **A `seq` resume that did not continue.** The first event carries a
+  `seq` below the one asked for (the instance's sequence started
+  again), or its witness time is more than
+  `firehose.tuning.gap_threshold` (300 s) after the stored cursor. A
+  sequence that started again and has already passed the stored number
+  shows in nothing but that distance.
+- **A timestamp resume on an instance with its own cursor** whose first
+  event is later than the stored cursor. The cursor was taken from an
+  event that this instance delivered, and the resume asks for 120 s
+  before it. A first event after it means that the instance no longer
+  holds what it sent, however short the distance.
+- **A failover with a trusted rewind** whose first event is more than
+  `gap_threshold` after the requested cursor.
+- **A failover without a safe rewind.** Always.
+
+A conditional gap is recorded only when the first event lies **after**
+the gap's start. If the instance replayed from an older point than
+that, nothing was skipped. A gap that is recorded unconditionally is
+never empty: if the first event is not after its start, the two clocks
+disagree, and the gap is the 30 minutes before that event.
 
 ```sql
 CREATE TABLE firehose_gaps (
@@ -304,12 +361,13 @@ CREATE TABLE firehose_gaps (
 
 | `cause` | Name | Recorded when |
 |---|---|---|
-| 1 | cursor too old | a v2 instance refused the cursor |
-| 2 | heuristic | a same-instance timestamp resume was clamped |
-| 3 | failover | a cross-instance resume was clamped, or had no safe rewind |
+| 1 | cursor too old | an instance refused the cursor, or announced that it clamped it |
+| 2 | heuristic | a resume on an instance with its own cursor did not continue where it left off, as far as the first event shows |
+| 3 | failover | a resume on an instance without a cursor was clamped, or had no safe rewind |
 | 4 | sync unavailable | an interval was spent on v1 (below) |
+| 5 | seam unrepaired | the re-read of a seam window could not be finished (below) |
 
-Gaps of causes 1 to 3 are recorded closed. Recording, closing or
+Gaps of causes 1 to 3 and 5 are recorded closed. Recording, closing or
 healing a gap sends `NOTIFY farsight_coverage`.
 
 ### What a gap does
@@ -332,26 +390,74 @@ stream is resumed without loss. See [coverage.md](coverage.md).
 At the moment a resumed session passes from replay to the live tail,
 an instance may drop events witnessed very close to that hand-over,
 while a later replay of the same window returns them. Farsight
-therefore re-reads the seam once after every resume from a prior
-position: same instance on either protocol, failover, or recovery
-from a clamp. It is skipped only on the first start ever.
+therefore re-reads the seam after every resume from a prior position:
+same instance on either protocol, failover, or recovery from a clamp.
+It is skipped only on the first start ever.
 
-- A session has **caught up** when an event's witness time first
-  comes within `seam_repair_catchup_margin` of wall time. For an
-  ordinary reconnect that is immediate; after a long replay it is
-  correspondingly later than the connect.
-- `seam_repair_delay` after catching up, a second connection to the
-  same instance reads the window
-  `[connect − seam_repair_before, caught up + seam_repair_after]` with
-  a timestamp cursor and hands the events to the writer.
-- Those events go through the normal apply path, where last-write-wins
-  turns everything already applied into a no-op.
-- A repair batch **never moves position state**. It writes no cursor,
-  no `applied_through`, no `firehose_clock` row, and opens or closes
-  no gap. The live session may still be replaying behind it, and a
-  cursor moved past data not yet replayed would make the next
-  reconnect skip it. The repair re-covers a window known to be lossy;
-  it does not redefine where the stream is.
+The window to read again is a row of `firehose_seams`, so it survives
+a restart, and only a finished re-read removes it.
+
+```sql
+CREATE TABLE firehose_seams (
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  source_url  TEXT NOT NULL,
+  protocol    SMALLINT NOT NULL,     -- 1 v1, 2 v2
+  trigger     SMALLINT NOT NULL,     -- 1 resume, 2 failover, 3 clamp_recovery
+  from_at     TIMESTAMPTZ NOT NULL,  -- witness clock
+  to_at       TIMESTAMPTZ,           -- NULL until the session caught up or ended
+  due_at      TIMESTAMPTZ,
+  attempts    INT NOT NULL DEFAULT 0,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+1. **Opened.** Before the first event of a resumed session is
+   applied, the writer stores the window, open, starting
+   `seam_repair_before` before the connect. From then on a stop at any
+   point leaves the window on record.
+2. **Closed.** A session has **caught up** when an event's witness
+   time first comes within `seam_repair_catchup_margin` of wall time,
+   or is later than the session's connect. The second holds for an
+   instance that stays further behind the clock than the margin. The
+   window then ends `seam_repair_after` past that moment and is due
+   `seam_repair_delay` later. A session that ends before it caught up
+   has its window closed at the last event it delivered; a window left
+   open by a stop is closed at `applied_through` at the next start. A
+   window whose session never reached its start had no hand-over and
+   is dropped.
+3. **Read again.** A task beside the reader takes the due windows,
+   merges those of one instance into one stretch, and reads it on a
+   second connection with a timestamp cursor. The events go to the
+   writer in batches of 500 as they arrive and through the normal
+   apply path, where last-write-wins turns everything already applied
+   into a no-op.
+4. **Finished.** The read is finished by the first event witnessed
+   after the window's end. The writer then deletes the rows, after the
+   batches that were sent ahead.
+
+A read that does not get that far is not taken for one that did:
+
+- A read that **fails** is tried again after 1 minute, then 2, 4 and
+  8: the connection cannot be opened, breaks or is closed, or the
+  window does not fit in 500,000 events or 10 minutes. After 5 failed
+  reads the window is recorded as a gap of cause "seam unrepaired"
+  over the window, and from there it is healed like any other gap.
+- A read that goes **silent** for `stall_timeout` before the window's
+  end was passed says nothing either way, because a quiet stream looks
+  the same as a stalled one. It is tried again after a minute without
+  being counted, and finishes once the stream has moved past the
+  window.
+
+A repair batch **never moves position state**. It writes no cursor,
+no `applied_through`, no `firehose_clock` row, and opens or closes
+no gap. The live session may still be replaying behind it, and a
+cursor moved past data not yet replayed would make the next
+reconnect skip it. The repair re-covers a window known to be lossy;
+it does not redefine where the stream is.
+
+A window that is waiting for its re-read does not lower coverage. The
+re-read normally follows the resume by `seam_repair_delay`;
+`farsight_firehose_pending_seams` shows the windows on record.
 
 | `firehose.tuning` key | Default |
 |---|---|
@@ -373,6 +479,7 @@ in [storage.md](storage.md)).
 | commit create or update, `list` | Last-write-wins upsert under the list's exclusive lock; the list's record is now present; state transition. |
 | commit create or update, `listitem` | Authority check (the item must be in the list owner's repository); stored only if the list is tracked. |
 | commit delete, any collection | Last-write-wins delete plus a tombstone; a listblock delete adjusts the counter. |
+| commit create or update with a rejected record | As a delete, when the repository, key and rev are valid ([Validation](#validation)). |
 | `#sync` (v2) | For **any** DID, known or not: a `resync` debt and a tier-1 re-list under `system:resync`, counted in `pendingResyncs`. |
 | `identity` | For a DID Farsight holds: clear its cached PDS, so the next job resolves it afresh, and note the account in `handle_due` so its handle is checked again. |
 | `account` | See below. |
@@ -405,9 +512,18 @@ For a DID Farsight does **not** hold:
 
 For a DID Farsight holds:
 
-1. `account` events carry no rev, so they are ordered by witness
-   time. An event older than the stored `status_at` is stale and
-   ignored, which makes replays idempotent.
+1. `account` events carry no rev, so they are ordered by the `time`
+   of the upstream account event. Every instance relays the same
+   value, while each witnesses the event at a moment of its own, so
+   ordering by witness time would let an instance that lags hand over
+   a newer status that a second instance then overwrites with an older
+   event it witnessed later. An event without a readable `time` is
+   ordered by its witness time, and so is one whose `time` is after
+   its witness time: an event cannot be witnessed before it happened,
+   and a time from the future must not pin the status. The time an
+   event is ordered by is stored as `status_at`. An event older than
+   the stored one is stale and ignored, which makes replays
+   idempotent.
 2. The status is stored: active, or the upstream status
    (`deactivated`, `takendown`, `suspended`, `deleted`, `throttled`,
    `desynchronized`; anything else is `unknown`). What a status hides
@@ -419,7 +535,10 @@ For a DID Farsight holds:
    `unavailable` lists.
 5. Becoming `deleted` purges the account's authored rows after the
    batch commits, in several transactions; an interrupted purge is
-   finished at the next start.
+   finished at the next start. The purge removes the account's
+   tombstones too, so nothing stored would turn a replay away: a
+   commit of a `deleted` account that was witnessed no later than its
+   `status_at` is therefore stale and stores nothing.
 
 ## Running on v1
 
@@ -442,8 +561,9 @@ otherwise:
   v1 therefore means a repair of days; see
   [backfill.md](backfill.md#gap-repair).
 - A `desynchronized` account status still triggers a re-list on v1.
-- The heuristic clamp detection applies to v1 resumes, since v1 never
-  announces a clamp.
+- A v1 instance never announces a clamp. One is found from the first
+  event of the resumed session, as described under
+  [How a gap is detected](#how-a-gap-is-detected).
 
 An operator who needs `complete` coverage uses instances that offer
 v2. The setup wizard tests each URL and reports which protocol it
@@ -455,7 +575,7 @@ speaks; see the [setup guide](../guide/setup.md).
 |---|---|---|
 | `firehose.urls` | the two instances above | Instances, in failover order |
 | `firehose.tuning.stall_timeout` | `60s` | Silence that ends a session |
-| `firehose.tuning.gap_threshold` | `300s` | Distance between requested cursor and first event that counts as a clamp |
+| `firehose.tuning.gap_threshold` | `300s` | On a failover, the distance between the requested cursor and the first event that counts as a clamp; on a `seq` resume, the distance between the stored cursor and the first event beyond which the stream is taken not to have continued |
 | `firehose.tuning.failover_rewind_min` | `10m` | Smallest rewind on failover |
 | `firehose.tuning.failover_max_lag` | `30m` | Largest instance lag for which a rewind is trusted |
 | `firehose.tuning.synthetic_gap_lag` | `5m` | Lag beyond which coverage treats the stream as behind |
@@ -464,13 +584,14 @@ speaks; see the [setup guide](../guide/setup.md).
 | Metric | Meaning |
 |---|---|
 | `farsight_firehose_connected{protocol}` | 1 for the protocol of the current session |
-| `farsight_firehose_lag_seconds` | now − `applied_through` |
+| `farsight_firehose_lag_seconds` | now − `applied_through`. Kept by a task of its own, so it goes on growing while the writer is held on one batch or the database does not answer |
 | `farsight_firehose_source_lag_seconds` | now − median commit time of the last 1,000 commit events |
 | `farsight_firehose_events_total{collection,op,outcome}` | events by outcome: `applied`, `stale`, `refused`, `dropped` |
 | `farsight_firehose_reconnects_total{reason}` | `connect_error`, `stall`, `closed`, `error`, `server_error`, `kill`, `failover`, `cursor_too_old` |
 | `farsight_firehose_open_gaps` | unhealed gaps |
-| `farsight_firehose_seam_repairs_total{trigger}` | `resume`, `failover`, `clamp_recovery` |
+| `farsight_firehose_seam_repairs_total{trigger}` | seam re-reads that finished and were applied: `resume`, `failover`, `clamp_recovery` |
 | `farsight_firehose_seam_repair_events_total` | events re-read by seam repairs |
+| `farsight_firehose_pending_seams` | seam windows on record whose re-read has not been applied yet |
 | `farsight_ingest_batch_seconds` | batch duration |
 | `farsight_ingest_buffer_depth` | events waiting in the channel |
 | `farsight_ingest_dropped_total{reason}` | `invalid`, `foreign_listitem`, `poisoned` |

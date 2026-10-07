@@ -35,8 +35,13 @@ pub const SEAM_REPAIRS: &str = "farsight_firehose_seam_repairs_total";
 /// `farsight_firehose_seam_repair_events_total` (counter).
 pub const SEAM_REPAIR_EVENTS: &str = "farsight_firehose_seam_repair_events_total";
 
+/// `farsight_firehose_pending_seams` (gauge): seam windows on record
+/// whose re-read has not been applied yet.
+pub const PENDING_SEAMS: &str = "farsight_firehose_pending_seams";
+
 /// Every ingest metric name.
-pub const ALL: [&str; 12] = [
+pub const ALL: [&str; 13] = [
+    PENDING_SEAMS,
     STORAGE_ERRORS,
     SEAM_REPAIRS,
     SEAM_REPAIR_EVENTS,
@@ -77,6 +82,10 @@ pub fn describe() {
         "seam repairs after cursor resumes, by trigger"
     );
     describe_counter!(SEAM_REPAIR_EVENTS, "events re-read by seam repairs");
+    describe_gauge!(
+        PENDING_SEAMS,
+        "seam windows whose re-read has not been applied yet"
+    );
     describe_gauge!(OPEN_GAPS, "unhealed firehose gaps");
     describe_histogram!(
         BATCH_SECONDS,
@@ -100,7 +109,7 @@ pub fn describe() {
 
 /// The storage calls the writer makes outside a batch (the `op` label of
 /// [`STORAGE_ERRORS`]).
-pub const STORAGE_OPS: [&str; 8] = [
+pub const STORAGE_OPS: [&str; 12] = [
     "mark_connected",
     "set_connected",
     "record_gap",
@@ -109,6 +118,10 @@ pub const STORAGE_OPS: [&str; 8] = [
     "close_sync_unavailable",
     "purge_account",
     "record_poisoned",
+    "open_seam",
+    "close_seams",
+    "finish_seams",
+    "forget_instance_seq",
 ];
 
 /// Registers every known label set at zero, so dashboards and the
@@ -156,6 +169,7 @@ pub fn register_zeroes() {
     metrics::gauge!(LAG).set(0.0);
     metrics::gauge!(SOURCE_LAG).set(0.0);
     metrics::gauge!(OPEN_GAPS).set(0.0);
+    metrics::gauge!(PENDING_SEAMS).set(0.0);
     metrics::gauge!(BUFFER_DEPTH).set(0.0);
 }
 

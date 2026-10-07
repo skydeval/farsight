@@ -104,13 +104,7 @@ pub struct View<'a> {
 
 /// The reason a `covered(t)` check failed, from the snapshot.
 fn uncovered_reason(s: &GlobalSnapshot, lag: Duration) -> &'static str {
-    if s.firehose.applied_through.is_none() || !s.firehose.connected {
-        "firehose_disconnected"
-    } else if s.synthetic_gap(lag) {
-        "firehose_lagging"
-    } else {
-        "firehose_gap"
-    }
+    s.synthetic_gap_reason(lag).unwrap_or("firehose_gap")
 }
 
 /// Reason for a list in a degraded state.
@@ -300,6 +294,7 @@ mod tests {
     fn snap(protocol: Protocol, baseline: bool) -> GlobalSnapshot {
         GlobalSnapshot {
             read_at: t(1000),
+            stale: false,
             firehose: FirehoseState {
                 applied_through: Some(t(999)),
                 connected: true,

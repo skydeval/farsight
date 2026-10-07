@@ -338,7 +338,7 @@ pub async fn lookup_list(
         ("limit".to_owned(), "1".to_owned()),
     ];
     let mut serves = false;
-    match handlers::get_list_members(&st.api, &Params::from_pairs(p)).await {
+    match handlers::get_list_members_any_owner(&st.api, &Params::from_pairs(p)).await {
         Ok(r) => {
             let b = &r.body;
             facts.push(stat("Owner", owner.as_str()));

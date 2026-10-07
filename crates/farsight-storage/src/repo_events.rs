@@ -6,7 +6,7 @@
 //! | Event | Effect |
 //! |---|---|
 //! | `identity` | known DID ⇒ PDS cache cleared (`pds_resolved_at = NULL`) |
-//! | `account` | known DID ⇒ status set from the event; `desynchronized` ⇒ `resync` debt; **any** DID becoming active: known with `inactive_at_listing` or a hidden status ⇒ `resync` debt + **OA** on its `unavailable` lists whose list lock the transaction holds; unknown ⇒ no row, no job (counted in the report); `deleted` ⇒ purge after commit |
+//! | `account` | known DID ⇒ status set from the event, unless a later event (by the upstream event's time) already set it; `desynchronized` ⇒ `resync` debt; **any** DID becoming active: known with `inactive_at_listing` or a hidden status ⇒ `resync` debt + **OA** on its `unavailable` lists whose list lock the transaction holds; unknown ⇒ no row, no job (counted in the report); `deleted` ⇒ purge after commit |
 //! | `#sync` | any DID ⇒ `resync` debt + tier-1 `system:resync` re-list |
 
 use chrono::{DateTime, Utc};
@@ -34,9 +34,12 @@ pub enum RepoEvent {
     Account {
         /// The account whose status changed.
         did: Did,
-        /// Witness time of the event. It is stored as the account's
-        /// `status_at`, and an event older than the stored one is skipped.
+        /// Witness time of the event.
         witness: DateTime<Utc>,
+        /// The `time` the upstream account event carries, if it has one.
+        /// Every instance relays the same value, so events are ordered by
+        /// it ([`account_order`]).
+        time: Option<DateTime<Utc>>,
         /// The event's `active` flag.
         active: bool,
         /// Upstream status when inactive.
@@ -67,6 +70,16 @@ impl RepoEvent {
     pub fn may_reactivate(&self) -> bool {
         matches!(self, RepoEvent::Account { active: true, .. })
     }
+}
+
+/// The time an account event is ordered by, stored as the account's
+/// `status_at`: the upstream event's own `time`, which is the same on
+/// every instance, and the witness time for an event without one. An
+/// event cannot have been witnessed before it happened, so a `time` after
+/// the witness time is not believed and the witness time is used: an
+/// account's status can never be pinned by a time in the future.
+pub fn account_order(witness: DateTime<Utc>, time: Option<DateTime<Utc>>) -> DateTime<Utc> {
+    time.map_or(witness, |t| t.min(witness))
 }
 
 /// The stored status code for an upstream account event.
@@ -143,9 +156,11 @@ impl Txn<'_> {
             RepoEvent::Account {
                 did,
                 witness,
+                time,
                 active,
                 status,
             } => {
+                let at = account_order(*witness, *time);
                 let new = status_code(*active, status.as_deref());
                 let known: Option<(ActorId, ActorStatus, bool, Option<DateTime<Utc>>)> =
                     sqlx::query_as(
@@ -166,17 +181,19 @@ impl Txn<'_> {
                     }
                     return Ok(());
                 };
-                // Account events carry no rev: order them by witness time so
-                // a replayed (older) status never overwrites a newer one and
-                // replays are idempotent.
-                if status_at.is_some_and(|at| *witness < at) {
+                // Account events carry no rev. They are ordered by the
+                // upstream event's time, so a replayed (older) status never
+                // overwrites a newer one, replays are idempotent, and two
+                // instances that witnessed the same events at different
+                // moments order them alike.
+                if status_at.is_some_and(|stored| at < stored) {
                     self.report.stale_repo_events += 1;
                     return Ok(());
                 }
                 sqlx::query("UPDATE actors SET status = $2, status_at = $3 WHERE id = $1")
                     .bind(id)
                     .bind(new)
-                    .bind(*witness)
+                    .bind(at)
                     .execute(&mut *self.conn)
                     .await?;
                 if new != old {
@@ -269,6 +286,25 @@ pub async fn record_poisoned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_events_are_ordered_by_their_own_time() {
+        let t = |s: i64| DateTime::<Utc>::from_timestamp(s, 0).unwrap();
+        // The upstream time, whenever each instance witnessed the event.
+        assert_eq!(account_order(t(100), Some(t(70))), t(70));
+        assert_eq!(account_order(t(91), Some(t(70))), t(70));
+        // Instance A, 30 s behind, witnesses a deactivation of t = 70 at
+        // 100. Instance B witnesses the reactivation of t = 80 at 91: it
+        // is the later event, although it was witnessed earlier.
+        let deactivated = account_order(t(100), Some(t(70)));
+        let reactivated = account_order(t(91), Some(t(80)));
+        assert!(reactivated > deactivated);
+        // No upstream time: the witness time.
+        assert_eq!(account_order(t(100), None), t(100));
+        // A time after the witness time is not believed.
+        assert_eq!(account_order(t(100), Some(t(5_000))), t(100));
+        assert_eq!(account_order(t(100), Some(t(100))), t(100));
+    }
 
     #[test]
     fn status_codes() {

@@ -10,11 +10,24 @@
 //! "did", "time", "witnessedAt"?, …}}`, an `#info` advisory, or
 //! `{"$type":"error","error","message"}`. The cursor is `seq`; the witness
 //! time is `witnessedAt` (falling back to `time` for older servers).
+//!
+//! A frame is read one level at a time: the envelope's members are split
+//! without being parsed, and each one the decoder needs is parsed on its
+//! own. A commit's `record` is whatever its author wrote, so a record
+//! that cannot be parsed (one nested deeper than the parser allows, for
+//! instance) makes that commit a rejected one and leaves the frame, and
+//! its position, readable. Only a frame whose envelope or position cannot
+//! be read is undecodable.
+
+use std::collections::HashMap;
 
 use chrono::DateTime;
-use farsight_core::record::{CommitOp, RecordError, parse_commit};
+use farsight_core::record::{
+    CommitAction, CommitOp, RecordError, commit_action, parse_commit_head,
+};
 use farsight_core::{Collection, Did};
-use serde_json::Value;
+use serde_json::value::RawValue;
+use serde_json::{Map, Value};
 
 /// The two Jetstream protocols an instance may speak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,6 +90,11 @@ pub enum Body {
         collection: Option<Collection>,
         /// Detail for logs.
         detail: String,
+        /// The delete applied in the record's place, when the commit is a
+        /// create or an update whose repository, key and rev are valid
+        /// and only its record is not: at that rev the key holds nothing
+        /// Farsight indexes, so a version stored under it is removed.
+        removes: Option<Box<CommitOp>>,
     },
     /// A commit on some other collection (not subscribed; ignored).
     OtherCommit,
@@ -90,6 +108,10 @@ pub enum Body {
         active: bool,
         /// Upstream status when inactive.
         status: Option<String>,
+        /// The `time` of the upstream account event, microseconds since
+        /// the epoch, if the event carries a readable one. It is the same
+        /// on every instance, unlike the witness time.
+        time_us: Option<i64>,
     },
     /// `#sync` (v2 only).
     Sync(Did),
@@ -134,14 +156,17 @@ pub enum Frame {
 #[error("undecodable frame: {0}")]
 pub struct FrameError(pub String);
 
-/// How far ahead of this machine's clock a witness time may be.
-pub const MAX_WITNESS_AHEAD_US: i64 = 24 * 3600 * 1_000_000;
+/// How far ahead of this machine's clock a witness time may be. Resume
+/// cursors, failover gaps and the lag that coverage reports are all
+/// measured from `applied_through`, so the allowance is no more than the
+/// clocks of two well-kept machines can differ by.
+pub const MAX_WITNESS_AHEAD_US: i64 = 5 * 60 * 1_000_000;
 
 /// Checks a witness time an instance reports before anything is computed
 /// from it or stored: it is the stream position, kept as a running
-/// maximum, so one far in the future would stand as `applied_through`
-/// for good, and one outside the range of the arithmetic done on
-/// positions would overflow it. Accepted: the epoch up to
+/// maximum, so one in the future would stand as `applied_through` until
+/// the clock passed it, and one outside the range of the arithmetic done
+/// on positions would overflow it. Accepted: the epoch up to
 /// [`MAX_WITNESS_AHEAD_US`] past `now_us`.
 pub fn check_witness(us: i64, now_us: i64) -> Result<i64, FrameError> {
     if us < 0 || us > now_us.saturating_add(MAX_WITNESS_AHEAD_US) {
@@ -164,10 +189,6 @@ pub(crate) fn now_us() -> i64 {
     chrono::Utc::now().timestamp_micros()
 }
 
-fn str_of<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
-    v.get(k).and_then(Value::as_str)
-}
-
 /// RFC 3339 → microseconds since the epoch.
 pub fn parse_time_us(s: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(s)
@@ -175,21 +196,89 @@ pub fn parse_time_us(s: &str) -> Option<i64> {
         .map(|d| d.timestamp_micros())
 }
 
-fn commit_body(did: &str, commit: &Value) -> Body {
-    let collection = str_of(commit, "collection").and_then(Collection::from_nsid);
+/// The members of a JSON object, each left as the text it was written
+/// in. A name written twice keeps its last value.
+type Members<'a> = HashMap<String, &'a RawValue>;
+
+/// Splits a JSON object into its members without parsing them. `None`
+/// for anything that is not one JSON object.
+fn members(json: &[u8]) -> Option<Members<'_>> {
+    serde_json::from_slice(json).ok()
+}
+
+/// The members of member `k` of `m`; none if it is absent or not an
+/// object.
+fn object<'a>(m: &Members<'a>, k: &str) -> Members<'a> {
+    m.get(k)
+        .and_then(|raw| members(raw.get().as_bytes()))
+        .unwrap_or_default()
+}
+
+/// Member `k` of `m`, parsed; `None` if it is absent or cannot be parsed.
+fn member(m: &Members<'_>, k: &str) -> Option<Value> {
+    m.get(k)
+        .and_then(|raw| serde_json::from_str(raw.get()).ok())
+}
+
+/// Member `k` of `m` if it is a string.
+fn text(m: &Members<'_>, k: &str) -> Option<String> {
+    match member(m, k) {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// Member `k` of `m` if it is an integer written as one.
+fn integer(m: &Members<'_>, k: &str) -> Option<i64> {
+    member(m, k).as_ref().and_then(Value::as_i64)
+}
+
+/// The body of a commit whose members are `commit` (`rev`, `operation`,
+/// `collection`, `rkey`, `record`).
+fn commit_body(did: &str, commit: &Members<'_>, now_us: i64) -> Body {
+    let collection = text(commit, "collection")
+        .as_deref()
+        .and_then(Collection::from_nsid);
     if collection.is_none() {
         return Body::OtherCommit;
     }
-    match parse_commit(did, commit) {
-        Ok(op) => Body::Commit(op),
-        Err(e) => Body::Rejected {
-            reason: match e {
-                RecordError::ForeignListItem { .. } => DropReason::ForeignListItem,
-                _ => DropReason::Invalid,
-            },
-            collection,
-            detail: e.to_string(),
+    let rejected = |e: &RecordError, detail: String, removes: Option<CommitOp>| Body::Rejected {
+        reason: match e {
+            RecordError::ForeignListItem { .. } => DropReason::ForeignListItem,
+            _ => DropReason::Invalid,
         },
+        collection,
+        detail,
+        removes: removes.map(Box::new),
+    };
+    let mut head = Map::new();
+    for k in ["collection", "rkey", "rev", "operation"] {
+        if let Some(v) = member(commit, k) {
+            head.insert(k.to_owned(), v);
+        }
+    }
+    let head = match parse_commit_head(did, &Value::Object(head)) {
+        Ok(h) => h,
+        Err(e) => return rejected(&e, e.to_string(), None),
+    };
+    // Writes are ordered by rev, so one from the future is refused whole:
+    // neither its record nor a delete in its place is applied at that rev.
+    if head.rev.is_ahead_of(now_us) {
+        let e = RecordError::Rev(head.rev.encode());
+        return rejected(&e, format!("rev {} is ahead of the clock", head.rev), None);
+    }
+    let record = match commit.get("record") {
+        None => Ok(None),
+        Some(raw) => serde_json::from_str::<Value>(raw.get())
+            .map(Some)
+            .map_err(|e| RecordError::Json(e.to_string())),
+    };
+    match record.and_then(|r| commit_action(&head, r.as_ref())) {
+        Ok(action) => Body::Commit(head.with(action)),
+        Err(e) => {
+            let detail = e.to_string();
+            rejected(&e, detail, Some(head.with(CommitAction::Delete)))
+        }
     }
 }
 
@@ -197,15 +286,18 @@ fn repo_did(did: &str) -> Result<Did, Box<Body>> {
     Did::parse(did).map_err(|e| Box::new(Body::Ignored(format!("invalid repo DID {did:?}: {e}"))))
 }
 
-fn account_body(did: &str, account: &Value) -> Body {
+/// The body of an account event whose `account` object has the members
+/// `account`.
+fn account_body(did: &str, account: &Members<'_>) -> Body {
     match repo_did(did) {
         Ok(did) => Body::Account {
             did,
-            active: account
-                .get("active")
+            active: member(account, "active")
+                .as_ref()
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            status: str_of(account, "status").map(str::to_owned),
+            status: text(account, "status"),
+            time_us: text(account, "time").as_deref().and_then(parse_time_us),
         },
         Err(b) => *b,
     }
@@ -213,30 +305,35 @@ fn account_body(did: &str, account: &Value) -> Body {
 
 /// Decodes a v1 event (one JSON object).
 pub fn decode_v1(bytes: &[u8]) -> Result<Frame, FrameError> {
-    let v: Value = serde_json::from_slice(bytes).map_err(|e| FrameError(e.to_string()))?;
-    let did = str_of(&v, "did").ok_or_else(|| FrameError("missing did".into()))?;
-    let witness_us = v
-        .get("time_us")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| FrameError("missing time_us".into()))?;
-    let witness_us = check_witness(witness_us, now_us())?;
-    let body = match str_of(&v, "kind") {
-        Some("commit") => match v.get("commit") {
-            Some(c) => commit_body(did, c),
-            None => Body::Rejected {
-                reason: DropReason::Invalid,
-                collection: None,
-                detail: "commit event without commit".into(),
-            },
-        },
-        Some("identity") => match repo_did(did) {
+    let v = members(bytes).ok_or_else(|| FrameError("not a JSON object".into()))?;
+    let did = text(&v, "did").ok_or_else(|| FrameError("missing did".into()))?;
+    let witness_us = integer(&v, "time_us").ok_or_else(|| FrameError("missing time_us".into()))?;
+    let now = now_us();
+    let witness_us = check_witness(witness_us, now)?;
+    let body = match text(&v, "kind").as_deref() {
+        Some("commit") => {
+            if v.contains_key("commit") {
+                commit_body(&did, &object(&v, "commit"), now)
+            } else {
+                Body::Rejected {
+                    reason: DropReason::Invalid,
+                    collection: None,
+                    detail: "commit event without commit".into(),
+                    removes: None,
+                }
+            }
+        }
+        Some("identity") => match repo_did(&did) {
             Ok(d) => Body::Identity(d),
             Err(b) => *b,
         },
-        Some("account") => match v.get("account") {
-            Some(a) => account_body(did, a),
-            None => Body::Ignored("account event without account".into()),
-        },
+        Some("account") => {
+            if v.contains_key("account") {
+                account_body(&did, &object(&v, "account"))
+            } else {
+                Body::Ignored("account event without account".into())
+            }
+        }
         other => Body::Ignored(format!("unknown kind {other:?}")),
     };
     Ok(Frame::Event(InEvent {
@@ -250,53 +347,58 @@ const V2_PREFIX: &str = "network.bsky.jetstream.subscribeEvents#";
 
 /// Decodes a v2 `xrpc.v1.json` frame.
 pub fn decode_v2(bytes: &[u8]) -> Result<Frame, FrameError> {
-    let v: Value = serde_json::from_slice(bytes).map_err(|e| FrameError(e.to_string()))?;
-    match str_of(&v, "$type") {
+    let v = members(bytes).ok_or_else(|| FrameError("not a JSON object".into()))?;
+    match text(&v, "$type").as_deref() {
         Some("error") => {
             return Ok(Frame::Error {
-                error: str_of(&v, "error").unwrap_or("Unknown").to_owned(),
-                message: str_of(&v, "message").map(str::to_owned),
+                error: text(&v, "error").unwrap_or_else(|| "Unknown".to_owned()),
+                message: text(&v, "message"),
             });
         }
         Some("message") => {}
         other => return Err(FrameError(format!("unknown frame type {other:?}"))),
     }
-    let p = v
-        .get("payload")
-        .ok_or_else(|| FrameError("message without payload".into()))?;
-    let kind = str_of(p, "$type")
+    if !v.contains_key("payload") {
+        return Err(FrameError("message without payload".into()));
+    }
+    let p = object(&v, "payload");
+    let kind = text(&p, "$type")
+        .as_deref()
         .and_then(|t| t.strip_prefix(V2_PREFIX))
+        .map(str::to_owned)
         .ok_or_else(|| FrameError("payload without a subscribeEvents $type".into()))?;
     if kind == "info" {
         return Ok(Frame::Info {
-            name: str_of(p, "name").unwrap_or("").to_owned(),
-            message: str_of(p, "message").map(str::to_owned),
+            name: text(&p, "name").unwrap_or_default(),
+            message: text(&p, "message"),
         });
     }
-    let seq = p
-        .get("seq")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| FrameError("event without seq".into()))?;
+    let seq = integer(&p, "seq").ok_or_else(|| FrameError("event without seq".into()))?;
     let seq = check_seq(seq)?;
-    let witness_us = str_of(p, "witnessedAt")
-        .or_else(|| str_of(p, "time"))
+    let witness_us = text(&p, "witnessedAt")
+        .or_else(|| text(&p, "time"))
+        .as_deref()
         .and_then(parse_time_us)
         .ok_or_else(|| FrameError("event without a parseable witnessedAt/time".into()))?;
-    let witness_us = check_witness(witness_us, now_us())?;
-    let did = str_of(p, "did").ok_or_else(|| FrameError("event without did".into()))?;
-    let body = match kind {
+    let now = now_us();
+    let witness_us = check_witness(witness_us, now)?;
+    let did = text(&p, "did").ok_or_else(|| FrameError("event without did".into()))?;
+    let body = match kind.as_str() {
         // v2 commit fields (rev, operation, collection, rkey, record) are
         // flat in the payload.
-        "commit" => commit_body(did, p),
-        "identity" => match repo_did(did) {
+        "commit" => commit_body(&did, &p, now),
+        "identity" => match repo_did(&did) {
             Ok(d) => Body::Identity(d),
             Err(b) => *b,
         },
-        "account" => match p.get("account") {
-            Some(a) => account_body(did, a),
-            None => Body::Ignored("account event without account".into()),
-        },
-        "sync" => match repo_did(did) {
+        "account" => {
+            if p.contains_key("account") {
+                account_body(&did, &object(&p, "account"))
+            } else {
+                Body::Ignored("account event without account".into())
+            }
+        }
+        "sync" => match repo_did(&did) {
             Ok(d) => Body::Sync(d),
             Err(b) => *b,
         },
@@ -312,7 +414,7 @@ pub fn decode_v2(bytes: &[u8]) -> Result<Frame, FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use farsight_core::record::{CommitAction, Record};
+    use farsight_core::record::Record;
     use serde_json::json;
 
     const A: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -390,7 +492,8 @@ mod tests {
             Body::Account {
                 did: Did::parse(A).unwrap(),
                 active: false,
-                status: Some("takendown".into())
+                status: Some("takendown".into()),
+                time_us: None,
             }
         );
         let i = json!({"did": "handle.test", "time_us": 6, "kind": "identity", "identity": {}});
@@ -446,8 +549,27 @@ mod tests {
             Body::Account {
                 active: true,
                 status: None,
+                time_us: None,
                 ..
             }
+        ));
+        // The upstream event's own time is kept apart from the witness time.
+        let acct = v2(
+            json!({"$type": "network.bsky.jetstream.subscribeEvents#account",
+            "seq": 45, "did": A, "time": "2026-09-30T16:00:09Z",
+            "account": {"did": A, "seq": 9, "time": "2026-09-30T16:00:03Z",
+                        "active": false, "status": "deactivated"}}),
+        );
+        let Frame::Event(ev) = decode_v2(&acct).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            ev.witness_us,
+            parse_time_us("2026-09-30T16:00:09Z").unwrap()
+        );
+        assert!(matches!(
+            ev.body,
+            Body::Account { time_us, .. } if time_us == parse_time_us("2026-09-30T16:00:03Z")
         ));
 
         let info = v2(
@@ -470,6 +592,147 @@ mod tests {
             }
         );
         assert!(decode_v2(br#"{"$type":"message","payload":{"$type":"x#commit"}}"#).is_err());
+    }
+
+    /// `depth` arrays inside one another.
+    fn nested(depth: usize) -> String {
+        format!("{}{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_parsed_is_a_rejected_commit_at_its_position() {
+        // Deeper than the JSON parser goes.
+        let deep = nested(4_000);
+        for op in ["create", "update"] {
+            let v1 = format!(
+                r#"{{"did":"{A}","time_us":9,"kind":"commit","commit":{{"rev":"3l3qo2vutsw2b",
+                    "operation":"{op}","collection":"app.bsky.graph.block","rkey":"3l3qo2vuowo2b",
+                    "record":{{"$type":"app.bsky.graph.block","subject":"{B}","x":{deep}}}}}}}"#
+            );
+            let v2 = format!(
+                r#"{{"$type":"message","payload":{{"$type":"{V2_PREFIX}commit","seq":77,
+                    "did":"{A}","time":"2026-09-30T16:00:00Z","rev":"3l3qo2vutsw2b",
+                    "operation":"{op}","collection":"app.bsky.graph.block","rkey":"3l3qo2vuowo2b",
+                    "record":{{"$type":"app.bsky.graph.block","subject":"{B}","x":{deep}}}}}}}"#
+            );
+            let frames = [
+                (decode_v1(v1.as_bytes()), None, 9),
+                (
+                    decode_v2(v2.as_bytes()),
+                    Some(77),
+                    parse_time_us("2026-09-30T16:00:00Z").unwrap(),
+                ),
+            ];
+            for (frame, seq, witness_us) in frames {
+                let Ok(Frame::Event(ev)) = frame else {
+                    panic!("{op}: {frame:?}")
+                };
+                assert_eq!((ev.seq, ev.witness_us), (seq, witness_us));
+                let Body::Rejected {
+                    reason,
+                    collection,
+                    removes,
+                    ..
+                } = ev.body
+                else {
+                    panic!("{op}: {:?}", ev.body)
+                };
+                assert_eq!(reason, DropReason::Invalid);
+                assert_eq!(collection, Some(Collection::Block));
+                // The key holds no block at that rev: a stored one goes.
+                let removes = removes.expect("a delete in the record's place");
+                assert_eq!(removes.action, CommitAction::Delete);
+                assert_eq!(removes.author.as_str(), A);
+                assert_eq!(removes.rkey.as_str(), "3l3qo2vuowo2b");
+                assert_eq!(removes.rev.encode(), "3l3qo2vutsw2b");
+            }
+        }
+        // Depth anywhere else the decoder does not read changes nothing.
+        let e = format!(
+            r#"{{"did":"{A}","time_us":9,"kind":"identity","identity":{deep},"extra":{deep}}}"#
+        );
+        let Ok(Frame::Event(ev)) = decode_v1(e.as_bytes()) else {
+            panic!()
+        };
+        assert!(matches!(ev.body, Body::Identity(_)));
+        // The commit of another collection stays ignored, whatever it holds.
+        let e = format!(
+            r#"{{"did":"{A}","time_us":9,"kind":"commit","commit":{{"rev":"3l3qo2vutsw2b",
+                "operation":"create","collection":"app.bsky.feed.post","rkey":"x","record":{deep}}}}}"#
+        );
+        let Ok(Frame::Event(ev)) = decode_v1(e.as_bytes()) else {
+            panic!()
+        };
+        assert_eq!(ev.body, Body::OtherCommit);
+    }
+
+    #[test]
+    fn a_rejected_record_removes_the_version_under_its_key() {
+        let commit = |op: &str, record: Value, rev: &str| {
+            json!({"did": A, "time_us": 7, "kind": "commit",
+                "commit": {"rev": rev, "operation": op,
+                           "collection": "app.bsky.graph.listitem", "rkey": "3l3qo2vuowo2b",
+                           "record": record}})
+        };
+        let removes = |e: Value| {
+            let Frame::Event(ev) = decode_v1(e.to_string().as_bytes()).unwrap() else {
+                panic!()
+            };
+            match ev.body {
+                Body::Rejected {
+                    reason, removes, ..
+                } => (reason, removes),
+                other => panic!("{other:?}"),
+            }
+        };
+        // An update that names another repository's list, and one whose
+        // subject is not a DID: the item stored under the key is gone.
+        let foreign = json!({"subject": B, "list": format!("at://{B}/app.bsky.graph.list/x")});
+        let (reason, r) = removes(commit("update", foreign, "3l3qo2vutsw2b"));
+        assert_eq!(reason, DropReason::ForeignListItem);
+        assert!(r.is_some_and(
+            |op| op.action == CommitAction::Delete && op.collection == Collection::ListItem
+        ));
+        let bad = json!({"subject": "nobody", "list": format!("at://{A}/app.bsky.graph.list/x")});
+        let (reason, r) = removes(commit("create", bad.clone(), "3l3qo2vutsw2b"));
+        assert_eq!(reason, DropReason::Invalid);
+        assert!(r.is_some());
+        // Without a valid rev there is nothing to order a delete by.
+        let (_, r) = removes(commit("update", bad, "nope"));
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn a_rev_from_the_future_is_rejected_whole() {
+        use farsight_core::Tid;
+        use farsight_core::tid::MAX_REV_AHEAD_US;
+        let now = u64::try_from(now_us()).unwrap();
+        let commit = |op: &str, rev: Tid| {
+            json!({"did": A, "time_us": 7, "kind": "commit",
+                "commit": {"rev": rev.encode(), "operation": op,
+                           "collection": "app.bsky.graph.block", "rkey": "3l3qo2vuowo2b",
+                           "record": {"subject": B}}})
+        };
+        let body = |e: Value| match decode_v1(e.to_string().as_bytes()).unwrap() {
+            Frame::Event(ev) => ev.body,
+            other => panic!("{other:?}"),
+        };
+        let soon = Tid::from_parts(now + MAX_REV_AHEAD_US / 2, 0).unwrap();
+        let far = Tid::from_parts(now + 2 * MAX_REV_AHEAD_US, 0).unwrap();
+        for op in ["create", "update", "delete"] {
+            assert!(matches!(body(commit(op, soon)), Body::Commit(_)), "{op}");
+            assert!(
+                matches!(
+                    body(commit(op, far)),
+                    Body::Rejected {
+                        reason: DropReason::Invalid,
+                        removes: None,
+                        ..
+                    }
+                ),
+                "{op}"
+            );
+        }
     }
 
     #[test]
@@ -668,7 +931,8 @@ mod tests {
 
             /// A v1 event with anything where `time_us` belongs is an
             /// event exactly when that is a plain integer from the epoch
-            /// to a day past the clock, and then carries that integer.
+            /// to the allowance past the clock, and then carries that
+            /// integer.
             #[test]
             fn v1_time_us_is_taken_only_as_a_plain_integer_in_range(
                 t in number(),
@@ -696,7 +960,7 @@ mod tests {
             /// A v2 event with anything where `seq` and the time belong is
             /// an event exactly when `seq` is a plain integer in
             /// `[0, i64::MAX)` and the time is RFC 3339 from the epoch to
-            /// a day past the clock; it then carries both.
+            /// the allowance past the clock; it then carries both.
             #[test]
             fn v2_seq_and_time_are_taken_only_in_range(
                 seq in number(),
@@ -751,7 +1015,7 @@ mod tests {
                 plc in "[a-z2-7]{24}",
                 us in 0i64..1_700_000_000_000_000,
                 seq in 0i64..i64::MAX,
-                rev_us in 0u64..(1 << 53),
+                rev_us in 0u64..1_700_000_000_000_000,
                 clock in 0u16..1024,
                 rkey in "[A-Za-z0-9_:~-][A-Za-z0-9._:~-]{0,20}",
                 c in 0usize..4,
@@ -769,7 +1033,12 @@ mod tests {
                     rev,
                     action: farsight_core::CommitAction::Delete,
                 });
-                let account = Body::Account { did: did.clone(), active, status: status.clone() };
+                let account = Body::Account {
+                    did: did.clone(),
+                    active,
+                    status: status.clone(),
+                    time_us: None,
+                };
 
                 let commit = json!({"rev": rev.encode(), "operation": "delete",
                     "collection": collection.nsid(), "rkey": rkey});
