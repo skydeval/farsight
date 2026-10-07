@@ -224,7 +224,11 @@ starting point from the first committed batch (see
 ### Reconnecting
 
 - **Stall.** No message for `firehose.tuning.stall_timeout` (60 s)
-  ends the session.
+  ends the session. An instance replaying a stretch with few wanted
+  events can stay silent for longer than that, and a new session from
+  the same cursor would meet the same silence. So every session that
+  stalls without one event gives the next one twice as long, up to 16
+  times the timeout; a session that delivers an event sets it back.
 - A closed socket, a read error or a v2 error frame ends the session.
 - **Backoff.** The reader waits before each reconnect: 0.5 s at
   first, doubled every time, up to 30 s. After a session that

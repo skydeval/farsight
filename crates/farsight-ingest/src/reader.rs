@@ -32,6 +32,8 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A session that delivered events and lasted this long was a healthy
 /// one: the wait starts again from [`BACKOFF_FIRST`] after it.
 pub const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+/// Most times the stall timeout is doubled for sessions that stay silent.
+pub const PATIENCE_DOUBLINGS: u32 = 4;
 /// Most events one seam repair collects before it applies what it has.
 pub const SEAM_REPAIR_MAX_EVENTS: usize = 500_000;
 /// Longest one seam repair reads for.
@@ -62,6 +64,18 @@ impl Ended {
             _ => Ended::Silent,
         }
     }
+}
+
+/// How long a session may stay silent before it counts as stalled, after
+/// `silent` sessions in a row that ended that way without one event.
+///
+/// An instance replaying a stretch with few wanted events can send
+/// nothing for longer than `stall_timeout`. Dropping the session then
+/// resumes at the same cursor and meets the same silence, so each silent
+/// stall doubles the wait, up to [`PATIENCE_DOUBLINGS`] times. A session
+/// that delivers an event sets it back.
+pub fn patience(stall_timeout: Duration, silent: u32) -> Duration {
+    stall_timeout.saturating_mul(1 << silent.min(PATIENCE_DOUBLINGS))
 }
 
 /// What to do before the next attempt.
@@ -444,6 +458,8 @@ impl Reader {
             prev_instance_lag: None,
         };
         let mut current_url: Option<String> = None;
+        // Sessions in a row that stalled without one event (see `patience`).
+        let mut silent_stalls = 0u32;
         loop {
             // Drain the pipeline so the persisted cursor reflects every
             // event already read (a dropped connection reconnects from
@@ -525,10 +541,22 @@ impl Reader {
                 return;
             }
             let started = Instant::now();
+            let stall = patience(self.cfg.stall_timeout, silent_stalls);
             let (end, delivered) = self
-                .read_session(&mut session, rule, prior, failover, &mut at.lag)
+                .read_session(&mut session, rule, prior, failover, &mut at.lag, stall)
                 .await;
             let lasted = started.elapsed();
+            if delivered {
+                silent_stalls = 0;
+            } else if matches!(end, End::Reconnect(ReconnectReason::Stall)) {
+                silent_stalls += 1;
+                tracing::warn!(
+                    url,
+                    waited_secs = stall.as_secs(),
+                    next_secs = patience(self.cfg.stall_timeout, silent_stalls).as_secs(),
+                    "the session sent nothing; the next one is given longer"
+                );
+            }
             session.close().await;
             set_connected_gauge(None);
             if self.tx.send(Item::Disconnected).await.is_err() {
@@ -683,6 +711,7 @@ impl Reader {
         prior: bool,
         failover: bool,
         lag: &mut LagTracker,
+        stall: Duration,
     ) -> (End, bool) {
         let mut first = true;
         let mut clamped_notice = false;
@@ -716,7 +745,7 @@ impl Reader {
                     }
                     Some(Control::Shutdown) | None => return (End::Shutdown, !first),
                 },
-                f = tokio::time::timeout(self.cfg.stall_timeout, session.next_frame()) => f,
+                f = tokio::time::timeout(stall, session.next_frame()) => f,
             };
             let frame = match frame {
                 Err(_) => return (End::Reconnect(ReconnectReason::Stall), !first),
@@ -867,6 +896,14 @@ mod tests {
 
     const LONG: Duration = Duration::from_secs(3600);
     const SHORT: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn silent_stalls_double_the_patience_up_to_a_bound() {
+        let base = Duration::from_secs(60);
+        let secs: Vec<u64> = (0..7).map(|n| patience(base, n).as_secs()).collect();
+        assert_eq!(secs, [60, 120, 240, 480, 960, 960, 960]);
+        assert_eq!(patience(Duration::MAX, 3), Duration::MAX);
+    }
 
     #[test]
     fn the_wait_starts_again_after_a_healthy_session() {

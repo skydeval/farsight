@@ -45,6 +45,11 @@ database schema; each entry says so where it does.
 - Sweep: a cycle's "failed for good" and "done" figures could come out
   one short for an account whose job was cut off at shutdown. The
   account and the figure now change together.
+- Firehose: an instance that replayed a stretch too slowly to send an
+  event within `stall_timeout` was dropped and resumed at the same
+  point without end, and ingest stood still. Each session that stalls
+  without an event now gives the next one twice as long, up to sixteen
+  times the timeout.
 - Firehose: after about seven disconnects in the life of a process
   every reconnect waited 30 seconds. The wait now starts again at
   half a second after a session that ran well for a minute.
