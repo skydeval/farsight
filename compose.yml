@@ -20,7 +20,7 @@ x-farsight-common: &farsight-common
   # gets the release the checkout describes, not whatever was published
   # last. Until an image is published, compose builds it from this
   # checkout and gives it this name.
-  image: ghcr.io/skydeval/farsight:0.6.1
+  image: ghcr.io/skydeval/farsight:0.6.2
   build: .
   restart: unless-stopped
   user: "10001:10001"

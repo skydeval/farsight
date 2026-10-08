@@ -9,6 +9,8 @@ database schema; each entry says so where it does.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-08
+
 ### Fixed
 
 - `checkBlocks` no longer spends time in proportion to the square of
@@ -1127,7 +1129,8 @@ Database schema version 9.
 - A Docker image and a compose file that runs the server, the backfill
   service and PostgreSQL.
 
-[Unreleased]: https://github.com/skydeval/farsight/compare/6871286...HEAD
+[Unreleased]: https://github.com/skydeval/farsight/compare/4293540...HEAD
+[0.6.2]: https://github.com/skydeval/farsight/compare/6871286...4293540
 [0.6.1]: https://github.com/skydeval/farsight/compare/08be68d...6871286
 [0.6.0]: https://github.com/skydeval/farsight/compare/dd11be4...08be68d
 [0.5.0]: https://github.com/skydeval/farsight/compare/380a503...dd11be4
