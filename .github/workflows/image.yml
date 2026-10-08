@@ -6,6 +6,9 @@ name: image
 # A release is a tag `v<version>` pushed to the repository: the version
 # must be the one in Cargo.toml, and the image is tagged with it (0.6.2
 # for v0.6.2). There is no `latest` tag: compose.yml names a version.
+# The run then creates the release on GitHub, with that version's
+# section of CHANGELOG.md as its notes. A release that already exists
+# for the tag is left as it is.
 #
 # Run by hand, the workflow builds the image and pushes nothing unless
 # `push` is ticked, so the build can be tried without a release.
@@ -23,8 +26,10 @@ on:
         type: boolean
         default: false
 
+# `contents: write` is for creating the release; nothing is pushed to
+# the repository.
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 # One build at a time for a given ref.
@@ -93,6 +98,32 @@ jobs:
             org.opencontainers.image.licenses=MIT OR Apache-2.0
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Create the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            echo "a release for $TAG exists; left as it is"
+            exit 0
+          fi
+          # The version's section of the changelog: from its heading to
+          # the next version heading or the link list at the end.
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            on { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "::error::CHANGELOG.md has no section for $VERSION"
+            exit 1
+          fi
+          gh release create "$TAG" --repo "$REPO" --verify-tag \
+            --title "Farsight $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
       - name: Summary
         env:
           IMAGE: ${{ steps.version.outputs.image }}
