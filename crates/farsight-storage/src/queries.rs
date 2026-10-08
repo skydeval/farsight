@@ -241,7 +241,10 @@ pub async fn incoming_list_blocks_count(
 
 /// Every listblock on every **ready or retained** list naming
 /// `subject_id` whose record is present: one pair per listblock,
-/// ordered by list id, blocker actor id, listblock rkey. Uncounted
+/// ordered by list id, blocker actor id, listblock rkey. The order and
+/// the cursor are written on the columns of `list_blocks_by_list`
+/// alone, so a later page is read from the cursor on and not from the
+/// start. Uncounted
 /// listblocks are returned (they are real blocks). A hidden list owner
 /// suppresses its lists, a hidden blocker its listblocks, unless
 /// `include_inactive`.
@@ -254,7 +257,7 @@ pub async fn incoming_list_blocks(
     limit: i64,
 ) -> Result<Vec<IncomingListBlock>> {
     let keyset = if after.is_some() {
-        "AND (l.id, b.author_id, b.rkey) > ($4, $5, $6)"
+        "AND (b.list_id, b.author_id, b.rkey) > ($4, $5, $6)"
     } else {
         "AND $4::bigint IS NULL AND $5::bigint IS NULL AND $6::text IS NULL"
     };
@@ -269,7 +272,7 @@ pub async fn incoming_list_blocks(
            AND ($2 OR (o.status NOT IN {HIDDEN} AND ba.status NOT IN {HIDDEN}))
            AND ($3::smallint IS NULL OR l.purpose = $3)
            {keyset}
-         ORDER BY l.id, b.author_id, b.rkey LIMIT $7"
+         ORDER BY b.list_id, b.author_id, b.rkey LIMIT $7"
     );
     type Row = (
         ListId,
@@ -788,7 +791,9 @@ pub async fn check_rows(
 /// Per-actor coverage inputs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActorCoverage {
-    /// `discovered_witness`: the discovery coverage point `D`.
+    /// The discovery coverage point `D`: the point of the last run that
+    /// completed untruncated, read from `subject_coverage`. A run that is
+    /// in flight, failed or truncated does not move it.
     pub discovered_witness: Option<DateTime<Utc>>,
     /// The last discovery was truncated.
     pub truncated: bool,
@@ -810,7 +815,7 @@ pub async fn actor_coverage(conn: &mut PgConnection, actor_id: ActorId) -> Resul
         Option<DateTime<Utc>>,
     );
     let r: Row = sqlx::query_as(
-        &format!("SELECT d.discovered_witness, d.truncated,
+        &format!("SELECT (SELECT min(c.discovered_witness) FROM subject_coverage c WHERE c.actor_id = $1), d.truncated,
                 EXISTS (SELECT 1 FROM subject_coverage c WHERE c.actor_id = $1 AND c.scope = {SCOPE_BLOCK}),
                 EXISTS (SELECT 1 FROM subject_coverage c WHERE c.actor_id = $1 AND c.scope = {SCOPE_LIST_CHAIN}),
                 (SELECT s.clean_witness FROM backfill_state s WHERE s.actor_id = $1)

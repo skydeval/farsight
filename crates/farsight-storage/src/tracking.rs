@@ -175,12 +175,20 @@ impl Txn<'_> {
                     } else {
                         None
                     };
+                    // A list deferred by a host cap or the lists cap is
+                    // looked at again once the cap has room, and not
+                    // before an hour has passed: one that is deferred
+                    // again goes behind the others that wait.
+                    let cap = matches!(cause, DeferCause::HostCap | DeferCause::ListsCap);
                     sqlx::query(
-                        "UPDATE lists SET deferred_by = $2, next_retry_at = $3 WHERE id = $1",
+                        "UPDATE lists SET deferred_by = $2,
+                           next_retry_at = CASE WHEN $4 THEN now() + interval '1 hour' ELSE $3 END
+                         WHERE id = $1",
                     )
                     .bind(list_id)
                     .bind(cause.code())
                     .bind(retry)
+                    .bind(cap)
                     .execute(&mut *self.conn)
                     .await?;
                 }

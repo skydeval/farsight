@@ -24,6 +24,7 @@ use farsight_api::config_store::ConfigStore;
 use farsight_api::snapshot::SnapshotHolder;
 use farsight_api::{ApiState, IngestLink, IpLayer, client_ip_middleware};
 use farsight_core::config::LoadedConfig;
+use farsight_core::listen;
 use farsight_core::net::{SafeClient, SafeClientConfig};
 use farsight_ingest::{Ingest, IngestConfig};
 use farsight_storage::counters::{CounterSink, FLUSH_INTERVAL};
@@ -46,6 +47,13 @@ pub const API_POOL_EXTRA: u32 = 8;
 /// flusher and the sort-index builder's short checks: apart from the API
 /// pool and from ingest's, so neither can starve them.
 pub const TASKS_POOL: u32 = 4;
+/// How long the teardown waits for the tasks it stopped.
+const TASKS_STOP: Duration = Duration::from_secs(5);
+/// How long the teardown waits for ingest to drain its writer.
+const INGEST_STOP: Duration = Duration::from_secs(20);
+/// How long the teardown waits for the last counter flushes.
+const LAST_FLUSH: Duration = Duration::from_secs(5);
+
 /// Counter sink shard of the server's own writes (ingest uses 0).
 pub const TASKS_SHARD: i16 = 1;
 
@@ -177,7 +185,15 @@ pub async fn run(
             Ok(()) => break,
             Err(e) => {
                 tracing::warn!(error = %e, "first coverage snapshot failed; retrying");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                // A stop asked for while the snapshot cannot be read is
+                // obeyed: ingest is shut down and the process exits.
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    () = stopped(shutdown.clone()) => {
+                        ingest.shutdown(INGEST_STOP).await;
+                        return Ok(ModeEnd::Shutdown);
+                    }
+                }
             }
         }
     }
@@ -353,6 +369,7 @@ pub async fn run(
             get(health::health).with_state(health::HealthState {
                 pool: api_pool.clone(),
                 config: config.clone(),
+                last: Arc::default(),
             }),
         )
         .route("/livez", get(health::livez))
@@ -420,8 +437,9 @@ pub async fn run(
     };
     let shutdown_wait = shutdown.clone();
     let mut reset_wait = reset_rx.clone();
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
     let served = axum::serve(
-        listener,
+        listen::guarded(listener, listen::MAX_CONNECTIONS),
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
@@ -433,16 +451,33 @@ pub async fn run(
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
+        let _ = stopping_tx.send(());
+    })
+    .into_future();
+    // Open connections get a bounded time to finish. One that is still
+    // open then (a client that stalled in the middle of a request) is
+    // left behind: the teardown and the exit do not wait for it.
+    let served = match listen::drain_within(served, stopping_rx, listen::DRAIN).await {
+        Some(r) => r,
+        None => {
+            tracing::warn!("connections still open after the drain time; going on without them");
+            Ok(())
+        }
+    };
+
+    // Teardown, in dependency order. Every wait has a deadline and the
+    // deadlines add up to less than the 45 seconds a supervisor gives
+    // (`stop_grace_period`): 10 for the drain above, 5 for the tasks, 20
+    // for ingest, 5 for the last flushes.
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(TASKS_STOP, async {
+        let _ = refresher.await;
+        let _ = scheduler.await;
+        if let Some(m) = metrics_task {
+            let _ = m.await;
+        }
     })
     .await;
-
-    // Teardown, in dependency order.
-    let _ = stop_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(5), refresher).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), scheduler).await;
-    if let Some(m) = metrics_task {
-        let _ = tokio::time::timeout(Duration::from_secs(5), m).await;
-    }
     housekeeping.abort();
     warming.abort();
     pass.abort();
@@ -450,15 +485,26 @@ pub async fn run(
     // An interrupted build leaves an invalid index; the next start drops
     // it and builds again.
     index_builder.abort();
-    ingest.shutdown().await;
+    ingest.shutdown(INGEST_STOP).await;
     flusher.abort();
     let limits = Limits::from_config(&config.current().config);
-    if let Err(e) = counters.flush(&tasks_pool, &limits).await {
-        tracing::warn!(error = %e, "final counter flush failed");
+    let flushed = tokio::time::timeout(LAST_FLUSH, async {
+        if let Err(e) = counters.flush(&tasks_pool, &limits).await {
+            tracing::warn!(error = %e, "final counter flush failed");
+        }
+        let _ = keys.flush_usage(&api_pool).await;
+    })
+    .await;
+    if flushed.is_err() {
+        tracing::warn!("final counter flush did not finish in time");
     }
-    let _ = keys.flush_usage(&api_pool).await;
-    api_pool.close().await;
-    tasks_pool.close().await;
+    // Closing a pool waits for its connections to come back; a
+    // connection held by a request that was left behind does not.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        api_pool.close().await;
+        tasks_pool.close().await;
+    })
+    .await;
     served.map_err(ServerError::io("listener"))?;
     if let Some(task) = *ingest_failed.lock().unwrap_or_else(|e| e.into_inner()) {
         return Err(ServerError::IngestPanicked(task));

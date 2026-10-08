@@ -86,15 +86,34 @@ pub async fn describe_repo(net: &Net, pds: &str, did: &Did) -> Result<Vec<String
             "describeRepo",
         )
         .await?;
-    Ok(v.get("collections")
+    collections_of(&v)
+}
+
+/// The `collections` of a `describeRepo` body. A body without the list,
+/// or with an entry that is not a string, is not an answer: read as "no
+/// collections" it would have every stored row of the repo removed.
+pub fn collections_of(v: &Value) -> Result<Vec<String>, NetError> {
+    v.get("collections")
         .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
+        .ok_or_else(|| NetError::Decode("describeRepo without collections".into()))?
+        .iter()
+        .map(|c| {
+            c.as_str()
                 .map(str::to_owned)
-                .collect()
+                .ok_or_else(|| NetError::Decode("a collection that is not a string".into()))
         })
-        .unwrap_or_default())
+        .collect()
+}
+
+/// The `cursor` of a paged answer: absent or `null` ends the listing, a
+/// string continues it, anything else is not an answer (read as the end
+/// it would close a listing or an enumeration early).
+pub fn cursor_of(v: &Value) -> Result<Option<String>, NetError> {
+    match v.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(c)) => Ok(Some(c.clone())),
+        Some(_) => Err(NetError::Decode("a cursor that is not a string".into())),
+    }
 }
 
 /// `com.atproto.sync.getLatestCommit`: the stamp `R` (decoded rev).
@@ -150,11 +169,21 @@ fn raw_string(raw: Option<&RawValue>) -> Option<String> {
     serde_json::from_str::<String>(raw?.get()).ok()
 }
 
+/// The cursor written as `raw`: absent or `null` ends the listing, a
+/// string continues it, anything else is refused.
+fn raw_cursor(raw: Option<&RawValue>) -> Result<Option<String>, NetError> {
+    let Some(raw) = raw else { return Ok(None) };
+    match serde_json::from_str::<Option<String>>(raw.get()) {
+        Ok(c) => Ok(c),
+        Err(_) => Err(NetError::Decode("a cursor that is not a string".into())),
+    }
+}
+
 /// Parses a `listRecords` body. One record that cannot be parsed costs
 /// that record ([`Listed::value`] is `None`), not the page: the page's
 /// other records and its cursor are read all the same. A page with more
-/// than [`PAGE_RECORDS`] records is refused; an entry without a `uri` or a
-/// `value` is dropped.
+/// than [`PAGE_RECORDS`] records is refused, and so is a cursor that is
+/// not a string; an entry without a `uri` or a `value` is dropped.
 pub fn parse_page(body: &[u8]) -> Result<(Vec<Listed>, Option<String>), NetError> {
     let page: RawPage<'_> =
         serde_json::from_slice(body).map_err(|e| NetError::Decode(e.to_string()))?;
@@ -178,7 +207,7 @@ pub fn parse_page(body: &[u8]) -> Result<(Vec<Listed>, Option<String>), NetError
             })
         })
         .collect();
-    Ok((listed, raw_string(page.cursor)))
+    Ok((listed, raw_cursor(page.cursor)?))
 }
 
 /// `com.atproto.repo.listRecords` with `limit=100&reverse=true` (ascending
@@ -232,7 +261,12 @@ pub async fn get_record(
         )
         .await
     {
-        Ok(v) => Ok(v.get("value").cloned()),
+        // Only the host's own "not found" says the record is gone. A
+        // 200 without a `value` is not an answer.
+        Ok(v) => match v.get("value") {
+            Some(value) => Ok(Some(value.clone())),
+            None => Err(NetError::Decode("getRecord without a value".into())),
+        },
         Err(NetError::Http { name, .. }) if name == RECORD_NOT_FOUND => Ok(None),
         Err(e) => Err(e),
     }
@@ -304,16 +338,16 @@ pub async fn list_repos(
         .and_then(Value::as_array)
         .ok_or_else(|| NetError::Decode("no repos".into()))?
         .iter()
-        .filter_map(|r| {
-            Some(ListedRepo {
-                did: s(r, "did")?,
+        .map(|r| {
+            Ok(ListedRepo {
+                did: s(r, "did").ok_or_else(|| NetError::Decode("a repo without a did".into()))?,
                 rev: s(r, "rev"),
                 active: r.get("active").and_then(Value::as_bool).unwrap_or(true),
                 status: s(r, "status"),
             })
         })
-        .collect();
-    Ok((repos, s(&v, "cursor")))
+        .collect::<Result<Vec<_>, NetError>>()?;
+    Ok((repos, cursor_of(&v)?))
 }
 
 /// `com.atproto.sync.listReposByCollection` at the relay.
@@ -340,9 +374,9 @@ pub async fn list_repos_by_collection(
         .and_then(Value::as_array)
         .ok_or_else(|| NetError::Decode("no repos".into()))?
         .iter()
-        .filter_map(|r| s(r, "did"))
-        .collect();
-    Ok((repos, s(&v, "cursor")))
+        .map(|r| s(r, "did").ok_or_else(|| NetError::Decode("a repo without a did".into())))
+        .collect::<Result<Vec<_>, NetError>>()?;
+    Ok((repos, cursor_of(&v)?))
 }
 
 /// One PLC export operation.
@@ -375,23 +409,54 @@ pub async fn plc_export(
     // keeps its reserved half.
     net.plc.acquire(crate::net::PlcUse::Export).await;
     let body = net.get_text(&url(plc, "/export", &q)?).await?;
-    Ok(body
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter_map(|v| {
-            let op = v.get("operation")?;
+    parse_export(&body)
+}
+
+/// Parses a PLC export page. A line that is not an operation with a
+/// `did` and a `createdAt` fails the page: dropped, it would make the
+/// page look shorter than it is, and a short page ends the enumeration.
+pub fn parse_export(body: &str) -> Result<Vec<ExportOp>, NetError> {
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let bad = |what: &str| NetError::Decode(format!("export line {what}"));
+            let v: Value = serde_json::from_str(l).map_err(|_| bad("is not JSON"))?;
+            let op = v.get("operation").ok_or_else(|| bad("has no operation"))?;
             let pds = op
                 .pointer("/services/atproto_pds/endpoint")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            Some(ExportOp {
-                did: s(&v, "did")?,
+            Ok(ExportOp {
+                did: s(&v, "did").ok_or_else(|| bad("has no did"))?,
                 pds,
-                created_at: s(&v, "createdAt")?,
+                created_at: s(&v, "createdAt").ok_or_else(|| bad("has no createdAt"))?,
                 nullified: v.get("nullified").and_then(Value::as_bool).unwrap_or(false),
             })
         })
-        .collect())
+        .collect()
+}
+
+/// Where the next export page starts, and how many operations of this
+/// one to use. The directory returns operations created after `after`,
+/// so a page that ends inside a run of operations with one `createdAt`
+/// would lose the rest of the run. A full page therefore gives up its
+/// last run and the next page starts before it. A page that is one run
+/// throughout is used whole (there is nothing earlier to start from).
+pub fn export_step(ops: &[ExportOp], full: bool) -> (usize, Option<&str>) {
+    let Some(last) = ops.last() else {
+        return (0, None);
+    };
+    if !full {
+        return (ops.len(), Some(last.created_at.as_str()));
+    }
+    let keep = ops
+        .iter()
+        .rposition(|o| o.created_at != last.created_at)
+        .map(|i| i + 1);
+    match keep {
+        Some(n) => (n, Some(ops[n - 1].created_at.as_str())),
+        None => (ops.len(), Some(last.created_at.as_str())),
+    }
 }
 
 /// One backlink reference.
@@ -464,6 +529,84 @@ mod tests {
             status: 500,
             name: String::new()
         }));
+    }
+
+    #[test]
+    fn a_body_without_the_expected_field_is_not_an_empty_answer() {
+        // describeRepo: no list, or a list with a non-string, is refused.
+        assert!(collections_of(&serde_json::json!({"handle": "a.test"})).is_err());
+        assert!(collections_of(&serde_json::json!({"collections": "x"})).is_err());
+        assert!(collections_of(&serde_json::json!({"collections": ["a", 1]})).is_err());
+        assert_eq!(
+            collections_of(&serde_json::json!({"collections": []})).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            collections_of(&serde_json::json!({"collections": ["app.bsky.graph.block"]})).unwrap(),
+            vec!["app.bsky.graph.block".to_owned()]
+        );
+        // A cursor: absent or null ends, a string continues, else refused.
+        assert_eq!(cursor_of(&serde_json::json!({})).unwrap(), None);
+        assert_eq!(
+            cursor_of(&serde_json::json!({"cursor": null})).unwrap(),
+            None
+        );
+        assert_eq!(
+            cursor_of(&serde_json::json!({"cursor": "c1"})).unwrap(),
+            Some("c1".to_owned())
+        );
+        assert!(cursor_of(&serde_json::json!({"cursor": 7})).is_err());
+        assert!(parse_page(br#"{"records":[],"cursor":7}"#).is_err());
+        assert!(parse_page(br#"{"records":[],"cursor":{"a":1}}"#).is_err());
+        let (_, c) = parse_page(br#"{"records":[],"cursor":null}"#).unwrap();
+        assert_eq!(c, None);
+        let (_, c) = parse_page(br#"{"records":[],"cursor":"k"}"#).unwrap();
+        assert_eq!(c.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn an_export_line_that_cannot_be_read_fails_the_page() {
+        let good = r#"{"did":"did:plc:a","operation":{"services":{"atproto_pds":{"endpoint":"https://p.test"}}},"createdAt":"2026-01-01T00:00:00.000Z","nullified":false}"#;
+        let ops = parse_export(&format!(
+            "{good}
+
+{good}
+"
+        ))
+        .unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].pds.as_deref(), Some("https://p.test"));
+        assert!(
+            parse_export(&format!(
+                "{good}
+not json
+"
+            ))
+            .is_err()
+        );
+        assert!(parse_export(r#"{"did":"did:plc:a","createdAt":"x"}"#).is_err());
+        assert!(parse_export(r#"{"operation":{},"createdAt":"x"}"#).is_err());
+        assert!(parse_export(r#"{"did":"did:plc:a","operation":{}}"#).is_err());
+    }
+
+    #[test]
+    fn a_full_export_page_gives_up_its_last_run_of_equal_timestamps() {
+        let op = |did: &str, at: &str| ExportOp {
+            did: did.to_owned(),
+            pds: None,
+            created_at: at.to_owned(),
+            nullified: false,
+        };
+        let ops = vec![op("a", "t1"), op("b", "t2"), op("c", "t3"), op("d", "t3")];
+        // Full: the run at t3 may go on in the next page, which starts
+        // after t2 and reads all of it.
+        assert_eq!(export_step(&ops, true), (2, Some("t2")));
+        // Short: the page is the end of the export.
+        assert_eq!(export_step(&ops, false), (4, Some("t3")));
+        // One run throughout: used whole.
+        let same = vec![op("a", "t1"), op("b", "t1")];
+        assert_eq!(export_step(&same, true), (2, Some("t1")));
+        assert_eq!(export_step(&[], true), (0, None));
     }
 
     #[test]

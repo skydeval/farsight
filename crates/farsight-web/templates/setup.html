@@ -251,7 +251,7 @@ wrong proxy lets clients choose their own IP.</p>
 <form class="stack card" method="post" action="/setup/storage">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="dsn">PostgreSQL connection string</label>
-<input type="text" id="dsn" name="dsn" value="{{ w.dsn }}" placeholder="postgres://farsight:…@postgres:5432/farsight">
+<input type="text" id="dsn" name="dsn" value="{{ w.dsn_shown() }}" placeholder="postgres://farsight:…@postgres:5432/farsight">
 <div class="hint">PostgreSQL 15 or newer. The database must be empty or already hold Farsight's
 schema (its data is then kept).</div>
 <div class="row">

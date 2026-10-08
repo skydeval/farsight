@@ -377,7 +377,7 @@ async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
         .await?
         .applied_through
         .unwrap_or_else(Utc::now);
-    gates::record_refusal_transition(&ctx.pool, prev, next, witness).await?;
+    gates::record_refusal_transition(&ctx.pool, next, witness).await?;
     let ratio = if budget.budget_bytes > 0 {
         bytes as f64 / budget.budget_bytes as f64
     } else {
@@ -427,6 +427,20 @@ async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
             .await?;
             reopened += 1;
         }
+    }
+    // Lists deferred by a host cap or the lists cap, once the cap has
+    // room again.
+    for id in janitor::cap_go_candidates(&ctx.pool, &limits, GO_PER_PASS).await? {
+        janitor::fire_event(
+            &ctx.pool,
+            &limits,
+            &ctx.counters,
+            id,
+            Event::GateOpen,
+            FireArgs::default(),
+        )
+        .await?;
+        reopened += 1;
     }
     let growth = growth_warning(&ctx, bytes);
     ctx.status.update(|s| {
@@ -643,9 +657,13 @@ async fn table_pruning(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
     let runs = janitor::prune_fetch_runs(&ctx.pool, now).await?;
     let errors = janitor::prune_op_errors(&ctx.pool, now).await?;
     let subject_lists = janitor::prune_subject_lists(&ctx.pool).await?;
+    let mut conn = ctx.pool.acquire().await?;
+    let handles_due = farsight_storage::handles::prune_due(&mut conn).await?;
+    let leases = janitor::prune_expired_leases(&ctx.pool).await?;
     Ok(format!(
         "pruned {runs} finished list fetch runs, {errors} logged errors, {subject_lists} \
-         references to deleted lists"
+         references to deleted lists, {handles_due} handle checks nothing served, {leases} \
+         expired job leases"
     ))
 }
 

@@ -116,6 +116,19 @@ enum Mode {
     Unreconciled,
 }
 
+/// Whether an attempt that takes the listing up from the cursor stored
+/// with this page could not reconcile it: the listing is past the
+/// seen-set cap, or it is out of order and has pages to go (the set of
+/// keys seen is in memory and ends with the attempt). A seen-set listing
+/// that reached its last page was reconciled against the set.
+fn resumes_unreconciled(mode: &Mode, more_pages: bool) -> bool {
+    match mode {
+        Mode::Ordered => false,
+        Mode::Seen(_) => more_pages,
+        Mode::Unreconciled => true,
+    }
+}
+
 /// The collections a `repo` job lists.
 pub const REPO_COLLECTIONS: [Collection; 4] = [
     Collection::Block,
@@ -133,15 +146,19 @@ pub enum Stop {
     Failed(String),
     /// A bound of the attempt (pages) was reached.
     Yield,
-    /// The repo looks diverged, as read from a host that came out of a
-    /// cache: the host is confirmed with the directory before anything is
-    /// purged on its word.
+    /// The repo looks diverged, or a page would remove stored rows, as
+    /// read from a host that came out of a cache: the host is confirmed
+    /// with the directory before anything is purged or removed on its
+    /// word.
     Unconfirmed,
 }
 
 impl From<farsight_storage::StorageError> for Stop {
     fn from(e: farsight_storage::StorageError) -> Stop {
-        Stop::Failed(e.to_string())
+        match e {
+            farsight_storage::StorageError::UnconfirmedHost => Stop::Unconfirmed,
+            e => Stop::Failed(e.to_string()),
+        }
     }
 }
 
@@ -200,6 +217,22 @@ impl CursorRun {
     }
 }
 
+/// Pages of one collection after which an attempt judges the host's
+/// pace.
+pub const SLOW_AFTER_PAGES: u32 = 5;
+/// The mean time a host may take to answer a `listRecords` page. A host
+/// slower than this over [`SLOW_AFTER_PAGES`] pages or more ends the
+/// attempt as failed: the job gives its worker back and is retried on
+/// the retry schedule, and goes on from its cursor then.
+pub const SLOW_PAGE: Duration = Duration::from_secs(10);
+
+/// Whether a host that took `waited_ms` to answer `pages` pages is too
+/// slow to go on with. Only the time spent waiting for the host counts,
+/// not the time a request waited for a slot under Farsight's own limits.
+pub fn too_slow(pages: u32, waited_ms: u64) -> bool {
+    pages >= SLOW_AFTER_PAGES && u128::from(waited_ms) > SLOW_PAGE.as_millis() * u128::from(pages)
+}
+
 /// What a listing produced.
 #[derive(Debug, Default, Clone)]
 pub struct Listing {
@@ -226,6 +259,9 @@ pub struct GatePolicy {
     pub gated: bool,
     /// The repo is on a large host.
     pub large: bool,
+    /// The host was looked up in the directory for this attempt, not
+    /// taken from a cache. Only then may a listing remove stored rows.
+    pub host_confirmed: bool,
 }
 
 impl GatePolicy {
@@ -239,7 +275,15 @@ impl GatePolicy {
                     RequesterKey::Token(_) | RequesterKey::Resync | RequesterKey::Lists
                 ),
             large,
+            host_confirmed: true,
         }
+    }
+
+    /// The policy for a host that was (`true`) or was not looked up in
+    /// the directory for this attempt.
+    pub fn on_host(mut self, confirmed: bool) -> GatePolicy {
+        self.host_confirmed = confirmed;
+        self
     }
 
     /// Whether a page under `g` runs deletes-only: at ≥ 100% of budget the
@@ -333,8 +377,8 @@ pub async fn list_collection(
     let mut cursor: Option<String> = None;
     let mut prev_last: Option<String> = None;
     if let Some(id) = jobs::actor_id(pool, did.as_str()).await? {
-        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT cursor, prev_last FROM backfill_cursors
+        let row: Option<(Option<String>, Option<String>, bool)> = sqlx::query_as(
+            "SELECT cursor, prev_last, unreconciled FROM backfill_cursors
              WHERE actor_id = $1 AND collection = $2 AND job_kind = $3 AND run_id = $4",
         )
         .bind(id)
@@ -343,7 +387,11 @@ pub async fn list_collection(
         .bind(run.id())
         .fetch_optional(pool)
         .await?;
-        if let Some((c, p)) = row {
+        if let Some((c, p, unreconciled)) = row {
+            // What an earlier attempt of this run could not reconcile
+            // stays unreconciled: the attempt that goes on, or finds the
+            // collection finished, reports it all the same.
+            out.reconcile_skipped = unreconciled;
             if c.is_none() && p.is_some() {
                 // Finished in an earlier attempt of this run.
                 return Ok(out);
@@ -352,9 +400,19 @@ pub async fn list_collection(
             prev_last = p;
         }
     }
-    let mut mode = Mode::Ordered;
+    // An attempt that takes up a listing which was out of order (its
+    // seen-set went with the attempt that held it) or past the seen-set
+    // cap cannot tell which stored rows the repo no longer has: it lists
+    // on to the end and reconciles nothing.
+    let mut mode = if out.reconcile_skipped {
+        Mode::Unreconciled
+    } else {
+        Mode::Ordered
+    };
     let hasher = RandomState::new();
     let mut cursors = Cursors::default();
+    let mut pages = 0u32;
+    let waited_at_start = crate::net::waited_ms();
     loop {
         if !budget.take() {
             return Err(Stop::Yield);
@@ -364,6 +422,7 @@ pub async fn list_collection(
                 .await
                 .map_err(net_stop)?;
         out.cost += 1;
+        pages += 1;
         if let Some(n) = &next
             && !cursors.follow(cursor.as_deref(), n)
         {
@@ -457,6 +516,7 @@ pub async fn list_collection(
         let mut batch = Batch::new(Origin::Listing {
             stamp_read_at: stamp.read_at,
             deletes_only,
+            host_confirmed: policy.host_confirmed,
         });
         batch.writes = writes;
         if matches!(mode, Mode::Ordered) {
@@ -482,10 +542,11 @@ pub async fn list_collection(
         if let Some(id) = jobs::actor_id(pool, did.as_str()).await? {
             sqlx::query(
                 "INSERT INTO backfill_cursors (actor_id, collection, job_kind, run_id, stamp_rev,
-                    stamp_read_at, late_stamp, cursor, prev_last)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    stamp_read_at, late_stamp, cursor, prev_last, unreconciled)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  ON CONFLICT (actor_id, collection, job_kind, run_id) DO UPDATE SET
-                   cursor = EXCLUDED.cursor, prev_last = EXCLUDED.prev_last",
+                   cursor = EXCLUDED.cursor, prev_last = EXCLUDED.prev_last,
+                   unreconciled = EXCLUDED.unreconciled",
             )
             .bind(id)
             .bind(k.code())
@@ -500,6 +561,7 @@ pub async fn list_collection(
                     .or_else(|| prev_last.clone())
                     .or(Some(String::new())),
             )
+            .bind(resumes_unreconciled(&mode, next.is_some()))
             .execute(pool)
             .await?;
             jobs::renew_lease(pool, did.as_str(), &ctx.lease_owner()).await?;
@@ -510,6 +572,16 @@ pub async fn list_collection(
                 prev_last = last;
             }
             None => return Ok(out),
+        }
+        // The page is stored and its cursor with it: a host too slow to
+        // go on with costs this attempt, not what it has listed.
+        if let (Some(from), Some(now)) = (waited_at_start, crate::net::waited_ms())
+            && too_slow(pages, now.saturating_sub(from))
+        {
+            return Err(Stop::Failed(format!(
+                "the host took {} s to answer {pages} pages",
+                now.saturating_sub(from) / 1000
+            )));
         }
     }
 }
@@ -573,6 +645,7 @@ async fn reconcile_unseen(
         let mut b = Batch::new(Origin::Listing {
             stamp_read_at: stamp.read_at,
             deletes_only: policy.deletes_only(gates),
+            host_confirmed: policy.host_confirmed,
         });
         b.reconciles.push(Reconcile {
             author: did.clone(),
@@ -1122,7 +1195,7 @@ async fn list_repo(
     let (resumed, point, run_id) = (at.resumed, at.run.point, at.run.id);
     let pool = &ctx.pool;
     let did = &req.did;
-    let policy = GatePolicy::new(req, host_is_large(ctx, pds));
+    let policy = GatePolicy::new(req, host_is_large(ctx, pds)).on_host(at.confirmed);
     let mut deletes_only = policy.deletes_only(ctx.gates.load());
     // 2. Stamp first if D holds rows.
     if stamp.is_none() && holds_rows(pool, did).await? {
@@ -1189,6 +1262,7 @@ async fn list_repo(
         let mut b = Batch::new(Origin::Listing {
             stamp_read_at: stamp.read_at,
             deletes_only: policy.deletes_only(gates),
+            host_confirmed: policy.host_confirmed,
         });
         for k in &absent {
             b.reconciles.push(Reconcile {
@@ -1257,6 +1331,29 @@ async fn list_repo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_is_judged_slow_only_after_enough_pages() {
+        // Four pages at half a minute each: not judged yet.
+        assert!(!too_slow(4, 120_000));
+        // Five at just over ten seconds each: too slow.
+        assert!(too_slow(5, 50_001));
+        assert!(!too_slow(5, 50_000));
+        // A long listing at one second a page is fine.
+        assert!(!too_slow(20_000, 20_000_000));
+    }
+
+    #[test]
+    fn a_listing_that_cannot_be_reconciled_says_so_to_the_attempt_that_resumes_it() {
+        assert!(!resumes_unreconciled(&Mode::Ordered, true));
+        assert!(!resumes_unreconciled(&Mode::Ordered, false));
+        // Out of order with pages to go: the set ends with the attempt.
+        assert!(resumes_unreconciled(&Mode::Seen(HashSet::new()), true));
+        // Its last page was reconciled against the set.
+        assert!(!resumes_unreconciled(&Mode::Seen(HashSet::new()), false));
+        assert!(resumes_unreconciled(&Mode::Unreconciled, true));
+        assert!(resumes_unreconciled(&Mode::Unreconciled, false));
+    }
 
     #[test]
     fn a_listed_key_is_kept_only_with_a_record_to_index() {

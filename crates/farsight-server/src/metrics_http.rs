@@ -3,20 +3,44 @@
 //! bearer token (`metrics.bearer_token_sha256`).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use farsight_core::listen;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 
-/// Installs the process-wide recorder once; every mode reuses it.
+/// How often the recorder's upkeep runs.
+const UPKEEP_EVERY: Duration = Duration::from_secs(5);
+
+/// How long a stopping metrics listener waits for a scrape in flight.
+const METRICS_DRAIN: Duration = Duration::from_secs(3);
+
+/// Pause before a metrics listener that could not bind tries again.
+const BIND_RETRY: Duration = Duration::from_secs(30);
+
+/// Installs the process-wide recorder once; every mode reuses it. Must
+/// run inside the runtime: the recorder's upkeep is a task. Histogram
+/// samples are held until a scrape or the upkeep drains them, so
+/// without it an instance nobody scrapes grows without bound.
 pub fn install() -> Option<PrometheusHandle> {
     match PrometheusBuilder::new().install_recorder() {
-        Ok(h) => Some(h),
+        Ok(h) => {
+            let upkeep = h.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(UPKEEP_EVERY);
+                loop {
+                    tick.tick().await;
+                    upkeep.run_upkeep();
+                }
+            });
+            Some(h)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "metrics recorder not installed");
             None
@@ -79,20 +103,36 @@ pub async fn serve(
     let app = Router::new()
         .route("/metrics", get(render))
         .with_state(state);
-    let listener = match tokio::net::TcpListener::bind(&bind).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(error = %e, bind, "metrics listener not started");
-            return;
-        }
-    };
-    let _ = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            while !*stop.borrow() {
-                if stop.changed().await.is_err() {
-                    break;
+    // An address that cannot be bound now (still held by a process that
+    // is on its way out, say) is tried again until it can.
+    let listener = loop {
+        match tokio::net::TcpListener::bind(&bind).await {
+            Ok(l) => break l,
+            Err(e) => {
+                tracing::warn!(error = %e, bind, "metrics listener not started; trying again");
+                tokio::select! {
+                    () = tokio::time::sleep(BIND_RETRY) => {}
+                    r = stop.changed() => if r.is_err() { return; },
+                }
+                if *stop.borrow() {
+                    return;
                 }
             }
-        })
-        .await;
+        }
+    };
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = axum::serve(
+        listen::guarded(listener, listen::MAX_METRICS_CONNECTIONS),
+        app,
+    )
+    .with_graceful_shutdown(async move {
+        while !*stop.borrow() {
+            if stop.changed().await.is_err() {
+                break;
+            }
+        }
+        let _ = stopping_tx.send(());
+    })
+    .into_future();
+    let _ = listen::drain_within(served, stopping_rx, METRICS_DRAIN).await;
 }

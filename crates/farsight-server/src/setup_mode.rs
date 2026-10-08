@@ -12,6 +12,7 @@ use axum::Router;
 use axum::routing::get;
 use farsight_api::clientip::{CfTracker, ProxyTrust};
 use farsight_api::{IpLayer, client_ip_middleware};
+use farsight_core::listen;
 use farsight_web::setup_token;
 use tokio::sync::watch;
 
@@ -19,28 +20,32 @@ use crate::error::ServerError;
 use crate::{ModeEnd, SETUP_BIND_ENV, VERSION, health};
 
 /// The setup listener address: `FARSIGHT_SETUP_BIND` (an address, or an
-/// IP combined with the default port), else `server.bind`'s default.
-pub fn setup_bind(env: &[(String, String)]) -> String {
+/// IP combined with the default port), else `server.bind`'s default. A
+/// value that is neither is an error: the variable is set to keep the
+/// wizard off some network, and falling back to every interface would
+/// do the opposite of what was asked.
+pub fn setup_bind(env: &[(String, String)]) -> Result<String, String> {
     let default = farsight_core::Config::default().server.bind;
     let port = default
         .rsplit_once(':')
         .map_or("8080", |(_, p)| p)
         .to_owned();
-    match env
+    let Some(v) = env
         .iter()
         .find(|(k, _)| k == SETUP_BIND_ENV)
         .map(|(_, v)| v.trim())
-    {
-        Some(v) if v.parse::<SocketAddr>().is_ok() => v.to_owned(),
-        Some(v) if v.parse::<std::net::IpAddr>().is_ok() => {
-            let ip: std::net::IpAddr = v.parse().expect("checked");
-            SocketAddr::new(ip, port.parse().unwrap_or(8080)).to_string()
-        }
-        Some(v) if !v.is_empty() => {
-            tracing::warn!(value = v, "ignoring unparseable FARSIGHT_SETUP_BIND");
-            default
-        }
-        _ => default,
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(default);
+    };
+    if v.parse::<SocketAddr>().is_ok() {
+        return Ok(v.to_owned());
+    }
+    match v.parse::<std::net::IpAddr>() {
+        Ok(ip) => Ok(SocketAddr::new(ip, port.parse().unwrap_or(8080)).to_string()),
+        Err(_) => Err(format!(
+            "{SETUP_BIND_ENV} is {v:?}: expected an IP address, or an address with a port"
+        )),
     }
 }
 
@@ -78,7 +83,12 @@ pub async fn run(
             client_ip_middleware,
         ));
 
-    let bind = setup_bind(&env);
+    let bind = setup_bind(&env).map_err(|e| {
+        ServerError::io("the setup listener's address")(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            e,
+        ))
+    })?;
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(ServerError::io(format!(
@@ -114,8 +124,9 @@ pub async fn run(
 
     let mut stop = shutdown.clone();
     let mut done = completed.clone();
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(
-        listener,
+        listen::guarded(listener, listen::MAX_CONNECTIONS),
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
@@ -126,8 +137,14 @@ pub async fn run(
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
-    });
-    let r = server.await;
+        let _ = stopping_tx.send(());
+    })
+    .into_future();
+    // A connection still open after the drain time is left behind: the
+    // exit, or the switch to normal mode, does not wait for it.
+    let r = listen::drain_within(server, stopping_rx, listen::DRAIN)
+        .await
+        .unwrap_or(Ok(()));
     ticker.abort();
     r.map_err(ServerError::io("setup listener"))?;
     if *completed.borrow_and_update() {
@@ -136,4 +153,27 @@ pub async fn run(
     }
     let _ = shutdown.borrow_and_update();
     Ok(ModeEnd::Shutdown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_setup_bind_that_cannot_be_read_is_refused_not_ignored() {
+        let env = |v: &str| vec![(SETUP_BIND_ENV.to_owned(), v.to_owned())];
+        assert_eq!(setup_bind(&env("127.0.0.1")).unwrap(), "127.0.0.1:8080");
+        assert_eq!(
+            setup_bind(&env("127.0.0.1:9000")).unwrap(),
+            "127.0.0.1:9000"
+        );
+        assert_eq!(setup_bind(&env(" ::1 ")).unwrap(), "[::1]:8080");
+        // Unset or empty: the default listener.
+        assert!(setup_bind(&[]).unwrap().ends_with(":8080"));
+        assert!(setup_bind(&env("")).unwrap().ends_with(":8080"));
+        // Anything else is an error, never every interface.
+        for bad in ["localhost", "127.0.0.1:", "127.0.0.1/8", "lo"] {
+            assert!(setup_bind(&env(bad)).is_err(), "{bad}");
+        }
+    }
 }

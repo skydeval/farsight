@@ -57,6 +57,11 @@ pub enum NetError {
     /// The body was not the expected JSON.
     #[error("bad response: {0}")]
     Decode(String),
+    /// The body is larger than the client reads; carries the bound in
+    /// bytes. Asking for the same thing again gives the same answer, so
+    /// a caller that can ask for less does.
+    #[error("response body exceeds {0} bytes")]
+    TooLarge(u64),
 }
 
 impl NetError {
@@ -89,7 +94,7 @@ impl NetError {
             NetError::Http { status, .. } if *status == 429 => "rate_limited",
             NetError::Http { status, .. } if *status >= 500 => "server",
             NetError::Http { .. } => "client",
-            NetError::Transport(_) => "transport",
+            NetError::Transport(_) | NetError::TooLarge(_) => "transport",
             NetError::Decode(_) => "decode",
         }
     }
@@ -397,6 +402,28 @@ impl HostLimiter {
         domain.is_none_or(|d| s.domain(d, now).inflight < limits.domain_concurrency)
     }
 
+    /// The hosts known not to take a request now: cooling down, at
+    /// their request limit, or under a domain (`domain_of`) at its limit.
+    /// Work for them is left where it waits, so it neither takes a
+    /// worker nor a place among the candidates loaded. Read-only: it
+    /// does not count as a use of the host.
+    pub fn blocked(&self, domain_of: impl Fn(&str) -> Option<String>) -> Vec<String> {
+        let s = self.lock();
+        let now = Instant::now();
+        let limits = s.limits;
+        s.hosts
+            .iter()
+            .filter(|(host, h)| {
+                h.cooldown_until.is_some_and(|u| u > now)
+                    || h.inflight >= limits.host_concurrency
+                    || domain_of(host)
+                        .and_then(|d| s.domains.get(&d))
+                        .is_some_and(|d| d.inflight >= limits.domain_concurrency)
+            })
+            .map(|(host, _)| host.clone())
+            .collect()
+    }
+
     /// Seconds `host` is still cooling down, if it is.
     pub fn cooling(&self, host: &str) -> Option<u64> {
         let s = self.lock();
@@ -607,6 +634,17 @@ tokio::task_local! {
     /// they are made: the scheduler charges a job's requester from it
     /// while the job runs.
     pub static METER: Arc<AtomicU64>;
+    /// The time, in milliseconds, the job running in this task has spent
+    /// waiting for hosts to answer (not for a request slot). A job's
+    /// requester is charged for it as for its requests, and a listing
+    /// judges a host's pace by it.
+    pub static WAITED_MS: Arc<AtomicU64>;
+}
+
+/// The milliseconds the job running in this task has waited for answers
+/// so far; `None` outside a metered job.
+pub fn waited_ms() -> Option<u64> {
+    WAITED_MS.try_with(|m| m.load(Ordering::Relaxed)).ok()
 }
 
 /// What a [`Net`] takes from the config, replaced together at a rebuild.
@@ -742,6 +780,11 @@ impl Net {
             .has_capacity(host, self.domain_of(host).as_deref())
     }
 
+    /// The hosts work is not started for now ([`HostLimiter::blocked`]).
+    pub fn blocked_hosts(&self) -> Vec<String> {
+        self.hosts.blocked(|h| self.domain_of(h))
+    }
+
     /// `GET url` as JSON through the per-host limiter. `method` labels the
     /// metrics (`describeRepo`, `listRecords`, …).
     pub async fn get_json(&self, url: &Url, method: &'static str) -> Result<Value, NetError> {
@@ -749,18 +792,40 @@ impl Net {
         serde_json::from_slice(&body).map_err(|e| NetError::Decode(e.to_string()))
     }
 
-    /// `GET url` as text (the PLC export's JSON lines).
+    /// `GET url` as JSON from the PLC directory: a DID document. The
+    /// caller has taken its turn at the directory's own limiter.
+    pub async fn get_plc_json(&self, url: &Url) -> Result<Value, NetError> {
+        let body = self.request(url, "plc", true).await?;
+        serde_json::from_slice(&body).map_err(|e| NetError::Decode(e.to_string()))
+    }
+
+    /// `GET url` as text from the PLC directory (the export's JSON
+    /// lines). The caller has taken its turn at the directory's limiter.
     pub async fn get_text(&self, url: &Url) -> Result<String, NetError> {
-        let body = self.get_body(url, "export").await?;
+        let body = self.request(url, "export", true).await?;
         String::from_utf8(body).map_err(|e| NetError::Decode(e.to_string()))
     }
 
     /// `GET url` through the per-host limiter: the body of a `200`.
     pub async fn get_body(&self, url: &Url, method: &'static str) -> Result<Vec<u8>, NetError> {
+        self.request(url, method, false).await
+    }
+
+    /// One request. `directory` is true for the two calls made to the
+    /// PLC directory, which its own limiter paces; every other request
+    /// takes a slot of its host, whatever the host is. An account whose
+    /// DID document names the directory's host as its PDS is therefore
+    /// limited like any other host and not let through unpaced.
+    async fn request(
+        &self,
+        url: &Url,
+        method: &'static str,
+        directory: bool,
+    ) -> Result<Vec<u8>, NetError> {
         let host = host_key(url);
         let (client, is_plc) = {
             let s = self.settings.read().unwrap_or_else(|e| e.into_inner());
-            (s.client.clone(), host == s.plc_host)
+            (s.client.clone(), directory && host == s.plc_host)
         };
         // Held across the request: if this future is dropped at the await
         // below, the slot is freed with it.
@@ -773,7 +838,14 @@ impl Net {
         let _ = METER.try_with(|m| m.fetch_add(1, Ordering::Relaxed));
         let started = Instant::now();
         let r = client.get(url).await;
-        let elapsed = started.elapsed().as_secs_f64();
+        let waited = started.elapsed();
+        let _ = WAITED_MS.try_with(|m| {
+            m.fetch_add(
+                u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            )
+        });
+        let elapsed = waited.as_secs_f64();
         let label = m::host_label(&host);
         if is_plc {
             metrics::histogram!(m::PLC_REQUEST_SECONDS).record(elapsed);
@@ -782,6 +854,9 @@ impl Net {
                 .record(elapsed);
         }
         let (result, outcome) = match r {
+            Err(farsight_core::net::OutboundError::TooLarge(n)) => {
+                (Err(NetError::TooLarge(n)), SlotOutcome::Failed)
+            }
             Err(e) => (Err(NetError::Transport(e.to_string())), SlotOutcome::Failed),
             Ok(resp) => {
                 let ra = retry_after(&resp);
@@ -884,6 +959,17 @@ mod tests {
         assert!(!l.has_capacity("b.evil.example", d));
         assert!(!l.has_capacity("c.evil.example", d));
         assert!(l.has_capacity("pds.other.example", Some("other.example")));
+        // The hosts work is not started for: every known host of the
+        // full domain, and no other. Asking does not count as a use.
+        let domain_of = |h: &str| h.split_once('.').map(|(_, d)| d.to_owned());
+        let (hosts, _) = l.remembered();
+        let mut blocked = l.blocked(domain_of);
+        blocked.sort();
+        assert_eq!(
+            blocked,
+            ["a.evil.example", "b.evil.example", "c.evil.example"]
+        );
+        assert_eq!(l.remembered().0, hosts);
         let waiting =
             tokio::time::timeout(Duration::from_millis(60), l.acquire("c.evil.example", d)).await;
         assert!(

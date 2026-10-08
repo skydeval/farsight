@@ -151,21 +151,25 @@ pub async fn compute(
         ),
         Kind::BlockedAll => format!(
             "SELECT a.did, t.n FROM (
-               SELECT subject_id, count(*) AS n FROM blocks
+               SELECT subject_id, count(DISTINCT author_id) AS n FROM blocks
                GROUP BY subject_id ORDER BY n DESC, subject_id LIMIT $1 * 2) t
              JOIN actors a ON a.id = t.subject_id
              WHERE a.status NOT IN {GONE}
              ORDER BY t.n DESC, a.id LIMIT $1"
         ),
         Kind::BlockersDay | Kind::BlockedDay => {
-            let by = if kind.blockers() {
-                "author_id"
+            // "Most blocked" counts the accounts that block, not their
+            // records: an account that writes many block records for
+            // one subject is one blocker of it. "Top blockers" counts
+            // the blocks an account made.
+            let (by, n) = if kind.blockers() {
+                ("author_id", "count(*)")
             } else {
-                "subject_id"
+                ("subject_id", "count(DISTINCT r.author_id)")
             };
             format!(
                 "SELECT a.did, t.n FROM (
-                   SELECT r.{by} AS id, count(*) AS n FROM block_recent r
+                   SELECT r.{by} AS id, {n} AS n FROM block_recent r
                    JOIN blocks b ON b.author_id = r.author_id AND b.rkey = r.rkey
                                 AND b.subject_id = r.subject_id
                    WHERE r.at >= $2 - {RECENT_SECS} * interval '1 second' AND r.at < $2

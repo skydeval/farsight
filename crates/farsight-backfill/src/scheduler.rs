@@ -50,7 +50,7 @@ use crate::ctx::{Ctx, JOB};
 use crate::jobs::{self, Finish, JobReq, JobResult, Outcome};
 use crate::lanes::{self, Item, Lanes};
 use crate::metrics as m;
-use crate::net::METER;
+use crate::net::{METER, WAITED_MS};
 
 /// High-priority picks per normal pick within a requester.
 pub const HIGH_PER_NORMAL: u32 = 4;
@@ -78,6 +78,14 @@ fn tier3_rate(per_hour: u64) -> Rate {
         per_sec,
         burst: per_sec.max(1.0),
     }
+}
+
+/// What a job has cost: one unit per request it made and one per second
+/// it waited for hosts to answer. Counted in requests alone, a job on a
+/// host that takes half a minute per answer would look the cheapest of
+/// all while it holds a worker the longest.
+pub fn job_cost(requests: u64, waited_ms: u64) -> u64 {
+    requests.saturating_add(waited_ms / 1000)
 }
 
 /// Charges `requester` for a job being dispatched.
@@ -187,6 +195,9 @@ struct Metered {
     lane: Option<String>,
     /// The job's outbound requests so far (`crate::net::METER`).
     meter: Arc<AtomicU64>,
+    /// The milliseconds it has waited for hosts to answer so far
+    /// (`crate::net::WAITED_MS`).
+    waited_ms: Arc<AtomicU64>,
     /// How many of them are charged.
     charged: u64,
 }
@@ -424,6 +435,11 @@ impl Scheduler {
         args: (Tier, Option<RequesterKey>, Option<Priority>),
     ) -> Result<Option<Work>, sqlx::Error> {
         let inflight: Vec<String> = self.st().inflight_dids.iter().cloned().collect();
+        // An entry whose account is on a host that takes no request now
+        // (cooling down, or at its limit) is left waiting too: its job
+        // would hold a worker while it waits for the host. This is what
+        // keeps a few slow hosts from holding every worker.
+        let blocked = self.ctx.net.blocked_hosts();
         let sql = format!(
             "UPDATE backfill_queue SET claimed_by = $5,
                claimed_until = now() + make_interval(secs => $6)
@@ -432,6 +448,8 @@ impl Scheduler {
                WHERE q.tier = $1 AND q.claimed_by IS NULL
                  AND (q.not_before IS NULL OR q.not_before <= now())
                  AND a.did <> ALL($2) {sql_filter}
+                 AND NOT EXISTS (SELECT 1 FROM pds_hosts h
+                                 WHERE h.id = a.pds_host_id AND h.host = ANY($7))
                  AND NOT EXISTS (SELECT 1 FROM job_leases j
                                  WHERE j.did = a.did AND j.lease_until > now())
                ORDER BY {} q.enqueued_at, q.id LIMIT 1 FOR UPDATE OF q SKIP LOCKED)
@@ -446,6 +464,7 @@ impl Scheduler {
             .bind(args.2)
             .bind(&self.ctx.process)
             .bind(queue::CLAIM.as_secs_f64())
+            .bind(&blocked)
             .fetch_optional(&self.ctx.pool)
             .await?;
         Ok(row.map(
@@ -476,7 +495,7 @@ impl Scheduler {
             .iter()
             .filter_map(|r| RequesterKey::parse(r))
             .collect();
-        let candidates = lanes::load(pool).await?;
+        let candidates = lanes::load(pool, &self.ctx.net.blocked_hosts()).await?;
         if !candidates.is_empty() && !reqs.contains(&RequesterKey::Lists) {
             reqs.push(RequesterKey::Lists);
         }
@@ -564,12 +583,15 @@ impl Scheduler {
                AND NOT EXISTS (SELECT 1 FROM job_leases j WHERE j.did = o.did AND j.lease_until > now())
                AND NOT EXISTS (SELECT 1 FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
                                WHERE a.did = o.did AND q.kind = {JOB_REPO})
+               AND NOT EXISTS (SELECT 1 FROM actors a JOIN pds_hosts h ON h.id = a.pds_host_id
+                               WHERE a.did = o.did AND h.host = ANY($5))
              ORDER BY o.did LIMIT 1"),
         )
         .bind(&cursor)
         .bind(&inflight)
         .bind(full_enabled)
         .bind(!self.ctx.cfg().backfill.repair.paused)
+        .bind(self.ctx.net.blocked_hosts())
         .fetch_optional(&self.ctx.pool)
         .await?;
         match row {
@@ -627,14 +649,22 @@ impl Scheduler {
         Ok(None)
     }
 
-    /// Charges every running job the requests it has made since it was
-    /// last charged.
+    /// Charges every running job what it has cost since it was last
+    /// charged ([`job_cost`]).
     fn charge_running(&self) {
         let mut s = self.st();
         let progress: Vec<(u64, u64)> = s
             .jobs
             .iter()
-            .map(|(n, j)| (*n, j.meter.load(Ordering::Relaxed)))
+            .map(|(n, j)| {
+                (
+                    *n,
+                    job_cost(
+                        j.meter.load(Ordering::Relaxed),
+                        j.waited_ms.load(Ordering::Relaxed),
+                    ),
+                )
+            })
             .collect();
         for (job, total) in progress {
             s.charge(job, total);
@@ -740,6 +770,7 @@ impl Scheduler {
 
     fn start(self: &Arc<Self>, jobs: &mut JoinSet<()>, tier: Tier, work: Work) {
         let meter = Arc::new(AtomicU64::new(0));
+        let waited = Arc::new(AtomicU64::new(0));
         let job = {
             let mut s = self.st();
             s.running[tier.index()] += 1;
@@ -777,6 +808,7 @@ impl Scheduler {
                     requester: work.requester(),
                     lane,
                     meter: meter.clone(),
+                    waited_ms: waited.clone(),
                     charged: DISPATCH_CHARGE,
                 },
             );
@@ -790,24 +822,30 @@ impl Scheduler {
         };
         jobs.spawn(JOB.scope(
             job,
-            METER.scope(meter, async move {
-                // `running` is owned by this task: it is dropped when the
-                // task ends, whether the job returned, panicked or was
-                // stopped.
-                let sched = running.sched.clone();
-                let ended =
-                    farsight_core::task::catch(sched.run_job(running.tier, &running.work, job))
-                        .await;
-                if let Err(message) = ended {
-                    farsight_core::task::report_panic(JOB_TASK, &message);
-                    let handled =
-                        farsight_core::task::catch(sched.panicked(&running.work, job, &message))
+            METER.scope(
+                meter,
+                WAITED_MS.scope(waited, async move {
+                    // `running` is owned by this task: it is dropped when the
+                    // task ends, whether the job returned, panicked or was
+                    // stopped.
+                    let sched = running.sched.clone();
+                    let ended =
+                        farsight_core::task::catch(sched.run_job(running.tier, &running.work, job))
                             .await;
-                    if let Err(again) = handled {
-                        farsight_core::task::report_panic(JOB_TASK, &again);
+                    if let Err(message) = ended {
+                        farsight_core::task::report_panic(JOB_TASK, &message);
+                        let handled = farsight_core::task::catch(sched.panicked(
+                            &running.work,
+                            job,
+                            &message,
+                        ))
+                        .await;
+                        if let Err(again) = handled {
+                            farsight_core::task::report_panic(JOB_TASK, &again);
+                        }
                     }
-                }
-            }),
+                }),
+            ),
         ));
     }
 
@@ -863,7 +901,11 @@ impl Scheduler {
                 .jobs
                 .get(&job)
                 .map_or(0, |j| j.meter.load(Ordering::Relaxed));
-            s.charge(job, result.cost.max(metered));
+            let waited = s
+                .jobs
+                .get(&job)
+                .map_or(0, |j| j.waited_ms.load(Ordering::Relaxed));
+            s.charge(job, job_cost(result.cost.max(metered), waited));
             if !matches!(result.outcome, Outcome::Busy | Outcome::Yielded) {
                 s.completions.push_back(Instant::now());
             }
@@ -1302,9 +1344,15 @@ mod tests {
                 requester: RequesterKey::Token(1),
                 lane: None,
                 meter: meter.clone(),
+                waited_ms: Arc::default(),
                 charged: DISPATCH_CHARGE,
             },
         );
+        // A job on a slow host: few requests, much waiting. It costs
+        // what it waited.
+        assert_eq!(job_cost(3, 0), 3);
+        assert_eq!(job_cost(3, 59_999), 62);
+        assert_eq!(job_cost(120, 3_600_000), 3_720);
         meter.store(400, Ordering::Relaxed);
         s.charge(1, meter.load(Ordering::Relaxed));
         assert_eq!(s.charged[&RequesterKey::Token(1)], 400.0);
@@ -1331,6 +1379,7 @@ mod tests {
                 requester: RequesterKey::Firehose,
                 lane: None,
                 meter: Arc::new(AtomicU64::new(0)),
+                waited_ms: Arc::default(),
                 charged: DISPATCH_CHARGE,
             },
         );

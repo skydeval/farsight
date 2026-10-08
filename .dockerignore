@@ -4,3 +4,4 @@ target
 .chainlink
 .claude
 docs
+.env

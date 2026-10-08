@@ -54,15 +54,22 @@ normal mode in-process: it runs migrations, connects to the firehose and
 starts serving the API. A config reset (Settings → Reset) returns it to
 the wizard; the database is kept.
 
-Set `POSTGRES_PASSWORD` in the environment before the first start; the
-compose file passes the matching connection string to Farsight, and the
-wizard's storage step is prefilled with it. Without it the password is
-`farsight`, and Farsight logs a warning at every start for as long as
-it connects with that. The bundled Postgres is not published outside
+Set `POSTGRES_PASSWORD` before the first start, in a file named `.env`
+beside `compose.yml` (`POSTGRES_PASSWORD=…` on a line of its own).
+Compose reads that file on every command, so a later
+`docker compose up -d` from another shell uses the same password. A
+password that is only exported in one shell is missing in the next,
+and compose then hands Farsight a connection string with the default
+password, which Postgres refuses. Use letters and digits only: the
+password is placed in a connection URL, where `/`, `#`, `?` and `%`
+mean something else. The compose file passes the matching connection
+string to Farsight, and the wizard's storage step is prefilled with it.
+Without a password set it is `farsight`, and Farsight logs a warning at
+every start for as long as it connects with that. The bundled Postgres is not published outside
 the compose network, but set a password of your own all the same. To
 change it later, change it in Postgres first
-(`ALTER ROLE farsight PASSWORD '…'`), then set `POSTGRES_PASSWORD` and
-restart.
+(`ALTER ROLE farsight PASSWORD '…'`), then change `POSTGRES_PASSWORD`
+in `.env` and restart.
 
 ## The image
 
@@ -86,7 +93,7 @@ progress, ETA and queue depths are on the dashboard and on its metrics
 port (9465, not published).
 
 Both containers can be stopped and updated at any time. They take up
-to 30 seconds to stop, and the compose file gives them 45
+to 40 seconds to stop, and the compose file gives them 45
 (`stop_grace_period`). Work that was under way goes back to the queue
 and is taken up after the start, also when a container was killed.
 

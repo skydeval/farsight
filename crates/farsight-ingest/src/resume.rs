@@ -11,8 +11,10 @@
 //! | instance without a cursor, lag unknown or too large | `applied − 30 min` | always gap `[applied − 30 min, first event]` |
 //!
 //! `from` is `applied_through` when the last applied batch came from the
-//! instance being resumed, and `applied_through − 30 min` otherwise: two
-//! instances are not equally far behind the network. An instance that
+//! instance being resumed (or that instance's own cursor, while it is
+//! still behind `applied_through`: an instance that took over replays a
+//! stretch the one before it had applied), and `applied_through − 30 min`
+//! otherwise: two instances are not equally far behind the network. An instance that
 //! refuses the cursor (`CursorTooOld`) is read from the live tail and the
 //! gap `[from, first live event]` is always recorded.
 //!
@@ -181,8 +183,18 @@ pub fn plan(
     let same_instance = p.source_url.as_deref() == Some(url);
     if same_instance {
         let applied_here = p.applied_from.as_deref().is_none_or(|u| u == url);
-        let from_us = if applied_here { applied } else { failover_from };
         let stored_us = p.cursor_us.unwrap_or(applied);
+        // A gap starts at the instance's own position when that is
+        // behind what was applied. It is right after a failover: the
+        // new instance replays a stretch the old one had applied, and
+        // while it does, its cursor is below `applied`. A loss on the
+        // new instance in that stretch starts at its cursor; started at
+        // `applied` the gap would be empty.
+        let from_us = if applied_here {
+            applied.min(stored_us)
+        } else {
+            failover_from
+        };
         if protocol == Protocol::V2
             && p.protocol == Some(Protocol::V2)
             && let Some(seq) = p.cursor_seq
@@ -355,6 +367,33 @@ mod tests {
         notice: bool,
     ) -> Option<(i64, i64, GapCause)> {
         first_event(rule, seq, first_us, notice).gap
+    }
+
+    #[test]
+    fn a_loss_during_the_replay_after_a_failover_starts_at_the_instances_own_cursor() {
+        // B took over and is replaying: its batches made it the applied
+        // source, its cursor stands at 9,500 s, and what was applied
+        // (from A) reaches 10,000 s.
+        for proto in [Protocol::V1, Protocol::V2] {
+            let p = Persisted {
+                source_url: Some(B.into()),
+                protocol: Some(proto),
+                cursor_seq: Some(70),
+                cursor_us: Some(9_500 * S),
+                applied_through_us: Some(10_000 * S),
+                applied_from: Some(B.into()),
+            };
+            let plan = plan(&p, B, proto, None, &T, NOW);
+            // B comes back clamped, its first event at 9,900 s: below
+            // what was applied, above where B stood.
+            let g = gap(plan.gap, Some(71), 9_900 * S, true);
+            let (from, to, _) = g.expect("a gap over what B skipped");
+            assert_eq!((from, to), (9_500 * S, 9_900 * S), "{proto:?}");
+            assert_eq!(plan.refused_from_us, Some(9_500 * S));
+        }
+        // With the cursor where the applied position is, nothing changes.
+        let plan = plan(&persisted(Protocol::V2), A, Protocol::V2, None, &T, NOW);
+        assert_eq!(plan.refused_from_us, Some(10_000 * S));
     }
 
     #[test]
@@ -708,7 +747,8 @@ mod tests {
             /// gap; a `seq` cursor is sent only to the instance it came
             /// from, on v2; a timestamp cursor is never after the
             /// position nor after the clock; a gap starts at
-            /// `applied_through` only on the instance the position came
+            /// `applied_through`, or at the instance's own cursor if
+            /// that is behind it, only on the instance the position came
             /// from, and 30 minutes before the position or the clock
             /// otherwise; and a gap is unconditional exactly on an
             /// instance without a cursor and without a usable lag.
@@ -731,7 +771,11 @@ mod tests {
                     return Ok(());
                 };
                 let here = same && p.applied_from.as_deref().is_none_or(|u| u == url);
-                let from = if here { applied } else { sub(applied.min(now), FAILOVER_GAP) };
+                let from = if here {
+                    applied.min(p.cursor_us.unwrap_or(applied))
+                } else {
+                    sub(applied.min(now), FAILOVER_GAP)
+                };
                 prop_assert_eq!(plan.refused_from_us, Some(from));
                 prop_assert_eq!(
                     plan.refused(),

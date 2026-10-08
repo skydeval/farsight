@@ -275,7 +275,15 @@ async fn fetch(
     let cfg = ctx.cfg();
     let pool = &ctx.pool;
     let started = std::time::Instant::now();
-    let pds = match ctx.resolver.resolve(owner, false).await {
+    // A run that may remove stored items lists the host the directory
+    // names now: one out of a cache may be a host the owner has left,
+    // and its listing would have the owner's items removed.
+    let holds_items: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM list_items WHERE owner_id = $1)")
+            .bind(owner_id)
+            .fetch_one(pool)
+            .await?;
+    let pds = match ctx.resolver.resolve(owner, holds_items).await {
         Ok(p) => p,
         Err(ResolveError::Tombstoned) => {
             repo::apply_status(ctx, owner, false, Some("deleted".into()))

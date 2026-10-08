@@ -61,7 +61,7 @@ use super::handles::{self, claimed_handle};
 use super::metrics::{self as m, Page};
 use super::text::{Stamp, clean};
 use super::{Cache, client_addr, finish, parse_did};
-use crate::pages::{WebState, handle_to_did};
+use crate::pages::WebState;
 
 /// The deadline of all of a card's fetches together.
 pub const CARD_DEADLINE: Duration = Duration::from_secs(3);
@@ -539,17 +539,20 @@ async fn handle(
     // The account's identity was read: no claim means it names no
     // handle, and a claim that resolves to another account is not its
     // handle either. Both drop a handle shown until now.
-    let back = match claim {
-        Some(c) => match tokio::time::timeout_at(deadline, handle_to_did(&st.safe, c)).await {
-            Ok(back) => Some(back),
-            Err(_) => {
-                m::handle_resolution(handles::Outcome::Failed);
-                return Err(());
+    let (back, answered) = match claim {
+        Some(c) => {
+            let resolving = crate::pages::handle_to_did_answered(&st.safe, c);
+            match tokio::time::timeout_at(deadline, resolving).await {
+                Ok((back, answered)) => (Some(back), answered),
+                Err(_) => {
+                    m::handle_resolution(handles::Outcome::Failed);
+                    return Err(());
+                }
             }
-        },
-        None => None,
+        }
+        None => (None, false),
     };
-    let (outcome, found) = handles::classify(did, claim.map(str::to_owned), back);
+    let (outcome, found) = handles::classify(did, claim.map(str::to_owned), back, answered);
     m::handle_resolution(outcome);
     Ok(handles::settle(st, cfg, did, found).await)
 }

@@ -190,12 +190,28 @@ fn too_many(page: Response, class: Class, retry: u64) -> Response {
     r
 }
 
-fn recently_signed_in(st: &WebState, ip: IpAddr) -> bool {
-    st.recent_logins
+/// Whether `ip` has signed in before: it did in this process within a
+/// session's lifetime, or an admin session on record was created from
+/// it. The second survives a restart, when the first is empty and the
+/// admin would otherwise share the process-wide budget with everyone
+/// who starts a sign-in.
+async fn recently_signed_in(st: &WebState, ip: IpAddr) -> bool {
+    let here = st
+        .recent_logins
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&ip)
-        .is_some_and(|t| t.elapsed() < SESSION_ABSOLUTE)
+        .is_some_and(|t| t.elapsed() < SESSION_ABSOLUTE);
+    if here {
+        return true;
+    }
+    // An address without one costs a primary-key-sized lookup; the
+    // per-address limit above bounds how often anyone asks.
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM admin_sessions WHERE ip = $1::inet)")
+        .bind(ip.to_string())
+        .fetch_one(&st.api.pool)
+        .await
+        .unwrap_or(false)
 }
 
 fn remember_sign_in(st: &WebState, ip: IpAddr) {
@@ -284,7 +300,8 @@ pub async fn submit(
     // One bucket for the whole process bounds what anonymous callers can
     // make Farsight send; an address that signed in recently is outside
     // it, so that the admin is not kept out by other people's starts.
-    if !recently_signed_in(&st, ip)
+    let known = recently_signed_in(&st, ip).await;
+    if !known
         && let Err((_, retry)) = st.api.limiter.check(
             Class::UiLoginStart,
             PROCESS_KEY,
@@ -337,6 +354,7 @@ pub async fn submit(
     };
     flow.back = again.map_or("/admin", Return::path);
     flow.replaces = replaces;
+    flow.known = known;
     st.oauth.flows.insert(state, flow);
     let Ok(location) = HeaderValue::from_str(to.as_str()) else {
         return unreachable("the authorization URL is not a header value");

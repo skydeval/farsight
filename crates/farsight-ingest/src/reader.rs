@@ -385,7 +385,7 @@ struct ResumedAt {
 
 /// Jetstream `#info` name: the cursor asked for was older than what the
 /// instance keeps, and it resumed from its floor.
-const INFO_OUTDATED_CURSOR: &str = "OutdatedCursor";
+pub(crate) const INFO_OUTDATED_CURSOR: &str = "OutdatedCursor";
 
 enum End {
     Reconnect(ReconnectReason),

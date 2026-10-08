@@ -55,7 +55,7 @@ Columns beside the state:
 | `retain_until` | end of grace for a `retained` list |
 | `purge_then` | target state after a purge |
 | `deferred_by` | the gate that deferred the list |
-| `next_retry_at` | next retry for `missing` and `unavailable` lists, and for lists deferred by the owner's re-admission budget |
+| `next_retry_at` | next retry for `missing` and `unavailable` lists, and for lists deferred by the owner's re-admission budget; for a list deferred by a host cap or the lists cap, the time before which it is not looked at again (an hour after it was deferred) |
 | `item_count` | stored items |
 
 `deferred_by` codes:

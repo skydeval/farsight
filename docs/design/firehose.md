@@ -229,7 +229,9 @@ CREATE TABLE firehose_cursors (
 Each instance has its own row, written in the batch transaction and
 kept with `GREATEST`, so a replay never lowers it. `firehose_state`
 (one row) holds the current session's copy together with the global
-`applied_through`, `first_applied_at` and the `connected` flag.
+`applied_through`, `first_applied_at` and the `connected` flag. The
+flag is cleared when ingest starts, before any session connects: a
+process that was killed never cleared it.
 
 Failing over to another instance starts a new cursor space. The
 previous instance's row stays, so a later return to it resumes from
@@ -344,10 +346,14 @@ arrives, and it runs from a start that depends on the instance to that
 first event.
 
 **Where a gap starts.** At `applied_through` when the last applied
-batch came from the instance being resumed. At
-`applied_through − 30 min` otherwise, which covers a failover and also
-a return to an instance while the position came from another: two
-instances are not equally far behind the network.
+batch came from the instance being resumed, or at that instance's own
+cursor while it is still behind `applied_through`. That is the case
+right after a failover: the new instance replays a stretch the old
+one had applied, and a loss on the new instance in that stretch
+starts where it stood. At `applied_through − 30 min` otherwise, which
+covers a failover and also a return to an instance while the position
+came from another: two instances are not equally far behind the
+network.
 
 **When a gap is recorded:**
 
@@ -467,8 +473,13 @@ CREATE TABLE firehose_seams (
    apply path, where last-write-wins turns everything already applied
    into a no-op.
 4. **Finished.** The read is finished by the first event witnessed
-   after the window's end. The writer then deletes the rows, after the
-   batches that were sent ahead.
+   after the window's end, provided the read began at the window's
+   start: the instance announced no clamp, and its first event is at
+   most `gap_threshold` after the start, the rule a resumed session is
+   judged by. An instance that no longer holds the window starts
+   later, and a read of it has replayed nothing; it counts as failed.
+   The writer then deletes the rows, after the batches that were sent
+   ahead.
 
 A read that does not get that far is not taken for one that did:
 
@@ -481,7 +492,10 @@ A read that does not get that far is not taken for one that did:
   end was passed says nothing either way, because a quiet stream looks
   the same as a stalled one. It is tried again after a minute without
   being counted, and finishes once the stream has moved past the
-  window.
+  window. That holds for 30 minutes after the window's end. A stream
+  that is still silent then is not a quiet one: its silent reads
+  count as failed, and the window becomes a gap like any other that
+  cannot be read.
 
 A repair batch **never moves position state**. It writes no cursor,
 no `applied_through`, no `firehose_clock` row, and opens or closes

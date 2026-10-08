@@ -82,6 +82,19 @@ pub async fn prune_fetch_runs(pool: &PgPool, now: DateTime<Utc>) -> Result<u64> 
     .rows_affected())
 }
 
+/// Deletes `job_leases` rows that ran out more than a day ago (nightly).
+/// A lease that ran out holds nothing; the row of a job whose process
+/// was killed is otherwise only replaced when the same account is
+/// listed again.
+pub async fn prune_expired_leases(pool: &PgPool) -> Result<u64> {
+    Ok(
+        sqlx::query("DELETE FROM job_leases WHERE lease_until < now() - interval '1 day'")
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}
+
 /// Deletes `op_errors` rows older than [`OP_ERROR_RETENTION`], and the
 /// oldest beyond [`OP_ERROR_ROWS`] (nightly).
 pub async fn prune_op_errors(pool: &PgPool, now: DateTime<Utc>) -> Result<u64> {
@@ -772,11 +785,44 @@ async fn purge_for_divergence_once(
     Ok(done)
 }
 
-/// The daily retry task: fires **GO** on `deferred` lists whose
-/// `next_retry_at` has passed (lists deferred by the owner re-admission
-/// budget get the next UTC midnight). Lists deferred by the budget, the
-/// ceiling or a bucket cap are re-opened by the budget monitor / counter
-/// flush instead, which call [`fire_event`] with GO themselves.
+/// The lists deferred by a host cap or the lists cap whose cap has room
+/// again, longest-waiting first, at most `limit`: the owner's cap
+/// buckets no longer carry the cap's bit and, for the lists cap, the
+/// owner is under `lists_per_author`. A list is not offered before its
+/// `next_retry_at` (an hour after it was deferred), so one that is
+/// deferred again does not come back ahead of the others.
+pub async fn cap_go_candidates(pool: &PgPool, limits: &Limits, limit: i64) -> Result<Vec<ListId>> {
+    use crate::codes::DeferCause;
+    Ok(sqlx::query_scalar(
+        "SELECT l.id FROM lists l JOIN actors a ON a.id = l.owner_id
+         LEFT JOIN pds_hosts h ON h.id = a.pds_host_id
+         WHERE l.track_state = $1 AND l.listblock_count > 0
+           AND l.deferred_by IN ($2, $3)
+           AND (l.next_retry_at IS NULL OR l.next_retry_at <= now())
+           AND (l.deferred_by <> $3 OR a.authored_lists < $4)
+           AND NOT EXISTS (
+             SELECT 1 FROM host_usage u
+             WHERE NOT COALESCE(h.large, false)
+               AND u.bucket IN ('d:' || h.cap_key, 'ip:' || h.ip_bucket)
+               AND u.capped_mask & (CASE WHEN l.deferred_by = $2 THEN $5 ELSE $6 END)::SMALLINT <> 0)
+         ORDER BY l.next_retry_at NULLS FIRST, l.id LIMIT $7",
+    )
+    .bind(TrackState::Deferred.code())
+    .bind(DeferCause::HostCap.code())
+    .bind(DeferCause::ListsCap.code())
+    .bind(limits.cfg.lists_per_author as i64)
+    .bind(keys::CapKind::Items.bit())
+    .bind(keys::CapKind::Lists.bit())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// The daily retry task: fires **GO** on the lists deferred by the owner
+/// re-admission budget whose `next_retry_at` has passed (the next UTC
+/// midnight). Lists deferred by the budget, the ceiling or a cap are
+/// re-opened by the budget monitor instead, which calls [`fire_event`]
+/// with GO itself ([`cap_go_candidates`] for the caps).
 pub async fn retry_deferred(
     pool: &PgPool,
     limits: &Limits,
@@ -784,10 +830,12 @@ pub async fn retry_deferred(
     now: DateTime<Utc>,
 ) -> Result<ApplyReport> {
     let lists: Vec<ListId> = sqlx::query_scalar(
-        "SELECT id FROM lists WHERE track_state = $1 AND next_retry_at <= $2 AND listblock_count > 0 ORDER BY id",
+        "SELECT id FROM lists WHERE track_state = $1 AND deferred_by = $3 AND next_retry_at <= $2
+           AND listblock_count > 0 ORDER BY id",
     )
     .bind(TrackState::Deferred.code())
     .bind(now)
+    .bind(crate::codes::DeferCause::OwnerReadmissions.code())
     .fetch_all(pool)
     .await?;
     let mut out = ApplyReport::default();

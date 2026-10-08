@@ -8,7 +8,9 @@ use axum::extract::{Form, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
 
-use super::{MessagePage, Nav, WebState, check_form, clear_admin_cookie, gate, nav};
+use super::{
+    MessagePage, Nav, Return, WebState, check_form, clear_admin_cookie, gate, nav, step_up,
+};
 use crate::common::{NO_STORE, render_private};
 
 /// The reset page.
@@ -82,6 +84,11 @@ pub(super) async fn reset_submit(
         Err(r) => return r,
     };
     if let Err(r) = check_form(&s, &headers, &form) {
+        return r;
+    }
+    // A reset ends every session and every key and opens the setup
+    // wizard: a fresh sign-in first.
+    if let Err(r) = step_up(&s, Return::Settings) {
         return r;
     }
     let cur = st.api.config.current();

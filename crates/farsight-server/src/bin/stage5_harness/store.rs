@@ -139,6 +139,7 @@ impl Env {
         let mut b = Batch::new(Origin::Listing {
             stamp_read_at: read_at,
             deletes_only: false,
+            host_confirmed: true,
         });
         b.reconciles = vec![Reconcile {
             author: d(author),

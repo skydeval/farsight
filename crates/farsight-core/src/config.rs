@@ -18,6 +18,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -1004,6 +1005,25 @@ pub fn load(path: &Path, env: &[(String, String)]) -> Result<StartMode, ConfigEr
     Ok(StartMode::Setup)
 }
 
+/// What is wrong with a file that is not TOML: the line and the
+/// parser's message. The line itself is not quoted, as the parser's own
+/// rendering does: the offending line may be the one that holds the
+/// database password, and this text goes to the log.
+fn toml_error(text: &str, e: &toml::de::Error) -> String {
+    match e.span() {
+        Some(span) => {
+            let upto = span.start.min(text.len());
+            let line = text.as_bytes()[..upto]
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count()
+                + 1;
+            format!("line {line}: {}", e.message())
+        }
+        None => e.message().to_owned(),
+    }
+}
+
 /// Builds and validates a config from optional file contents and the
 /// environment. `None` means env-only (`FARSIGHT_SKIP_WIZARD`).
 pub fn load_from_parts(
@@ -1013,7 +1033,7 @@ pub fn load_from_parts(
     let mut table: toml::Table = match file {
         Some(text) => text
             .parse::<toml::Table>()
-            .map_err(|e| ConfigError::Toml(e.to_string()))?,
+            .map_err(|e| ConfigError::Toml(toml_error(text, &e)))?,
         None => toml::Table::new(),
     };
     let env_keys = apply_env_overrides(&mut table, env)?;
@@ -1372,6 +1392,7 @@ impl Config {
                 "must be at least 72h, the time a listing may still be applied after it was read",
             ));
         }
+        self.validate_bounds()?;
         self.validate_public_ui()?;
         let mut warnings = Vec::new();
         if self.public_ui.card_burst < self.public_ui.card_rps {
@@ -1397,7 +1418,219 @@ impl Config {
         if has_default_db_password(&self.storage.database_url) {
             warnings.push(DEFAULT_DB_PASSWORD_WARNING.to_owned());
         }
+        let connections = self.database_connections();
+        if connections > POSTGRES_DEFAULT_CONNECTIONS {
+            warnings.push(format!(
+                "rate_limit.query_concurrency ({}) and backfill.concurrency ({}) make up to \
+                 {connections} database connections, more than Postgres allows by default \
+                 ({POSTGRES_DEFAULT_CONNECTIONS}); raise max_connections in Postgres to at least \
+                 that, or lower one of the two",
+                self.rate_limit.query_concurrency, self.backfill.concurrency
+            ));
+        }
         Ok(warnings)
+    }
+}
+
+/// `max_connections` of a Postgres nobody configured, the bundled one
+/// included.
+pub const POSTGRES_DEFAULT_CONNECTIONS: u32 = 100;
+
+/// Connections the two processes open beyond the two configured pools:
+/// 8 spare in each, 4 for ingest, 4 for the periodic tasks and 1 for
+/// the sort-index builder.
+pub const FIXED_DATABASE_CONNECTIONS: u32 = 25;
+
+impl Config {
+    /// The most database connections the server and the backfill process
+    /// hold together under this config.
+    pub fn database_connections(&self) -> u32 {
+        self.rate_limit
+            .query_concurrency
+            .saturating_add(self.backfill.concurrency)
+            .saturating_add(FIXED_DATABASE_CONNECTIONS)
+    }
+}
+
+/// The longest any duration in the config may be. Every one of them is
+/// added to a time somewhere, and a value near the largest a duration
+/// can hold would overflow there.
+pub const MAX_CONFIG_DURATION: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+
+impl Config {
+    /// The bounds of the durations and limits a wrong value of which
+    /// would make answers claim more than is known, stop a subsystem, or
+    /// overflow.
+    fn validate_bounds(&self) -> Result<(), ConfigError> {
+        const SEC: Duration = Duration::from_secs(1);
+        const HOUR: Duration = Duration::from_secs(3600);
+        const DAY: Duration = Duration::from_secs(24 * 3600);
+        let t = &self.firehose.tuning;
+        let b = &self.backfill;
+        // (key, value, at least, at most)
+        let bounded: [(&str, ConfigDuration, Duration, Duration); 20] = [
+            // Answers call the index current for this long after the
+            // last applied event: hours of it would hide an outage.
+            (
+                "firehose.tuning.synthetic_gap_lag",
+                t.synthetic_gap_lag,
+                SEC,
+                HOUR,
+            ),
+            // Zero would end every session at once; too long would
+            // leave a dead one in place.
+            ("firehose.tuning.stall_timeout", t.stall_timeout, SEC, HOUR),
+            ("firehose.tuning.gap_threshold", t.gap_threshold, SEC, DAY),
+            (
+                "firehose.tuning.failover_rewind_min",
+                t.failover_rewind_min,
+                Duration::ZERO,
+                DAY,
+            ),
+            (
+                "firehose.tuning.failover_max_lag",
+                t.failover_max_lag,
+                Duration::ZERO,
+                DAY,
+            ),
+            (
+                "firehose.tuning.seam_repair_before",
+                t.seam_repair_before,
+                Duration::ZERO,
+                DAY,
+            ),
+            (
+                "firehose.tuning.seam_repair_after",
+                t.seam_repair_after,
+                Duration::ZERO,
+                DAY,
+            ),
+            (
+                "firehose.tuning.seam_repair_delay",
+                t.seam_repair_delay,
+                Duration::ZERO,
+                DAY,
+            ),
+            (
+                "firehose.tuning.seam_repair_catchup_margin",
+                t.seam_repair_catchup_margin,
+                Duration::ZERO,
+                DAY,
+            ),
+            (
+                "storage.tombstone_ttl",
+                self.storage.tombstone_ttl,
+                Duration::ZERO,
+                MAX_CONFIG_DURATION,
+            ),
+            (
+                "storage.block_history_retention",
+                self.storage.block_history_retention,
+                Duration::ZERO,
+                MAX_CONFIG_DURATION,
+            ),
+            (
+                "backfill.request_fresh_window",
+                b.request_fresh_window,
+                Duration::ZERO,
+                MAX_CONFIG_DURATION,
+            ),
+            (
+                "backfill.owner_fetch_cooldown",
+                b.owner_fetch_cooldown,
+                Duration::ZERO,
+                MAX_CONFIG_DURATION,
+            ),
+            (
+                "backfill.terminal_after",
+                b.terminal_after,
+                SEC,
+                MAX_CONFIG_DURATION,
+            ),
+            (
+                "backfill.list_fetch_max_duration",
+                b.list_fetch_max_duration,
+                SEC,
+                7 * DAY,
+            ),
+            (
+                "backfill.repo_job_max_duration",
+                b.repo_job_max_duration,
+                SEC,
+                7 * DAY,
+            ),
+            (
+                "backfill.repair_slack",
+                b.repair_slack,
+                Duration::ZERO,
+                MAX_CONFIG_DURATION,
+            ),
+            (
+                "backfill.backlinks.lag_allowance",
+                b.backlinks.lag_allowance,
+                Duration::ZERO,
+                DAY,
+            ),
+            (
+                "limits.list_grace",
+                self.limits.list_grace,
+                Duration::ZERO,
+                MAX_CONFIG_DURATION,
+            ),
+            (
+                "limits.pending_max_age",
+                self.limits.pending_max_age,
+                SEC,
+                MAX_CONFIG_DURATION,
+            ),
+        ];
+        for (key, value, least, most) in bounded {
+            let v = value.get();
+            if v < least || v > most {
+                return Err(invalid(
+                    key,
+                    format!(
+                        "must be between {} and {}",
+                        ConfigDuration::secs(least.as_secs()),
+                        ConfigDuration::secs(most.as_secs())
+                    ),
+                ));
+            }
+        }
+        for (key, list) in [
+            ("backfill.retry_schedule", &b.retry_schedule),
+            ("backfill.missing_retry", &b.missing_retry),
+            ("backfill.phase1_retry", &b.phase1_retry),
+        ] {
+            if list.iter().any(|d| d.get() > MAX_CONFIG_DURATION) {
+                return Err(invalid(
+                    key,
+                    format!(
+                        "no step may be longer than {}",
+                        ConfigDuration::secs(MAX_CONFIG_DURATION.as_secs())
+                    ),
+                ));
+            }
+        }
+        let q = self.rate_limit.query_timeout.get();
+        if q.is_zero() || q > HOUR {
+            return Err(invalid(
+                "rate_limit.query_timeout",
+                "must be longer than 0s and at most 1h",
+            ));
+        }
+        if self.rate_limit.query_concurrency == 0 {
+            return Err(invalid("rate_limit.query_concurrency", "must be positive"));
+        }
+        // Enumeration runs only below this bound: at zero no cycle, full
+        // or repair, would ever enumerate.
+        if b.sweep.max_outstanding == 0 {
+            return Err(invalid(
+                "backfill.sweep.max_outstanding",
+                "must be positive",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1902,6 +2135,20 @@ gap_threshold = "300s"
         assert!(c.validate().unwrap().is_empty());
         c.storage.database_url = "postgres://farsight:farsight@postgres:5432/farsight".into();
         assert_eq!(c.validate().unwrap(), [DEFAULT_DB_PASSWORD_WARNING]);
+        // A syntax error names its line and never quotes it.
+        let broken = "[storage]\ndatabase_url = \"postgres://farsight:s3cret@db/f\n";
+        let e = load_from_parts(Some(broken), &[]).unwrap_err().to_string();
+        assert!(e.contains("line 2"), "{e}");
+        assert!(!e.contains("s3cret"), "{e}");
+        // Pools larger than Postgres takes by default are named.
+        let mut wide = complete();
+        assert_eq!(wide.database_connections(), 89);
+        wide.backfill.concurrency = 64;
+        let w = wide.validate().unwrap();
+        assert!(
+            w.len() == 1 && w[0].contains("121 database connections"),
+            "{w:?}"
+        );
         // Another user, or no password in the URL: nothing to say.
         c.storage.database_url = "postgres://other:farsight@postgres:5432/farsight".into();
         assert!(c.validate().unwrap().is_empty());
@@ -1986,6 +2233,45 @@ gap_threshold = "300s"
             }),
         ];
         for (key, edit) in refused {
+            let mut c = complete();
+            edit(&mut c);
+            let e = c.validate().unwrap_err().to_string();
+            assert!(e.contains(key), "{key}: {e}");
+        }
+        let bounds: [(&str, Edit); 9] = [
+            // Days behind and still "complete".
+            ("firehose.tuning.synthetic_gap_lag", |c| {
+                c.firehose.tuning.synthetic_gap_lag = ConfigDuration::days(3650)
+            }),
+            ("firehose.tuning.synthetic_gap_lag", |c| {
+                c.firehose.tuning.synthetic_gap_lag = ConfigDuration::secs(0)
+            }),
+            // Every session ended at once.
+            ("firehose.tuning.stall_timeout", |c| {
+                c.firehose.tuning.stall_timeout = ConfigDuration::secs(0)
+            }),
+            // No cycle enumerates.
+            ("backfill.sweep.max_outstanding", |c| {
+                c.backfill.sweep.max_outstanding = 0
+            }),
+            // Past what a time can be moved by.
+            ("storage.tombstone_ttl", |c| {
+                c.storage.tombstone_ttl = ConfigDuration::secs(u64::MAX / 2)
+            }),
+            ("backfill.terminal_after", |c| {
+                c.backfill.terminal_after = ConfigDuration::secs(u64::MAX / 2)
+            }),
+            ("backfill.retry_schedule", |c| {
+                c.backfill.retry_schedule = vec![ConfigDuration::secs(u64::MAX / 2)]
+            }),
+            ("rate_limit.query_timeout", |c| {
+                c.rate_limit.query_timeout = ConfigDuration::secs(0)
+            }),
+            ("rate_limit.query_concurrency", |c| {
+                c.rate_limit.query_concurrency = 0
+            }),
+        ];
+        for (key, edit) in bounds {
             let mut c = complete();
             edit(&mut c);
             let e = c.validate().unwrap_err().to_string();

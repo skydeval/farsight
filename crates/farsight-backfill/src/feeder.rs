@@ -12,7 +12,7 @@
 //! re-fed at once).
 
 use farsight_storage::codes::sql::{
-    JOB_LIST_FETCH, JOB_REPO, REPO_FAILED, TRACK_SERVED, TRACK_UNFETCHED,
+    DEBT_UNREACHABLE, JOB_LIST_FETCH, JOB_REPO, REPO_FAILED, TRACK_SERVED, TRACK_UNFETCHED,
 };
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ use farsight_storage::keys::{self, CapKind, HostFacts, Limits};
 use farsight_storage::queue::{self, Enqueued, JobKind};
 use farsight_storage::txn::Gates;
 
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, DebtCursor};
 
 /// Debts examined per pass.
 const PASS: i64 = 2000;
@@ -154,6 +154,7 @@ struct Row {
     reason: i16,
     cap_type: Option<i16>,
     since_witness: DateTime<Utc>,
+    created_at: DateTime<Utc>,
     admission_key: Option<String>,
     resolve_failures: i32,
     resolved: bool,
@@ -177,9 +178,17 @@ pub async fn pass(ctx: &Ctx) -> Result<u64, farsight_storage::StorageError> {
     let now: DateTime<Utc> = crate::jobs::db_now(pool).await?;
     let cap = Some(limits.system_queue_cap);
     // Actors with a debt, not running and without a waiting repo entry,
-    // oldest debt first.
+    // oldest debt first, from where the pass before stopped. Each pass
+    // examines the next [`PASS`] debts and the one after the last debt
+    // starts over, so debts that cannot be fed now (a host that stays
+    // down, a cap that stays closed) are passed by and every other debt
+    // is reached, however many of them there are. A failed run that
+    // waits for its next attempt is left out by the query itself.
+    let start = *ctx.feeder_cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let (after_at, after_actor, after_reason) =
+        start.unwrap_or((DateTime::<Utc>::UNIX_EPOCH, i64::MIN, i16::MIN));
     let rows: Vec<Row> = sqlx::query_as(
-            &format!("SELECT d.actor_id, a.did, d.reason, d.cap_type, d.since_witness,
+            &format!("SELECT d.actor_id, a.did, d.reason, d.cap_type, d.since_witness, d.created_at,
                     a.admission_key, a.resolve_failures, a.pds_host_id IS NOT NULL AS resolved,
                     h.cap_key, h.ip_bucket, COALESCE(h.large, false) AS large,
                     a.authored_blocks, a.authored_listblocks, a.authored_lists, a.fetch_triggers,
@@ -190,11 +199,25 @@ pub async fn pass(ctx: &Ctx) -> Result<u64, farsight_storage::StorageError> {
              LEFT JOIN backfill_state b ON b.actor_id = d.actor_id
              WHERE NOT EXISTS (SELECT 1 FROM backfill_queue q WHERE q.actor_id = d.actor_id AND q.kind = {JOB_REPO})
                AND NOT EXISTS (SELECT 1 FROM job_leases j WHERE j.did = a.did AND j.lease_until > now())
-             ORDER BY d.created_at LIMIT $1"),
+               AND NOT (d.reason = {DEBT_UNREACHABLE} AND b.state = {REPO_FAILED}
+                        AND b.next_attempt_at > now())
+               AND (d.created_at, d.actor_id, d.reason) > ($2, $3, $4)
+             ORDER BY d.created_at, d.actor_id, d.reason LIMIT $1"),
         )
         .bind(PASS)
+        .bind(after_at)
+        .bind(after_actor)
+        .bind(after_reason)
         .fetch_all(pool)
         .await?;
+    // The next pass goes on after the last debt examined here; a pass
+    // that reached the end starts the next one at the oldest debt.
+    let mut next = next_cursor(
+        rows.len(),
+        rows.last()
+            .map(|r| (r.created_at, r.actor_id.get(), r.reason)),
+    );
+    let mut full = false;
     let mut fed = 0u64;
     let mut done: std::collections::HashSet<ActorId> = std::collections::HashSet::new();
     let today = now.date_naive();
@@ -271,12 +294,29 @@ pub async fn pass(ctx: &Ctx) -> Result<u64, farsight_storage::StorageError> {
                 done.insert(actor);
             }
             // The system queue is full: the debts stay (counted) and are
-            // fed as capacity frees.
-            Enqueued::CapReached => return Ok(fed),
+            // fed as capacity frees. The next pass starts where this one
+            // did, since the debts after this one were not examined.
+            Enqueued::CapReached => {
+                full = true;
+                break;
+            }
         }
     }
+    if full {
+        next = start;
+    }
+    *ctx.feeder_cursor.lock().unwrap_or_else(|e| e.into_inner()) = next;
+    // List fetches wait in their own entries: a full queue of re-lists
+    // does not hold them back.
     fed += feed_list_fetches(ctx, &limits).await?;
     Ok(fed)
+}
+
+/// Where the pass after one that read `read` debts, the last of them at
+/// `last`, starts: after `last`, or at the oldest debt again (`None`)
+/// once a pass came back short of [`PASS`].
+pub fn next_cursor(read: usize, last: Option<DebtCursor>) -> Option<DebtCursor> {
+    if (read as i64) < PASS { None } else { last }
 }
 
 /// What [`recover`] found.
@@ -415,6 +455,14 @@ mod tests {
             last_point: None,
             next_attempt: None,
         }
+    }
+
+    #[test]
+    fn a_full_pass_goes_on_after_its_last_debt_and_a_short_one_starts_over() {
+        let last = Some((t("2026-10-01T10:00:00Z"), 7, 2));
+        assert_eq!(next_cursor(PASS as usize, last), last);
+        assert_eq!(next_cursor(PASS as usize - 1, last), None);
+        assert_eq!(next_cursor(0, None), None);
     }
 
     const NOW: &str = "2026-10-01T12:00:00Z";

@@ -270,17 +270,29 @@ impl IngestHandle {
         }
     }
 
-    /// Stops reading, lets the writer drain, waits for both tasks and
-    /// flushes the approximate counters one last time.
-    pub async fn shutdown(self) {
-        let _ = self.control.send(Control::Shutdown).await;
-        for t in self.tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(30), t).await;
+    /// Stops reading, lets the writer drain, waits for the tasks and
+    /// flushes the approximate counters one last time. `within` bounds
+    /// the whole wait: a task still running then is aborted (a batch in
+    /// flight rolls back and its cursor with it), and the flush gets what
+    /// is left, at least one second.
+    pub async fn shutdown(self, within: Duration) {
+        let deadline = tokio::time::Instant::now() + within;
+        let _ = tokio::time::timeout_at(deadline, self.control.send(Control::Shutdown)).await;
+        for mut t in self.tasks {
+            if tokio::time::timeout_at(deadline, &mut t).await.is_err() {
+                tracing::warn!("an ingest task did not stop in time; aborting it");
+                t.abort();
+            }
         }
         self.flusher.abort();
         self.gauges.abort();
-        if let Err(e) = self.counters.flush(&self.pool, &self.limits).await {
-            tracing::warn!(error = %e, "final counter flush failed");
+        let left = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .max(Duration::from_secs(1));
+        match tokio::time::timeout(left, self.counters.flush(&self.pool, &self.limits)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "final counter flush failed"),
+            Err(_) => tracing::warn!("final counter flush did not finish in time"),
         }
     }
 }
@@ -307,6 +319,14 @@ impl Ingest {
         #[cfg(feature = "harness")]
         let faults = Arc::new(FaultHook::default());
 
+        // No session is connected yet, whatever the process before left
+        // on record: one that was killed never cleared the flag, and
+        // answers would say `firehoseConnected: true` for an instance
+        // that is reading nothing.
+        farsight_storage::firehose::set_connected(&pool, false)
+            .await
+            .map_err(|e| e.to_string())?;
+
         // A seam window still open belongs to a session that did not live
         // to close it: it ends where the stream got to.
         let state = farsight_storage::firehose::read_state(&pool)
@@ -326,6 +346,7 @@ impl Ingest {
             pool: pool.clone(),
             tx: tx.clone(),
             stall_timeout: cfg.reader.stall_timeout,
+            gap_threshold: cfg.reader.tuning.gap_threshold,
             plain: plain.clone(),
             #[cfg(feature = "harness")]
             tap: cfg.tap.clone(),

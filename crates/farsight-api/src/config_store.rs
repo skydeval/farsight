@@ -63,14 +63,34 @@ fn reads_rank(m: config::ReadsMode) -> u8 {
     }
 }
 
+/// The public-UI switches that show more, or to more readers, when on.
+const PUBLIC_UI_WIDENING: [&str; 6] = [
+    "public_ui.show_outgoing_blocks",
+    "public_ui.show_top_blockers",
+    "public_ui.show_top_blocked",
+    "public_ui.crawlable",
+    "public_ui.show_avatars",
+    "public_ui.avatar_thumbnails",
+];
+
 /// The dotted keys by which `new` differs from `old` in a way the admin
 /// UI treats as sensitive (it asks for a fresh sign-in before storing
-/// them): every `auth.*` and `net.*` key, `backfill.plc_url`,
-/// `backfill.relay_url`, and an `access.*` key that lets more callers in
-/// (`reads` towards `public`, `cors` or `public_ui` switched on). With
-/// these a session could outlive its own end: a token it knows, a
-/// directory or relay it runs, a host the outbound client may newly
-/// reach, or data served to people who could not read it before.
+/// them):
+///
+/// - every `auth.*`, `net.*`, `proxy.*` and `metrics.*` key;
+/// - `storage.database_url`, `server.hostname`, `firehose.urls`,
+///   `backfill.plc_url`, `backfill.relay_url`, `backfill.backlinks.url`
+///   and `public_ui.record_viewer_url`;
+/// - an `access.*` key that lets more callers in (`reads` towards
+///   `public`, `cors` or `public_ui` switched on);
+/// - a public-UI switch that shows more ([`PUBLIC_UI_WIDENING`]) turned
+///   on, and an account taken off `public_ui.excluded_dids`.
+///
+/// With these a session could outlive its own end: a token it knows, a
+/// database, directory, relay, firehose or backlink source it runs, a
+/// proxy header it can forge, a host the outbound client may newly
+/// reach, links on public pages to a site of its choosing, or data
+/// served to people who could not read it before.
 pub fn sensitive_changes(old: &config::Config, new: &config::Config) -> Vec<String> {
     let flat = |c: &config::Config| {
         toml::Value::try_from(c)
@@ -83,12 +103,36 @@ pub fn sensitive_changes(old: &config::Config, new: &config::Config) -> Vec<Stri
         .chain(n.keys())
         .filter(|k| o.get(*k) != n.get(*k))
         .filter(|k| {
-            k.starts_with("auth.")
-                || k.starts_with("net.")
-                || matches!(k.as_str(), "backfill.plc_url" | "backfill.relay_url")
+            ["auth.", "net.", "proxy.", "metrics."]
+                .iter()
+                .any(|p| k.starts_with(p))
+                || matches!(
+                    k.as_str(),
+                    "storage.database_url"
+                        | "server.hostname"
+                        | "firehose.urls"
+                        | "backfill.plc_url"
+                        | "backfill.relay_url"
+                        | "backfill.backlinks.url"
+                        | "public_ui.record_viewer_url"
+                )
         })
         .cloned()
         .collect();
+    for key in PUBLIC_UI_WIDENING {
+        let on = |m: &BTreeMap<String, String>| m.get(key).is_some_and(|v| v == "true");
+        if on(&n) && !on(&o) {
+            out.insert(key.to_owned());
+        }
+    }
+    if old
+        .public_ui
+        .excluded_dids
+        .iter()
+        .any(|d| !new.public_ui.excluded_dids.contains(d))
+    {
+        out.insert("public_ui.excluded_dids".into());
+    }
     if reads_rank(new.access.reads) > reads_rank(old.access.reads) {
         out.insert("access.reads".into());
     }
@@ -392,11 +436,84 @@ mod tests {
             with(&|c| c.net.allow_http_hosts = vec!["198.51.100.1".into()]),
             ["net.allow_http_hosts"]
         );
+        // What else outlives a session.
+        assert_eq!(
+            with(&|c| c.storage.database_url = "postgres://x@db.evil.example/f".into()),
+            ["storage.database_url"]
+        );
+        assert_eq!(
+            with(&|c| c.server.hostname = "evil.example".into()),
+            ["server.hostname"]
+        );
+        assert_eq!(
+            with(&|c| c.firehose.urls = vec!["wss://jet.evil.example".into()]),
+            ["firehose.urls"]
+        );
+        assert_eq!(
+            with(&|c| c.backfill.backlinks.url = "https://links.evil.example".into()),
+            ["backfill.backlinks.url"]
+        );
+        assert_eq!(
+            with(&|c| c.metrics.bearer_token_sha256 = "cd".repeat(32)),
+            ["metrics.bearer_token_sha256"]
+        );
+        assert_eq!(
+            with(&|c| c.metrics.bind = "0.0.0.0:9090".into()),
+            ["metrics.bind"]
+        );
+        assert_eq!(
+            with(&|c| c.proxy.trusted = vec!["203.0.113.0/24".parse().unwrap()]),
+            ["proxy.trusted"]
+        );
+        assert_eq!(
+            with(&|c| c.public_ui.record_viewer_url = "https://v.evil.example/{rkey}".into()),
+            ["public_ui.record_viewer_url"]
+        );
         // Everything else is an ordinary change.
         assert!(with(&|c| c.server.contact = "mailto:x@example.com".into()).is_empty());
         assert!(with(&|c| c.backfill.plc_rps += 1).is_empty());
-        assert!(with(&|c| c.public_ui.crawlable = !c.public_ui.crawlable).is_empty());
+        assert!(with(&|c| c.public_ui.instance_description = "x".into()).is_empty());
         assert!(with(&|c| c.rate_limit.anon_rps += 1).is_empty());
+        // The public UI: only what shows more.
+        let mut shut = base.clone();
+        for f in [
+            |c: &mut Config| c.public_ui.show_outgoing_blocks = false,
+            |c: &mut Config| c.public_ui.show_top_blockers = false,
+            |c: &mut Config| c.public_ui.show_top_blocked = false,
+            |c: &mut Config| c.public_ui.crawlable = false,
+            |c: &mut Config| c.public_ui.show_avatars = false,
+            |c: &mut Config| c.public_ui.avatar_thumbnails = false,
+        ] {
+            f(&mut shut);
+        }
+        shut.public_ui.excluded_dids = vec!["did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into()];
+        let mut shown = shut.clone();
+        shown.public_ui.show_outgoing_blocks = true;
+        shown.public_ui.show_top_blockers = true;
+        shown.public_ui.show_top_blocked = true;
+        shown.public_ui.crawlable = true;
+        shown.public_ui.show_avatars = true;
+        shown.public_ui.avatar_thumbnails = true;
+        shown.public_ui.excluded_dids.clear();
+        assert_eq!(
+            sensitive_changes(&shut, &shown),
+            [
+                "public_ui.avatar_thumbnails",
+                "public_ui.crawlable",
+                "public_ui.excluded_dids",
+                "public_ui.show_avatars",
+                "public_ui.show_outgoing_blocks",
+                "public_ui.show_top_blocked",
+                "public_ui.show_top_blockers",
+            ]
+        );
+        assert!(sensitive_changes(&shown, &shut).is_empty());
+        // Withholding one more account is not a widening.
+        let mut more = shut.clone();
+        more.public_ui
+            .excluded_dids
+            .push("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into());
+        assert!(sensitive_changes(&shut, &more).is_empty());
         // Access: only the direction that lets more callers in.
         let mut closed = base.clone();
         closed.access.reads = ReadsMode::Disabled;

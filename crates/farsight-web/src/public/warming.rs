@@ -26,7 +26,7 @@
 //! shows DIDs. A restart empties the queue and the memory cache; the
 //! stored handles stay.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -125,19 +125,77 @@ pub fn register() {
     ::metrics::gauge!(QUEUE).set(0.0);
 }
 
+/// The lane of requests that name no requester.
+pub const SHARED_LANE: u64 = 0;
+
 #[derive(Debug, Default)]
 struct Inner {
-    // Front = served next.
-    order: VecDeque<String>,
-    set: HashSet<String>,
+    // What each requester waits for. Front = served next.
+    lanes: HashMap<u64, VecDeque<String>>,
+    // The requesters with something waiting, in the order they are
+    // served: the worker takes one DID from the first and moves it to
+    // the back.
+    turn: VecDeque<u64>,
+    // Every waiting DID, with the lane it waits in.
+    set: HashMap<String, u64>,
     // Taken by the worker and not finished: asking for one of these again
     // would verify it twice.
     taken: HashSet<String>,
 }
 
-/// The warming queue: the DIDs whose handles pages have asked for, most
-/// recently asked first, at most [`QUEUE_CAP`]. A DID is in it once; one
-/// the worker has taken is not queued again until it is finished.
+impl Inner {
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Drops the DID that waits longest in the longest lane.
+    fn drop_one(&mut self) -> bool {
+        let Some(lane) = self
+            .lanes
+            .iter()
+            .max_by_key(|(k, q)| (q.len(), **k))
+            .map(|(k, _)| *k)
+        else {
+            return false;
+        };
+        let Some(q) = self.lanes.get_mut(&lane) else {
+            return false;
+        };
+        let Some(old) = q.pop_back() else {
+            return false;
+        };
+        self.set.remove(&old);
+        if q.is_empty() {
+            self.lanes.remove(&lane);
+            self.turn.retain(|l| *l != lane);
+        }
+        true
+    }
+
+    /// Puts `did` at the front of `lane`; `ahead` also moves the lane to
+    /// the front of the turn order.
+    fn front(&mut self, lane: u64, did: String, ahead: bool) {
+        let q = self.lanes.entry(lane).or_default();
+        let fresh = q.is_empty();
+        q.push_front(did.clone());
+        self.set.insert(did, lane);
+        if ahead {
+            self.turn.retain(|l| *l != lane);
+            self.turn.push_front(lane);
+        } else if fresh {
+            self.turn.push_back(lane);
+        }
+    }
+}
+
+/// The warming queue: the DIDs whose handles pages have asked for, at
+/// most [`QUEUE_CAP`]. Each requester (a client address) has a lane of
+/// its own, most recently asked first, and the worker serves the lanes
+/// in turn, one DID each: a client that asks for hundreds of accounts a
+/// second gets its turn like every other and no more, so the rows other
+/// visitors wait for are checked at the pace their number allows. A DID
+/// is in the queue once; one the worker has taken is not queued again
+/// until it is finished.
 #[derive(Debug, Default)]
 pub struct WarmQueue {
     inner: Mutex<Inner>,
@@ -145,10 +203,16 @@ pub struct WarmQueue {
 }
 
 impl WarmQueue {
-    /// Queues the DIDs one page asked for, in the page's row order, ahead
-    /// of everything already waiting. Returns how many entries a full
-    /// queue dropped.
+    /// [`WarmQueue::push_page_for`] in the lane of no requester.
     pub fn push_page(&self, dids: Vec<String>) -> usize {
+        self.push_page_for(SHARED_LANE, dids)
+    }
+
+    /// Queues the DIDs one page asked for on behalf of `requester`, in
+    /// the page's row order, ahead of everything that requester already
+    /// waits for. A DID another requester waits for stays where it is.
+    /// Returns how many entries a full queue dropped.
+    pub fn push_page_for(&self, requester: u64, dids: Vec<String>) -> usize {
         if dids.is_empty() {
             return 0;
         }
@@ -159,22 +223,26 @@ impl WarmQueue {
             if inner.taken.contains(&did) {
                 continue;
             }
-            if !inner.set.insert(did.clone()) {
-                // Asked for again: it moves to the front.
-                if let Some(i) = inner.order.iter().position(|d| *d == did) {
-                    inner.order.remove(i);
+            match inner.set.get(&did).copied() {
+                // Asked for again by the same requester: it moves to the
+                // front of its lane.
+                Some(lane) if lane == requester => {
+                    if let Some(q) = inner.lanes.get_mut(&lane)
+                        && let Some(i) = q.iter().position(|d| *d == did)
+                    {
+                        q.remove(i);
+                    }
                 }
+                Some(_) => continue,
+                None => {}
             }
-            inner.order.push_front(did);
+            inner.front(requester, did, false);
         }
         let mut dropped = 0;
-        while inner.order.len() > QUEUE_CAP {
-            if let Some(old) = inner.order.pop_back() {
-                inner.set.remove(&old);
-                dropped += 1;
-            }
+        while inner.len() > QUEUE_CAP && inner.drop_one() {
+            dropped += 1;
         }
-        let len = inner.order.len();
+        let len = inner.len();
         drop(g);
         ::metrics::gauge!(QUEUE).set(len as f64);
         if dropped > 0 {
@@ -184,14 +252,31 @@ impl WarmQueue {
         dropped
     }
 
-    /// Takes the DID to serve next. Until [`WarmQueue::finished`] is
-    /// called for it, asking for it again queues nothing.
+    /// Takes the DID to serve next: the first of the lane whose turn it
+    /// is. Until [`WarmQueue::finished`] is called for it, asking for it
+    /// again queues nothing.
     pub fn pop(&self) -> Option<String> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let did = g.order.pop_front()?;
-        g.set.remove(&did);
-        g.taken.insert(did.clone());
-        let len = g.order.len();
+        let inner = &mut *g;
+        let did = loop {
+            let lane = inner.turn.pop_front()?;
+            let Some(q) = inner.lanes.get_mut(&lane) else {
+                continue;
+            };
+            let Some(did) = q.pop_front() else {
+                inner.lanes.remove(&lane);
+                continue;
+            };
+            if q.is_empty() {
+                inner.lanes.remove(&lane);
+            } else {
+                inner.turn.push_back(lane);
+            }
+            break did;
+        };
+        inner.set.remove(&did);
+        inner.taken.insert(did.clone());
+        let len = inner.len();
         drop(g);
         ::metrics::gauge!(QUEUE).set(len as f64);
         Some(did)
@@ -204,14 +289,15 @@ impl WarmQueue {
         g.taken.remove(did);
     }
 
-    /// Puts a DID the worker could not serve yet back at the front.
+    /// Puts a DID the worker could not serve yet back, to be served
+    /// next.
     fn put_back(&self, did: String) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.taken.remove(&did);
-        if g.set.insert(did.clone()) {
-            g.order.push_front(did);
+        if !g.set.contains_key(&did) {
+            g.front(SHARED_LANE, did, true);
         }
-        let len = g.order.len();
+        let len = g.len();
         drop(g);
         ::metrics::gauge!(QUEUE).set(len as f64);
     }
@@ -220,7 +306,8 @@ impl WarmQueue {
     /// not affected.
     pub fn clear(&self) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.order.clear();
+        g.lanes.clear();
+        g.turn.clear();
         g.set.clear();
         drop(g);
         ::metrics::gauge!(QUEUE).set(0.0);
@@ -228,17 +315,21 @@ impl WarmQueue {
 
     /// DIDs waiting, not counting those the worker has taken.
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .order
-            .len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Nothing waiting.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// The lane of a client address: its hash, never [`SHARED_LANE`].
+pub fn lane_of(addr: std::net::IpAddr) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    addr.hash(&mut h);
+    h.finish().max(1)
 }
 
 /// Whether a row showing `did` asks the worker for it: the cache has no
@@ -267,6 +358,7 @@ pub enum Known {
 pub struct Asked {
     enabled: bool,
     dids: Vec<String>,
+    requester: u64,
 }
 
 impl Asked {
@@ -275,7 +367,15 @@ impl Asked {
         Asked {
             enabled: cfg.public_ui.handle_warming_enabled,
             dids: Vec::new(),
+            requester: SHARED_LANE,
         }
+    }
+
+    /// The same collector for a render asked for from `addr`: what it
+    /// asks the worker for waits in that client's own lane.
+    pub fn from_client(mut self, addr: std::net::IpAddr) -> Asked {
+        self.requester = lane_of(addr);
+        self
     }
 
     /// The cached handle of an account a cell shows, if there is one.
@@ -311,7 +411,7 @@ impl Asked {
 
     /// Hands what the render asked for to the queue.
     pub fn submit(self, st: &WebState) {
-        st.public.warm.push_page(self.dids);
+        st.public.warm.push_page_for(self.requester, self.dids);
     }
 }
 
@@ -481,6 +581,46 @@ mod tests {
         q.push_page(page("x", 3));
         q.clear();
         assert!(q.is_empty() && q.pop().is_none());
+    }
+
+    #[test]
+    fn requesters_are_served_in_turn_however_much_one_of_them_asks_for() {
+        let q = WarmQueue::default();
+        // One client walks a large account's pages.
+        for n in 0..20 {
+            q.push_page_for(7, page(&format!("big{n}x"), 50));
+        }
+        // Two visitors each open one page.
+        q.push_page_for(8, page("v", 3));
+        q.push_page_for(9, page("w", 2));
+        let served: Vec<String> = (0..9).filter_map(|_| q.pop()).collect();
+        let of = |p: &str| served.iter().filter(|d| d.starts_with(p)).count();
+        // Each visitor's rows are all served within the first nine
+        // checks; the walker got its turns in between, not all of them.
+        assert_eq!(of("did:plc:v"), 3, "{served:?}");
+        assert_eq!(of("did:plc:w"), 2, "{served:?}");
+        assert_eq!(of("did:plc:big"), 4, "{served:?}");
+        // A DID another requester already waits for is not queued twice
+        // and keeps its place.
+        let before = q.len();
+        q.push_page_for(8, vec!["did:plc:big19x49".into()]);
+        assert_eq!(q.len(), before);
+        // What is put back is served next, whoever asked for it.
+        let next = q.pop().unwrap();
+        q.put_back(next.clone());
+        assert_eq!(q.pop(), Some(next));
+        assert_ne!(lane_of("0.0.0.0".parse().unwrap()), SHARED_LANE);
+    }
+
+    #[test]
+    fn a_full_queue_drops_from_the_requester_that_waits_for_the_most() {
+        let q = WarmQueue::default();
+        q.push_page_for(8, page("mine", 10));
+        let dropped = q.push_page_for(7, page("flood", QUEUE_CAP));
+        assert_eq!(dropped, 10);
+        assert_eq!(q.len(), QUEUE_CAP);
+        let left: HashSet<String> = std::iter::from_fn(|| q.pop()).collect();
+        assert!((0..10).all(|i| left.contains(&format!("did:plc:mine{i}"))));
     }
 
     #[test]

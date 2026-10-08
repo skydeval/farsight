@@ -809,7 +809,7 @@ async fn top_groups(
     dids.dedup();
     recall(r.st, cfg, &dids).await;
     let shown = Shown::load(r, &withheld, dids, false).await?;
-    let mut asked = Asked::new(cfg);
+    let mut asked = Asked::new(cfg).from_client(r.addr);
     let mut held = 0;
     let mut table = |kind: Kind| -> Option<TopTable> {
         let (_, list) = stored.iter().find(|(k, _)| *k == kind)?;
@@ -1161,7 +1161,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     dids.extend(ol_rows.iter().map(|l| l.owner_did.clone()));
     recall(r.st, cfg, &dids).await;
     let shown = Shown::load(r, &withheld, dids, taken_down).await?;
-    let mut asked = Asked::new(cfg);
+    let mut asked = Asked::new(cfg).from_client(r.addr);
     let pager = |section, label, key, number, total, more| {
         Pager::new(
             section,
@@ -1577,7 +1577,7 @@ pub async fn list(
     dids.extend(blocker_page.rows.iter().map(|b| b.did.clone()));
     recall(r.st, cfg, &dids).await;
     let shown = Shown::load(r, &withheld, dids, taken_down).await?;
-    let mut asked = Asked::new(cfg);
+    let mut asked = Asked::new(cfg).from_client(r.addr);
     let pager = |section, label, key, number, total, more| {
         Pager::new(
             section,

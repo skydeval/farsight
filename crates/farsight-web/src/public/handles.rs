@@ -44,7 +44,7 @@ use farsight_core::{Did, DidMethod};
 use farsight_storage::handles::Cached;
 
 use super::metrics as m;
-use crate::pages::{WebState, handle_to_did};
+use crate::pages::WebState;
 
 /// How long a page waits for its handle before rendering the DID alone.
 pub const RESOLVE_WAIT: Duration = Duration::from_secs(2);
@@ -152,11 +152,14 @@ pub enum Verified {
 }
 
 /// Classifies what was read: the document (or why there is none) and,
-/// if it names a handle, what that handle resolved to.
+/// if it names a handle, what that handle resolved to. `answered` says
+/// that a failed resolution is the handle's own domain saying it names
+/// no account (see `handle_to_did_answered`).
 pub(crate) fn classify(
     did: &Did,
     claim: Option<String>,
     back: Option<Result<Did, crate::pages::HandleError>>,
+    answered: bool,
 ) -> (Outcome, Verified) {
     let Some(claim) = claim else {
         return (Outcome::Failed, Verified::Gone);
@@ -165,6 +168,8 @@ pub(crate) fn classify(
         Some(Ok(b)) if b == *did => (Outcome::Resolved, Verified::Handle(claim)),
         // The handle is someone else's now.
         Some(Ok(_)) => (Outcome::Unverified, Verified::Gone),
+        // The domain withdrew it: it names no account any more.
+        Some(Err(_)) if answered => (Outcome::Unverified, Verified::Gone),
         _ => (Outcome::Unverified, Verified::Unresolved(claim)),
     }
 }
@@ -184,11 +189,14 @@ pub(crate) async fn verify(safe: &SafeClient, cfg: &Config, did: &Did) -> (Outco
         _ => return (Outcome::Failed, Verified::Unknown),
     };
     let claim = claimed_handle(&doc);
-    let back = match &claim {
-        Some(handle) => Some(handle_to_did(safe, handle).await),
-        None => None,
+    let (back, answered) = match &claim {
+        Some(handle) => {
+            let (back, answered) = crate::pages::handle_to_did_answered(safe, handle).await;
+            (Some(back), answered)
+        }
+        None => (None, false),
     };
-    classify(did, claim, back)
+    classify(did, claim, back, answered)
 }
 
 /// Whether an answer checked at `resolved_at` is older than `after`.
@@ -268,8 +276,9 @@ pub(crate) async fn cached(st: &WebState, cfg: &Config, did: &Did) -> Option<Cac
 /// - [`Verified::Gone`] removes whatever was shown: memory and table say
 ///   "nothing to show" from now on.
 /// - [`Verified::Unresolved`] keeps a shown handle only if it is the one
-///   the document still names (its host may only be unreachable); any
-///   other shown handle is removed like a gone one.
+///   the document still names (its host may only be unreachable) and it
+///   was verified within the last two weeks; any other shown handle is
+///   removed like a gone one.
 /// - [`Verified::Unknown`] is remembered in memory for [`NEGATIVE_TTL`]:
 ///   as the handle shown until now if there is one, as "nothing to show"
 ///   otherwise — and then in the table too, so that the account's rows
@@ -395,28 +404,46 @@ mod tests {
         let other = Did::parse("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let claim = || Some("alice.example".to_owned());
         assert_eq!(
-            classify(&me, claim(), Some(Ok(me.clone()))),
+            classify(&me, claim(), Some(Ok(me.clone())), true),
             (Outcome::Resolved, Verified::Handle("alice.example".into()))
         );
         // Someone else holds the name now: certain, not a failure to
         // reach a host.
         assert_eq!(
-            classify(&me, claim(), Some(Ok(other))),
+            classify(&me, claim(), Some(Ok(other)), true),
             (Outcome::Unverified, Verified::Gone)
         );
         // The document names no handle at all.
-        assert_eq!(classify(&me, None, None), (Outcome::Failed, Verified::Gone));
+        assert_eq!(
+            classify(&me, None, None, false),
+            (Outcome::Failed, Verified::Gone)
+        );
         // The handle's host did not say: the claim stands unproven.
         assert_eq!(
             classify(
                 &me,
                 claim(),
-                Some(Err(HandleError::NotADid("alice.example".into())))
+                Some(Err(HandleError::NotADid("alice.example".into()))),
+                false
             ),
             (
                 Outcome::Unverified,
                 Verified::Unresolved("alice.example".into())
             )
+        );
+        // The domain itself answered that it names no account: the
+        // handle was withdrawn, and is not kept on the account's rows.
+        assert_eq!(
+            classify(
+                &me,
+                claim(),
+                Some(Err(HandleError::Http {
+                    handle: "alice.example".into(),
+                    status: 404
+                })),
+                true
+            ),
+            (Outcome::Unverified, Verified::Gone)
         );
     }
 

@@ -204,11 +204,39 @@ For a DID `D`:
      (2,000,000, about 40 MB) the listing goes on to the end without
      it and without starting again, the reconcile is skipped for that
      collection and `D` gets an `unreachable` debt, which stays until
-     a clean listing succeeds.
+     a clean listing succeeds. The set is in memory and ends with the
+     attempt, so each cursor row records whether an attempt that
+     resumes from it could still reconcile (`unreconciled`). An
+     attempt that takes up a listing that was out of order, or past
+     the cap, lists on without reconcile and raises the same debt; so
+     does a later attempt that finds the collection already finished.
 10. **Finish** with one of the outcomes below.
 
 Bounds on every outbound request: a 30 second timeout, a 2 MB response
-cap, no redirects followed.
+cap, no redirects followed. A redirect is the answer the job gets (an
+HTTP 3xx, which fails the request): a request is counted against the
+limits of the host it was made to, and never leaves that host.
+
+An answer is used only if it has the shape the method promises. A
+`describeRepo` without a `collections` list, a `getRecord` without a
+`value`, a `cursor` that is not a string, a repository entry without
+a `did` and an export line that is not an operation are decode
+errors: the request failed. None of them is read as "nothing there",
+which would remove stored rows or end a listing early.
+
+A listing removes stored rows only on the word of a host the directory
+named in this attempt. A host out of a cache (up to an hour in memory,
+up to seven days in the database) may be one the account has left. A
+page from such a host may add and update rows. If a reconcile of it
+would remove a row, nothing is written, the host is looked up again
+in the directory, and the attempt lists the host that names. A list
+fetch run whose owner holds stored items looks the host up before it
+starts.
+
+Records are taken from `listRecords` as the host gives them. Farsight
+does not fetch the repository's commit or verify its Merkle tree, so
+a host can list records its repository does not hold. It can only do
+so for its own accounts, which it could also have written for real.
 
 Bounds on a job, so that no host can keep a worker:
 
@@ -217,7 +245,21 @@ Bounds on a job, so that no host can keep a worker:
 | Time of one attempt | `backfill.repo_job_max_duration` (1 hour) | the attempt **yields** |
 | Pages of one attempt, over all collections | 25,000 | the attempt **yields** |
 | A `listRecords` cursor the listing has already followed | none allowed | the job **fails** |
+| Mean time the host takes to answer a `listRecords` page | 10 seconds, judged from the fifth page of a collection on | the job **fails** |
 | Attempts of one run that yielded, in a row | 10 | the job **fails** |
+
+Three more rules keep slow hosts from holding the workers. A queue
+entry, a sweep member and a list item are not started while their
+account's host takes no request: it is cooling down, at its request
+limit, or under a domain at its limit. They wait where they are and
+the worker goes to other work. A host that answers validly but takes
+longer than 10 seconds a page ends the attempt as failed, with what
+it listed stored and its cursor kept; the job is retried on
+`backfill.retry_schedule` and goes on from there. Only the time spent
+waiting for the host counts, not the time a request waited for a slot
+under Farsight's own limits. And a job is charged to its requester
+one unit per request and one per second it waited for answers, so a
+job on a slow host is not the cheapest one to give the next turn to.
 
 A cursor is remembered by its hash for the length of a listing, so a
 cursor that repeats and a cycle of cursors of any length are both
@@ -382,6 +424,11 @@ The shares are `backfill.tier_shares` (three percentages that sum to
   source of truth is the debt table and the list state; a feeder, run
   every 10 seconds, enqueues from them as capacity frees and only when
   a re-list can clear the debt. Nothing is refused for queue space.
+  Each pass examines the next 2,000 debts, oldest first, and the pass
+  after the last debt starts over. Debts that cannot be fed now (a
+  host that stays down, a cap that stays closed) are passed by, so
+  every other debt is reached however many of them there are. A failed
+  run that waits for its next attempt is left out by the query.
 - **Collapse rule.** There is one *waiting* entry per `(actor, kind)`;
   the entry of a running job is claimed and apart from it. A new
   request for a DID that already has a waiting one upgrades it: the tier
@@ -545,6 +592,19 @@ member needs no `actors` row.
   entries) while its outstanding rows are fewer than
   `backfill.sweep.max_outstanding` (10,000). A page asks for no more
   than the room left, so the bound holds.
+- A member whose job failed stays outstanding while it is retried, up
+  to `backfill.terminal_after`. Such members must not fill the bound
+  and stop enumeration for that long. When the bound is full and at
+  least half of it is members that wait for their next attempt, up to
+  2,000 of them, the longest-failing first, are settled at once as
+  what they would become: `terminal` in the cycle, with an
+  `unreachable` debt, which coverage counts. Their retries stay
+  queued, and one that succeeds clears the debt.
+- A page of the `plc` source that is too large to read is asked for
+  again at half the size. A full page gives up its last run of
+  operations with one `createdAt`, and the next page starts before
+  that run: the directory returns what was created after the cursor,
+  and a run cut by a page end would otherwise lose its rest.
 - An entry of the page that is not a valid DID is left out and
   logged: it names no repository. A member that is not a valid DID
   all the same is set to `terminal` when it is dispatched, so it does
@@ -759,6 +819,12 @@ that is not a large host and one of its cap buckets is marked full
 for list items, the list fires **GF** and is `deferred`. A bucket is
 marked at 100% of a cap and unmarked below 95%; the server reopens
 the lists waiting on it (see [security.md](security.md#cap-buckets)).
+The budget monitor does that, once a minute: it fires **GO** on up to
+200 lists deferred by a host cap or the lists cap whose owner's
+buckets no longer carry the cap's mark (and, for the lists cap, whose
+owner is under `limits.lists_per_author`), the longest-waiting first.
+A list is not looked at again within an hour of being deferred, so
+one that is deferred again goes behind the others.
 
 **The pass.** Under the list's lock, and only if the list has not
 been re-admitted since the check began: `phase1_epoch = admit_epoch`,
@@ -855,7 +921,11 @@ resolved; see
   A lane is charged the outbound requests of what it served: one
   when the item is dispatched, the rest when it ends. At most 5,000
   waiting items of each kind are considered at a time, the oldest
-  admissions first.
+  admissions first. Items that could not be served now take no place
+  among them: the items of a host that is cooling down or at its
+  limit are left out, and no registrable domain has more than 500
+  items among the 5,000. However many lists one operator has waiting,
+  and however its hosts answer, the lists of others are considered.
 - An item is servable when it is not already running and its owner's
   host has a free slot and is not cooling down. A lane whose head is
   blocked serves its next servable item, or yields its turn.
@@ -965,7 +1035,10 @@ normal way.
   `discovered_witness`, `completed_at`, `truncated`, `refs_found`,
   `source`, `last_error`.
 - **Only an untruncated completion** writes `subject_coverage` for
-  `X`, which lets `freshness` report incoming state as `assisted`.
+  `X`, with the run's own coverage point. `freshness` reads the point
+  from there, so a run that is in flight, failed or truncated never
+  moves it. That row lets `freshness` report incoming state as
+  `assisted`.
 
 For an AppView enrolling a member: without a backlink source,
 `requestBackfill` makes Farsight current on the member's own actions,

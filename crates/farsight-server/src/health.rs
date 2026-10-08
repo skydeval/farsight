@@ -1,7 +1,7 @@
 //! `/health` and `/livez` (see `docs/design/operations.md`).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -39,7 +39,16 @@ pub struct HealthState {
     pub pool: PgPool,
     /// The live configuration (`firehose.tuning.synthetic_gap_lag`).
     pub config: Arc<ConfigStore>,
+    /// The last answer and when it was read. The endpoint is open to
+    /// anyone and not rate limited: however often it is asked, the
+    /// database is asked at most once per [`HEALTH_MEMO`], by one
+    /// request at a time.
+    pub last: Arc<tokio::sync::Mutex<Option<(Instant, StatusCode, serde_json::Value)>>>,
 }
+
+/// How long an answer of `/health` is given again without asking the
+/// database.
+pub const HEALTH_MEMO: Duration = Duration::from_millis(500);
 
 /// Whether the instance is healthy: the database answers, the firehose is
 /// connected, and what was applied is not further behind than
@@ -55,6 +64,14 @@ pub fn healthy(db_ok: bool, connected: bool, lag: Option<f64>, max_lag: Duration
 /// firehose is connected and `applied_through` is at most
 /// `firehose.tuning.synthetic_gap_lag` behind; else 503.
 pub async fn health(State(st): State<HealthState>) -> Response {
+    // Held across the check: requests that arrive meanwhile wait for
+    // this one's answer and do not take connections of their own.
+    let mut last = st.last.lock().await;
+    if let Some((at, status, body)) = last.as_ref()
+        && at.elapsed() < HEALTH_MEMO
+    {
+        return no_store((*status, axum::Json(body.clone())).into_response());
+    }
     let pool = &st.pool;
     let db_ok = tokio::time::timeout(
         Duration::from_secs(1),
@@ -97,6 +114,7 @@ pub async fn health(State(st): State<HealthState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+    *last = Some((Instant::now(), status, body.clone()));
     no_store((status, axum::Json(body)).into_response())
 }
 

@@ -868,6 +868,13 @@ fn parse_list(p: Result<Path<(String, String)>, PathRejection>) -> Result<(Did, 
     ))
 }
 
+/// The longest one public page may take: three statement timeouts
+/// (`rate_limit.query_timeout`), and not under ten seconds. A page that
+/// is not done by then is answered as busy and its work is dropped.
+pub fn page_deadline(query_timeout: Duration) -> Duration {
+    query_timeout.saturating_mul(3).max(Duration::from_secs(10))
+}
+
 /// Runs one public request: gates, the page, the failure page, metrics.
 async fn serve<'a, F, Fut>(
     st: &'a WebState,
@@ -885,9 +892,15 @@ where
         Err((cfg, f)) => fail(&cfg.config, f),
         Ok(req) => {
             let cfg = req.cfg.clone();
-            match f(req).await {
-                Ok(r) => r,
-                Err(f) => fail(&cfg.config, f),
+            // One page is several reads, each with its own timeout: the
+            // page as a whole gets a deadline too, so that a request
+            // made to be slow (a far page, a filter that matches
+            // nothing) gives its render slot back in bounded time.
+            let within = page_deadline(cfg.config.rate_limit.query_timeout.get());
+            match tokio::time::timeout(within, f(req)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(f)) => fail(&cfg.config, f),
+                Err(_) => fail(&cfg.config, Fail::Busy),
             }
         }
     };

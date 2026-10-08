@@ -612,24 +612,42 @@ async fn run(
         Caller::Anonymous => Some(wait(&st.anon_permits).await?),
         _ => None,
     };
-    let _permit = wait(&st.query_permits).await?;
-    match ep {
-        Endpoint::GetIncomingBlocks => handlers::get_incoming_blocks(st, &params).await,
-        Endpoint::GetIncomingListBlocks => handlers::get_incoming_list_blocks(st, &params).await,
-        Endpoint::GetListsNaming => handlers::get_lists_naming(st, &params).await,
-        Endpoint::GetListMembers => handlers::get_list_members(st, &params).await,
-        Endpoint::CheckBlocks => handlers::check_blocks(st, &params).await,
-        Endpoint::GetStats => handlers::get_stats(st, &params).await,
-        Endpoint::GetBackfillStatus => admin::get_backfill_status(st, &params).await,
-        Endpoint::RequestBackfill => admin::request_backfill(st, &caller, &params, body).await,
-        Endpoint::ListErrors => admin::list_errors(st, &params).await,
-        Endpoint::RestartFirehose => admin::restart_firehose(st).await,
-        Endpoint::PauseSweep => admin::pause_sweep(st, body).await,
-        Endpoint::StartRepair => admin::start_repair(st).await,
-        Endpoint::PauseRepair => admin::pause_repair(st, body).await,
-        Endpoint::CancelRepair => admin::cancel_repair(st).await,
-        Endpoint::CreateApiKey => admin::create_api_key(st, body).await,
-        Endpoint::RevokeApiKey => admin::revoke_api_key(st, body).await,
+    let permit = wait(&st.query_permits).await?;
+    // The handler runs in a task of its own, which holds the caller's
+    // slots until it has ended. A client that goes away drops this
+    // request, not the statement it started: the database goes on with
+    // it until its timeout, and for that long the slots stay taken.
+    // Given back at the disconnect, they would let one caller start far
+    // more statements than its bound allows.
+    let (st, body) = (st.clone(), body.clone());
+    let held = (_flight, _anon, permit);
+    let task = tokio::spawn(async move {
+        let _held = held;
+        let (st, body) = (&st, &body);
+        match ep {
+            Endpoint::GetIncomingBlocks => handlers::get_incoming_blocks(st, &params).await,
+            Endpoint::GetIncomingListBlocks => {
+                handlers::get_incoming_list_blocks(st, &params).await
+            }
+            Endpoint::GetListsNaming => handlers::get_lists_naming(st, &params).await,
+            Endpoint::GetListMembers => handlers::get_list_members(st, &params).await,
+            Endpoint::CheckBlocks => handlers::check_blocks(st, &params).await,
+            Endpoint::GetStats => handlers::get_stats(st, &params).await,
+            Endpoint::GetBackfillStatus => admin::get_backfill_status(st, &params).await,
+            Endpoint::RequestBackfill => admin::request_backfill(st, &caller, &params, body).await,
+            Endpoint::ListErrors => admin::list_errors(st, &params).await,
+            Endpoint::RestartFirehose => admin::restart_firehose(st).await,
+            Endpoint::PauseSweep => admin::pause_sweep(st, body).await,
+            Endpoint::StartRepair => admin::start_repair(st).await,
+            Endpoint::PauseRepair => admin::pause_repair(st, body).await,
+            Endpoint::CancelRepair => admin::cancel_repair(st).await,
+            Endpoint::CreateApiKey => admin::create_api_key(st, body).await,
+            Endpoint::RevokeApiKey => admin::revoke_api_key(st, body).await,
+        }
+    });
+    match task.await {
+        Ok(reply) => reply,
+        Err(e) => Err(XrpcError::internal(format!("the handler ended early: {e}"))),
     }
 }
 

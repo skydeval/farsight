@@ -2076,7 +2076,7 @@ async fn phase_coverage(
     let x2id = seed::actor(&pool, &x2).await?;
     seed::exec(&pool, &format!("INSERT INTO discovery_state (actor_id, state, source, started_at, discovered_witness, completed_at, truncated, refs_found)
         VALUES ({x2id}, 3, 'https://backlinks.test', now() - interval '12 minutes', now() - interval '10 minutes', now() - interval '5 minutes', false, 3)")).await?;
-    seed::exec(&pool, &format!("INSERT INTO subject_coverage (actor_id, scope, confirmed_at, refs_found) VALUES ({x2id}, 1, now(), 1), ({x2id}, 2, now(), 2)")).await?;
+    seed::exec(&pool, &format!("INSERT INTO subject_coverage (actor_id, scope, confirmed_at, refs_found, discovered_witness) VALUES ({x2id}, 1, now(), 1, now() - interval '10 minutes'), ({x2id}, 2, now(), 2, now() - interval '10 minutes')")).await?;
     let x3 = did("cvx", 3);
     let x3id = seed::actor(&pool, &x3).await?;
     seed::exec(&pool, &format!("INSERT INTO discovery_state (actor_id, state, source, started_at, discovered_witness, completed_at, truncated, refs_found)
@@ -2084,7 +2084,7 @@ async fn phase_coverage(
     v.refresh().await?;
     let dwit = sql_ts(
         &pool,
-        &format!("SELECT discovered_witness FROM discovery_state WHERE actor_id = {x2id}"),
+        &format!("SELECT min(discovered_witness) FROM subject_coverage WHERE actor_id = {x2id}"),
     )
     .await?;
     let (cv, r) = v
@@ -2106,6 +2106,37 @@ async fn phase_coverage(
         "assisted list endpoints: other pending lists lower indexedAt to at most D",
         level(&cv) == "assisted" && !idx.is_empty() && idx <= dwit.as_str(),
         format!("indexedAt {idx}, D {dwit}"),
+    );
+    // A second run for the same subject starts: its own point is newer,
+    // and nothing it has fetched is confirmed yet. The answer keeps the
+    // point of the run that completed.
+    seed::exec(&pool, &format!("UPDATE discovery_state SET state = 2, started_at = now(), discovered_witness = now() - interval '1 minute', completed_at = NULL, truncated = false, refs_found = 0 WHERE actor_id = {x2id}")).await?;
+    let (cv, r) = v
+        .cov("query.getIncomingBlocks", &format!("actor={}", enc(&x2)))
+        .await?;
+    c.check(
+        "assisted: a second discovery run in flight does not move completeSince",
+        level(&cv) == "assisted" && cv["completeSince"] == dwit.as_str(),
+        r.short(),
+    );
+    // The second run fails, then a third ends truncated: still the point
+    // of the complete run.
+    seed::exec(
+        &pool,
+        &format!("UPDATE discovery_state SET state = 4, last_error = 'x' WHERE actor_id = {x2id}"),
+    )
+    .await?;
+    let (cv_failed, _) = v
+        .cov("query.getIncomingBlocks", &format!("actor={}", enc(&x2)))
+        .await?;
+    seed::exec(&pool, &format!("UPDATE discovery_state SET state = 3, completed_at = now(), truncated = true WHERE actor_id = {x2id}")).await?;
+    let (cv, r) = v
+        .cov("query.getIncomingBlocks", &format!("actor={}", enc(&x2)))
+        .await?;
+    c.check(
+        "assisted: a failed or truncated later run does not move completeSince",
+        cv_failed["completeSince"] == dwit.as_str() && cv["completeSince"] == dwit.as_str(),
+        r.short(),
     );
     let (cv, r) = v
         .cov("query.getIncomingBlocks", &format!("actor={}", enc(&x3)))

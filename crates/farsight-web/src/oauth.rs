@@ -39,6 +39,9 @@ pub const SCOPE: &str = "atproto";
 pub const FLOW_TTL: Duration = Duration::from_secs(600);
 /// Flows held at once; a start beyond it evicts the oldest.
 pub const MAX_FLOWS: usize = 256;
+/// Flows held, beyond [`MAX_FLOWS`], for addresses that have signed in
+/// before.
+pub const RESERVED_FLOWS: usize = 16;
 /// How long a successful discovery is reused.
 pub const DISCOVERY_TTL: Duration = Duration::from_secs(300);
 /// How long a failed discovery is reused.
@@ -556,6 +559,10 @@ pub struct Flow {
     /// The stored key of the session that asked for a repeated sign-in;
     /// the new session replaces it.
     pub replaces: Option<[u8; 32]>,
+    /// Started from an address that has signed in before. Such flows
+    /// are held apart from the others ([`RESERVED_FLOWS`]), so that
+    /// flows started by anyone else never push one out.
+    pub known: bool,
 }
 
 /// Pushes the authorization request (PAR) and returns the flow record
@@ -617,6 +624,7 @@ pub async fn start(
             created: Instant::now(),
             back: "/admin",
             replaces: None,
+            known: false,
         },
         to,
     ))
@@ -728,12 +736,16 @@ impl FlowStore {
         }
     }
 
-    /// Stores a flow under `state`, evicting the oldest when full.
+    /// Stores a flow under `state`, evicting the oldest of its kind when
+    /// that kind is full: the store's size for flows from addresses not
+    /// known, [`RESERVED_FLOWS`] more for flows from known ones.
     pub fn insert(&self, state: String, flow: Flow) {
         let mut m = self.flows.lock().unwrap_or_else(|e| e.into_inner());
-        while m.len() >= self.cap {
+        let cap = if flow.known { RESERVED_FLOWS } else { self.cap };
+        while m.values().filter(|f| f.known == flow.known).count() >= cap {
             let Some(oldest) = m
                 .iter()
+                .filter(|(_, f)| f.known == flow.known)
                 .min_by_key(|(_, f)| f.created)
                 .map(|(k, _)| k.clone())
             else {
@@ -913,7 +925,34 @@ mod tests {
             created,
             back: "/admin",
             replaces: None,
+            known: false,
         }
+    }
+
+    #[test]
+    fn flows_from_a_known_address_are_not_pushed_out_by_the_others() {
+        let store = FlowStore::new(FLOW_TTL, 4);
+        let t0 = Instant::now();
+        let c = [7u8; 32];
+        let mut mine = flow(t0, c);
+        mine.known = true;
+        store.insert("mine".into(), mine);
+        // Anyone else fills their own share over and over.
+        for i in 0..50u64 {
+            store.insert(format!("s{i}"), flow(t0 + Duration::from_millis(i + 1), c));
+        }
+        assert_eq!(store.len(), 5);
+        let now = t0 + Duration::from_secs(1);
+        assert!(matches!(store.take("mine", &c, now), Taken::Flow(_)));
+        // The known share is bounded too, oldest out first.
+        for i in 0..RESERVED_FLOWS + 1 {
+            let mut f = flow(t0 + Duration::from_millis(i as u64), c);
+            f.known = true;
+            store.insert(format!("k{i}"), f);
+        }
+        assert_eq!(store.len(), 4 + RESERVED_FLOWS);
+        assert!(matches!(store.take("k0", &c, now), Taken::Absent));
+        assert!(matches!(store.take("k1", &c, now), Taken::Flow(_)));
     }
 
     #[test]

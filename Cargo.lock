@@ -540,6 +540,7 @@ dependencies = [
 name = "farsight-core"
 version = "0.6.0"
 dependencies = [
+ "axum",
  "chrono",
  "hickory-resolver",
  "ipnet",

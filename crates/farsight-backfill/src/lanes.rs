@@ -19,6 +19,10 @@ use sqlx::PgPool;
 /// The shared fallback lane.
 pub const FALLBACK: &str = "*fallback";
 const LOAD_LIMIT: i64 = 5000;
+/// The most waiting items of one registrable domain a load takes: a
+/// tenth of the window. However many lists one operator has waiting,
+/// nine tenths of the candidates are other operators'.
+const PER_DOMAIN: i64 = LOAD_LIMIT / 10;
 
 /// A waiting list-job item.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -55,25 +59,37 @@ pub struct Candidate {
 
 /// Loads the waiting items: due `list_jobs` rows, `missing` lists whose
 /// re-check is due, and due `list_fetch` queue entries.
-pub async fn load(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
+///
+/// Items that could not be served now do not take a place among the
+/// candidates, or they would keep every newer item out for as long as
+/// their host stays as it is: the items of a host in `blocked` (cooling
+/// down or at its limit, see `Net::blocked_hosts`) are left out, and no
+/// registrable domain gets more than [`PER_DOMAIN`] of them.
+pub async fn load(pool: &PgPool, blocked: &[String]) -> Result<Vec<Candidate>, sqlx::Error> {
     type P1 = (ListId, Option<DateTime<Utc>>, Option<String>);
     // Ordered as a lane serves (oldest admission first, lists never
     // admitted before those), so when more wait than are loaded, the ones
     // left out are the youngest and the same ones on every load.
     let p1: Vec<P1> = sqlx::query_as(
         &format!("SELECT id, admitted_at, host FROM (
-           SELECT l.id, l.admitted_at, h.host FROM list_jobs j
-           JOIN lists l ON l.id = j.list_id JOIN actors o ON o.id = l.owner_id
-           LEFT JOIN pds_hosts h ON h.id = o.pds_host_id
-           WHERE (j.not_before IS NULL OR j.not_before <= now()) AND l.track_state IN {TRACK_WAITING}
-           UNION ALL
-           SELECT l.id, l.admitted_at, h.host FROM lists l
-           JOIN actors o ON o.id = l.owner_id LEFT JOIN pds_hosts h ON h.id = o.pds_host_id
-           WHERE l.track_state = {TRACK_MISSING} AND (l.next_retry_at IS NULL OR l.next_retry_at <= now())
-             AND NOT EXISTS (SELECT 1 FROM list_jobs j WHERE j.list_id = l.id)) w
+           SELECT w.*, row_number() OVER (PARTITION BY w.cap_key
+                                          ORDER BY w.admitted_at NULLS FIRST, w.id) AS nth FROM (
+             SELECT l.id, l.admitted_at, h.host, h.cap_key FROM list_jobs j
+             JOIN lists l ON l.id = j.list_id JOIN actors o ON o.id = l.owner_id
+             LEFT JOIN pds_hosts h ON h.id = o.pds_host_id
+             WHERE (j.not_before IS NULL OR j.not_before <= now()) AND l.track_state IN {TRACK_WAITING}
+             UNION ALL
+             SELECT l.id, l.admitted_at, h.host, h.cap_key FROM lists l
+             JOIN actors o ON o.id = l.owner_id LEFT JOIN pds_hosts h ON h.id = o.pds_host_id
+             WHERE l.track_state = {TRACK_MISSING} AND (l.next_retry_at IS NULL OR l.next_retry_at <= now())
+               AND NOT EXISTS (SELECT 1 FROM list_jobs j WHERE j.list_id = l.id)) w
+           WHERE w.host IS NULL OR w.host <> ALL($2)) n
+         WHERE cap_key IS NULL OR nth <= $3
          ORDER BY admitted_at NULLS FIRST, id LIMIT $1"),
     )
     .bind(LOAD_LIMIT)
+    .bind(blocked)
+    .bind(PER_DOMAIN)
     .fetch_all(pool)
     .await?;
     type F = (
@@ -84,18 +100,24 @@ pub async fn load(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
         Option<String>,
     );
     let fetch: Vec<F> = sqlx::query_as(&format!(
-        "SELECT q.id, q.actor_id, a.did,
+        "SELECT id, actor_id, did, admitted_at, host FROM (
+           SELECT q.id, q.actor_id, a.did, q.enqueued_at,
                 (SELECT min(l.admitted_at) FROM lists l WHERE l.owner_id = q.actor_id
                    AND ((l.track_state IN {TRACK_UNFETCHED} AND l.phase1_epoch = l.admit_epoch)
-                        OR (l.track_state IN {TRACK_SERVED} AND l.refresh_requested))),
-                h.host
-         FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
-         LEFT JOIN pds_hosts h ON h.id = a.pds_host_id
-         WHERE q.kind = {JOB_LIST_FETCH} AND q.claimed_by IS NULL
-           AND (q.not_before IS NULL OR q.not_before <= now())
-         ORDER BY q.enqueued_at, q.id LIMIT $1"
+                        OR (l.track_state IN {TRACK_SERVED} AND l.refresh_requested))) AS admitted_at,
+                h.host, h.cap_key,
+                row_number() OVER (PARTITION BY h.cap_key ORDER BY q.enqueued_at, q.id) AS nth
+           FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
+           LEFT JOIN pds_hosts h ON h.id = a.pds_host_id
+           WHERE q.kind = {JOB_LIST_FETCH} AND q.claimed_by IS NULL
+             AND (q.not_before IS NULL OR q.not_before <= now())
+             AND (h.host IS NULL OR h.host <> ALL($2))) n
+         WHERE cap_key IS NULL OR nth <= $3
+         ORDER BY enqueued_at, id LIMIT $1"
     ))
     .bind(LOAD_LIMIT)
+    .bind(blocked)
+    .bind(PER_DOMAIN)
     .fetch_all(pool)
     .await?;
     let list_ids: Vec<ListId> = p1.iter().map(|r| r.0).collect();
@@ -154,6 +176,9 @@ pub async fn load(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
     Ok(out)
 }
 
+/// Lanes whose charge is remembered while they have nothing waiting.
+const CHARGED_KEPT: usize = 10_000;
+
 /// Deficit state of the lanes (charged in outbound requests).
 #[derive(Debug, Default)]
 pub struct Lanes {
@@ -174,6 +199,12 @@ impl Lanes {
             for l in &c.lanes {
                 lanes.entry(l.as_str()).or_default().push(c);
             }
+        }
+        // The charges of lanes that have nothing waiting are forgotten
+        // once there are many of them: a lane that comes back starts at
+        // the current minimum, like a new one.
+        if self.charged.len() > CHARGED_KEPT {
+            self.charged.retain(|l, _| lanes.contains_key(l.as_str()));
         }
         // New lanes start at the current minimum (no burst advantage).
         let floor = lanes

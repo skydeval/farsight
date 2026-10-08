@@ -4,8 +4,10 @@
 //! did:web hosts, handle domains, PDS endpoints, backlink results) goes
 //! through one client that requires `https` (except operator-allowlisted
 //! hosts), resolves DNS itself and refuses non-public addresses on every
-//! hop (max 3 redirects), and applies the size/time caps of the backfill
-//! jobs (see `docs/design/backfill.md`).
+//! hop (max 3 redirects; the backfill process follows none, so that a
+//! request never leaves the host whose limits it was counted against),
+//! and applies the size/time caps of the backfill jobs (see
+//! `docs/design/backfill.md`).
 //!
 //! [`OutboundClient`] is the contract (tests substitute a fake);
 //! [`SafeClient`] is the production implementation.
@@ -33,7 +35,8 @@ pub const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 pub struct SafeClientConfig {
     /// Hosts that may be reached over plain `http` (`net.allow_http_hosts`).
     pub allow_http_hosts: Vec<String>,
-    /// Redirect limit; every hop is re-checked.
+    /// Redirect limit; every hop is re-checked. With 0 a redirect is
+    /// returned to the caller as the response it is.
     pub max_redirects: u8,
     /// Whole-request timeout.
     pub timeout: Duration,
@@ -380,6 +383,11 @@ impl OutboundClient for SafeClient {
                 let Some((_, location)) = resp.headers.iter().find(|(k, _)| k == "location") else {
                     return Ok(resp);
                 };
+                // A client that follows none hands the redirect itself to
+                // its caller, to be treated as the answer it is.
+                if self.config.max_redirects == 0 {
+                    return Ok(resp);
+                }
                 if hops >= self.config.max_redirects {
                     return Err(OutboundError::TooManyRedirects);
                 }

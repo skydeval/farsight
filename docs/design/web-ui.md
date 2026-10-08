@@ -254,11 +254,15 @@ authenticates the account and grants no access to its repository.
 
 1. `POST /enter` checks same-origin, rate limits (5 starts a minute
    per address; one process-wide bucket for addresses that have not
-   signed in recently, so that anonymous callers cannot make Farsight
+   signed in before, so that anonymous callers cannot make Farsight
    send unbounded requests and cannot keep the admin out), starts the
-   flow, and redirects to the authorization server. The flow is kept
-   in memory for 10 minutes; at most 256 flows are held, the oldest
-   evicted.
+   flow, and redirects to the authorization server. An address has
+   signed in before if it did so in this process within the last
+   seven days, or if an admin session on record was created from it;
+   the second holds across a restart. The flow is kept in memory for
+   10 minutes; at most 256 flows are held, the oldest evicted, and 16
+   more for addresses that have signed in before, so that flows
+   started by others never push the admin's out.
 2. `GET /enter/callback` runs its checks in a fixed order: rate limit;
    flow cookie and `state` present; the flow exists and is young
    enough; the cookie is the one the flow was started with (otherwise
@@ -362,14 +366,23 @@ after the session has ended, so they are carried out only in a session
 whose sign-in completed **at most 10 minutes ago**
 (`STEP_UP_WINDOW`):
 
-- a settings save that changes any `auth.*` or `net.*` key,
-  `backfill.plc_url` or `backfill.relay_url`, or that opens access
-  further: `access.reads` towards `public`, `access.cors` or
-  `access.public_ui` switched on. This holds for the config editor,
-  for the Public UI form and for the confirmation step of the public
-  UI;
+- a settings save that changes any `auth.*`, `net.*`, `proxy.*` or
+  `metrics.*` key, `storage.database_url`, `server.hostname`,
+  `firehose.urls`, `backfill.plc_url`, `backfill.relay_url`,
+  `backfill.backlinks.url` or `public_ui.record_viewer_url`;
+- a settings save that opens access further: `access.reads` towards
+  `public`, `access.cors` or `access.public_ui` switched on;
+- a settings save that shows more on the public pages:
+  `public_ui.show_outgoing_blocks`, `show_top_blockers`,
+  `show_top_blocked`, `crawlable`, `show_avatars` or
+  `avatar_thumbnails` switched on, or an account taken off
+  `public_ui.excluded_dids`;
 - rotating the admin token;
-- creating an API key.
+- creating or revoking an API key;
+- resetting the instance.
+
+The settings rules hold for the config editor, for the Public UI form
+and for the confirmation step of the public UI.
 
 Everything else, and every change that narrows access, is done by any
 session.
@@ -702,7 +715,12 @@ cannot get a slot within 2 seconds is a `503` with `Retry-After`).
 One address (IPv6: one /48) has at most half of those slots under way
 at once, at least one; a request beyond that is the rate limit's
 `429`, so one visitor's slow pages do not turn everyone else's into
-`503`.
+`503`. A page is several reads, each under
+`rate_limit.query_timeout`; the page as a whole has a deadline of
+three of those timeouts, at least 10 seconds. One that is not done by
+then is answered `503` and gives its slot back, so a request made to
+be slow (a far page, a filter that matches nothing) holds a slot for
+a bounded time.
 
 An unknown root path is the bare `404` also while the public UI is on;
 the public not-found page is for public routes whose subject does not
@@ -906,7 +924,8 @@ on the caller.
 | A page that held rows back, or a top list still waiting for handles | `no-store` |
 | An account or list page whose own handle could not be checked this time (no budget, or no answer within 2 seconds) | `no-store` |
 | A complete profile card | `public, max-age=300` |
-| Every 4xx and 5xx, every redirect to a public page | `no-store` |
+| Every 4xx and 5xx, and the redirect at `/` | `no-store` |
+| The permanent redirect to a page's canonical address | `public, max-age=3600` |
 | `robots.txt`, the API-only text at `/` | `public, max-age=300` |
 | Assets | `public, max-age=3600` |
 
@@ -936,8 +955,15 @@ memory and from `handle_cache`: the document names no handle, the
 directory says the DID is gone, the document names another handle, or
 the handle resolves to **another account**. Handles change hands, and
 a name someone else may now hold is never left on this account's
-rows. Only a check that establishes nothing (a host that does not
-answer) keeps a stored handle. Rendering a row
+rows. The same holds when the handle's own domain answers that it
+names no account: DNS has no `_atproto` record for it and the host
+refuses the well-known request (a 4xx other than 408, 425 and 429) or
+answers with something that is not a DID. Only a check that
+establishes nothing (a host that does not answer) keeps a stored
+handle, and only for two weeks after its last verification: a domain
+that has stopped answering for good does not vouch for a handle for
+ever. An identity event for an account marks its stored handle as due
+a check, so the next page that shows it has it verified again. Rendering a row
 never waits for an outbound request. A page verifies at most one
 handle inline (its own subject, or a list's owner), waiting at most 2
 seconds.
@@ -997,11 +1023,17 @@ A page that meets an account with no answer, or with a stale one,
 puts its DID on an in-memory queue. One worker in the server verifies
 them.
 
-- The queue holds at most 2,000 DIDs without duplicates. The newest
-  request is served first, because the page someone is looking at now
-  matters more than one from ten minutes ago; a DID asked for again
-  moves to the front; within one page the first row is served first;
-  when the queue is full the oldest entry is dropped.
+- The queue holds at most 2,000 DIDs without duplicates. Each client
+  address has a lane of its own, and the worker serves the lanes in
+  turn, one DID each: a client that asks for hundreds of accounts a
+  second gets its turn like every other and no more, so it cannot
+  keep other visitors' rows waiting. Within a lane the newest request
+  is served first, because the page someone is looking at now matters
+  more than one from ten minutes ago; a DID asked for again by the
+  same client moves to the front of its lane; within one page the
+  first row is served first. When the queue is full, the entry that
+  has waited longest in the longest lane is dropped. Admin pages share
+  one lane.
 - Each verification has a 5-second deadline, and at most 64 are in
   flight; the budget sets the pace and that bound limits what slow
   hosts can pile up.

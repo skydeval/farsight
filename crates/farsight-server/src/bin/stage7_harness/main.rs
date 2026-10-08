@@ -1812,12 +1812,19 @@ async fn check_step_up(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), Strin
     };
     let file = || std::fs::read_to_string(s.config_path()).map_err(|e| e.to_string());
     let keys = || ctx.n("SELECT count(*) FROM api_tokens");
+    // Every form here is sent as a browser sends it from the admin's own
+    // page: with the page's origin. What is refused is refused by the
+    // rule under test, not for a missing header.
     let post = |path: &'static str, cookie: String, form: Vec<(&'static str, String)>| {
         let (http, base) = (http.clone(), s.base.clone());
         async move {
             let form: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            http.post_form(&format!("{base}{path}"), &[("cookie", &cookie)], &form)
-                .await
+            http.post_form(
+                &format!("{base}{path}"),
+                &[("cookie", &cookie), ("origin", &base)],
+                &form,
+            )
+            .await
         }
     };
 
@@ -1904,6 +1911,52 @@ async fn check_step_up(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), Strin
             "access.reads widened",
             base.replace("reads = \"api_key\"", "reads = \"public\""),
         ),
+        (
+            "server.hostname",
+            base.replace(
+                &format!("hostname = \"{HOSTNAME}\""),
+                "hostname = \"farsight.attacker.example\"",
+            ),
+        ),
+        (
+            "storage.database_url",
+            base.replace(
+                "database_url = \"",
+                "database_url = \"postgres://u:p@db.attacker.example/f?was=",
+            ),
+        ),
+        (
+            "firehose.urls",
+            base.replace(
+                "urls = [\"ws://127.0.0.1:9\"]",
+                "urls = [\"wss://jetstream.attacker.example\"]",
+            ),
+        ),
+        (
+            "backfill.backlinks.url",
+            format!("{base}\n[backfill.backlinks]\nurl = \"https://links.attacker.example\"\n"),
+        ),
+        (
+            "metrics.bearer_token_sha256",
+            base.replace(
+                "[metrics]\n",
+                &format!("[metrics]\nbearer_token_sha256 = \"{other_hash}\"\n"),
+            ),
+        ),
+        (
+            "proxy.mode and proxy.trusted",
+            format!("{base}\n[proxy]\nmode = \"forwarded\"\ntrusted = [\"203.0.113.0/24\"]\n"),
+        ),
+        (
+            "public_ui.crawlable switched on",
+            format!("{base}\n[public_ui]\ncrawlable = true\n"),
+        ),
+        (
+            "public_ui.record_viewer_url",
+            format!(
+                "{base}\n[public_ui]\nrecord_viewer_url = \"https://viewer.attacker.example/{{authority}}/{{collection}}/{{rkey}}\"\n"
+            ),
+        ),
     ] {
         if text == base {
             wrong.push(format!(
@@ -1917,7 +1970,7 @@ async fn check_step_up(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), Strin
         }
     }
     c.check(
-        "the same session's raw-editor save that changes backfill.plc_url, backfill.relay_url, net.allow_http_hosts or auth.admin_token_sha256, or widens access.reads ⇒ 303 to /enter?again=settings, and config.toml is byte for byte what it was",
+        "the same session's raw-editor save that changes backfill.plc_url, backfill.relay_url, net.allow_http_hosts, auth.admin_token_sha256, server.hostname, storage.database_url, firehose.urls, backfill.backlinks.url, metrics.bearer_token_sha256, proxy.mode with proxy.trusted or public_ui.record_viewer_url, or widens access.reads, or switches public_ui.crawlable on ⇒ 303 to /enter?again=settings, and config.toml is byte for byte what it was",
         wrong.is_empty(),
         format!("{wrong:?}"),
     );
@@ -1947,6 +2000,34 @@ async fn check_step_up(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), Strin
             && !rotate.text.contains("fsa_")
             && !create.text.contains("fsk_"),
         format!("{} / {}", rotate.short(), create.short()),
+    );
+    // What ends keys and sessions for good needs the fresh sign-in too.
+    let live_keys = || ctx.n("SELECT count(*) FROM api_tokens WHERE revoked_at IS NULL");
+    let live_before = live_keys().await?;
+    let key_id = ctx
+        .n("SELECT max(id)::bigint FROM api_tokens WHERE revoked_at IS NULL")
+        .await?;
+    let revoke = post(
+        "/admin/ops/keys-revoke",
+        cookie.clone(),
+        vec![("csrf", csrf.clone()), ("id", key_id.to_string())],
+    )
+    .await?;
+    let reset = post(
+        "/admin/reset",
+        cookie.clone(),
+        vec![("csrf", csrf.clone()), ("hostname", HOSTNAME.to_owned())],
+    )
+    .await?;
+    c.check(
+        "revoking an API key ⇒ 303 to /enter?again=ops and the key stays live; resetting the instance ⇒ 303 to /enter?again=settings with config.toml, the session and every key as they were",
+        asks_again(&revoke, "ops")
+            && asks_again(&reset, "settings")
+            && live_keys().await? == live_before
+            && live_before >= 1
+            && file()? == base
+            && ctx.has_session_key(&old_key).await?,
+        format!("{} / {}", revoke.short(), reset.short()),
     );
     // Without a form token the answer is the form check's, before anything else.
     let forged = post(

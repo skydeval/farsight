@@ -43,7 +43,7 @@ use dashboard::{alerts, dashboard, dashboard_fragment, stat};
 pub use layout::{MessagePage, Nav};
 pub(crate) use layout::{message, nav};
 pub(crate) use lookup::permit;
-pub use lookup::{Busy, HandleError, handle_to_did, parse_list_ref};
+pub use lookup::{Busy, HandleError, handle_to_did, handle_to_did_answered, parse_list_ref};
 pub use ops::OpsPage;
 use ops::{ops_action, ops_page};
 pub use reset::{ResetError, ResetPage, perform_reset};
@@ -75,10 +75,11 @@ pub const SESSION_IDLE: Duration = Duration::from_secs(12 * 3600);
 pub const SESSION_ABSOLUTE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// A sensitive action is carried out only in a session whose sign-in
 /// completed at most this long ago; an older session is asked to sign in
-/// again first. Sensitive: a settings change that touches `auth.*`,
-/// `net.*`, `backfill.plc_url` or `backfill.relay_url` or that widens
-/// `access.*` (`farsight_api::config_store::sensitive_changes`), rotating
-/// the admin token, and creating an API key.
+/// again first. Sensitive: a settings change that
+/// `farsight_api::config_store::sensitive_changes` names (tokens, the
+/// database, the hostname, the proxy trust, the upstream services, what
+/// is served to whom), rotating the admin token, creating or revoking an
+/// API key, and resetting the instance.
 pub const STEP_UP_WINDOW: Duration = Duration::from_secs(600);
 
 /// [`STEP_UP_WINDOW`] as the running process applies it.

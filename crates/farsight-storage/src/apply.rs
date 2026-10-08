@@ -41,7 +41,7 @@ use crate::error::{Result, StorageError};
 use crate::firehose::FirehoseProgress;
 use crate::history::{Cause as Removed, Gone, GoneRow, Removal, Table};
 use crate::keys::{self, CapKind, Limits, clamp};
-use crate::repo_events::{RepoEvent, unavailable_list_keys};
+use crate::repo_events::{RepoEvent, reactivation_list_keys};
 use crate::tracking::FireArgs;
 use crate::transition::Event;
 use crate::txn::{
@@ -77,6 +77,12 @@ pub enum Origin {
         /// Budget gate on the job: inserts skipped with a `refused` debt,
         /// deletes and reconcile applied.
         deletes_only: bool,
+        /// The host the page was read from was looked up in the directory
+        /// for this attempt. A page from a host that came out of a cache
+        /// may be from one the account has left: it may add and update
+        /// rows, and a reconcile of it that would remove a row fails the
+        /// batch with [`StorageError::UnconfirmedHost`] instead.
+        host_confirmed: bool,
     },
     /// Discovery writes (`W = 0`), charged to the requester.
     Discovery {
@@ -317,12 +323,22 @@ async fn apply_once(
             }
             candidates.push(c);
         }
-
-        // A reactivation fires OA on the DID's unavailable lists.
-        for e in batch.events.iter().filter(|e| e.may_reactivate()) {
-            for (_, lrkey) in unavailable_list_keys(&mut t, e.did()).await? {
-                locks.add(e.did().as_str(), &lrkey, true);
+        // No row is removed on the word of a host out of a cache.
+        if matches!(
+            &batch.origin,
+            Origin::Listing {
+                host_confirmed: false,
+                ..
             }
+        ) && candidates.iter().any(|c| !c.is_empty())
+        {
+            return Err(StorageError::UnconfirmedHost);
+        }
+
+        // A reactivation fires OA on the DID's unavailable lists. All the
+        // reactivations of the batch share one bound on the locks.
+        for (did, lrkey) in reactivation_list_keys(&mut t, &batch.events).await? {
+            locks.add(did.as_str(), &lrkey, true);
         }
 
         // 3. List locks.
@@ -335,11 +351,9 @@ async fn apply_once(
         // its next read sees the list. Lists that turn later still are
         // ordered after this batch (`apply_repo_event` fires OA only under
         // a lock that is held).
-        for e in batch.events.iter().filter(|e| e.may_reactivate()) {
-            for (_, lrkey) in unavailable_list_keys(&mut t, e.did()).await? {
-                if !t.holds_list_exclusive(keys::list_lock_key(e.did().as_str(), &lrkey)) {
-                    return Err(StorageError::LockSetChanged);
-                }
+        for (did, lrkey) in reactivation_list_keys(&mut t, &batch.events).await? {
+            if !t.holds_list_exclusive(keys::list_lock_key(did.as_str(), &lrkey)) {
+                return Err(StorageError::LockSetChanged);
             }
         }
 

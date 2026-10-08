@@ -95,19 +95,49 @@ pub fn status_code(active: bool, status: Option<&str>) -> ActorStatus {
 }
 
 /// Owner keys (DID, list rkey) of a DID's `unavailable` lists, for lock
-/// discovery: the [`crate::txn::MAX_LOCKS`] with the lowest ids, since one
-/// transaction locks no more. Lists beyond them keep their own retry.
-/// Read-only.
-pub async fn unavailable_list_keys(t: &mut Txn<'_>, did: &Did) -> Result<Vec<(ListId, String)>> {
+/// discovery: the `limit` with the lowest ids. Read-only.
+pub async fn unavailable_list_keys(
+    t: &mut Txn<'_>,
+    did: &Did,
+    limit: usize,
+) -> Result<Vec<(ListId, String)>> {
     Ok(sqlx::query_as(
         "SELECT l.id, l.rkey FROM lists l JOIN actors a ON a.id = l.owner_id
          WHERE a.did = $1 AND l.track_state = $2 ORDER BY l.id LIMIT $3",
     )
     .bind(did.as_str())
     .bind(TrackState::Unavailable.code())
-    .bind(crate::txn::MAX_LOCKS as i64)
+    .bind(limit as i64)
     .fetch_all(&mut *t.conn)
     .await?)
+}
+
+/// The `unavailable` lists the reactivations among `events` lock, as
+/// `(owner DID, list rkey)`: [`crate::txn::MAX_LOCKS`] for the whole
+/// batch, since one transaction locks no more, given to the events in
+/// order and within an event to the lists with the lowest ids. Lists
+/// beyond them keep their own retry. Read-only, and the same answer for
+/// the same stored state, so a second read tells whether the set
+/// changed.
+pub async fn reactivation_list_keys<'a>(
+    t: &mut Txn<'_>,
+    events: &'a [RepoEvent],
+) -> Result<Vec<(&'a Did, String)>> {
+    let mut left = crate::txn::MAX_LOCKS;
+    let mut out = Vec::new();
+    let mut seen: std::collections::BTreeSet<&Did> = std::collections::BTreeSet::new();
+    for e in events.iter().filter(|e| e.may_reactivate()) {
+        if left == 0 {
+            break;
+        }
+        if !seen.insert(e.did()) {
+            continue;
+        }
+        let keys = unavailable_list_keys(t, e.did(), left).await?;
+        left -= keys.len().min(left);
+        out.extend(keys.into_iter().map(|(_, rkey)| (e.did(), rkey)));
+    }
+    Ok(out)
 }
 
 impl Txn<'_> {
@@ -132,6 +162,18 @@ impl Txn<'_> {
                                 RETURNING did)
                      INSERT INTO handle_due (did) SELECT did FROM a
                      ON CONFLICT (did) DO UPDATE SET asked_at = now()",
+                )
+                .bind(did.as_str())
+                .execute(&mut *self.conn)
+                .await?;
+                // What is stored for the account is due a check from now
+                // on, pass or no pass: the next page that reads it has it
+                // verified again, and a handle the account gave up does
+                // not stay on its rows until the weekly re-check.
+                sqlx::query(
+                    "UPDATE handle_cache
+                     SET resolved_at = LEAST(resolved_at, now() - interval '7 days 1 second')
+                     WHERE did = $1",
                 )
                 .bind(did.as_str())
                 .execute(&mut *self.conn)
@@ -208,7 +250,19 @@ impl Txn<'_> {
                         .await?;
                     self.report.resyncs += 1;
                 }
-                if *active && (old.is_hidden() || inactive_at_listing) {
+                let reactivated = *active && (old.is_hidden() || inactive_at_listing);
+                // An account that leaves `deleted` had its rows purged, or
+                // is being purged. Whatever it becomes (a status that is
+                // not hidden included, after which a later activation
+                // would look like no change), its repository has to be
+                // listed again.
+                let undeleted = old == ActorStatus::Deleted && new != ActorStatus::Deleted;
+                if undeleted && !reactivated {
+                    self.add_debt(id, DebtReason::Resync, None, Some(*witness))
+                        .await?;
+                    self.report.resyncs += 1;
+                }
+                if reactivated {
                     self.add_debt(id, DebtReason::Resync, None, Some(*witness))
                         .await?;
                     self.report.resyncs += 1;

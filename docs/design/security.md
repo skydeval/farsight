@@ -310,7 +310,10 @@ from a backlink index — goes through one client
   contact the target itself, past the address check;
 - follows at most 3 redirects, and applies every check again to each
   hop. A form `POST` (used by the admin sign-in) follows none: a 3xx is
-  returned as it is, so a form is never re-sent to another host;
+  returned as it is, so a form is never re-sent to another host. The
+  backfill process follows none either: its requests are counted
+  against the limits of the host they were made to, and a redirect
+  would take one to a host whose limits it never touched;
 - bounds time and size: 10 s to connect, 30 s for the whole request, a
   response body of at most 2 MiB (checked against `Content-Length` and
   again while reading);
@@ -626,15 +629,20 @@ left, so requests are never starved by it. The handle pass
   refused. At most 256 sign-ins are held in progress; a newer one
   displaces the oldest.
 - **A fresh sign-in for what outlasts a session.** A session cookie
-  that is stolen is good for up to seven days, and four things would
-  let its holder keep control afterwards: a PLC directory or relay of
-  their own (`backfill.plc_url`, `backfill.relay_url`), a host the
-  outbound client may newly reach (`net.*`), an admin token they know
-  (`auth.*`, the rotate button) and an API key they made. Each of
-  these, and any change that opens `access.*` further, is carried out
-  only in a session that signed in at most 10 minutes ago; an older
-  one is sent through the sign-in again and nothing is changed until
-  it returns. See
+  that is stolen is good for up to seven days, and some things would
+  let its holder keep control, or keep the damage, afterwards: a
+  database, PLC directory, relay, firehose or backlink source of their
+  own (`storage.database_url`, `backfill.plc_url`,
+  `backfill.relay_url`, `firehose.urls`, `backfill.backlinks.url`), a
+  hostname of their own (`server.hostname`), proxy trust that lets
+  them forge client addresses (`proxy.*`), a host the outbound client
+  may newly reach (`net.*`), a token they know (`auth.*`, `metrics.*`,
+  the rotate button), an API key they made or one of the operator's
+  they revoked, and a reset of the instance. Each of these, and any
+  change that opens `access.*` further or shows more on the public
+  pages, is carried out only in a session that signed in at most 10
+  minutes ago; an older one is sent through the sign-in again and
+  nothing is changed until it returns. See
   [web-ui.md](web-ui.md#a-fresh-sign-in-for-sensitive-actions). Two
   rules close what that leaves. The admin DID is resolved through the
   PLC directory named when the process started, so a changed

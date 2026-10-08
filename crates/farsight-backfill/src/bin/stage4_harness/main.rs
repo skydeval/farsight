@@ -1981,6 +1981,40 @@ async fn check_feeder(h: &H, c: &mut Checks) -> Res<()> {
         r.outcome == Outcome::Clean && !left && !again,
         format!("outcome {:?}, debt left {left}, re-fed {again}", r.outcome),
     );
+    // More debts that cannot be fed than one pass examines (2,000), all
+    // of them older than one that can: the pass after goes on where the
+    // first stopped and reaches it.
+    h.exec(&format!(
+        "WITH a AS (INSERT INTO actors (did)
+           SELECT 'did:plc:fdw' || translate(lpad(g::text, 21, '0'), '0123456789', 'abcdefghij')
+           FROM generate_series(1, 2000) g RETURNING id),
+         d AS (INSERT INTO relist_debt (actor_id, reason, since_witness, created_at)
+           SELECT id, 2, {clock} - interval '1 hour', now() - interval '30 days' FROM a
+           RETURNING actor_id)
+         INSERT INTO backfill_state (actor_id, state, backfilled_at, backfilled_witness, last_outcome)
+         SELECT actor_id, 3, now() - interval '1 day', {clock}, 2 FROM d"
+    ))
+    .await?;
+    let late = debt(h, &did("fdx", 1), 2, None, clock).await?;
+    feeder::pass(&h.ctx).await.map_err(e)?;
+    let after_first = fed(h, late).await?;
+    feeder::pass(&h.ctx).await.map_err(e)?;
+    let after_second = fed(h, late).await?;
+    let old_fed = h
+        .i64("SELECT count(*) FROM backfill_queue q JOIN actors a ON a.id = q.actor_id WHERE a.did LIKE 'did:plc:fdw%'")
+        .await?;
+    c.check(
+        "2,000 older debts that cannot be fed do not keep a newer one from being fed: the first pass examines them, the second goes on after them and feeds it",
+        !after_first && after_second && old_fed == 0,
+        format!("fed after the first pass {after_first}, after the second {after_second}; {old_fed} of the old ones queued"),
+    );
+    // The seeded debts go again; later checks count debts.
+    h.exec(
+        "WITH d AS (DELETE FROM relist_debt WHERE actor_id IN
+                      (SELECT id FROM actors WHERE did LIKE 'did:plc:fdw%') RETURNING actor_id)
+         DELETE FROM backfill_state WHERE actor_id IN (SELECT actor_id FROM d)",
+    )
+    .await?;
     // System queue full: debts stay counted, nothing is enqueued.
     let waiting = h
         .i64("SELECT count(*) FROM backfill_queue WHERE requester = 'system:resync'")
@@ -2002,6 +2036,53 @@ async fn check_feeder(h: &H, c: &mut Checks) -> Res<()> {
         !fed_full && kept && fed_after,
         format!("fed at cap {fed_full}, debt kept {kept}, fed after {fed_after}"),
     );
+    // Lists deferred by a cap are offered for re-admission once the cap
+    // has room: one whose owner's buckets are open is, one whose owner
+    // is still at lists_per_author is not, and neither is one deferred
+    // less than an hour ago.
+    let limits = h.ctx.limits();
+    let mut deferred = Vec::new();
+    for (n, cause, retry, lists) in [
+        (1, 3, "NULL", 0),
+        (2, 4, "NULL", limits.cfg.lists_per_author),
+        (3, 3, "now() + interval '30 minutes'", 0),
+        (4, 4, "now() - interval '1 minute'", 0),
+    ] {
+        let owner = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO actors (did, authored_lists) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(did("fdg", n))
+        .bind(lists as i32)
+        .fetch_one(h.pool())
+        .await
+        .map_err(e)?;
+        let id = sqlx::query_scalar::<_, i64>(&format!(
+            "INSERT INTO lists (owner_id, rkey, record_state, purpose, name, listblock_count, track_state,
+                                deferred_by, next_retry_at, admitted_at, admit_epoch, phase1_epoch)
+             VALUES ({owner}, '{}', 1, 1, 'q', 1, 8, {cause}, {retry}, now(), 1, 1) RETURNING id",
+            tid_now()
+        ))
+        .fetch_one(h.pool())
+        .await
+        .map_err(e)?;
+        deferred.push(id);
+    }
+    let offered: Vec<i64> = farsight_storage::janitor::cap_go_candidates(h.pool(), &limits, 100)
+        .await
+        .map_err(e)?
+        .into_iter()
+        .map(|l| l.get())
+        .filter(|l| deferred.contains(l))
+        .collect();
+    c.check(
+        "lists deferred by a host cap or the lists cap are offered again once the cap has room: not while the owner is at lists_per_author, and not within the hour after the deferral",
+        offered == [deferred[0], deferred[3]],
+        format!("offered {offered:?} of {deferred:?}"),
+    );
+    h.exec(&format!(
+        "DELETE FROM lists WHERE id = ANY(ARRAY{deferred:?}::bigint[])"
+    ))
+    .await?;
     Ok(())
 }
 
@@ -2104,6 +2185,55 @@ async fn check_discovery(h: &H, c: &mut Checks) -> Res<()> {
         "untruncated completion: discovery_state completed, subject coverage confirmed for both scopes",
         row.is_some_and(|(st, tr, n)| st == 3 && !tr && n == 4) && scopes == 2 && r.outcome == Outcome::Clean,
         format!("discovery_state {row:?}, subject_coverage rows {scopes}"),
+    );
+    // The coverage point is stored with the confirmation. A second run
+    // for the same subject that cannot check a reference (its author's
+    // PDS fails) ends truncated: it has a newer point of its own, and
+    // the confirmed one stays where it was.
+    let confirmed = "SELECT min(discovered_witness)::text FROM subject_coverage WHERE actor_id";
+    let point_then: Option<String> = sqlx::query_scalar(&format!("{confirmed} = {xid}"))
+        .fetch_one(h.pool())
+        .await
+        .map_err(e)?;
+    let with_run: i64 = h
+        .i64(&format!(
+            "SELECT count(*) FROM subject_coverage c JOIN discovery_state d ON d.actor_id = c.actor_id
+             WHERE c.actor_id = {xid} AND c.discovered_witness = d.discovered_witness"
+        ))
+        .await?;
+    h.exec("INSERT INTO firehose_clock (server_at, witness_at) VALUES (clock_timestamp(), now() + interval '1 hour')
+            ON CONFLICT DO NOTHING")
+        .await?;
+    h.edit_repo(&blocker, |r| {
+        r.repo_error = Some("InternalServerError".into())
+    });
+    let base = h.pds.clone();
+    h.set_cfg(|c| c.backfill.backlinks.url = base);
+    let again = jobs::discovery::run(
+        &h.ctx,
+        &Did::parse(&x).map_err(e)?,
+        farsight_storage::codes::RequesterKey::Token(7),
+    )
+    .await;
+    h.set_cfg(|c| c.backfill.backlinks.url = String::new());
+    h.edit_repo(&blocker, |r| r.repo_error = None);
+    // The clock row that made the second run's point a later one.
+    h.exec("DELETE FROM firehose_clock WHERE witness_at > now() + interval '30 minutes'")
+        .await?;
+    let point_now: Option<String> = sqlx::query_scalar(&format!("{confirmed} = {xid}"))
+        .fetch_one(h.pool())
+        .await
+        .map_err(e)?;
+    let run_point_moved = h
+        .bool(&format!(
+            "SELECT d.truncated AND d.discovered_witness > (SELECT min(discovered_witness) FROM subject_coverage WHERE actor_id = {xid})
+             FROM discovery_state d WHERE d.actor_id = {xid}"
+        ))
+        .await?;
+    c.check(
+        "the coverage point is stored with the confirmation, and a second run that ends truncated does not move it: its own, newer point stays on the run",
+        with_run == 2 && point_then.is_some() && point_now == point_then && run_point_moved,
+        format!("outcome {:?}; point {point_then:?} → {point_now:?}; rows at the run's point {with_run}; run truncated with a newer point {run_point_moved}", again.outcome),
     );
     // A reference that cannot be checked: its author's PDS fails. The
     // run found one blocker and may have missed the other, so it confirms
@@ -2985,6 +3115,7 @@ async fn check_bounds(h: &H, c: &mut Checks) -> Res<()> {
     let mut b = Batch::new(Origin::Listing {
         stamp_read_at: Utc::now(),
         deletes_only: false,
+        host_confirmed: true,
     });
     b.reconciles.push(farsight_storage::apply::Reconcile {
         author: Did::parse(&reconciled_author).map_err(e)?,

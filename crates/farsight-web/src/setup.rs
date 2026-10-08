@@ -140,6 +140,32 @@ pub struct Wizard {
 }
 
 impl Wizard {
+    /// The connection string as the storage step shows it: with its
+    /// secrets redacted, like everywhere else it is shown.
+    pub fn dsn_shown(&self) -> String {
+        redact_dsn(&self.dsn)
+    }
+
+    /// The connection string a storage form means. A field left as the
+    /// step showed it stands for the string that is held. A URL that was
+    /// edited around the redacted password (another host, say) keeps the
+    /// held password. Anything else is what was typed.
+    fn dsn_typed(&self, typed: &str) -> String {
+        let typed = typed.trim();
+        if !self.dsn.is_empty() && typed == redact_dsn(&self.dsn) {
+            return self.dsn.clone();
+        }
+        let held = url::Url::parse(self.dsn.trim()).ok();
+        let held_password = held.as_ref().and_then(|u| u.password());
+        if let (Some(password), Ok(mut u)) = (held_password, url::Url::parse(typed))
+            && u.password() == Some("redacted")
+            && u.set_password(Some(password)).is_ok()
+        {
+            return u.to_string();
+        }
+        typed.to_owned()
+    }
+
     fn new(env: &[(String, String)]) -> Wizard {
         let d = Config::default();
         let env_dsn = env
@@ -1238,7 +1264,7 @@ fn apply_step(w: &mut Wizard, step: &str, f: &HashMap<String, String>) -> Result
             w.proxy_ack = !public.is_empty();
         }
         "storage" => {
-            let dsn = get("dsn");
+            let dsn = w.dsn_typed(&get("dsn"));
             if dsn != w.dsn {
                 w.storage_ok = false;
                 w.storage_report.clear();
@@ -1610,10 +1636,10 @@ async fn storage_test(
     if let Err(r) = check_csrf(&st, &id, &headers, &form) {
         return r;
     }
-    let dsn = form
-        .get("dsn")
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default();
+    let typed = form.get("dsn").cloned().unwrap_or_default();
+    let dsn = st
+        .with_session(&id, |s| s.wizard.dsn_typed(&typed))
+        .unwrap_or_else(|| typed.trim().to_owned());
     let (report, ok) = if dsn.is_empty() {
         (vec!["Enter a connection string.".to_owned()], false)
     } else {
@@ -1913,6 +1939,32 @@ mod tests {
                     .join(format!("farsight-setup-test-{s}-{}", std::process::id())),
             );
         }
+    }
+
+    #[test]
+    fn the_storage_step_shows_no_password_and_still_means_the_one_it_holds() {
+        let mut w = Wizard::new(&[]);
+        w.dsn = "postgres://farsight:s3cret@postgres:5432/farsight".into();
+        let shown = w.dsn_shown();
+        assert!(!shown.contains("s3cret"), "{shown}");
+        // Left as shown: the held string.
+        assert_eq!(w.dsn_typed(&shown), w.dsn);
+        // Edited around the password: the held password stays.
+        assert_eq!(
+            w.dsn_typed("postgres://farsight:redacted@db.internal:5432/farsight"),
+            "postgres://farsight:s3cret@db.internal:5432/farsight"
+        );
+        // A new string is taken as typed.
+        assert_eq!(
+            w.dsn_typed(" postgres://other:new@db/f "),
+            "postgres://other:new@db/f"
+        );
+        // Nothing held: nothing to stand for.
+        let empty = Wizard::new(&[]);
+        assert_eq!(
+            empty.dsn_typed("postgres://u:redacted@db/f"),
+            "postgres://u:redacted@db/f"
+        );
     }
 
     #[test]

@@ -308,18 +308,30 @@ pub(super) async fn ops_action(
                 },
             }
         }
-        "keys-revoke" => match get("id").parse::<i32>() {
-            Ok(id) => match api_admin::revoke_key(&st.api, id).await {
-                Ok(true) => Ok((format!("API key {id} revoked."), None)),
-                Ok(false) => Err(format!("No live key {id}.")),
-                Err(e) => Err(e.message),
-            },
-            Err(_) => Err("bad key id".into()),
-        },
+        "keys-revoke" => {
+            // A revoked key stays revoked after the session has ended: a
+            // fresh sign-in first, as for creating one.
+            if let Err(r) = step_up(&s, Return::Ops) {
+                return r;
+            }
+            revoke(&st, &get("id")).await
+        }
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
     match result {
         Ok((notice, key)) => ops_render(&st, &s, Some(notice), None, key).await,
         Err(e) => ops_render(&st, &s, None, Some(e), None).await,
+    }
+}
+
+/// Revokes the API key with the id written as `id`.
+async fn revoke(st: &WebState, id: &str) -> Result<(String, Option<String>), String> {
+    match id.parse::<i32>() {
+        Ok(id) => match api_admin::revoke_key(&st.api, id).await {
+            Ok(true) => Ok((format!("API key {id} revoked."), None)),
+            Ok(false) => Err(format!("No live key {id}.")),
+            Err(e) => Err(e.message),
+        },
+        Err(_) => Err("bad key id".into()),
     }
 }

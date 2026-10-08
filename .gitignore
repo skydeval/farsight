@@ -2,3 +2,4 @@ docs/internal/
 /target/
 .chainlink/
 .claude/
+.env

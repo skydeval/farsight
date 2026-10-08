@@ -41,17 +41,27 @@ and `farsight-backfill`, and one Postgres database. The overview is in
    `account_purges`, and the purge task goes on with it once the
    server serves.
 5. **Serving.** The first coverage snapshot is read, the API keys are
-   loaded, and the listener on `server.bind` opens.
-6. **Background work** starts once the server is serving, so that none
-   of it stands between a start and a healthy instance: the periodic
-   tasks, the handle workers, the top-list task and the builder of the
-   UI sort indexes (see [Background tasks](#background-tasks)).
+   loaded, the periodic tasks start, and the listener on `server.bind`
+   opens.
+6. **Background work** that can take long starts once the server is
+   serving, so that none of it stands between a start and a healthy
+   instance: the handle workers, the top-list task and the builder of
+   the UI sort indexes (see [Background tasks](#background-tasks)).
 
 On `SIGTERM` or `SIGINT` the server stops accepting requests, stops
 its tasks, shuts ingest down, flushes its counters and exits 0. The
 backfill process stops its jobs, gives their work back to the queue
-and exits. Each takes up to 30 seconds; the compose file gives the
-containers 45 (`stop_grace_period`) before they are killed. A process
+and exits. Every step has a deadline, and together they stay under
+40 seconds: in the server 10 for requests in flight, 5 for the tasks,
+20 for ingest to drain its writer and 5 for the last flushes; in the
+backfill process 30 for the jobs and 5 for the last flush. What is
+not done by its deadline is left: a connection that is still open, a
+task that did not stop (it is aborted, and a batch in flight rolls
+back with its cursor). The same bounds hold when the server stops
+because an ingest task panicked or the configuration was reset, so a
+client that holds a connection open cannot keep a process that must
+exit alive. The compose file gives the containers 45
+(`stop_grace_period`) before they are killed. A process
 that is killed loses nothing that was committed: what it held is
 taken up again ([backfill.md](backfill.md#what-a-stopped-process-leaves)).
 
@@ -167,10 +177,10 @@ deployment supplies them in the environment.
 |---|---|---|
 | `FARSIGHT_SKIP_WIZARD` | both processes | Set to anything but empty, `0` or `false`: with no file, build the configuration from `FARSIGHT__*` alone and never enter setup mode. Such an instance is managed from outside: no setting can be changed from the admin UI or through the API. |
 | `FARSIGHT_CONFIG` | both processes | Path of the configuration file. |
-| `FARSIGHT_SETUP_BIND` | server | Restricts the listener while in setup mode, for example `127.0.0.1` or `127.0.0.1:8080`. |
+| `FARSIGHT_SETUP_BIND` | server | Restricts the listener while in setup mode, for example `127.0.0.1` or `127.0.0.1:8080`. A value that is neither an IP address nor an address with a port stops the start with an error. |
 | `RUST_LOG` | both processes | Log filter; the default is `info,sqlx=warn,hyper=warn`. |
 | `FARSIGHT_PORT` | `compose.yml` | Host side of the published web port (default `8080`). |
-| `POSTGRES_PASSWORD` | `compose.yml` | Password of the bundled Postgres, also placed in `FARSIGHT__STORAGE__DATABASE_URL`. Unset, it is `farsight`, and the server logs a warning at every start while the database is reached with that password. |
+| `POSTGRES_PASSWORD` | `compose.yml` | Password of the bundled Postgres, also placed in `FARSIGHT__STORAGE__DATABASE_URL`. Keep it in `.env` beside `compose.yml`, so that every `docker compose` command sees the same value, and use letters and digits only (it is part of a URL). Unset, it is `farsight`, and the server logs a warning at every start while the database is reached with that password. |
 
 A key set from the environment is **locked**: the admin UI shows it
 but cannot change it, and an API procedure that would write it answers
@@ -275,8 +285,8 @@ endpoint. An instance that offers only v1 works, but caps coverage at
 | `gap_threshold` | `"300s"` | On a failover, a first event later than the requested cursor by more than this counts as a clamp (the instance no longer had the position) and opens a gap. The failover cursor is set this much before the rewind, so a clamp too short to detect costs none of the rewind. On a resume by `seq`, a first event later than the stored cursor by more than this means the stream did not continue, and opens a gap too. |
 | `failover_rewind_min` | `"10m"` | Smallest rewind on failover: the new instance is asked for the applied position minus the larger of this and its lag plus 5 minutes, and minus `gap_threshold`. |
 | `failover_max_lag` | `"30m"` | Largest lag of the new instance for which such a rewind is trusted. |
-| `synthetic_gap_lag` | `"5m"` | Applied-through lag beyond which coverage treats the stream as behind, as it does while disconnected. |
-| `stall_timeout` | `"60s"` | Silence that ends a session. |
+| `synthetic_gap_lag` | `"5m"` | Applied-through lag beyond which coverage treats the stream as behind, as it does while disconnected. Between `1s` and `1h`. |
+| `stall_timeout` | `"60s"` | Silence that ends a session. Between `1s` and `1h`. |
 | `seam_repair_before` | `"150s"` | A seam repair's window starts this long before the session's connect. |
 | `seam_repair_after` | `"30s"` | And ends this long after the session caught up. |
 | `seam_repair_delay` | `"60s"` | Wait between catching up and the seam repair. |
@@ -321,7 +331,7 @@ The resume plan, failover and seam repair are explained in
 | `source` | `"relay_collections"` | Enumeration source: `relay_collections` (the relay's per-collection repository listing), `relay_repos` (the relay's `listRepos`) or `plc` (the PLC export, exhaustive and slow). |
 | `max_repos_per_hour` | `0` | Pacing cap; `0` means bounded only by the per-host limits. |
 | `full_every_days` | `0` | Interval of a periodic full cycle; `0` means never. |
-| `max_outstanding` | `10_000` | Bound on cycle members handed out and not yet finished. |
+| `max_outstanding` | `10_000` | Bound on cycle members handed out and not yet finished. At least 1. |
 
 ### `[backfill.repair]`
 
@@ -549,7 +559,7 @@ at its next time.
 | `rate_tables` | 1 day | 16 min | Deletes `admission_rate`, `intern_rate` and `history_rate` rows older than two days. |
 | `account_purges` | 10 s | 8 s | Purges the accounts asked for in `account_purges` (an account that became `deleted`): up to 20 accounts a run, each for up to 25 batches, so a large account goes on over several runs. No writer waits for a purge. One that fails is recorded with the account's DID, tried again an hour later, and the others still run. |
 | `account_purge_scan` | 1 day | 45 s | Looks for accounts with status `deleted` that still author rows and have no purge asked for, and asks for it. |
-| `table_pruning` | 1 day | 19 min | Deletes list fetch runs finished more than 7 days ago, operational errors older than 30 days (and the oldest beyond 100,000), and `subject_lists` rows of lists whose record is deleted. |
+| `table_pruning` | 1 day | 19 min | Deletes list fetch runs finished more than 7 days ago, operational errors older than 30 days (and the oldest beyond 100,000), `subject_lists` rows of lists whose record is deleted, `handle_due` rows nothing has served for 7 days, and job leases that ran out more than a day ago. |
 | `orphaned_cursors` | 1 day | 17 min | Deletes listing-cursor rows of runs that are no longer current. |
 | `history_retention` | 1 day | 18 min | Deletes history rows older than `storage.block_history_retention`. Does not run with `"0s"`. |
 | `counter_recount` | 1 day | 20 min | Recounts the per-list and per-account counters exactly, in batches of 1,000, each list under its list lock. Drift is repaired; where a repair takes a list's listblock count across zero the tracking transition is run. Any drift is recorded as an operational error. |
@@ -599,6 +609,30 @@ then:
 
 A series that is not zero is a bug worth reporting, with the log line.
 
+### Inbound connections
+
+Every listener of both processes bounds what a client can hold:
+
+| Listener | Connections open at once |
+|---|---|
+| `server.bind`, and the setup listener | 2,048 |
+| `metrics.bind`, `metrics.backfill_bind` | 32 each |
+
+Connections beyond the bound wait in the accept queue and take no
+open file. A connection is closed when:
+
+- no byte was read or written on it for 75 seconds;
+- it has waited for a request for 5 seconds while its listener holds
+  more than half of the connections it may. Connections that only sit
+  there are the first to go when room is short; one with a request in
+  flight is left alone;
+- nothing was written on it for 120 seconds, whatever was read. A
+  client that sends a request a byte at a time is never idle, and is
+  closed all the same.
+
+A reverse proxy in front should keep its idle time to the origin under
+75 seconds, or expect to reconnect.
+
 ### Outbound connections
 
 Both processes make many short requests to many hosts. Idle outbound
@@ -615,7 +649,7 @@ that can reach the network only through a proxy cannot run.
 
 | Path | Answer |
 |---|---|
-| `/health` | `200` if and only if `SELECT 1` answers within 1 second, the firehose is connected, and `applied_through` is at most `firehose.tuning.synthetic_gap_lag` behind; otherwise `503`. In setup mode `503 {"status":"setup"}`. |
+| `/health` | `200` if and only if `SELECT 1` answers within 1 second, the firehose is connected, and `applied_through` is at most `firehose.tuning.synthetic_gap_lag` behind; otherwise `503`. In setup mode `503 {"status":"setup"}`. An answer is given again for half a second, and one request at a time asks the database, so the endpoint cannot be used to take the API's connections. |
 | `/livez` | `200 {"status":"ok"}` whenever the process serves HTTP. |
 
 ```json
@@ -648,7 +682,11 @@ and publishes neither port, so a scraper joins the compose network.
 Outside compose, set a bind another host can reach only together with
 `metrics.bearer_token_sha256`: with it, both listeners require
 `Authorization: Bearer <token>`; without it, anyone who reaches the
-port reads the metrics.
+port reads the metrics. A listener whose address cannot be bound (it
+is still held by a process on its way out, say) is tried again every
+30 seconds. The recorder is kept up without a scraper: the samples of
+histograms are folded in every 5 seconds, so a process nobody scrapes
+does not grow.
 
 Metric names are kept stable on a best-effort basis and are not part
 of the API contract.

@@ -1504,6 +1504,49 @@ pub async fn s10_repo_events(env: &mut Env, c: &mut Checks) -> Result<()> {
         format!("applied {} rows {}", r.applied, rows(env).await?),
     );
     janitor::purge_account(&env.pool, &env.limits, &env.counters, &gone).await?;
+
+    // An account that leaves `deleted` for a status that is not hidden.
+    // Its rows were purged, and a later activation finds a status that
+    // was never hidden: the debt has to be raised when it leaves.
+    let back = plc("evdeleted", 2);
+    let mut wrote = block(&back, "b1", &victim, rev(60));
+    wrote.witness = Some(t(40));
+    env.firehose(vec![wrote]).await?;
+    let account = |witness, active, status: Option<&str>| E::Account {
+        did: back.clone(),
+        witness,
+        time: None,
+        active,
+        status: status.map(str::to_owned),
+    };
+    events_batch(env, vec![account(t(41), false, Some("deleted"))]).await?;
+    janitor::purge_account(&env.pool, &env.limits, &env.counters, &back).await?;
+    let left = events_batch(env, vec![account(t(42), false, Some("throttled"))]).await?;
+    let debts = |env: &Env| {
+        let pool = env.pool.clone();
+        let back = back.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM relist_debt d JOIN actors a ON a.id = d.actor_id
+                 WHERE a.did = $1 AND d.reason = 2",
+            )
+            .bind(back.as_str())
+            .fetch_one(&pool)
+            .await
+        }
+    };
+    let after_leaving = debts(env).await?;
+    let active = events_batch(env, vec![account(t(43), true, None)]).await?;
+    c.check(
+        "an account that leaves deleted for a status that is not hidden gets its resync debt then; the activation that follows adds none",
+        left.resyncs == 1 && after_leaving == 1 && active.resyncs == 0 && debts(env).await? == 1,
+        format!(
+            "resyncs {} then {}; debts {after_leaving} then {}",
+            left.resyncs,
+            active.resyncs,
+            debts(env).await?
+        ),
+    );
     consistency(env, c, "after repo events").await?;
     Ok(())
 }

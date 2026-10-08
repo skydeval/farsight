@@ -287,21 +287,42 @@ pub async fn store_gone(conn: &mut PgConnection, did: &Did) -> Result<()> {
 /// for the handle pass again a day later.
 const UNKNOWN_AGE: &str = "interval '6 days'";
 
+/// How long a stored handle is kept on the strength of its last
+/// verification while its host gives no answer.
+const UNRESOLVED_KEPT: &str = "interval '14 days'";
+
 /// Records that the document of `did` names `claim` and the handle could
 /// not be resolved back. A stored handle equal to the claim is kept as
-/// it is (the host may only be unreachable); any other stored handle is
-/// no longer the account's and is replaced by "nothing to show".
+/// it is (the host may only be unreachable) for as long as its last
+/// verification is not older than two weeks: a domain that has stopped
+/// answering for good does not vouch for the handle for ever. Any other
+/// stored handle is no longer the account's. Both are replaced by
+/// "nothing to show".
 pub async fn store_unresolved(conn: &mut PgConnection, did: &Did, claim: &str) -> Result<()> {
     sqlx::query(&format!(
         "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, '', now() - {UNKNOWN_AGE})
          ON CONFLICT (did) DO UPDATE SET handle = '', resolved_at = EXCLUDED.resolved_at
-           WHERE handle_cache.handle <> $2"
+           WHERE handle_cache.handle <> $2
+              OR (handle_cache.handle <> '' AND handle_cache.resolved_at < now() - {UNRESOLVED_KEPT})"
     ))
     .bind(did.as_str())
     .bind(claim)
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// Deletes `handle_due` rows nothing has served for a week (nightly).
+/// The handle pass removes a row when it has checked the account; with
+/// the pass off the rows are only ever added, and the stored handle was
+/// marked for a new check when the row was written.
+pub async fn prune_due(conn: &mut PgConnection) -> Result<u64> {
+    Ok(
+        sqlx::query("DELETE FROM handle_due WHERE asked_at < now() - interval '7 days'")
+            .execute(conn)
+            .await?
+            .rows_affected(),
+    )
 }
 
 /// Records that a check of `did` established nothing. A stored handle is

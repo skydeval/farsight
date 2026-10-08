@@ -48,6 +48,11 @@ pub const SEAM_REPAIR_ATTEMPTS: i32 = 5;
 pub const SEAM_RETRY_FIRST: Duration = Duration::from_secs(60);
 /// Longest wait between two reads of a window.
 pub const SEAM_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
+/// How long after a window's end a silent read still proves nothing. A
+/// stream that has sent no event for longer than this past the end of a
+/// window is not a quiet stream: its silent reads count as failed ones,
+/// and the window becomes a gap like any other that cannot be read.
+pub const SEAM_SILENT_MAX: Duration = Duration::from_secs(30 * 60);
 /// How often the due windows are looked up.
 pub const SEAM_POLL: Duration = Duration::from_secs(2);
 
@@ -160,15 +165,17 @@ pub fn retry_wait(failed: i32) -> Duration {
         .min(SEAM_RETRY_MAX)
 }
 
-/// Decides what follows a read.
-pub fn next_step(read: &Read, attempts: i32) -> Next {
+/// Decides what follows a read of a window that ended `ended_ago` ago.
+pub fn next_step(read: &Read, attempts: i32, ended_ago: Duration) -> Next {
     match read {
         Read::Finished(_) => Next::Done,
-        Read::Silent => Next::Retry {
+        // A stream may be quiet for a while after the window: the read
+        // is tried again and not held against it.
+        Read::Silent if ended_ago < SEAM_SILENT_MAX => Next::Retry {
             wait: retry_wait(attempts.max(1)),
             failed: false,
         },
-        Read::Failed(_) => {
+        Read::Silent | Read::Failed(_) => {
             let failed = attempts.saturating_add(1);
             if failed >= SEAM_REPAIR_ATTEMPTS {
                 Next::Abandon
@@ -182,6 +189,15 @@ pub fn next_step(read: &Read, attempts: i32) -> Next {
     }
 }
 
+/// Whether a re-read asked to start at `from_us` whose first event was
+/// witnessed at `first_us` replays the window from its start: the
+/// instance announced no clamp, and the first event is within
+/// `threshold` of the start (the rule a resumed session is judged by).
+pub fn replays_window(from_us: i64, first_us: i64, clamped: bool, threshold: Duration) -> bool {
+    let limit = i64::try_from(threshold.as_micros()).unwrap_or(i64::MAX);
+    !clamped && first_us.saturating_sub(from_us) <= limit
+}
+
 /// The seam repair task's inputs.
 #[derive(Clone)]
 pub struct Repairer {
@@ -191,6 +207,10 @@ pub struct Repairer {
     pub tx: mpsc::Sender<Item>,
     /// Silence that ends a read (`firehose.tuning.stall_timeout`).
     pub stall_timeout: Duration,
+    /// How far after the start of a window the first event of its
+    /// re-read may be before the instance counts as no longer holding
+    /// the window (`firehose.tuning.gap_threshold`, as for a resume).
+    pub gap_threshold: Duration,
     /// Set once an instance stopped accepting the bundled dictionary:
     /// frames are then requested uncompressed.
     pub plain: Arc<AtomicBool>,
@@ -233,7 +253,10 @@ impl Repairer {
         let Some(read) = self.read(w).await else {
             return false;
         };
-        match next_step(&read, w.attempts) {
+        let now_us = chrono::Utc::now().timestamp_micros();
+        let ended_ago =
+            Duration::from_micros(u64::try_from(now_us.saturating_sub(w.until_us)).unwrap_or(0));
+        match next_step(&read, w.attempts, ended_ago) {
             Next::Done => {
                 let events = match read {
                     Read::Finished(n) => n,
@@ -336,6 +359,7 @@ impl Repairer {
         let started = Instant::now();
         let mut buf: Vec<InEvent> = Vec::with_capacity(BATCH_MAX);
         let mut total = 0u64;
+        let mut clamped = false;
         let read = loop {
             if total >= SEAM_REPAIR_MAX_EVENTS as u64 || started.elapsed() >= SEAM_REPAIR_MAX_READ {
                 break Read::Failed(format!(
@@ -345,6 +369,18 @@ impl Repairer {
             }
             match tokio::time::timeout(self.stall_timeout, session.next_frame()).await {
                 Ok(Some(Ok(Frame::Event(ev)))) => {
+                    // The instance starts where it still holds events. A
+                    // read that starts late replays nothing of what it
+                    // skipped, and an event past the window's end would
+                    // then close a window that was never read.
+                    if total == 0
+                        && !replays_window(w.from_us, ev.witness_us, clamped, self.gap_threshold)
+                    {
+                        break Read::Failed(format!(
+                            "the instance no longer holds the window: its first event is {} s after the start",
+                            ev.witness_us.saturating_sub(w.from_us) / 1_000_000
+                        ));
+                    }
                     let past = ev.witness_us > w.until_us;
                     buf.push(ev);
                     total += 1;
@@ -356,7 +392,11 @@ impl Repairer {
                         return None;
                     }
                 }
-                Ok(Some(Ok(Frame::Info { .. }))) => {}
+                Ok(Some(Ok(Frame::Info { name, .. }))) => {
+                    if name == crate::reader::INFO_OUTDATED_CURSOR {
+                        clamped = true;
+                    }
+                }
                 Ok(Some(Ok(Frame::Error { error, .. }))) => {
                     break Read::Failed(format!("error frame: {error}"));
                 }
@@ -459,12 +499,14 @@ mod tests {
 
     #[test]
     fn only_a_finished_read_closes_a_window() {
-        assert_eq!(next_step(&Read::Finished(0), 0), Next::Done);
-        assert_eq!(next_step(&Read::Finished(900), 4), Next::Done);
-        // Silence proves nothing: tried again, never counted, never a gap.
+        let fresh = Duration::from_secs(60);
+        assert_eq!(next_step(&Read::Finished(0), 0, fresh), Next::Done);
+        assert_eq!(next_step(&Read::Finished(900), 4, fresh), Next::Done);
+        // Silence soon after the window proves nothing: tried again, not
+        // counted, not a gap.
         for attempts in [0, 1, SEAM_REPAIR_ATTEMPTS, 1_000] {
             assert!(matches!(
-                next_step(&Read::Silent, attempts),
+                next_step(&Read::Silent, attempts, fresh),
                 Next::Retry { failed: false, .. }
             ));
         }
@@ -472,15 +514,54 @@ mod tests {
         let failed = Read::Failed("connect: refused".into());
         let mut waits = Vec::new();
         for attempts in 0..SEAM_REPAIR_ATTEMPTS - 1 {
-            match next_step(&failed, attempts) {
+            match next_step(&failed, attempts, fresh) {
                 Next::Retry { wait, failed: true } => waits.push(wait),
                 other => panic!("{attempts}: {other:?}"),
             }
         }
         assert_eq!(waits[0], SEAM_RETRY_FIRST);
         assert!(waits.windows(2).all(|w| w[1] > w[0]), "{waits:?}");
-        assert_eq!(next_step(&failed, SEAM_REPAIR_ATTEMPTS - 1), Next::Abandon);
-        assert_eq!(next_step(&failed, i32::MAX), Next::Abandon);
+        assert_eq!(
+            next_step(&failed, SEAM_REPAIR_ATTEMPTS - 1, fresh),
+            Next::Abandon
+        );
+        assert_eq!(next_step(&failed, i32::MAX, fresh), Next::Abandon);
+    }
+
+    #[test]
+    fn a_stream_silent_long_after_the_window_is_counted_and_ends_in_a_gap() {
+        let old = SEAM_SILENT_MAX;
+        assert!(matches!(
+            next_step(&Read::Silent, 0, old),
+            Next::Retry { failed: true, .. }
+        ));
+        assert_eq!(
+            next_step(&Read::Silent, SEAM_REPAIR_ATTEMPTS - 1, old),
+            Next::Abandon
+        );
+        // Just inside the bound it still waits.
+        assert!(matches!(
+            next_step(
+                &Read::Silent,
+                SEAM_REPAIR_ATTEMPTS,
+                old - Duration::from_secs(1)
+            ),
+            Next::Retry { failed: false, .. }
+        ));
+    }
+
+    #[test]
+    fn a_read_that_starts_after_the_window_does_not_replay_it() {
+        let t = Duration::from_secs(300);
+        // The first event is at the start, or a little after it.
+        assert!(replays_window(1_000 * S, 1_000 * S, false, t));
+        assert!(replays_window(1_000 * S, 1_300 * S, false, t));
+        // Past the threshold: the instance started later than asked.
+        assert!(!replays_window(1_000 * S, 1_301 * S, false, t));
+        // An announced clamp, wherever the first event is.
+        assert!(!replays_window(1_000 * S, 1_000 * S, true, t));
+        // An instance that replays from before the start holds it all.
+        assert!(replays_window(1_000 * S, 900 * S, false, t));
     }
 
     #[test]

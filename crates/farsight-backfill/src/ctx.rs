@@ -43,9 +43,17 @@ pub struct Ctx {
     /// simply expires. It is `backfill_queue.claimed_by` of the entries
     /// whose jobs run here, and the stem of [`Ctx::lease_owner`].
     pub process: String,
+    /// Where the debt feeder's next pass starts: the `(created_at,
+    /// actor_id, reason)` of the last debt the pass before examined.
+    /// `None` starts at the oldest debt. Kept in memory: a new process
+    /// starts at the oldest again.
+    pub feeder_cursor: Mutex<Option<DebtCursor>>,
     /// Binary version (User-Agent).
     pub version: &'static str,
 }
+
+/// A place in `relist_debt` in the feeder's order.
+pub type DebtCursor = (chrono::DateTime<chrono::Utc>, i64, i16);
 
 impl Ctx {
     /// A context with open gates and a fresh process name. `counters` is
@@ -69,6 +77,7 @@ impl Ctx {
             counters,
             gates: SharedGates::default(),
             gate_state: Mutex::new(GateState::default()),
+            feeder_cursor: Mutex::new(None),
             process: format!(
                 "backfill-{}-{}",
                 std::process::id(),

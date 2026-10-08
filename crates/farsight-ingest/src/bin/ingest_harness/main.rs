@@ -419,7 +419,7 @@ async fn check_model(
     m.apply_events(tapped);
     let d = model::compare(pool, &m).await?;
     c.check(
-        format!("{label}: stored rows equal the LWW replay of every received event (no loss, no duplicates)"),
+        format!("{label}: stored rows equal the LWW replay of every event ingest received (nothing lost or doubled between receipt and storage)"),
         d.mismatches.is_empty() && d.compared > 0,
         format!(
             "{} commits replayed, {} keys compared ({} excluded: purged accounts), {} mismatches {:?}",
@@ -596,7 +596,7 @@ async fn mode_a(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
     let ingest = run.ingest.take().expect("running");
     let final_stats = ingest.stats.snapshot();
     let status = ingest.status().await.map_err(|e| e.to_string())?;
-    ingest.shutdown().await;
+    ingest.shutdown(std::time::Duration::from_secs(30)).await;
     let (ref_events, ref_intervals, ref_protocol) = reference.stop().await;
     run.tap_task.abort();
     run.watcher.task.abort();
@@ -990,16 +990,31 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
                         format!("new gaps {new:?}; expected cause {expected_cause:?} from {target} to ≈ floor {floor_us}"),
                     );
                     excluded_from_monotonic.push((rewind_start, Utc::now().timestamp_micros()));
-                    // Reconnect mid-replay, after the outage's seam repair:
-                    // the replay must continue where it was, not from the
-                    // repair's (newer) events.
-                    tokio::time::sleep(Duration::from_secs(45)).await;
-                    println!(
-                        "[{:>5}s] kill during the outage replay",
-                        t0.elapsed().as_secs()
-                    );
-                    let _ = ingest.control.send(Control::KillSocket).await;
-                    replay_slice = Some(floor_us + 6 * 3_600_000_000);
+                    // An instance that clamps replays from its floor, and
+                    // the gap ends there. One that refuses the cursor is
+                    // read from the live tail: the gap runs to now, and
+                    // there is no replay whose slice could be compared.
+                    let replays = new.iter().any(|g| {
+                        g.to_at
+                            .is_some_and(|t| t.timestamp_micros() < floor_us + 6 * 3_600_000_000)
+                    });
+                    if replays {
+                        // Reconnect mid-replay, after the outage's seam
+                        // repair: the replay must continue where it was,
+                        // not from the repair's (newer) events.
+                        tokio::time::sleep(Duration::from_secs(45)).await;
+                        println!(
+                            "[{:>5}s] kill during the outage replay",
+                            t0.elapsed().as_secs()
+                        );
+                        let _ = ingest.control.send(Control::KillSocket).await;
+                        replay_slice = Some(floor_us + 6 * 3_600_000_000);
+                    } else {
+                        c.unverified(
+                            "outage replay slice fully applied",
+                            "the instance refused the old cursor and is read from the live tail: nothing is replayed",
+                        );
+                    }
                 }
                 None => c.unverified(
                     "simulated cursor-too-old",
@@ -1104,6 +1119,26 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
             );
             counted_snapshot = now_counted;
             let ttl = farsight_storage::keys::Limits::from_config(cfg).tombstone_ttl;
+            // No tombstone of this run is as old as the TTL, so one that
+            // is gets planted, next to one that is an hour short of it:
+            // the purge has to take the first and leave the second.
+            let young_before: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM tombstones WHERE deleted_at >= now() - $1 * interval '1 second'",
+            )
+            .bind(ttl.as_secs_f64())
+            .fetch_one(&run.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            sqlx::query(
+                "INSERT INTO tombstones (collection, author_id, rkey, rev, deleted_at) VALUES
+                   (1, -1, 'harness-old', 1, now() - $1 * interval '1 second' - interval '1 hour'),
+                   (1, -1, 'harness-young', 1, now() - $1 * interval '1 second' + interval '1 hour')
+                 ON CONFLICT (collection, author_id, rkey) DO UPDATE SET deleted_at = EXCLUDED.deleted_at",
+            )
+            .bind(ttl.as_secs_f64())
+            .execute(&run.pool)
+            .await
+            .map_err(|e| e.to_string())?;
             let purged = farsight_storage::janitor::purge_tombstones(&run.pool, Utc::now(), ttl)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -1112,10 +1147,28 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
                 .fetch_one(&run.pool)
                 .await
                 .map_err(|e| e.to_string())?;
+            let planted: Vec<String> = sqlx::query_scalar(
+                "SELECT rkey FROM tombstones WHERE author_id = -1 ORDER BY rkey",
+            )
+            .fetch_all(&run.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let young_after: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM tombstones WHERE author_id <> -1
+                   AND deleted_at >= now() - $1 * interval '1 second'",
+            )
+            .bind(ttl.as_secs_f64())
+            .fetch_one(&run.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            sqlx::query("DELETE FROM tombstones WHERE author_id = -1")
+                .execute(&run.pool)
+                .await
+                .map_err(|e| e.to_string())?;
             c.check(
-                format!("{label}: tombstone TTL enforced"),
-                old == 0,
-                format!("{purged} purged, {old} older than TTL remain"),
+                format!("{label}: the purge takes a tombstone older than the TTL and leaves every younger one"),
+                old == 0 && purged >= 1 && planted == ["harness-young"] && young_after >= young_before,
+                format!("{purged} purged, {old} older than TTL remain, planted left {planted:?}, younger {young_before} → {young_after}"),
             );
             let s = run.ingest.as_ref().expect("running").stats.snapshot();
             println!(
@@ -1128,7 +1181,7 @@ async fn mode_b(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
     let late = scrape(&args.metrics).await?;
     let ingest = run.ingest.take().expect("running");
     let final_stats = ingest.stats.snapshot();
-    ingest.shutdown().await;
+    ingest.shutdown(std::time::Duration::from_secs(30)).await;
     let (ref_events, ref_intervals, _) = reference.stop().await;
     run.tap_task.abort();
     run.watcher.task.abort();
@@ -1296,10 +1349,14 @@ async fn check_replay_slice(c: &mut Checks, url: &str, start_us: i64, tapped: &[
         },
     };
     let (mut compared, mut missing) = (0usize, Vec::new());
+    // Whether the reference stream was read to the slice's end. One that
+    // went silent, closed or failed before it compared only a part.
+    let mut whole = false;
     loop {
         match tokio::time::timeout(Duration::from_secs(30), s.next_frame()).await {
             Ok(Some(Ok(farsight_ingest::frame::Frame::Event(ev)))) => {
                 if ev.witness_us > end_us {
+                    whole = true;
                     break;
                 }
                 if let (Body::Commit(_), Some(k)) = (&ev.body, model::event_key(&ev)) {
@@ -1314,6 +1371,13 @@ async fn check_replay_slice(c: &mut Checks, url: &str, start_us: i64, tapped: &[
         }
     }
     s.close().await;
+    if !whole && missing.is_empty() {
+        c.unverified(
+            "outage replay slice fully applied",
+            format!("the reference stream ended after {compared} commits, before the slice's end"),
+        );
+        return;
+    }
     c.check(
         "outage replay slice fully applied (no replay skipped after a mid-replay reconnect)",
         compared > 0 && missing.is_empty(),

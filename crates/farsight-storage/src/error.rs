@@ -27,6 +27,11 @@ pub enum StorageError {
     /// fresh stamp.
     #[error("listing stamp read at {0} is older than 72 h")]
     StaleStamp(chrono::DateTime<chrono::Utc>),
+    /// A listing read from a host that was not confirmed with the
+    /// directory would have removed stored rows. Nothing was written; the
+    /// job confirms the host and lists again.
+    #[error("a listing from an unconfirmed host would remove stored rows")]
+    UnconfirmedHost,
     /// The database schema is not the version this build expects.
     #[error("schema version {found:?}, expected {expected}")]
     SchemaVersion {

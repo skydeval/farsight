@@ -280,7 +280,7 @@ impl Resolver {
                 self.net.plc.acquire(PlcUse::Resolver).await;
                 let u = Url::parse(&format!("{}/{}", self.plc_url, did.as_str()))
                     .map_err(|e| ResolveError::Transient(e.to_string()))?;
-                match self.net.get_json(&u, "plc").await {
+                match self.net.get_plc_json(&u).await {
                     Ok(v) => v,
                     Err(NetError::Http { status: 404, .. }) => return Err(ResolveError::NotFound),
                     Err(NetError::Http { status: 410, .. }) => {

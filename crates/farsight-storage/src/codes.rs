@@ -820,6 +820,8 @@ pub mod sql {
         MEMBER_TERMINAL = MemberState::Terminal;
         /// `relist_debt.reason` = capped.
         DEBT_CAPPED = DebtReason::Capped;
+        /// `relist_debt.reason` = unreachable.
+        DEBT_UNREACHABLE = DebtReason::Unreachable;
         /// `subject_coverage.scope` = block.
         SCOPE_BLOCK = SubjectScope::Block;
         /// `subject_coverage.scope` = list chain.

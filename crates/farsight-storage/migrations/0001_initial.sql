@@ -289,6 +289,8 @@ CREATE TABLE backfill_state (
 
 CREATE INDEX backfill_state_running ON backfill_state (actor_id) WHERE state = 2; -- jobs a stopped process left behind are found here
 
+CREATE INDEX backfill_state_by_backfilled ON backfill_state (backfilled_at); -- the repositories listed in the last hour (getStats)
+
 -- Which worker holds the job for a DID, and until when.
 CREATE TABLE job_leases (
   did         TEXT COLLATE "C" PRIMARY KEY,
@@ -308,6 +310,7 @@ CREATE TABLE backfill_cursors (
   late_stamp    BOOLEAN  NOT NULL,
   cursor        TEXT,
   prev_last     TEXT COLLATE "C",
+  unreconciled  BOOLEAN NOT NULL DEFAULT false, -- an attempt that resumes here cannot tell which stored rows are gone
   PRIMARY KEY (actor_id, collection, job_kind, run_id),
   CONSTRAINT backfill_cursors_collection_code CHECK (collection IN (1, 2, 3, 4)),
   CONSTRAINT backfill_cursors_job_kind_code CHECK (job_kind IN (1, 2))
@@ -374,7 +377,7 @@ CREATE TABLE discovery_state (
   state             SMALLINT NOT NULL,  -- 1 queued 2 running 3 done 4 failed
   source            TEXT NOT NULL,
   started_at        TIMESTAMPTZ,
-  discovered_witness TIMESTAMPTZ,     -- the witness time of started_at: the coverage point
+  discovered_witness TIMESTAMPTZ,     -- the witness time of started_at: the point of the run in flight
   completed_at      TIMESTAMPTZ,
   truncated         BOOLEAN NOT NULL DEFAULT false,
   refs_found        INT NOT NULL DEFAULT 0,
@@ -426,6 +429,7 @@ CREATE TABLE subject_coverage (
   scope        SMALLINT NOT NULL,    -- 1 block 2 list_chain
   confirmed_at TIMESTAMPTZ NOT NULL,
   refs_found   INT NOT NULL,
+  discovered_witness TIMESTAMPTZ,    -- the coverage point of the run that confirmed it
   PRIMARY KEY (actor_id, scope),
   CONSTRAINT subject_coverage_scope_code CHECK (scope IN (1, 2))
 );

@@ -326,14 +326,21 @@ async fn run_inner(
             .bind(&named)
             .execute(pool)
             .await?;
+        // The coverage point is stored with the confirmation and only
+        // here: a run that is in flight, fails or ends truncated leaves
+        // the point of the last complete run in place. A run without a
+        // point (no firehose position yet) stores none, and a row
+        // without a point claims nothing.
         sqlx::query(&format!(
-            "INSERT INTO subject_coverage (actor_id, scope, confirmed_at, refs_found)
-             VALUES ($1, {SCOPE_BLOCK}, now(), $2), ($1, {SCOPE_LIST_CHAIN}, now(), $2)
+            "INSERT INTO subject_coverage (actor_id, scope, confirmed_at, refs_found, discovered_witness)
+             VALUES ($1, {SCOPE_BLOCK}, now(), $2, $3), ($1, {SCOPE_LIST_CHAIN}, now(), $2, $3)
              ON CONFLICT (actor_id, scope) DO UPDATE SET confirmed_at = now(),
-               refs_found = EXCLUDED.refs_found"
+               refs_found = EXCLUDED.refs_found,
+               discovered_witness = EXCLUDED.discovered_witness"
         ))
         .bind(x_id)
         .bind(i32::try_from(run.refs).unwrap_or(i32::MAX))
+        .bind(point)
         .execute(pool)
         .await?;
     }

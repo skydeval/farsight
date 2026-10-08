@@ -2074,10 +2074,18 @@ async fn check_top_lists(
             .await
             .map_err(|e| e.to_string())
     };
+    // "Top blockers" counts the blocks an account made; "Most blocked"
+    // counts the accounts that block one, however many records each of
+    // them wrote for it.
     let of_day = |by: &str| {
+        let n = if by == "subject_id" {
+            "count(DISTINCT r.author_id)"
+        } else {
+            "count(*)"
+        };
         format!(
             "SELECT a.did, t.n FROM (
-               SELECT r.{by} AS id, count(*) AS n FROM block_recent r
+               SELECT r.{by} AS id, {n} AS n FROM block_recent r
                JOIN blocks b ON b.author_id = r.author_id AND b.rkey = r.rkey AND b.subject_id = r.subject_id
                WHERE r.at >= {DAY_END} - interval '24 hours' AND r.at < {DAY_END} GROUP BY 1) t
              JOIN actors a ON a.id = t.id WHERE a.status IN (0, 3)
@@ -2093,7 +2101,7 @@ async fn check_top_lists(
     )
     .await?;
     let all_blocked = first(
-        "SELECT a.did, t.n FROM (SELECT subject_id, count(*) AS n FROM blocks GROUP BY 1) t
+        "SELECT a.did, t.n FROM (SELECT subject_id, count(DISTINCT author_id) AS n FROM blocks GROUP BY 1) t
          JOIN actors a ON a.id = t.subject_id WHERE a.status IN (0, 3)
          ORDER BY t.n DESC, a.id LIMIT 1"
             .into(),
@@ -2121,7 +2129,7 @@ async fn check_top_lists(
     );
     let lead = |t: &[Vec<(String, i64)>], i: usize| t.get(i).and_then(|t| t.first()).cloned();
     c.check(
-        "each table leads with the right account and number: the most blocks made and received in that day, and of all time; a block logged after the day ended does not count, nor one that is no longer stored",
+        "each table leads with the right account and number: the most blocks made, and the most accounts blocking it, in that day and of all time; a block logged after the day ended does not count, nor one that is no longer stored",
         lead(&day, 0) == Some(day_blocks.clone())
             && lead(&day, 1) == Some(day_blocked.clone())
             && lead(&all, 0) == Some(all_blocks.clone())
@@ -2552,7 +2560,7 @@ async fn check_warming(
     let first = a.get(&public_did(&w.w21)).await?;
     let sec = section(&first.text, "blockers").unwrap_or("");
     c.check(
-        "a page nobody has rendered since the server started shows the stored handles at once — the one verified a day ago and the one verified eight days ago — and holds back the one account that has never been checked",
+        "a page nobody has rendered since the server started shows the stored handles at once — the one stored as verified a day ago and the one stored as verified eight days ago — and holds back the one account that has never been checked",
         first.status == 200
             && shown_as(sec, &fresh) == "stored-fresh.example"
             && shown_as(sec, &stale) == "stored-stale.example"
@@ -2691,12 +2699,12 @@ async fn check_warming(
             .count();
     }
     c.check(
-        "switched on again: it starts from an empty queue (none of the 2,000 dropped accounts comes back) and the next render's 20 accounts are verified",
+        "switched on again: it starts from an empty queue (none of the 2,000 dropped accounts comes back) and the next render's 20 accounts are each checked once (their documents are requested; the stand-in names no handle, so no handle is resolved forward here)",
         on.status < 400
             && restarted_empty
             && done == 20
             && a.gauge(queue).await? == 0.0,
-        format!("{done} of 20 verified in {:?}", started.elapsed()),
+        format!("{done} of 20 checked in {:?}", started.elapsed()),
     );
     let m8 = a.metrics_text().await?;
     c.check(

@@ -45,6 +45,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use farsight_core::Config;
 use farsight_core::config::{self, StartMode};
+use farsight_core::listen;
 use farsight_core::net::{SafeClient, SafeClientConfig};
 use farsight_storage::gates::{self, Budget};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -74,6 +75,12 @@ const GAUGES_EVERY: Duration = Duration::from_secs(15);
 const COUNTER_FLUSH: Duration = Duration::from_secs(5);
 /// Series not updated for this long are dropped (bounded host labels).
 const METRIC_IDLE: Duration = Duration::from_secs(900);
+/// How often the recorder's upkeep runs.
+const UPKEEP_EVERY: Duration = Duration::from_secs(5);
+/// Pause before a metrics listener that could not bind tries again.
+const BIND_RETRY: Duration = Duration::from_secs(30);
+/// How long a stopping metrics listener waits for a scrape in flight.
+const METRICS_DRAIN: Duration = Duration::from_secs(3);
 
 /// The supervised tasks, by the name their panics are counted under.
 pub const TASKS: [&str; 9] = [
@@ -97,11 +104,23 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Installs the process-wide recorder (host series expire when idle).
+/// Must run inside the runtime: the recorder's upkeep is a task.
 pub fn install_metrics() -> Option<PrometheusHandle> {
     let b =
         PrometheusBuilder::new().idle_timeout(metrics_util::MetricKindMask::ALL, Some(METRIC_IDLE));
     match b.install_recorder() {
         Ok(h) => {
+            // Histogram samples are held until a scrape or the upkeep
+            // drains them: without it a process nobody scrapes grows
+            // without bound.
+            let upkeep = h.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(UPKEEP_EVERY);
+                loop {
+                    tick.tick().await;
+                    upkeep.run_upkeep();
+                }
+            });
             metrics::register();
             farsight_core::task::register(&TASKS);
             // Reconciles write history rows in this process.
@@ -165,22 +184,38 @@ async fn serve_metrics(handle: PrometheusHandle, cfg: &Config, mut stop: watch::
         .route("/metrics", get(render))
         .with_state(state);
     let bind = cfg.metrics.backfill_bind.clone();
-    let listener = match tokio::net::TcpListener::bind(&bind).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(error = %e, bind, "metrics listener not started");
-            return;
-        }
-    };
-    let _ = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            while !*stop.borrow() {
-                if stop.changed().await.is_err() {
-                    break;
+    // An address that cannot be bound now (still held by a process that
+    // is on its way out, say) is tried again until it can.
+    let listener = loop {
+        match tokio::net::TcpListener::bind(&bind).await {
+            Ok(l) => break l,
+            Err(e) => {
+                tracing::warn!(error = %e, bind, "metrics listener not started; trying again");
+                tokio::select! {
+                    () = tokio::time::sleep(BIND_RETRY) => {}
+                    r = stop.changed() => if r.is_err() { return; },
+                }
+                if *stop.borrow() {
+                    return;
                 }
             }
-        })
-        .await;
+        }
+    };
+    let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
+    let served = axum::serve(
+        listen::guarded(listener, listen::MAX_METRICS_CONNECTIONS),
+        app,
+    )
+    .with_graceful_shutdown(async move {
+        while !*stop.borrow() {
+            if stop.changed().await.is_err() {
+                break;
+            }
+        }
+        let _ = stopping_tx.send(());
+    })
+    .into_future();
+    let _ = listen::drain_within(served, stopping_rx, METRICS_DRAIN).await;
 }
 
 /// Why a run ended.
@@ -296,7 +331,12 @@ fn client(cfg: &Config) -> Client {
             return Client::Plain(plain);
         }
     }
-    Client::Safe(SafeClient::new(SafeClientConfig::from_config(cfg, VERSION)))
+    // No redirect is followed: a request is counted against the limits
+    // of the host it was made to, and a redirect would take it to a host
+    // whose slot and breaker it never touched.
+    let mut settings = SafeClientConfig::from_config(cfg, VERSION);
+    settings.max_redirects = 0;
+    Client::Safe(SafeClient::new(settings))
 }
 
 async fn run_normal(
@@ -459,7 +499,13 @@ async fn run_normal(
     {
         tasks.abort_all();
     }
-    let _ = ctx.counters.flush(&ctx.pool, &ctx.limits()).await;
+    // 30 seconds for the jobs and 5 for the last flush stay under the 45
+    // a supervisor gives.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        ctx.counters.flush(&ctx.pool, &ctx.limits()),
+    )
+    .await;
     tracing::info!(?end, "backfill stopped");
     Ok(end)
 }

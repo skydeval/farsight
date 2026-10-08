@@ -99,39 +99,42 @@ pub async fn measure_database_bytes(pool: &PgPool) -> Result<u64> {
     Ok(u64::try_from(n).unwrap_or(0))
 }
 
-/// Opens or closes the global `storage_refusals` interval when the
-/// "any global refusal active" condition changes (network scope is
-/// `partial` + `storage_refusal` while one is open). `witness` is the
-/// current applied-through witness time.
+/// Makes the global `storage_refusals` interval agree with `next`: one
+/// is open exactly while the budget or the ceiling refuses (network
+/// scope is `partial` + `storage_refusal` while one is open). It is
+/// run on every pass of the budget monitor and compares with the table,
+/// not with the state of the pass before: an open or a close that
+/// failed to be written, or that a restart came between, is written by
+/// the next pass. `witness` is the current applied-through witness
+/// time.
 pub async fn record_refusal_transition(
     pool: &PgPool,
-    prev: GateState,
     next: GateState,
     witness: DateTime<Utc>,
 ) -> Result<()> {
-    let was = prev.gates.budget_refusing || prev.gates.ceiling_refusing;
-    let is = next.gates.budget_refusing || next.gates.ceiling_refusing;
-    if was == is {
-        return Ok(());
-    }
+    let refusing = next.gates.budget_refusing || next.gates.ceiling_refusing;
     let mut tx = pool.begin().await?;
-    if is {
+    let changed = if refusing {
         sqlx::query(
             "INSERT INTO storage_refusals (from_witness)
              SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM storage_refusals WHERE to_witness IS NULL)",
         )
         .bind(witness)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected()
     } else {
         sqlx::query("UPDATE storage_refusals SET to_witness = $1 WHERE to_witness IS NULL")
             .bind(witness)
             .execute(&mut *tx)
+            .await?
+            .rows_affected()
+    };
+    if changed > 0 {
+        sqlx::query("SELECT pg_notify('farsight_coverage', '')")
+            .execute(&mut *tx)
             .await?;
     }
-    sqlx::query("SELECT pg_notify('farsight_coverage', '')")
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await?;
     Ok(())
 }

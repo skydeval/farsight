@@ -47,7 +47,7 @@ The object is defined in the lexicon
 | `asOf` | yes | Server time the response was built. |
 | `indexedAt` | no | Watermark of the response's scope, at or before `firehoseAppliedThrough`: everything witnessed at or before it is reflected for this scope, within the level. Absent before the first firehose batch. |
 | `firehoseAppliedThrough` | no | Running maximum of the Jetstream witness time of applied events. Global. Absent before the first batch. |
-| `firehoseLagSeconds` | no | `asOf` minus `firehoseAppliedThrough`. Includes the age of the coverage snapshot (at most 10 s). Present with `firehoseAppliedThrough`. |
+| `firehoseLagSeconds` | no | `asOf` minus `firehoseAppliedThrough`. Includes the age of the coverage snapshot: 10 s at most while it can be read again, up to 30 s while reads fail, after which it is stale (below). Present with `firehoseAppliedThrough`. |
 | `sourceLagSeconds` | no | `asOf` minus the median rev commit time of the last 1000 applied events. Informational. |
 | `firehoseConnected` | yes | Whether the firehose stream is connected. |
 | `coverage.level` | yes | `complete`, `assisted` or `partial`. Open enum. |
@@ -111,7 +111,7 @@ arrives through the firehose. It persists across a resume of the work.
 | full sweep or repair cycle | `S_C = clock(max(started_at, first_applied_at))` |
 | repository job | `clock(job start)`: the job's first database round trip, before its stamp and `describeRepo` |
 | list fetch run | `clock(run start)`, stored as `lists.fetched_witness` |
-| subject discovery | `clock(started_at) − backfill.backlinks.lag_allowance` (5 min, for the lag of the backlink index), stored as `discovered_witness` |
+| subject discovery | `clock(started_at) − backfill.backlinks.lag_allowance` (5 min, for the lag of the backlink index), stored as `discovered_witness` on `subject_coverage` when the run completes untruncated |
 
 ### The gap predicate
 

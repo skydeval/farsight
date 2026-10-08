@@ -27,3 +27,12 @@
    over HTTPS: only then are its cookies `Secure`, and the admin
    session cookie `__Host-farsight_admin`. Behind a proxy it does not
    trust, they are set without `Secure`.
+
+   With Cloudflare Tunnel the connection to Farsight comes from
+   `cloudflared`, not from a Cloudflare address, so the ranges the
+   preset trusts match nothing. Keep `proxy.mode = "cloudflare"` and
+   add the address `cloudflared` connects from to `proxy.trusted` in
+   Settings (its container's address, or `127.0.0.1/32` when it runs
+   on the same host). Nothing but `cloudflared` may then be able to
+   reach Farsight's port: whoever can, is believed about the client
+   address.

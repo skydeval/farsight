@@ -49,32 +49,62 @@ pub struct Busy;
 /// Resolves a handle to a DID: DNS TXT `_atproto.<handle>`, then
 /// `https://<handle>/.well-known/atproto-did`, through the safe client.
 pub async fn handle_to_did(safe: &SafeClient, handle: &str) -> Result<Did, HandleError> {
+    handle_to_did_answered(safe, handle).await.0
+}
+
+/// [`handle_to_did`], and whether a failure is the domain's own answer:
+/// DNS answered that the name carries no DID, and the host answered the
+/// well-known request with a refusal or with something that is not a
+/// DID. Then the domain does not name an account, as opposed to not
+/// having been heard from.
+pub async fn handle_to_did_answered(
+    safe: &SafeClient,
+    handle: &str,
+) -> (Result<Did, HandleError>, bool) {
     let handle = handle.trim().trim_start_matches('@').to_ascii_lowercase();
     if !farsight_core::did::is_valid_hostname(&handle) {
-        return Err(HandleError::Invalid(handle));
+        return (Err(HandleError::Invalid(handle)), false);
     }
-    if let Ok(txts) = safe.txt(&format!("_atproto.{handle}")).await {
+    let dns = safe.txt(&format!("_atproto.{handle}")).await;
+    let dns_answered = dns.is_ok();
+    if let Ok(txts) = dns {
         for t in txts {
             if let Some(d) = t.strip_prefix("did=")
                 && let Ok(did) = Did::parse(d.trim())
             {
-                return Ok(did);
+                return (Ok(did), true);
             }
         }
     }
-    let url = url::Url::parse(&format!("https://{handle}/.well-known/atproto-did"))?;
+    let url = match url::Url::parse(&format!("https://{handle}/.well-known/atproto-did")) {
+        Ok(u) => u,
+        Err(e) => return (Err(e.into()), false),
+    };
     let r = match safe.get(&url).await {
         Ok(r) => r,
-        Err(source) => return Err(HandleError::Unreachable { handle, source }),
+        Err(source) => return (Err(HandleError::Unreachable { handle, source }), false),
     };
     if r.status != 200 {
-        return Err(HandleError::Http {
-            handle,
-            status: r.status,
-        });
+        let refused = denies(r.status);
+        return (
+            Err(HandleError::Http {
+                handle,
+                status: r.status,
+            }),
+            dns_answered && refused,
+        );
     }
     let body = String::from_utf8_lossy(&r.body);
-    Did::parse(body.trim()).map_err(|_| HandleError::NotADid(handle))
+    match Did::parse(body.trim()) {
+        Ok(did) => (Ok(did), true),
+        Err(_) => (Err(HandleError::NotADid(handle)), dns_answered),
+    }
+}
+
+/// Whether a status of the well-known request says the host does not
+/// name an account: a client error other than "try later".
+pub fn denies(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
 }
 
 pub(crate) async fn permit(st: &WebState) -> Result<tokio::sync::OwnedSemaphorePermit, Busy> {
@@ -108,6 +138,16 @@ pub fn parse_list_ref(q: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_plain_refusal_says_the_host_names_no_account() {
+        for s in [400, 401, 403, 404, 410, 451] {
+            assert!(denies(s), "{s}");
+        }
+        for s in [200, 301, 408, 425, 429, 500, 502, 503] {
+            assert!(!denies(s), "{s}");
+        }
+    }
 
     #[test]
     fn list_refs() {

@@ -362,6 +362,7 @@ CREATE TABLE backfill_state (
   yields              INT NOT NULL DEFAULT 0
 );
 CREATE INDEX backfill_state_running ON backfill_state (actor_id) WHERE state = 2;
+CREATE INDEX backfill_state_by_backfilled ON backfill_state (backfilled_at);
 
 CREATE TABLE job_leases (
   did         TEXT COLLATE "C" PRIMARY KEY,
@@ -379,6 +380,7 @@ CREATE TABLE backfill_cursors (
   late_stamp    BOOLEAN  NOT NULL,
   cursor        TEXT,
   prev_last     TEXT COLLATE "C",
+  unreconciled  BOOLEAN NOT NULL DEFAULT false,
   PRIMARY KEY (actor_id, collection, job_kind, run_id)
 );
 
@@ -479,7 +481,10 @@ CREATE TABLE cycle_outstanding (
   is the name of the process and the number of its job.
 - `backfill_cursors`: the paging position and the listing stamp of one
   running job (`job_kind` 1 repository, 2 list fetch). A cursor belongs
-  to its run and is never adopted by another.
+  to its run and is never adopted by another. `unreconciled` says that
+  an attempt which resumes from the row cannot tell which stored rows
+  the repository no longer has (the listing was out of order, or past
+  the seen-set cap).
 - `backfill_queue`: jobs that wait or run. The scheduler claims an
   entry when it starts the job (`claimed_by` names the process,
   `claimed_until` the time the claim runs out unless it is renewed)
@@ -514,6 +519,7 @@ CREATE TABLE subject_coverage (
   scope        SMALLINT NOT NULL,
   confirmed_at TIMESTAMPTZ NOT NULL,
   refs_found   INT NOT NULL,
+  discovered_witness TIMESTAMPTZ,
   PRIMARY KEY (actor_id, scope)
 );
 
@@ -571,7 +577,9 @@ CREATE INDEX list_sched_keys_by_key ON list_sched_keys (key);
 
 - `subject_coverage`: what a discovery run confirmed about an account
   as a subject (`scope` 1 direct blocks, 2 the listitem → list →
-  listblock chain).
+  listblock chain). `discovered_witness` is the coverage point of the
+  run that confirmed it. A later run that fails or is truncated leaves
+  the row as it is.
 - `subject_lists`: every list a discovery run found naming the account.
   A run that checked every reference replaces the account's set, and
   rows whose list's record is deleted are removed once a day. The
@@ -922,7 +930,7 @@ takes a number of advisory locks that grows with the data:
 | One batch of an account purge or a divergence purge | 1 author lock and 500 list locks; a batch ends where its rows would need more |
 | The re-evaluation of uncounted listblocks | 1 author lock and 500 list locks per transaction |
 | The claim of a list fetch run | 500 list locks |
-| A reactivation (**OA** on the account's `unavailable` lists) | 500 list locks; lists beyond them keep their own retry |
+| The reactivations in one firehose batch (**OA** on the accounts' `unavailable` lists) | 500 list locks for the batch, given to the events in order; lists beyond them keep their own retry |
 | One batch of the nightly recount of per-account counters | 500 author locks |
 
 Work that needs more is split over several transactions. Keep
@@ -1147,7 +1155,10 @@ counters they were counted in:
 A batch reads the account's status under its author lock and removes
 nothing unless it is `deleted`: a purge asked for an account that has
 since been reactivated ends there, and the reactivation's `resync`
-debt has the repository listed again.
+debt has the repository listed again. The debt is raised whenever the
+status leaves `deleted`, whatever it becomes: an account that goes
+from `deleted` to a status that is not hidden, and is activated
+later, would otherwise come back without its rows and without a debt.
 
 An account's row in `account_purges` is deleted when a batch finds
 nothing left. The request survives a restart, so an interrupted purge

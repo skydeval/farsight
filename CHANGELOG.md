@@ -32,6 +32,53 @@ database schema; each entry says so where it does.
 - The DNS resolver (`hickory-resolver`) is at 0.26, which clears two
   advisories against 0.25; `deny.toml` no longer ignores any. Building
   from source needs Rust 1.88 or later.
+- Admin UI: more actions ask for a sign-in made in the last 10
+  minutes. A settings save needs one when it changes
+  `storage.database_url`, `server.hostname`, `firehose.urls`,
+  `backfill.backlinks.url`, `public_ui.record_viewer_url` or any
+  `proxy.*` or `metrics.*` key, when it switches a public page section,
+  avatars or crawling on, or takes an account off
+  `public_ui.excluded_dids`. Revoking an API key and resetting the
+  instance need one too. An older session is sent to the sign-in page
+  and nothing is changed until it returns.
+- Every HTTP listener holds a bounded number of connections (2,048 on
+  `server.bind` and in setup mode, 32 on each metrics listener). A
+  connection is closed after 75 seconds without a byte, after 120
+  seconds without an answer, and, while a listener is more than half
+  full, after 5 seconds of waiting for a request. A reverse proxy that
+  keeps idle connections to Farsight longer than 75 seconds
+  reconnects.
+- Stopping takes at most 40 seconds, and every step of it has a
+  deadline: 10 seconds for requests in flight, then the tasks, ingest
+  and the last flushes. `stop_grace_period` in `compose.yml` stays 45.
+- Backfill follows no redirect. A PDS, relay or directory that answers
+  with one is answered as failed; name the final address in
+  `backfill.relay_url`, `backfill.plc_url` and `backfill.backlinks.url`.
+- Backfill: a job whose host takes more than 10 seconds a `listRecords`
+  page, over five pages or more, ends as failed and is retried on
+  `backfill.retry_schedule` from where it stopped.
+- Config: `firehose.tuning.synthetic_gap_lag` and `stall_timeout` must
+  be between `1s` and `1h`, `backfill.sweep.max_outstanding` and
+  `rate_limit.query_concurrency` at least 1, `rate_limit.query_timeout`
+  above `0s`, and no duration may exceed 100 years. A config outside
+  these bounds does not load. The loader warns when
+  `rate_limit.query_concurrency` and `backfill.concurrency` together
+  need more than 100 database connections.
+- `FARSIGHT_SETUP_BIND` with a value that is not an address stops the
+  start with an error. It used to be ignored, and the wizard then
+  listened on every interface.
+- Home page: "Most blocked" counts the accounts that block an account,
+  not their block records.
+- Public pages: a page that is not rendered within three statement
+  timeouts (at least 10 seconds) is answered `503`.
+- The quick start keeps `POSTGRES_PASSWORD` in `.env` beside
+  `compose.yml`, which compose reads on every command.
+- Schema: `subject_coverage` has a `discovered_witness` column,
+  `backfill_cursors` an `unreconciled` column, and `backfill_state` an
+  index on `backfilled_at`. Schema version 1.
+- For contributors: the nightly workflow also runs the ingest harness,
+  and a stage fails when it passes nothing or leaves more checks
+  unverified than its flags explain.
 - The database schema is one initial migration, and the database checks
   every stored code: a column that holds a code accepts only the codes
   its enumeration defines. Schema version 1.
@@ -146,6 +193,91 @@ database schema; each entry says so where it does.
 
 ### Fixed
 
+- Coverage: asking for a backfill of an account a second time made its
+  incoming blocks read `assisted` from the moment the new discovery
+  run started, also across a gap, and also when that run then failed
+  or was cut short. `completeSince` now moves only when a run has
+  completed and seen everything.
+- A client that opened a connection and sent nothing kept the server
+  from exiting after `SIGTERM`, a configuration reset or a failed
+  ingest task: the container stayed "running" with no listener and no
+  ingest. The wait for open connections is bounded.
+- Backfill: a few hosts that answer slowly could hold every worker for
+  hours. Work is not started for a host that is cooling down or at its
+  limit, a slow host ends the attempt, and a job is charged for the
+  time it waits as well as for its requests.
+- Backfill: with 2,000 or more debts that could not be fed (accounts
+  on hosts that stay down), no newer debt was ever looked at, so
+  repair stopped. The feeder now works through all debts in turn. A
+  full re-list queue no longer holds back list fetches either.
+- Sweep: 10,000 members whose jobs kept failing stopped the
+  enumeration for up to a week at a time. When the bound is full of
+  members that only wait for a retry, the longest-failing are counted
+  as unreachable at once and enumeration goes on.
+- Lists: a host that answered `429` for thousands of lists, or one
+  operator with thousands of lists waiting, kept every later list from
+  being checked or fetched.
+- Lists deferred because a host cap or the lists cap was full were
+  never looked at again when the cap had room. The budget monitor
+  re-admits them, up to 200 a minute.
+- Backfill: an answer without the field it should carry was read as
+  "nothing there". A `describeRepo` without `collections` removed
+  every stored row of the account; a `getRecord` without `value`
+  counted as "record deleted"; a malformed cursor ended a listing or a
+  sweep early; export lines that could not be read were dropped. Each
+  is now a failed request.
+- Backfill: a listing that was out of order, or larger than
+  `backfill.seen_set_cap`, and was interrupted went on as an ordinary
+  listing and ended clean, with rows the repository no longer has
+  still stored.
+- Backfill: a host an account had left could be used from a cache and
+  have the account's rows removed. Rows are removed only on the word
+  of a host the directory names at that moment.
+- Backfill: a request redirected by a host was counted against that
+  host's limits and sent to another; a PDS named after the PLC
+  directory's host was not limited at all.
+- Sweep with the `plc` source: a page over 2 MB was asked for again at
+  the same size without end, and operations sharing a timestamp across
+  a page end could be skipped.
+- An account that left `deleted` for a status that is not hidden, and
+  became active later, came back without its rows and was not listed
+  again.
+- Firehose: after a stop longer than the instance keeps events, the
+  re-read of a seam window started past the window and still counted
+  as done; a loss on a new instance during its replay after a failover
+  got no gap; a seam window on a stream that stayed silent waited
+  without end. Each now ends in a recorded gap.
+- After a crash or a kill, answers said `firehoseConnected: true` and
+  `complete` until the stream had been behind for five minutes. The
+  flag is cleared at start.
+- The `storage_refusal` reason was not reported when the write that
+  opens its interval failed once, and an interval could stay open
+  across a restart.
+- A firehose batch with many reactivated accounts could take thousands
+  of list locks. The batch takes at most 500.
+- Sign-in: after a restart, a handful of addresses starting sign-ins
+  could keep the admin from signing in, and their sign-ins could push
+  the admin's out of the 256 held in progress.
+- Public pages: a handle its domain had withdrawn stayed on the
+  account until someone else claimed it; a handle an account gave up
+  stayed for up to a week unless the handle pass was on. Both are
+  dropped at the next check, and an identity event has the handle
+  checked again at the next page view.
+- Public pages: one visitor walking a large account's pages kept
+  everyone else's rows waiting for their handles. Each client address
+  has its own place in the queue.
+- `getIncomingListBlocks`: a later page read everything before its
+  cursor again.
+- Memory grew without bound on an instance whose `/metrics` nobody
+  scrapes.
+- A metrics listener whose address was in use at start was never
+  tried again.
+- `/health` could be used to take the API's database connections.
+- An API client that disconnected gave its query slots back while its
+  statement still ran, so one caller could run more statements than
+  its bound.
+- `handle_due` and expired `job_leases` rows were never deleted; the
+  nightly pruning removes them.
 - Backfill: a host answering `429` with an enormous `Retry-After`
   crashed the job that asked and took its worker out of the pool for
   good. The header is now honoured for at most an hour, and a job that

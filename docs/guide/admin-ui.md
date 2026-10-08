@@ -111,8 +111,15 @@ Some changes are made only within **10 minutes of signing in**:
   `backfill.relay_url`;
 - opening access further: `access.reads` towards `public`, `access.cors`
   or the public UI switched on;
+- changing where Farsight gets its data or who it trusts: the database
+  URL, the hostname, the Jetstream URLs, the backlink source, the
+  proxy settings, the metrics address and token, the record viewer
+  URL;
+- showing more on the public pages: a section or avatars switched on,
+  crawling allowed, an account taken off the excluded list;
 - rotating the admin token;
-- creating an API key.
+- creating or revoking an API key;
+- resetting the instance.
 
 Later than that, the change is not made. You are sent to the sign-in
 page, which says "Sign in again to change this setting". Sign in as

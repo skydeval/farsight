@@ -16,7 +16,7 @@
 //!   `S_C = clock(max(started_at, first_applied_at))`.
 
 use farsight_storage::codes::sql::{
-    ACTOR_ACTIVE, CYCLE_FULL, CYCLE_REPAIR, MEMBER_OUTSTANDING, RUN_LISTED, TRACKED,
+    ACTOR_ACTIVE, CYCLE_FULL, CYCLE_REPAIR, MEMBER_OUTSTANDING, REPO_FAILED, RUN_LISTED, TRACKED,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,9 +24,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use farsight_core::config::SweepSource;
-use farsight_core::{Collection, Tid};
+use farsight_core::{Collection, Did, Tid};
 use farsight_storage::codes::{CycleKind, CycleSource, DebtReason, TrackState};
-use farsight_storage::ids::{CycleId, GapId, ListId};
+use farsight_storage::ids::{ActorId, CycleId, GapId, ListId};
 use farsight_storage::tracking::FireArgs;
 use farsight_storage::transition::Event;
 use tokio::sync::watch;
@@ -195,12 +195,17 @@ pub async fn tick(ctx: &Ctx, sweep: &Sweep) -> Res<()> {
             ctx.cfg().backfill.repair.paused
         };
         if c.enumerated_at.is_none() && !paused {
-            let outstanding: i64 = sqlx::query_scalar(
+            let mut outstanding: i64 = sqlx::query_scalar(
                 &format!("SELECT count(*) FROM cycle_outstanding WHERE cycle_id = $1 AND state = {MEMBER_OUTSTANDING}"),
             )
             .bind(c.id)
             .fetch_one(pool)
             .await?;
+            // A full bound must not stop enumeration for as long as
+            // failing members are retried (a week each).
+            if outstanding >= max_out {
+                outstanding -= release_waiting(ctx, c.id, max_out).await?;
+            }
             // Each page asks for at most the room left, so outstanding
             // rows never exceed the bound.
             if outstanding < max_out {
@@ -212,6 +217,63 @@ pub async fn tick(ctx: &Ctx, sweep: &Sweep) -> Res<()> {
     }
     publish_progress(ctx).await;
     Ok(())
+}
+
+/// Makes room in a full cycle whose members mostly wait for a retry.
+///
+/// A member whose job failed stays outstanding while it is retried, for
+/// up to `backfill.terminal_after`. Enough of them (accounts on hosts
+/// that are down, or on a host that fails on purpose) fill the bound,
+/// and nothing new is enumerated until they give up. So when at least
+/// half of a full bound is members that wait for their next attempt, up
+/// to one page of them, the longest-failing first, are settled now as
+/// what they would become: `terminal` in the cycle, with an
+/// `unreachable` debt. Coverage counts them from then on. Their retries
+/// stay queued, and one that succeeds clears the debt. Returns how many
+/// were settled.
+async fn release_waiting(ctx: &Ctx, cycle: CycleId, max_out: i64) -> Res<i64> {
+    let pool = &ctx.pool;
+    let waiting: Vec<(String, ActorId, Option<DateTime<Utc>>)> = sqlx::query_as(&format!(
+        "SELECT o.did, a.id, b.current_run_point FROM cycle_outstanding o
+         JOIN actors a ON a.did = o.did JOIN backfill_state b ON b.actor_id = a.id
+         WHERE o.cycle_id = $1 AND o.state = {MEMBER_OUTSTANDING}
+           AND b.state = {REPO_FAILED} AND b.next_attempt_at > now()
+         ORDER BY b.first_failed_at NULLS LAST, a.id LIMIT $2"
+    ))
+    .bind(cycle)
+    .bind(max_out)
+    .fetch_all(pool)
+    .await?;
+    if (waiting.len() as i64) < (max_out + 1) / 2 {
+        return Ok(0);
+    }
+    let now = crate::jobs::db_now(pool).await?;
+    let witness = farsight_storage::firehose::clock(pool, now)
+        .await?
+        .unwrap_or(now);
+    let mut settled = 0;
+    for (did, id, point) in waiting.into_iter().take(PAGE as usize) {
+        let Ok(did) = Did::parse(&did) else { continue };
+        farsight_storage::debts::add_debt(
+            pool,
+            id,
+            DebtReason::Unreachable,
+            None,
+            point.unwrap_or(witness),
+        )
+        .await?;
+        crate::jobs::settle_membership(pool, &did, now, true).await?;
+        settled += 1;
+    }
+    if settled > 0 {
+        tracing::warn!(
+            cycle = cycle.get(),
+            settled,
+            "the sweep's outstanding bound was full of members waiting for a retry; \
+             the longest-failing are counted as unreachable so that enumeration goes on"
+        );
+    }
+    Ok(settled)
 }
 
 async fn maybe_start(ctx: &Ctx, sweep: &Sweep, first_applied: DateTime<Utc>) -> Res<()> {
@@ -475,11 +537,21 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
             Ok((members, next.or(cp), done))
         }
         CycleSource::Plc => {
-            let ops = xrpc::plc_export(&ctx.net, &cfg.backfill.plc_url, cp.as_deref(), room)
-                .await
-                .map_err(SweepError::from)?;
-            let done = ops.len() < room.min(1000) as usize;
-            let next = ops.last().map(|o| o.created_at.clone()).or(cp);
+            // A page too large to read is asked for again at half the
+            // size: at the same size it would be too large every time.
+            let mut count = room.clamp(1, 1000);
+            let mut ops = loop {
+                match xrpc::plc_export(&ctx.net, &cfg.backfill.plc_url, cp.as_deref(), count).await
+                {
+                    Err(crate::net::NetError::TooLarge(_)) if count > 1 => count /= 2,
+                    r => break r.map_err(SweepError::from)?,
+                }
+            };
+            let full = ops.len() >= count as usize;
+            let done = !full;
+            let (used, next) = xrpc::export_step(&ops, full);
+            let next = next.map(str::to_owned).or(cp);
+            ops.truncate(used);
             // The directory decides how many operations a page holds, so
             // DIDs are told apart with a set, not by searching the page.
             let mut members = Vec::new();

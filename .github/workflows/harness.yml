@@ -2,8 +2,9 @@ name: harness
 
 # Runs the integration harnesses: the feature-gated binaries that drive
 # real `farsight` processes against a throwaway Postgres and read the
-# stored rows and the responses back. ci.yml compiles and lints them on
-# every push; this workflow runs them every night and on request.
+# stored rows and the responses back, and the ingest harness, which reads
+# the public Jetstream into one. ci.yml compiles and lints them on every
+# push; this workflow runs them every night and on request.
 
 on:
   schedule:
@@ -57,7 +58,7 @@ jobs:
           set -euo pipefail
           cd target/debug
           tar -cf "$RUNNER_TEMP/harness-binaries.tar.zst" -I 'zstd -T0 -3' \
-            farsight farsight-backfill \
+            farsight farsight-backfill farsight-ingest-harness \
             farsight-stage1-harness farsight-stage3-harness \
             farsight-stage4-harness farsight-stage5-harness \
             farsight-stage6-harness farsight-stage7-harness \
@@ -82,43 +83,72 @@ jobs:
         include:
           # `pass` is the line a successful run prints last; `args` are the
           # harness's own flags (see the module docs of each main.rs).
+          # `unverified` is the number of checks those flags leave out: a
+          # run that reports more did not check what it is here to check,
+          # and fails. `bin` is the binary's name.
           - stage: 1
+            bin: farsight-stage1-harness
             args: ""
             pass: '^ALL STREAMS PASSED$'
+            unverified: 0
             browser: false
           # The first phase of stage 3 runs ingest on the public Jetstream;
           # the harness has no flag that leaves it out.
           - stage: 3
+            bin: farsight-stage3-harness
             args: ""
             pass: '^RESULT: PASS '
+            unverified: 0
             browser: false
           # --skip-live: check 11 needs a v2 Jetstream on this machine.
           - stage: 4
+            bin: farsight-stage4-harness
             args: "--skip-live"
             pass: '^== summary: [0-9]+ passed, 0 failed, '
+            unverified: 1
             browser: false
           - stage: 5
+            bin: farsight-stage5-harness
             args: ""
             pass: '^RESULT: PASS '
+            unverified: 0
             browser: false
           # --skip-live: no real handle, no real account's card.
           - stage: 6
+            bin: farsight-stage6-harness
             args: "--skip-live --browser"
             pass: '^RESULT: PASS '
+            unverified: 4
             browser: true
           - stage: 7
+            bin: farsight-stage7-harness
             args: "--browser"
             pass: '^RESULT: PASS '
+            unverified: 2
             browser: true
           # --skip-live: no handles from the real PLC directory and DNS.
           - stage: 8
+            bin: farsight-stage8-harness
             args: "--skip-live --browser"
             pass: '^RESULT: PASS '
+            unverified: 2
             browser: true
           - stage: 9
+            bin: farsight-stage9-harness
             args: "--browser"
             pass: '^RESULT: PASS '
+            unverified: 0
             browser: true
+          # The ingest harness: real Jetstream into a real Postgres, with
+          # an independent reference connection. Mode a is the bounded
+          # conformance run. It is the only run of the gap and seam
+          # checks.
+          - stage: ingest
+            bin: farsight-ingest-harness
+            args: "--mode a --minutes 8"
+            pass: '^RESULT: PASS '
+            unverified: 0
+            browser: false
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -145,8 +175,10 @@ jobs:
         timeout-minutes: 25
         env:
           STAGE: ${{ matrix.stage }}
+          BIN: ${{ matrix.bin }}
           ARGS: ${{ matrix.args }}
           PASS: ${{ matrix.pass }}
+          MAX_UNVERIFIED: ${{ matrix.unverified }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/logs"
@@ -155,12 +187,33 @@ jobs:
           # (stage 1: only when every check passed), 2 when Postgres or a
           # Docker network could not be started.
           # shellcheck disable=SC2086
-          "$RUNNER_TEMP/bin/farsight-stage$STAGE-harness" $ARGS 2>&1 | tee "$log"
+          "$RUNNER_TEMP/bin/$BIN" $ARGS 2>&1 | tee "$log"
           # And the run must have reached its verdict line.
           grep -Eq "$PASS" "$log" || {
             echo "::error::stage $STAGE exited 0 without its pass line"
             exit 1
           }
+          # A verdict with counts must have passed something, and may
+          # leave unverified only what the flags above explain: a run of
+          # nothing but unverified checks has failed no check and has
+          # proved nothing.
+          verdict="$(grep -E '^(RESULT: |== summary: )' "$log" | tail -n 1 || true)"
+          if [ -n "$verdict" ]; then
+            passed="$(printf '%s\n' "$verdict" | sed -nE 's/.*[^0-9]([0-9]+) passed.*/\1/p')"
+            unverified="$(printf '%s\n' "$verdict" | sed -nE 's/.*[^0-9]([0-9]+) unverified.*/\1/p')"
+            if [ -z "$passed" ] || [ -z "$unverified" ]; then
+              echo "::error::stage $STAGE: no counts in its verdict line: $verdict"
+              exit 1
+            fi
+            if [ "$passed" -eq 0 ]; then
+              echo "::error::stage $STAGE passed no check"
+              exit 1
+            fi
+            if [ "$unverified" -gt "$MAX_UNVERIFIED" ]; then
+              echo "::error::stage $STAGE left $unverified checks unverified; its flags explain $MAX_UNVERIFIED"
+              exit 1
+            fi
+          fi
       - name: Summary
         if: always()
         env:
