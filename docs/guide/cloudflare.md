@@ -1,7 +1,16 @@
 # Running behind Cloudflare
 
+Farsight serves plain HTTP on one port (8080) and does not terminate
+TLS. Something else has to: a reverse proxy of your choice with a
+certificate, or Cloudflare Tunnel, which needs neither a certificate
+nor an open port. Keep Farsight's own port off the public internet,
+for example with `FARSIGHT_PORT=127.0.0.1:8080` in `.env`.
+
 1. Create the DNS record as **proxied**.
-2. Set SSL/TLS to **Full (strict)**, or use Cloudflare Tunnel.
+2. Set SSL/TLS to **Full (strict)** with a reverse proxy in front of
+   Farsight that holds a certificate Cloudflare accepts, or use
+   Cloudflare Tunnel. Do not use Flexible: it sends the admin sign-in
+   from Cloudflare to the server unencrypted.
 3. Add cache rules:
    - Make `/xrpc/app.nearhorizon.farsight.query.*` eligible for cache
      and respect origin headers, except
@@ -28,11 +37,16 @@
    session cookie `__Host-farsight_admin`. Behind a proxy it does not
    trust, they are set without `Secure`.
 
-   With Cloudflare Tunnel the connection to Farsight comes from
-   `cloudflared`, not from a Cloudflare address, so the ranges the
-   preset trusts match nothing. Keep `proxy.mode = "cloudflare"` and
-   add the address `cloudflared` connects from to `proxy.trusted` in
-   Settings (its container's address, or `127.0.0.1/32` when it runs
-   on the same host). Nothing but `cloudflared` may then be able to
-   reach Farsight's port: whoever can, is believed about the client
-   address.
+   With Cloudflare Tunnel, or a reverse proxy of your own between
+   Cloudflare and Farsight, the connection to Farsight comes from
+   `cloudflared` or that proxy, not from a Cloudflare address, so the
+   ranges the preset trusts match nothing. The wizard's choice for
+   this is **Cloudflare Tunnel or a local reverse proxy**, which asks
+   for the address it connects from; its preview shows the address
+   Farsight sees. Afterwards the same is done in Settings: keep
+   `proxy.mode = "cloudflare"` and add that address to `proxy.trusted`
+   (the container's address, or `127.0.0.1/32` when it runs on the
+   same host). Nothing but `cloudflared` or the proxy may then be able
+   to reach Farsight's port: whoever can, is believed about the client
+   address. A proxy of your own must itself accept connections from
+   Cloudflare only, since it passes `CF-Connecting-IP` on.
