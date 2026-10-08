@@ -101,18 +101,16 @@ pub fn pds_endpoint(doc: &Value) -> Option<String> {
         .map(|e| e.trim_end_matches('/').to_owned())
 }
 
-/// The address block of `ip` for cap buckets: /24 (IPv4) or /48 (IPv6).
-pub fn ip_block(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(a) => {
-            let o = a.octets();
-            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
-        }
-        IpAddr::V6(a) => {
-            let s = a.segments();
-            format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
-        }
+pub use farsight_core::ip_block;
+
+/// The address bucket of a host with these addresses: the block of the
+/// first, or none when that one is in a shared CDN range.
+pub fn address_bucket(ips: &[IpAddr], cdn_ranges: &[ipnet::IpNet]) -> Option<String> {
+    let ip = *ips.first()?;
+    if cdn_ranges.iter().any(|n| n.contains(&ip)) {
+        return None;
     }
+    Some(ip_block(ip))
 }
 
 impl Resolver {
@@ -151,7 +149,7 @@ impl Resolver {
     }
 
     fn endpoint_for(&self, host: &str) -> String {
-        let bare = host.split(':').next().unwrap_or(host);
+        let bare = crate::net::bare_host(host);
         if self.allow_http.iter().any(|h| h == bare) {
             format!("http://{host}")
         } else {
@@ -159,12 +157,11 @@ impl Resolver {
         }
     }
 
+    /// Whether `host` (a limiter key, `host[:port]`) is one of
+    /// `limits.large_hosts`, by the one rule the configuration has for
+    /// it.
     fn is_large(&self, host: &str) -> bool {
-        let bare = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
-        self.large_hosts.iter().any(|p| match p.strip_prefix("*.") {
-            Some(suffix) => bare.ends_with(&format!(".{suffix}")),
-            None => bare == p.to_ascii_lowercase(),
-        })
+        farsight_core::config::host_matches(&self.large_hosts, crate::net::bare_host(host))
     }
 
     /// Cached resolution only (no I/O beyond the database).
@@ -317,19 +314,15 @@ impl Resolver {
     }
 
     async fn ip_bucket(&self, host: &str) -> Option<String> {
-        let bare = host.split(':').next().unwrap_or(host);
-        let ips: Vec<IpAddr> = match bare.parse::<IpAddr>() {
-            Ok(ip) => vec![ip],
-            Err(_) => match &self.dns {
+        let bare = crate::net::bare_host(host);
+        let ips: Vec<IpAddr> = match farsight_core::literal_ip(bare) {
+            Some(ip) => vec![ip],
+            None => match &self.dns {
                 Some(d) => d.lookup_ip(bare).await.ok()?,
                 None => return None,
             },
         };
-        let ip = *ips.first()?;
-        if self.cdn_ranges.iter().any(|n| n.contains(&ip)) {
-            return None;
-        }
-        Some(ip_block(ip))
+        address_bucket(&ips, &self.cdn_ranges)
     }
 
     async fn record(&self, did: &Did, pds: &Pds) -> Result<(), farsight_storage::StorageError> {
@@ -383,6 +376,38 @@ impl Resolver {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_host_that_is_an_address_gets_the_buckets_of_its_block() {
+        // The limiter key of a PDS at an IPv6 address, with and without a
+        // port, and of two more addresses of the same /48.
+        for host in [
+            "[2001:db8:1:2::1]",
+            "[2001:db8:1:2::1]:8443",
+            "[2001:db8:1:ffff::9]",
+            "[2001:db8:1::7]:443",
+        ] {
+            let bare = crate::net::bare_host(host);
+            let ip = farsight_core::literal_ip(bare).expect("an address");
+            assert_eq!(
+                address_bucket(&[ip], &[]).as_deref(),
+                Some("2001:db8:1::/48"),
+                "{host}"
+            );
+            // The domain bucket and the admission key go by the block too.
+            assert_eq!(farsight_core::registrable_domain(bare), "2001:db8:1::/48");
+        }
+        let v4 = farsight_core::literal_ip(crate::net::bare_host("203.0.113.9:2583"));
+        assert_eq!(
+            address_bucket(&[v4.expect("an address")], &[]).as_deref(),
+            Some("203.0.113.0/24")
+        );
+        // An address in a shared CDN range has no address bucket.
+        let cdn: Vec<IpNet> = vec!["2001:db8:1::/48".parse().expect("net")];
+        let ip = farsight_core::literal_ip("[2001:db8:1::7]").expect("an address");
+        assert_eq!(address_bucket(&[ip], &cdn), None);
+        assert_eq!(address_bucket(&[], &[]), None);
+    }
 
     #[test]
     fn a_full_cache_drops_what_expired_and_everything_if_nothing_did() {

@@ -234,7 +234,8 @@ CREATE INDEX tombstones_by_age ON tombstones (deleted_at);
   event that first stored the row, NULL when a listing stored it.
   `sched_key` is the admission key charged when the row was inserted.
   `list_blocks_by_author_list` serves the outgoing direction of
-  `checkBlocks`.
+  `checkBlocks`, which reads at most 1,000 lists per account through
+  it, in list id order.
 - `lists`: one row per list that anything refers to, whether or not its
   record has been seen. The record's fields are `record_state`
   (0 unknown, 1 present, 2 deleted), `purpose` (0 other, 1 moderation,
@@ -326,7 +327,7 @@ CREATE TABLE firehose_seams (
 - `firehose_gaps`: intervals of the witness clock during which events
   may have been lost. `cause` is 1 `cursor_too_old`, 2 `heuristic`,
   3 `failover`, 4 `sync_unavailable`, 5 `seam_unrepaired`,
-  6 `unreadable`; `to_at` is
+  6 `unreadable`, 7 `unapplied`; `to_at` is
   NULL while the gap is open; `healed_*` are set by the repair that
   covered it.
 - `firehose_seams`: the seam windows that still have to be read again,
@@ -1220,7 +1221,9 @@ changes under the author lock and, in the same step, moves the
 account's usage: its exact per-author counts are taken out of the old
 buckets and added to the new. Without that the rows of every new
 author would stay in `unresolved`, which only the nightly rebuild
-would empty. The lifetime intern charge is not moved. A change to a
+would empty. The lifetime intern charge is not moved, which is why
+`unresolved` has no lifetime bound on interning
+([security.md](security.md#admission-keys-and-daily-rates)). A change to a
 host's own facts (its address block, or whether it is a large host)
 moves nothing; the nightly rebuild accounts for it.
 
@@ -1276,7 +1279,7 @@ and defers and releases lists:
 ```toml
 [storage]
 budget_bytes = 70_000_000_000   # the setup wizard sets 70% of the disk you enter
-hard_ceiling_bytes = 0          # 0 = 115% of budget_bytes; must exceed the budget
+hard_ceiling_bytes = 0          # 0 = 115% of budget_bytes; at least 105% of the budget
 tombstone_ttl = "7d"
 ```
 

@@ -120,6 +120,11 @@ fn streams() -> Vec<Stream> {
             name: "seam windows: recorded, read again, or recorded as a gap",
             run: stream!(streams_more::s13_seam_windows),
         },
+        Stream {
+            n: 14,
+            name: "discovery writes pass their author's gates",
+            run: stream!(streams_more::s14_discovery_gates),
+        },
     ]
 }
 

@@ -83,6 +83,9 @@ pub const GAUGE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct FaultHook {
     /// DIDs whose events fail.
     pub poison_dids: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// DIDs whose poisoned events cannot be recorded either: the write
+    /// of the operational error and the `resync` debt fails every time.
+    pub unrecordable_dids: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Ingest settings derived from the config.

@@ -8,7 +8,7 @@ use farsight_core::{Collection, Did, RecordKey};
 use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Write, WriteAction};
 use farsight_storage::codes::sql::{TRACK_MISSING, TRACK_PENDING};
 use farsight_storage::codes::{
-    DeferCause, JobKind, Priority, RecordState, RequesterKey, Tier, TrackState,
+    CapType, DeferCause, JobKind, Priority, RecordState, RequesterKey, Tier, TrackState,
 };
 use farsight_storage::ids::{ActorId, ListId, Stamp};
 use farsight_storage::keys::CapKind;
@@ -144,8 +144,20 @@ enum Check {
     Present,
     NotFound,
     OwnerInactive,
-    Refused,
+    /// The record was found and a gate or cap refused it.
+    Refused(DeferCause),
     Error(String),
+}
+
+/// The gate a refused list record is deferred by: the storage budget or
+/// the hard ceiling when one of them refused it, the lists cap for the
+/// per-author and per-host caps on list records.
+pub fn deferral_for(refusal: Option<CapType>) -> DeferCause {
+    match refusal {
+        Some(CapType::Budget) => DeferCause::Budget,
+        Some(CapType::Ceiling) => DeferCause::Ceiling,
+        _ => DeferCause::ListsCap,
+    }
 }
 
 /// Runs phase 1 for one list (the scheduler picked it from its lanes).
@@ -233,8 +245,8 @@ async fn run_inner(ctx: &Ctx, list_id: ListId, cost: &mut u64) -> Result<Outcome
             pass(ctx, &now).await?;
             Ok(Outcome::Clean)
         }
-        Check::Refused => {
-            fire(ctx, list_id, Event::GateFail(DeferCause::ListsCap)).await?;
+        Check::Refused(cause) => {
+            fire(ctx, list_id, Event::GateFail(cause)).await?;
             Ok(Outcome::CompleteWithDebts)
         }
         Check::OwnerInactive => {
@@ -386,8 +398,8 @@ async fn record_check(ctx: &Ctx, l: &ListRow, cost: &mut u64) -> Check {
         {
             Ok(Some(value)) => {
                 return match apply_record(ctx, l, &value).await {
-                    Ok(true) => Check::Present,
-                    Ok(false) => Check::Refused,
+                    Ok(None) => Check::Present,
+                    Ok(Some(cause)) => Check::Refused(cause),
                     Err(e) => Check::Error(e.to_string()),
                 };
             }
@@ -430,8 +442,14 @@ async fn record_check(ctx: &Ctx, l: &ListRow, cost: &mut u64) -> Check {
 }
 
 /// Applies a fetched list record with `W = 0` under author(O) + list(L)
-/// exclusive (the apply path); `false` if a cap refused it.
-async fn apply_record(ctx: &Ctx, l: &ListRow, value: &serde_json::Value) -> Result<bool, JobError> {
+/// exclusive (the apply path). The record passes the owner's gates like
+/// any write of the owner: `Some` names the gate that defers the list
+/// when one refused it.
+async fn apply_record(
+    ctx: &Ctx,
+    l: &ListRow,
+    value: &serde_json::Value,
+) -> Result<Option<DeferCause>, JobError> {
     let rec = parse_record(&l.owner, Collection::List, value)?;
     let limits = ctx.limits();
     let actx = ApplyCtx {
@@ -452,7 +470,11 @@ async fn apply_record(ctx: &Ctx, l: &ListRow, value: &serde_json::Value) -> Resu
     });
     let report = apply::apply(&ctx.pool, &actx, &b).await?;
     crate::metrics::count_refusals(&report);
-    Ok(report.refused == 0)
+    if report.refused == 0 {
+        return Ok(None);
+    }
+    let refusal = report.refusals.first().map(|r| r.refusal.cap_type());
+    Ok(Some(deferral_for(refusal)))
 }
 
 /// The wall-clock bound: lists `pending` longer than
@@ -476,4 +498,21 @@ pub async fn pending_timeouts(
         fire(ctx, *id, Event::FailTerminal).await?;
     }
     Ok(lists.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_list_record_is_deferred_by_the_gate_that_refused_it() {
+        // The budget monitor reopens these two when the gate reopens.
+        assert_eq!(deferral_for(Some(CapType::Budget)), DeferCause::Budget);
+        assert_eq!(deferral_for(Some(CapType::Ceiling)), DeferCause::Ceiling);
+        // The caps on list records, per author and per host bucket.
+        for cap in [CapType::ListsPerAuthor, CapType::HostLists] {
+            assert_eq!(deferral_for(Some(cap)), DeferCause::ListsCap);
+        }
+        assert_eq!(deferral_for(None), DeferCause::ListsCap);
+    }
 }

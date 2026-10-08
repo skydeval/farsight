@@ -14,6 +14,9 @@ token = "fsk_…"   # API key with read + backfill scopes
    `assisted` or `partial`.
    - Treat any DID listed in `partialFor` as partial.
    - Treat any level value you don't recognise as partial.
+4. **A relation names at most 100 lists.** When `blocksActor` or
+   `blockedByActor` carries `"listsTruncated": true`, more lists hold
+   the block than `lists` shows. The block is there either way.
 
 `requestBackfill` indexes the account's own repo. Knowing who blocks
 that account requires either a completed network sweep, or the

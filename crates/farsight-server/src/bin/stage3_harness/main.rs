@@ -2066,6 +2066,122 @@ async fn phase_coverage(
         rr.short(),
     );
 
+    // A party that listblocks more lists than one call weighs, and a
+    // relation through more lists than one answer names.
+    let cap = farsight_storage::queries::CHECK_LISTS_PER_PARTY as i64;
+    let td = did("cvt", 1);
+    let tid = seed::actor(&pool, &td).await?;
+    let (heavy, light) = (did("cvh", 1), did("cvh", 2));
+    let hid = seed::actor(&pool, &heavy).await?;
+    let lid = seed::actor(&pool, &light).await?;
+    let many = cap + 1;
+    seed::exec(
+        &pool,
+        &format!(
+            "INSERT INTO lists (owner_id, rkey, record_state, purpose, name, listblock_count,
+                                track_state, admitted_at, admit_epoch, phase1_epoch, fetched_at,
+                                fetched_witness)
+             SELECT {p}, 'many' || lpad(g::text, 6, '0'), 1, 1, 'many', 1, 2,
+                    now() - interval '1 hour', 1, 1, now() - interval '1 hour',
+                    now() - interval '1 hour'
+             FROM generate_series(1, {many}) g"
+        ),
+    )
+    .await?;
+    let many_lists = format!("SELECT id FROM lists WHERE owner_id = {p} AND rkey LIKE 'many%'");
+    seed::exec(
+        &pool,
+        &format!(
+            "INSERT INTO list_blocks (author_id, rkey, list_id, counted, witnessed_at, created_at,
+                                      rev, first_seen, last_seen)
+             SELECT {hid}, '3lh' || l.id, l.id, true, now() - interval '10 minutes', now(), 1,
+                    now(), now()
+             FROM ({many_lists}) l"
+        ),
+    )
+    .await?;
+    seed::exec(
+        &pool,
+        &format!(
+            "INSERT INTO list_blocks (author_id, rkey, list_id, counted, witnessed_at, created_at,
+                                      rev, first_seen, last_seen)
+             SELECT {lid}, '3ll' || l.id, l.id, true, now() - interval '10 minutes', now(), 1,
+                    now(), now()
+             FROM ({many_lists} ORDER BY id LIMIT 2) l"
+        ),
+    )
+    .await?;
+    seed::exec(
+        &pool,
+        &format!(
+            "INSERT INTO list_items (owner_id, rkey, list_id, subject_id, created_at, rev,
+                                     first_seen, last_seen)
+             SELECT {p}, '3lmi' || l.id, l.id, {tid}, now(), 1, now(), now()
+             FROM ({many_lists}) l"
+        ),
+    )
+    .await?;
+    v.refresh().await?;
+    let q = format!(
+        "actor={}&others={}&others={}",
+        enc(&td),
+        enc(&heavy),
+        enc(&light)
+    );
+    let started = Instant::now();
+    let r = v.get("query.checkBlocks", &q).await?;
+    let took = started.elapsed();
+    let pf = r.body["partialFor"].as_array().cloned().unwrap_or_default();
+    let res = r.body["results"].as_array().cloned().unwrap_or_default();
+    let of = |rows: &[Value], d: &str| {
+        rows.iter()
+            .find(|e| e["did"] == d)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    c.check(
+        "checkBlocks: a party with more listblocks than a call weighs is partial with listblocks_truncated; the other pair is not",
+        r.status == 200
+            && reasons(&of(&pf, &heavy)).contains("listblocks_truncated")
+            && of(&pf, &light).is_null()
+            && level(&r.body["freshness"]["coverage"]) == "complete",
+        format!("{} {pf:?}", r.status),
+    );
+    let (h, l) = (of(&res, &heavy), of(&res, &light));
+    let n_lists = |e: &Value| e["blocksActor"]["lists"].as_array().map_or(0, Vec::len);
+    c.check(
+        "checkBlocks: a relation names at most 100 lists and says listsTruncated; a shorter one has no such field",
+        n_lists(&h) == 100
+            && h["blocksActor"]["listsTruncated"] == true
+            && n_lists(&l) == 2
+            && l["blocksActor"].get("listsTruncated").is_none()
+            && l["blockedByActor"].get("listsTruncated").is_none(),
+        format!(
+            "heavy {} lists, truncated {}; light {}",
+            n_lists(&h),
+            h["blocksActor"]["listsTruncated"],
+            l["blocksActor"]
+        ),
+    );
+    c.check(
+        "checkBlocks: the answer over a thousand lists comes within the statement timeout",
+        took < Duration::from_secs(5),
+        format!("{took:?}"),
+    );
+    let (hv, hr) = v
+        .cov(
+            "query.checkBlocks",
+            &format!("actor={}&others={}", enc(&heavy), enc(&td)),
+        )
+        .await?;
+    c.check(
+        "checkBlocks: the viewer itself over the bound makes the response partial with listblocks_truncated",
+        level(&hv) == "partial"
+            && reasons(&hv).contains("listblocks_truncated")
+            && hr.body["results"][0]["blockedByActor"]["listsTruncated"] == true,
+        hr.short(),
+    );
+
     // d. assisted from a seeded discovery state; discovery_truncated.
     seed::exec(
         &pool,

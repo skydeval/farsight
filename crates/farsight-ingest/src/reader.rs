@@ -312,6 +312,24 @@ pub const UNREADABLE_SKIP_MAX: u32 = 64;
 /// The position a session resumes from, as a number that is the same on
 /// every resume from that position: the `seq` or the time asked for.
 /// `None` at the live tail.
+/// Connects at the live tail after a refused cursor: `connect(compress)`,
+/// and once more uncompressed when the instance answers that it no
+/// longer knows the bundled dictionary. An instance may check the cursor
+/// before the dictionary, so the second refusal can come only here; left
+/// to the next attempt, that one would meet the refused cursor first
+/// again, and the stream would never be read. Returns the session and
+/// whether it is uncompressed for that reason.
+async fn live_tail<S, F, Fut>(compress: bool, mut connect: F) -> (Result<S, ConnectError>, bool)
+where
+    F: FnMut(bool) -> Fut,
+    Fut: std::future::Future<Output = Result<S, ConnectError>>,
+{
+    match connect(compress).await {
+        Err(ConnectError::UnknownDictionary(_)) if compress => (connect(false).await, true),
+        r => (r, false),
+    }
+}
+
 fn resume_key(cursor: Cursor) -> Option<i64> {
     match cursor {
         Cursor::Live => None,
@@ -528,7 +546,18 @@ impl Reader {
                     // the first live event.
                     tracing::warn!(url, %msg, "CursorTooOld; resuming at the live tail");
                     ReconnectReason::CursorTooOld.count();
-                    let s = conn::connect(url, proto, Cursor::Live, compress).await?;
+                    let (s, plain) = live_tail(compress, |compress| {
+                        conn::connect(url, proto, Cursor::Live, compress)
+                    })
+                    .await;
+                    if plain {
+                        tracing::warn!(
+                            url,
+                            "zstd dictionary retired upstream; continuing uncompressed"
+                        );
+                        self.plain.store(true, Ordering::Relaxed);
+                    }
+                    let s = s?;
                     // At the live tail there is no position to be stuck at.
                     let at = ResumedAt::default();
                     return Ok((s, plan.refused(), p.applied_through_us.is_some(), at));
@@ -1005,6 +1034,44 @@ mod tests {
 
     const LONG: Duration = Duration::from_secs(3600);
     const SHORT: Duration = Duration::from_secs(2);
+
+    #[tokio::test]
+    async fn the_live_tail_is_read_uncompressed_when_the_dictionary_is_gone() {
+        use std::cell::RefCell;
+        // The instance refuses compressed sessions and takes plain ones.
+        let asked = RefCell::new(Vec::new());
+        let retired = |compress: bool| {
+            asked.borrow_mut().push(compress);
+            async move {
+                if compress {
+                    Err(ConnectError::UnknownDictionary("retired".into()))
+                } else {
+                    Ok("session")
+                }
+            }
+        };
+        assert_eq!(live_tail(true, retired).await, (Ok("session"), true));
+        assert_eq!(*asked.borrow(), [true, false]);
+        // An instance that knows the dictionary is asked once.
+        let known = |compress: bool| async move { Ok::<_, ConnectError>(compress) };
+        assert_eq!(live_tail(true, known).await, (Ok(true), false));
+        // Any other refusal is the answer, and nothing is tried again.
+        let tries = RefCell::new(0);
+        let down = |_: bool| {
+            *tries.borrow_mut() += 1;
+            async { Err::<(), _>(ConnectError::Transport("refused".into())) }
+        };
+        let (r, plain) = live_tail(true, down).await;
+        assert_eq!(
+            (r, plain, *tries.borrow()),
+            (Err(ConnectError::Transport("refused".into())), false, 1)
+        );
+        // A session that was plain already has nothing to fall back to.
+        let gone =
+            |_: bool| async { Err::<(), _>(ConnectError::UnknownDictionary("retired".into())) };
+        let (r, plain) = live_tail(false, gone).await;
+        assert!(matches!(r, Err(ConnectError::UnknownDictionary(_))) && !plain);
+    }
 
     fn event(seq: Option<i64>, witness_us: i64) -> InEvent {
         InEvent {

@@ -96,6 +96,13 @@ impl Limits {
     }
 
     /// Cap of `kind` for a host-usage bucket.
+    ///
+    /// `unresolved` has no lifetime bound on interning. Every `did:plc`
+    /// author starts in it, its interned count never goes down, and
+    /// nothing moves the count when an author resolves: with a bound it
+    /// would fill once, for good, and refuse every unresolved author
+    /// from then on. What one unresolved author interns is bounded by
+    /// its daily rate, and by the time it stays unresolved.
     pub fn bucket_cap(&self, bucket: &str, kind: CapKind) -> i64 {
         let c = &self.cfg;
         let v = if bucket == UNRESOLVED_BUCKET {
@@ -104,7 +111,7 @@ impl Limits {
                 CapKind::Items => c.unresolved_list_items,
                 CapKind::Listblocks => c.unresolved_listblocks,
                 CapKind::Lists => c.unresolved_lists,
-                CapKind::Interned => c.host_interned_lifetime,
+                CapKind::Interned => u64::MAX,
             }
         } else if bucket.starts_with(DID_BUCKET_PREFIX) {
             // A per-DID bucket uses the per-author caps.
@@ -339,6 +346,9 @@ mod tests {
         assert_eq!(l.history_limit("did:did:plc:x"), 10_000);
         assert!(l.history_enabled);
         assert_eq!(l.bucket_cap("unresolved", CapKind::Blocks), 1_000_000);
+        assert_eq!(l.bucket_cap("unresolved", CapKind::Interned), i64::MAX);
+        assert_eq!(l.bucket_cap("d:example.com", CapKind::Interned), 5_000_000);
+        assert_eq!(l.bucket_cap("did:did:plc:x", CapKind::Interned), 5_000_000);
         assert_eq!(l.bucket_cap("d:example.com", CapKind::Blocks), 20_000_000);
         assert_eq!(l.bucket_cap("did:did:plc:x", CapKind::Listblocks), 100_000);
     }

@@ -1,5 +1,7 @@
-//! Streams 5–9: counter drift, counted stickiness, tombstone TTL, lock
-//! order under contention, and coverage/clock/notify plumbing.
+//! Streams 5–14: counter drift, counted stickiness, tombstone TTL, lock
+//! order under contention, coverage/clock/notify plumbing, repository
+//! events, instance cursors, reactivation, seam windows, and the gates
+//! on discovery writes.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -1932,6 +1934,128 @@ pub async fn s12_reactivation_lock(env: &mut Env, c: &mut Checks) -> Result<()> 
         "the listblock of the same batch is stored once",
         scalar(env, "SELECT count(*) FROM list_blocks WHERE rkey = 'lbm'").await?,
         1,
+    );
+    Ok(())
+}
+
+/// Stream 14: a record that discovery found is stored in its author's
+/// buckets, so it passes its author's gates (the storage budget, the
+/// host caps), while what it interns is charged to the requester.
+pub async fn s14_discovery_gates(env: &mut Env, c: &mut Checks) -> Result<()> {
+    use farsight_storage::codes::RequesterKey;
+    use farsight_storage::ids::Stamp;
+    use farsight_storage::keys::CapKind;
+
+    async fn discovery(
+        env: &Env,
+        writes: Vec<apply::Write>,
+    ) -> Result<farsight_storage::txn::ApplyReport> {
+        let mut b = Batch::new(Origin::Discovery {
+            requester: RequesterKey::Token(7),
+        });
+        b.writes = writes;
+        apply::apply(&env.pool, &env.ctx(), &b).await
+    }
+    let refused_by = |r: &farsight_storage::txn::ApplyReport| -> Vec<(String, CapType)> {
+        r.refusals
+            .iter()
+            .map(|x| (x.author.as_str().to_owned(), x.refusal.cap_type()))
+            .collect()
+    };
+
+    // One author on an ordinary (here: unresolved) host, one on a large
+    // host.
+    let small = plc("gatesmall", 1);
+    let big = plc("gatebig", 1);
+    let subject = plc("gatesubject", 1);
+    sqlx::query(
+        "WITH h AS (INSERT INTO pds_hosts (host, cap_key, large)
+                    VALUES ('big.example', 'big.example', true) RETURNING id)
+         INSERT INTO actors (did, pds_host_id) SELECT $1, id FROM h",
+    )
+    .bind(big.as_str())
+    .execute(&env.pool)
+    .await?;
+
+    // The budget gate is closed.
+    env.gates.budget_refusing = true;
+    let r = discovery(
+        env,
+        vec![
+            block(&small, "b1", &subject, Stamp::ZERO),
+            block(&big, "b1", &subject, Stamp::ZERO),
+        ],
+    )
+    .await?;
+    c.check(
+        "budget gate closed: a discovery write of an author on an ordinary host is refused with a `refused` debt, one of an author on a large host is stored",
+        r.refused == 1
+            && refused_by(&r) == [(small.as_str().to_owned(), CapType::Budget)]
+            && env.block_row(&small, "b1").await?.is_none()
+            && env.block_row(&big, "b1").await?.is_some()
+            && env.debt(&small, DebtReason::Refused.code()).await?
+                == Some(Some(CapType::Budget.code())),
+        format!(
+            "refused {} {:?}, small row {:?}, big row {:?}, debt {:?}",
+            r.refused,
+            refused_by(&r),
+            env.block_row(&small, "b1").await?,
+            env.block_row(&big, "b1").await?,
+            env.debt(&small, DebtReason::Refused.code()).await?
+        ),
+    );
+    let r = discovery(env, vec![list(&small, "l1", Stamp::ZERO)]).await?;
+    c.check(
+        "budget gate closed: a list record found by the record check is refused by the budget too",
+        refused_by(&r) == [(small.as_str().to_owned(), CapType::Budget)]
+            && env.list_id(&small, "l1").await?.is_none(),
+        format!("{:?}", refused_by(&r)),
+    );
+    env.gates.budget_refusing = false;
+
+    // Two authors on one ordinary host, whose bucket is over its cap on
+    // list records and over its lifetime bound on interning.
+    let capped = plc("gatecapped", 1);
+    let other = plc("gatecapped", 2);
+    sqlx::query(
+        "WITH h AS (INSERT INTO pds_hosts (host, cap_key, large)
+                    VALUES ('pds.small.example', 'small.example', false) RETURNING id)
+         INSERT INTO actors (did, pds_host_id) SELECT d, h.id FROM h, unnest($1::TEXT[]) d",
+    )
+    .bind(vec![capped.as_str().to_owned(), other.as_str().to_owned()])
+    .execute(&env.pool)
+    .await?;
+    sqlx::query("INSERT INTO host_usage (bucket, capped_mask) VALUES ('d:small.example', $1)")
+        .bind(CapKind::Lists.bit() | CapKind::Interned.bit())
+        .execute(&env.pool)
+        .await?;
+    let r = discovery(env, vec![list(&capped, "l1", Stamp::ZERO)]).await?;
+    c.check(
+        "host bucket over `host_lists`: a discovery write of a list record is refused by the host cap",
+        refused_by(&r) == [(capped.as_str().to_owned(), CapType::HostLists)]
+            && env.list_id(&capped, "l1").await?.is_none(),
+        format!("{:?}", refused_by(&r)),
+    );
+    // What a discovery write interns is the requester's: the bucket's
+    // lifetime bound does not refuse it. The same write from the
+    // firehose is the author's own and is refused.
+    let fresh = plc("gatefresh", 1);
+    let r = discovery(env, vec![block(&capped, "b1", &fresh, Stamp::ZERO)]).await?;
+    let stored = env.block_row(&capped, "b1").await?.is_some();
+    let fresh2 = plc("gatefresh", 2);
+    let f = env
+        .firehose(vec![block(&other, "b1", &fresh2, rev(50))])
+        .await?;
+    c.check(
+        "interning by a discovery write is charged to the requester; the same write from the firehose meets the author's lifetime bound",
+        r.refused == 0
+            && stored
+            && refused_by(&f) == [(other.as_str().to_owned(), CapType::InternLifetime)],
+        format!(
+            "discovery refused {} stored {stored}; firehose {:?}",
+            r.refused,
+            refused_by(&f)
+        ),
     );
     Ok(())
 }

@@ -587,14 +587,11 @@ fn seen_for(t: &Txn<'_>, origin: &Origin, w: &Write) -> DateTime<Utc> {
     }
 }
 
+/// What the rows a write interns are charged to: the requester for a
+/// discovery write, the author otherwise.
 fn cause_for(author: &AuthorInfo, origin: &Origin) -> Cause {
     match origin {
-        Origin::Discovery { requester } => Cause {
-            key: requester.to_string(),
-            buckets: Vec::new(),
-            large: true,
-            mask: 0,
-        },
+        Origin::Discovery { requester } => Cause::requester(requester),
         _ => author.cause(),
     }
 }
@@ -648,7 +645,7 @@ async fn apply_write(t: &mut Txn<'_>, origin: &Origin, w: &Write) -> Result<()> 
             match record {
                 Record::Block(r) => block_upsert(t, origin, &author, &cause, w, r).await,
                 Record::ListBlock(r) => listblock_upsert(t, origin, &author, &cause, w, r).await,
-                Record::List(r) => list_upsert(t, &author, &cause, w, r).await,
+                Record::List(r) => list_upsert(t, &author, w, r).await,
                 Record::ListItem(r) => listitem_upsert(t, origin, &author, &cause, w, r).await,
             }
         }
@@ -790,7 +787,7 @@ async fn block_upsert(
     if let Some((old_subject, _, old_created, old_first, old_last)) = row {
         let same = t.actor_id(&r.subject).await? == Some(old_subject);
         let refused = removal_for(origin, w, Removed::RefusedUpdate);
-        if let Some(refusal) = t.gate(cause, CapKind::Blocks) {
+        if let Some(refusal) = t.gate(author, CapKind::Blocks) {
             if !same {
                 block_delete_row(t, author, rkey, Some(&refused)).await?;
                 t.put_refusal_tombstone(Collection::Block, author.id, &w.rkey, w.stamp)
@@ -876,7 +873,7 @@ async fn block_insert(
     r: &BlockRecord,
     seen: DateTime<Utc>,
 ) -> Result<Result<(), Refusal>> {
-    if let Some(refusal) = t.gate(cause, CapKind::Blocks) {
+    if let Some(refusal) = t.gate(author, CapKind::Blocks) {
         return Ok(Err(refusal));
     }
     let subject_id = match t.intern_actor(&r.subject, cause).await? {
@@ -1101,7 +1098,7 @@ async fn listblock_upsert(
     if let Some(old) = row {
         if Some(old.list_id) == target {
             // Same subject: counted, witnessed_at and sched_key are sticky.
-            if let Some(refusal) = t.gate(cause, CapKind::Listblocks) {
+            if let Some(refusal) = t.gate(author, CapKind::Listblocks) {
                 return t
                     .refuse(author, Collection::ListBlock, &w.rkey, refusal, w.witness)
                     .await;
@@ -1211,7 +1208,7 @@ async fn listblock_insert(
     r: &ListBlockRecord,
     seen: DateTime<Utc>,
 ) -> Result<Result<(), Refusal>> {
-    if let Some(refusal) = t.gate(cause, CapKind::Listblocks) {
+    if let Some(refusal) = t.gate(author, CapKind::Listblocks) {
         return Ok(Err(refusal));
     }
     let list_id = match t
@@ -1430,7 +1427,15 @@ async fn listitem_upsert(
         t.report.stale += 1;
         return Ok(());
     }
-    // Authority rule held at parse time: r.list.authority == author.
+    // Authority rule held at parse time: r.list.authority == author. The
+    // lock taken for the write is the list's by its authority, and the
+    // row is looked up by the author: the two must be the same account.
+    debug_assert!(
+        r.list.authority == author.did,
+        "a listitem of {} names a list of {}",
+        author.did,
+        r.list.authority
+    );
     let target: Option<(ListId, i16)> =
         sqlx::query_as("SELECT id, track_state FROM lists WHERE owner_id = $1 AND rkey = $2")
             .bind(author.id)
@@ -1449,7 +1454,7 @@ async fn listitem_upsert(
         let same_list = Some(old.list_id) == target_id;
         let same_subject = t.actor_id(&r.subject).await? == Some(old.subject_id);
         if same_list && same_subject && tracked {
-            if let Some(refusal) = t.gate(cause, CapKind::Items) {
+            if let Some(refusal) = t.gate(author, CapKind::Items) {
                 return t
                     .refuse(author, Collection::ListItem, &w.rkey, refusal, w.witness)
                     .await;
@@ -1571,7 +1576,7 @@ async fn item_insert(
     list_id: ListId,
     seen: DateTime<Utc>,
 ) -> Result<Result<(), ItemRefusal>> {
-    if let Some(refusal) = t.gate(cause, CapKind::Items) {
+    if let Some(refusal) = t.gate(author, CapKind::Items) {
         mark_list_capped(t, list_id, false).await?;
         return Ok(Err(ItemRefusal::Debt(refusal)));
     }
@@ -1741,7 +1746,6 @@ async fn listitem_delete(
 async fn list_upsert(
     t: &mut Txn<'_>,
     author: &AuthorInfo,
-    cause: &Cause,
     w: &Write,
     r: &ListRecord,
 ) -> Result<()> {
@@ -1760,7 +1764,7 @@ async fn list_upsert(
         return Ok(());
     }
     let was_present = row.is_some_and(|x| x.2 == RecordState::Present);
-    if let Some(refusal) = t.gate(cause, CapKind::Lists) {
+    if let Some(refusal) = t.gate(author, CapKind::Lists) {
         return t
             .refuse(author, Collection::List, &w.rkey, refusal, w.witness)
             .await;

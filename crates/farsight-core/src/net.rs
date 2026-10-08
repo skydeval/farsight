@@ -477,6 +477,10 @@ fn v6_reason(a: Ipv6Addr) -> Option<&'static str> {
         Some("multicast")
     } else if let Some(v4) = a.to_ipv4_mapped() {
         v4_reason(v4)
+    } else if s[..4] == [0, 0, 0, 0] && s[4] == 0xffff && s[5] == 0 {
+        // `::ffff:0:a.b.c.d` (SIIT): a translator turns it into the IPv4
+        // address it carries, which was not the address vetted.
+        Some("IPv4-translated (::ffff:0:0:0/96)")
     } else if s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
         // NAT64 well-known prefix: judge the embedded IPv4 address.
         let v4 = Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
@@ -507,8 +511,8 @@ fn v6_reason(a: Ipv6Addr) -> Option<&'static str> {
 /// 169.254.169.254), CGNAT, benchmarking, multicast, unspecified and
 /// reserved addresses are refused, as are the IPv6
 /// forms that carry an IPv4 address: IPv4-mapped and NAT64 addresses are
-/// judged by the address they carry, 6to4, Teredo and IPv4-compatible
-/// addresses are refused outright.
+/// judged by the address they carry, 6to4, Teredo, IPv4-compatible and
+/// IPv4-translated addresses are refused outright.
 pub fn blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(a) => v4_reason(a),
@@ -566,6 +570,9 @@ mod tests {
             "2001:2::1",
             "::127.0.0.1",
             "::8.8.8.8",
+            // IPv4-translated, carrying 127.0.0.1 and a public address.
+            "::ffff:0:7f00:1",
+            "::ffff:0:808:808",
             "64:ff9b:1::a00:1",
             "fec0::1",
             "100::1",

@@ -675,7 +675,7 @@ every repository that could have changed in it.
 
 A repair walks the relay's `com.atproto.sync.listRepos`, which carries
 each repository's `rev` and `active` flag, whatever the sweep source
-is. An entry becomes a member when either holds:
+is. An entry becomes a member when one of these holds:
 
 - **It changed since the gap.** The time inside its rev is at or
   after `repair_from − backfill.repair_slack − lag`, where
@@ -687,6 +687,14 @@ is. An entry becomes a member when either holds:
   `inactive_at_listing`. A reactivation does not bump the rev, so this
   catches an `account` event lost in the gap. Such an account gets a
   `resync` debt at once and its `unavailable` lists are re-admitted.
+- **It went inactive unseen.** The relay reports it inactive while
+  Farsight holds it active and stores records of it (blocks,
+  listblocks, lists or list items). A deletion, a takedown or a
+  deactivation does not bump the rev either. The job asks the relay
+  for the account's status and records it, which hides the account's
+  rows, and for a deleted account asks for its purge. An inactive
+  account of which nothing is stored is not a member: there is
+  nothing to hide.
 
 Each member gets the ordinary `repo` job in tier 3 under the requester
 `system:repair`, with the membership rules of the sweep. The range
@@ -765,6 +773,13 @@ event falls in a gap, is found by the repair's reactivation rule only
 if Farsight already holds a row for it. Otherwise it is found when it
 next writes one of the indexed collections, or by the next full
 cycle (`backfill.sweep.full_every_days`).
+
+The status rules need the relay to list the account. An account that
+was deleted during a gap and that the relay no longer lists at all is
+not found by a repair. Neither is one that removed its last indexed
+record during a gap when the gap is healed by a full cycle on the
+source `relay_collections`, which lists only accounts that hold such
+records now. Their rows stay until the account is next listed.
 
 ## List jobs
 

@@ -67,14 +67,10 @@ pub async fn handle_to_did_answered(
     }
     let dns = safe.txt(&format!("_atproto.{handle}")).await;
     let dns_answered = dns.is_ok();
-    if let Ok(txts) = dns {
-        for t in txts {
-            if let Some(d) = t.strip_prefix("did=")
-                && let Ok(did) = Did::parse(d.trim())
-            {
-                return (Ok(did), true);
-            }
-        }
+    if let Ok(txts) = dns
+        && let Some(did) = txt_did(&txts)
+    {
+        return (Ok(did), true);
     }
     let url = match url::Url::parse(&format!("https://{handle}/.well-known/atproto-did")) {
         Ok(u) => u,
@@ -99,6 +95,19 @@ pub async fn handle_to_did_answered(
         Ok(did) => (Ok(did), true),
         Err(_) => (Err(HandleError::NotADid(handle)), dns_answered),
     }
+}
+
+/// The DID the `_atproto` TXT records of a handle name: the one every
+/// `did=` record that holds a DID agrees on. Records that name different
+/// DIDs name none, as the handle specification has it, and the handle is
+/// then asked over HTTPS like one without a record.
+pub fn txt_did(records: &[String]) -> Option<Did> {
+    let mut named = records
+        .iter()
+        .filter_map(|t| t.strip_prefix("did="))
+        .filter_map(|d| Did::parse(d.trim()).ok());
+    let first = named.next()?;
+    named.all(|d| d == first).then_some(first)
 }
 
 /// Whether a status of the well-known request says the host does not
@@ -138,6 +147,36 @@ pub fn parse_list_ref(q: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn txt_records_that_disagree_name_no_account() {
+        let txt = |v: &[&str]| -> Vec<String> { v.iter().map(|s| (*s).to_owned()).collect() };
+        let a = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        let did = |s: &str| Did::parse(s).ok();
+        assert_eq!(txt_did(&txt(&[&format!("did={a}")])), did(a));
+        // Other records, and `did=` records that hold no DID, do not count.
+        assert_eq!(
+            txt_did(&txt(&["v=spf1 -all", "did=nonsense", &format!("did={a} ")])),
+            did(a)
+        );
+        // The same DID twice is one answer.
+        assert_eq!(
+            txt_did(&txt(&[&format!("did={a}"), &format!("did={a}")])),
+            did(a)
+        );
+        // Two DIDs are none, in either order.
+        assert_eq!(
+            txt_did(&txt(&[&format!("did={a}"), &format!("did={b}")])),
+            None
+        );
+        assert_eq!(
+            txt_did(&txt(&[&format!("did={b}"), &format!("did={a}")])),
+            None
+        );
+        assert_eq!(txt_did(&txt(&["v=spf1 -all"])), None);
+        assert_eq!(txt_did(&[]), None);
+    }
 
     #[test]
     fn only_a_plain_refusal_says_the_host_names_no_account() {

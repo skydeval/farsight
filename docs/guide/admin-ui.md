@@ -153,8 +153,9 @@ Things to know:
   server.** If that server remembers you, signing in again may take one
   click.
 - **Changing the admin account, or recovering from a lost one,** is done
-  in the container: `docker exec farsight farsight set-admin-did <did>`,
-  then `docker restart farsight`. The change applies at the restart
+  in the container:
+  `docker compose exec farsight farsight set-admin-did <did>`, then
+  `docker compose restart farsight`. The change applies at the restart
   (the running server refuses to pick it up in between), and every session of
   the previous account ends then. `farsight admin-did` prints the
   current value. With `FARSIGHT_SKIP_WIZARD=1`, set

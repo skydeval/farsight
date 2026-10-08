@@ -65,7 +65,7 @@ Columns beside the state:
 | 1 | storage budget at or over 100% |
 | 2 | hard storage ceiling |
 | 3 | the owner's host bucket is over `limits.host_list_items` |
-| 4 | the found list record was refused by `limits.lists_per_author` or `limits.host_lists` |
+| 4 | the found list record was refused by `limits.lists_per_author` or `limits.host_lists` (a found record that the budget or the ceiling refuses is deferred with code 1 or 2) |
 | 5 | the owner's re-admission budget |
 
 The list jobs that perform the record check (phase 1) and the fetch
@@ -242,7 +242,8 @@ the batch and keeps its own retry.
 | listblock create, update or delete by A on L | author(A); list(L) exclusive (both lists on a subject change) |
 | listitem create, update or delete by O in L | author(O); list(L) shared (both lists on a list change) |
 | `list` record write by O for L | author(O); list(L) exclusive |
-| list-job record check or promotion | author(O); list(L) exclusive |
+| list-job record check | author(O); list(L) exclusive |
+| a list event fired on one list outside a write (promotion, a gate closing or reopening, a retry) | list(L) exclusive |
 | purge batch of L | author(O); list(L) exclusive |
 | reactivation of O (`account` event, active) | author(O); list(L) exclusive for the `unavailable` lists of O, the 500 with the lowest ids (the others keep their own retry) |
 | account purge of D | author(D); then, per batch, the list locks it touches, at most 500 |

@@ -86,9 +86,9 @@ Every author is charged to one or more rows of `host_usage`, keyed by
 
 | Bucket | Who is charged to it |
 |---|---|
-| `d:<registrable domain>` | Authors whose PDS host is under that domain (eTLD+1 by the Public Suffix List). A `did:web` author is charged to its DID's domain before it is resolved; that needs no I/O. |
+| `d:<registrable domain>` | Authors whose PDS host is under that domain (eTLD+1 by the Public Suffix List). A `did:web` author is charged to its DID's domain before it is resolved; that needs no I/O. A host that is an address and not a name has no domain: its bucket is `d:` followed by its address block, the same /24 or /48 as below, so the addresses of one block share one bucket, one admission key and one outbound pace. |
 | `ip:<a.b.c.0/24>`, `ip:<x:y:z::/48>` | Authors whose PDS host resolves into that address block. Omitted when the address is in a shared CDN range: the bundled Cloudflare ranges and `limits.cdn_ranges_extra`. Only the domain bucket applies there. |
-| `unresolved` | `did:plc` authors whose DID has not been resolved yet. |
+| `unresolved` | `did:plc` authors whose DID has not been resolved yet. It has the four record caps and no lifetime bound on interning (see [Admission keys and daily rates](#admission-keys-and-daily-rates)). |
 | `did:<did>` | A `did:plc` author whose resolution has failed three times with an error other than not-found (`actors.resolve_failures`). It gets a bucket of its own, with the per-author caps, so that one unresolvable account cannot fill `unresolved` for everyone. |
 | (none) | Authors on a host matching `limits.large_hosts`. Exempt. |
 
@@ -132,9 +132,9 @@ All keys are in `[limits]`.
 | `list_items_per_owner` | 2,000,000 | Items per list owner. |
 | `host_blocks` | 20,000,000 | Blocks per `d:` or `ip:` bucket. |
 | `host_list_items` | 5,000,000 | List items per bucket. |
-| `host_listblocks` | 2,000,000 | Listblocks per bucket, placeholder list rows included. |
+| `host_listblocks` | 2,000,000 | Listblocks per bucket. A placeholder list row counts as one from the write that creates it until the next daily rebuild, which counts stored listblocks only. |
 | `host_lists` | 200,000 | List records per bucket. |
-| `host_interned_lifetime` | 5,000,000 | Rows a bucket has ever caused to be interned. |
+| `host_interned_lifetime` | 5,000,000 | Rows a `d:`, `ip:` or `did:` bucket has ever caused to be interned. |
 | `unresolved_blocks` | 1,000,000 | Blocks in the `unresolved` bucket. |
 | `unresolved_list_items` | 500,000 | List items in `unresolved`. |
 | `unresolved_listblocks` | 200,000 | Listblocks in `unresolved`. |
@@ -195,6 +195,25 @@ key has the per-DID rate. Days are UTC days.
 hostile host grow the table for months. That is what
 `host_interned_lifetime` bounds: once a bucket has caused that many
 rows, further interning by it is refused until the limit is raised.
+
+The bound applies to the buckets of a host (`d:`, `ip:`) and to a
+`did:` bucket. The shared `unresolved` bucket has none. Every
+`did:plc` author starts there, the count of a bucket never goes down,
+and it is not moved when an author resolves, so a bound on it would be
+reached once by ordinary traffic and would then refuse every new
+author for good. An unresolved author is bounded by its own daily
+rate, by the short time it stays unresolved, and, if it never
+resolves, by the bucket of its own that it gets at the third failure.
+
+**A record found by discovery is its author's.** Discovery, and the
+record check of a list, write records with no firehose event behind
+them. What such a write interns is charged to the requester. The
+record itself is stored in its author's buckets and passes its
+author's gates like any other write: the budget gate, the hard
+ceiling and the host caps. So a job requested with an API key stores
+nothing for an author on an ordinary host while the budget gate is
+closed, and a list record found by the record check counts against
+`host_lists`.
 
 Placeholder `lists` rows, unlike `actors` rows, are removed by a
 nightly cleanup once nothing references them and their record is still
@@ -260,13 +279,16 @@ the expected way out; see [../guide/storage.md](../guide/storage.md).
 ### The hard ceiling
 
 `storage.hard_ceiling_bytes` (default `0`, meaning 115% of
-`budget_bytes`; it must exceed the budget) is the disk backstop. At or
+`budget_bytes`; it must be at least 105% of the budget) is the disk
+backstop. At or
 above it **all** creates and updates are refused, large hosts
 included. Every job the admin did not request applies deletes only;
 an admin-requested job still runs, but its creates and updates are
 refused like any other. `pending` lists not yet claimed are deferred,
 those of large-host owners too. The ceiling gate reopens when usage
-falls below 105% of the budget.
+falls below 105% of the budget. That is why a ceiling under 105% is
+refused at load: its gate would close at the ceiling and reopen on
+the next measurement.
 
 The ceiling fires only if growth from large hosts outruns the budget.
 It never changes the budget's order: non-large authors are refused
@@ -303,7 +325,8 @@ from a backlink index — goes through one client
   or under the NAT64 prefix `64:ff9b::/96` — is judged as the IPv4
   address it carries. The forms that tunnel to an IPv4 address are
   refused whatever address they carry: 6to4 (`2002::/16`), Teredo
-  (`2001::/32`) and IPv4-compatible addresses (`::/96`). A host in
+  (`2001::/32`), IPv4-compatible addresses (`::/96`) and
+  IPv4-translated addresses (`::ffff:0:0:0/96`). A host in
   `net.allow_http_hosts` is not exempt from any of this;
 - connects directly. A proxy named in the environment (`HTTPS_PROXY`,
   `HTTP_PROXY`, `ALL_PROXY`) is not used: a proxy would resolve and
@@ -425,7 +448,7 @@ proxy.
 | Behind Cloudflare, Cloudflare not trusted | Every client appears as a Cloudflare edge; all share a few rate-limit buckets; false `429`s. | When more than half of the requests of a five-minute window (of at least 20 requests) arrive from Cloudflare ranges that are not trusted, the dashboard shows a warning and it is logged. |
 | Trust that is too broad | Clients can forge their address. | Refused or warned about at load, as above. |
 | Bundled Cloudflare ranges out of date | New edges are not trusted; their clients share a bucket. | The bundle is dated; `proxy.cloudflare_refresh` keeps it current. |
-| Behind any proxy that is not in `proxy.trusted` | All callers share the proxy's address: one anonymous bucket and one sign-in bucket. | None in general (the Cloudflare case above is detected). Set `proxy.mode` and `proxy.trusted`. |
+| Behind any proxy that is not in `proxy.trusted` | All callers share the proxy's address: one anonymous bucket and one sign-in bucket. A proxy with a public address also holds at most 128 connections to Farsight at once ([operations.md](operations.md#inbound-connections)). | None in general (the Cloudflare case above is detected). Set `proxy.mode` and `proxy.trusted`. |
 
 Operator steps for Cloudflare — DNS, TLS mode, cache rules, locking
 the origin — are in [../guide/cloudflare.md](../guide/cloudflare.md).
@@ -556,9 +579,16 @@ left, so requests are never starved by it. The handle pass
   `rate_limit.query_timeout` (`5s`); a timeout is `503 Overloaded`.
 - Public pages have their own render gate,
   `public_ui.query_concurrency` (8, never more than
-  `rate_limit.query_concurrency`), with the same 2 s wait. Public
-  traffic cannot take every query slot from the API. One address
-  (IPv6: one `/48`) renders at most half of those slots at once.
+  `rate_limit.query_concurrency`), with the same 2 s wait. A page's
+  queries take their slot as an anonymous API call does, from the
+  slots open to anonymous callers, so public pages and anonymous API
+  calls together never hold a slot kept for callers with a token. One
+  address (IPv6: one `/48`) renders at most half of the render slots
+  at once.
+- One `checkBlocks` call weighs at most 1,000 lists per account and
+  names at most 100 lists per relation
+  ([api.md](api.md#querycheckblocks)), so what it reads and builds is
+  in proportion to its 101 accounts, whatever they subscribe to.
 - A table's count is read at most once in 30 seconds for the same
   table and filters. It is remembered by what was counted, not by the
   address, so adding query parameters the page does not read does not
@@ -797,6 +827,13 @@ counted where a query or the dashboard can see it.
   admits at most 10 + *t* starts in *t* seconds and 256 are held, so
   one is safe for about four minutes (246 s). The admin token API is
   not affected.
+- **Connection slots.** One address (IPv6: one /48) holds at most 128
+  of the 2,048 connections of the public listener, so a single host
+  cannot fill it with requests sent a byte at a time. Sixteen
+  addresses, each at its bound, still can, for as long as they keep
+  reopening connections that are closed after 120 seconds. Peers with
+  an address that is not public are not bounded, so behind a proxy or
+  a NAT that hides client addresses the bound is the proxy's to keep.
 - **Row order is as good as the witness clock.** The time a row is
   ordered by cannot be set by the record's author, but it can by
   whoever runs the firehose source. While the firehose is

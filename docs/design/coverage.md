@@ -196,6 +196,7 @@ names what a `complete` scope leaves out. The last use matters: a
 | `list_not_tracked` | `getListMembers` on a list that no counted listblock targets. Farsight holds no items for it by design. | A listblock on the list admits it. |
 | `discovery_truncated` | The network-wide claim cannot be made and the discovery run for the subject did not check every reference: it stopped at its reference cap, or a reference could not be read. Level `partial`. | A later discovery run completes, or the first full sweep completes. |
 | `party_debt` | `checkBlocks`: the actor or one of the `others` has an open re-list debt. | A clean listing of that account. |
+| `listblocks_truncated` | `checkBlocks`: the actor or one of the `others` holds listblocks on more than 1,000 lists. Only the first 1,000, in the order of Farsight's list ids, are weighed, so a block through one of the others is not known. For the actor it makes the response `partial`; for one of the `others`, its pair. | The account holds listblocks on 1,000 lists or fewer. |
 
 ## Exceptions
 
@@ -368,7 +369,9 @@ the X side:
   `list_…` reason), or tracked and capped (`partial` with
   `list_capped`);
 - `covered(fetched_witness)` for each `ready` or `retained` list X
-  listblocks.
+  listblocks;
+- X holds listblocks on at most 1,000 lists, else `partial` with
+  `listblocks_truncated`.
 
 `partialFor` lists each of the `others` whose pair is not complete
 beyond that, with its reasons:
@@ -379,7 +382,15 @@ beyond that, with its reasons:
   `unavailable`, `deferred` or `missing`: the matching `list_…`
   reason;
 - a `ready` or `retained` list the other listblocks, and that names X,
-  fails `covered(fetched_witness)`: the gap reason.
+  fails `covered(fetched_witness)`: the gap reason;
+- the other holds listblocks on more than 1,000 lists:
+  `listblocks_truncated`.
+
+One call weighs at most 1,000 lists per account, the first by
+Farsight's list ids. The bound keeps the work of one call in
+proportion to its 101 accounts, whatever those accounts subscribe to.
+An account over it is never reported as fully covered: the lists left
+out could hold a block.
 
 A list whose record is deleted, or whose owner is hidden (unless
 `includeInactive` is set), does not bear on either side. Only lists on
@@ -452,6 +463,7 @@ lost. Gaps are rows of `firehose_gaps` with a cause:
 | `sync_unavailable` | 4 | An interval spent on a v1 Jetstream. |
 | `seam_unrepaired` | 5 | The re-read of a seam window failed 5 times: the gap is the window. |
 | `unreadable` | 6 | Three sessions in a row ended on a frame that could not be read at the same position, and the next one stepped past it: the gap runs from that position to the first event read after it. |
+| `unapplied` | 7 | Events failed every attempt to apply them, and the `resync` debt that stands in for such an event could not be written either: the gap covers their witness times ([firehose.md](firehose.md#poisoned-events)). |
 
 A disconnected or lagging stream needs no row: it is the synthetic gap
 of the [gap predicate](#the-gap-predicate), and it ends by itself when
@@ -476,7 +488,7 @@ process:
    start, from the earliest `from_at`. Gaps that open or close while
    it runs are taken by the next repair. An open gap waits.
 2. The repair walks the relay's `com.atproto.sync.listRepos` and
-   takes two groups of repositories. The first: every repository
+   takes three groups of repositories. The first: every repository
    whose rev is at or after `from − backfill.repair_slack − lag`,
    where `repair_slack` is 1 h and `lag` is the firehose lag at the
    time of enumeration; an entry with no rev, or a rev that does not
@@ -484,7 +496,10 @@ process:
    reports active that Farsight holds with a status other than active
    or as inactive at its last listing. This group catches
    reactivations whose `account` event was lost; those accounts get a
-   `resync` debt and their `unavailable` lists are re-admitted. Each
+   `resync` debt and their `unavailable` lists are re-admitted. The
+   third: every repository the relay reports inactive that Farsight
+   holds active with records stored, which catches a deletion, a
+   takedown or a deactivation whose `account` event was lost. Each
    member gets a repository job.
 3. When every member's job has ended, the covered gaps get
    `healed_at` and `healed_witness`, and `firehose_gap` clears.

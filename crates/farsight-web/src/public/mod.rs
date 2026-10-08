@@ -142,6 +142,8 @@ pub struct RenderSlot<'a> {
 pub struct Rendering<'a> {
     _slot: RenderSlot<'a>,
     _flight: farsight_api::ratelimit::Flight,
+    /// The page's slot among those open to anonymous callers.
+    _anon: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// What a remembered count is of.
@@ -784,8 +786,11 @@ impl Req<'_> {
         &self.cfg.config
     }
 
-    /// Takes a render slot and a slot of the global read semaphore for the
-    /// page's queries (which run one at a time), each waiting at most 2 s.
+    /// Takes a render slot and, for the page's queries (which run one at
+    /// a time), a query slot as an anonymous API call takes it: one of
+    /// the slots open to anonymous callers and one of the global read
+    /// semaphore, each waiting at most 2 s. A page therefore never holds
+    /// a slot kept for callers with a token.
     /// One address holds at most [`renders_per_address`] of the render
     /// slots; beyond that the answer is the rate limit's `429`, so one
     /// visitor's slow pages do not turn everyone else's into `503`.
@@ -813,17 +818,14 @@ impl Req<'_> {
             .acquire(limit, RENDER_WAIT)
             .await
             .ok_or(Fail::Busy)?;
-        let permit = tokio::time::timeout(
-            farsight_api::PERMIT_WAIT,
-            self.st.api.query_permits.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| Fail::Busy)?
-        .map_err(|_| Fail::Busy)?;
+        let (anon, permit) = farsight_api::anonymous_query_slots(&self.st.api)
+            .await
+            .ok_or(Fail::Busy)?;
         Ok((
             Rendering {
                 _slot: slot,
                 _flight: flight,
+                _anon: anon,
             },
             permit,
         ))

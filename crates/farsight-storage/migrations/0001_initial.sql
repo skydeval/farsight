@@ -237,12 +237,12 @@ CREATE TABLE firehose_gaps (
   id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   from_at      TIMESTAMPTZ NOT NULL,
   to_at        TIMESTAMPTZ,           -- NULL while the gap is open (an interval spent on v1)
-  cause        SMALLINT NOT NULL,     -- 1 cursor_too_old 2 heuristic 3 failover 4 sync_unavailable 5 seam_unrepaired 6 unreadable
+  cause        SMALLINT NOT NULL,     -- 1 cursor_too_old 2 heuristic 3 failover 4 sync_unavailable 5 seam_unrepaired 6 unreadable 7 unapplied
   detected_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   healed_at    TIMESTAMPTZ,
   healed_witness TIMESTAMPTZ,
   repair_cycle_id BIGINT,
-  CONSTRAINT firehose_gaps_cause_code CHECK (cause IN (1, 2, 3, 4, 5, 6))
+  CONSTRAINT firehose_gaps_cause_code CHECK (cause IN (1, 2, 3, 4, 5, 6, 7))
 );
 
 -- Seam windows that still have to be read again: one row per resumed

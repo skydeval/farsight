@@ -358,7 +358,7 @@ pub async fn run(
 
     let layer = IpLayer {
         config: Some(config.clone()),
-        trust,
+        trust: trust.clone(),
         cf,
     };
     let app = Router::new()
@@ -438,8 +438,24 @@ pub async fn run(
     let shutdown_wait = shutdown.clone();
     let mut reset_wait = reset_rx.clone();
     let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
+    // The proxies the configuration trusts hold the connections of all
+    // their clients: the per-peer bound is not for them.
+    let trusted_proxy: listen::PeerFilter = {
+        let (config, trust) = (config.clone(), trust.clone());
+        Arc::new(move |ip| {
+            trust
+                .trusted(&config.current().config.proxy)
+                .iter()
+                .any(|net| net.contains(&ip))
+        })
+    };
     let served = axum::serve(
-        listen::guarded(listener, listen::MAX_CONNECTIONS),
+        listen::guarded_per_peer(
+            listener,
+            listen::MAX_CONNECTIONS,
+            listen::MAX_PER_PEER,
+            trusted_proxy,
+        ),
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {

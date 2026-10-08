@@ -13,6 +13,13 @@
 //!   client that sends a request head a byte at a time is never idle,
 //!   and never gets an answer either.
 //!
+//! One peer holds at most [`MAX_PER_PEER`] connections of the public
+//! listener ([`guarded_per_peer`]); a further one from it is closed as
+//! soon as it is accepted. A peer is an IPv4 address or an IPv6 /48. The
+//! bound leaves alone the peers that stand for many clients: an address
+//! that is not public (a proxy or a gateway of the operator's own
+//! network) and whatever the caller exempts (the trusted proxies).
+//!
 //! At most a fixed number of connections are open at once; further ones
 //! wait in the accept queue and take no open file. A client that opens
 //! sockets and sends nothing, or stops in the middle of a request head,
@@ -22,11 +29,12 @@
 //! [`drain_within`] bounds the wait for open connections once a listener
 //! was told to stop, so that a process that must exit does exit.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -56,6 +64,13 @@ pub const UNANSWERED: Duration = Duration::from_secs(120);
 /// Connections the public listener (`server.bind`, and the setup
 /// listener) holds open at once. Further ones wait in the accept queue.
 pub const MAX_CONNECTIONS: usize = 2048;
+
+/// Connections one peer (an IPv4 address, an IPv6 /48) holds open on the
+/// public listener at once: a sixteenth of [`MAX_CONNECTIONS`]. A
+/// browser opens a handful and a busy client a few dozen; without the
+/// bound one host could take every slot by sending request heads a byte
+/// at a time.
+pub const MAX_PER_PEER: usize = 128;
 
 /// Connections a metrics listener holds open at once.
 pub const MAX_METRICS_CONNECTIONS: usize = 32;
@@ -123,11 +138,105 @@ impl Slots {
     }
 }
 
+/// A yes or no about a peer address: whether the caller exempts it from
+/// the per-peer bound, or whether the bound applies to it.
+pub type PeerFilter = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
+
+/// What the connections of one peer are counted under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PeerKey {
+    V4(Ipv4Addr),
+    /// The /48.
+    V6([u16; 3]),
+}
+
+impl PeerKey {
+    fn of(ip: IpAddr) -> PeerKey {
+        match ip {
+            IpAddr::V4(a) => PeerKey::V4(a),
+            IpAddr::V6(a) => match a.to_ipv4_mapped() {
+                Some(v4) => PeerKey::V4(v4),
+                None => {
+                    let s = a.segments();
+                    PeerKey::V6([s[0], s[1], s[2]])
+                }
+            },
+        }
+    }
+}
+
+/// The connections each peer of one listener holds.
+#[derive(Clone)]
+struct Peers {
+    max: usize,
+    /// Whether the bound applies to an address.
+    bounded: PeerFilter,
+    open: Arc<Mutex<HashMap<PeerKey, usize>>>,
+}
+
+/// One connection's place in its peer's count; dropping it gives the
+/// place back.
+struct PeerPlace {
+    key: PeerKey,
+    open: Arc<Mutex<HashMap<PeerKey, usize>>>,
+}
+
+impl Drop for PeerPlace {
+    fn drop(&mut self) {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = open.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                open.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// Whether the per-peer bound applies to `ip`: a public address that
+/// `exempt` does not name. An address that is not public cannot be a
+/// client on the internet; it is a proxy, a container gateway or a
+/// neighbour, and may stand for every client there is.
+pub fn peer_is_bounded(ip: IpAddr, exempt: &PeerFilter) -> bool {
+    crate::net::blocked_ip_reason(ip).is_none() && !exempt(ip)
+}
+
+impl Peers {
+    fn new(max: usize, bounded: PeerFilter) -> Peers {
+        Peers {
+            max: max.max(1),
+            bounded,
+            open: Arc::default(),
+        }
+    }
+
+    /// Counts a new connection of `ip`. `Err` when the peer already
+    /// holds as many as it may; `Ok(None)` for a peer the bound leaves
+    /// alone.
+    fn enter(&self, ip: IpAddr) -> Result<Option<PeerPlace>, ()> {
+        if !(self.bounded)(ip) {
+            return Ok(None);
+        }
+        let key = PeerKey::of(ip);
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let n = open.entry(key).or_insert(0);
+        if *n >= self.max {
+            return Err(());
+        }
+        *n += 1;
+        Ok(Some(PeerPlace {
+            key,
+            open: self.open.clone(),
+        }))
+    }
+}
+
 /// A TCP listener with a connection cap and time bounds per connection.
 pub struct Guarded {
     inner: TcpListener,
     slots: Slots,
     bounds: Bounds,
+    peers: Option<Peers>,
 }
 
 /// The listener type [`guarded`] returns. The no-op tap is what gives it
@@ -143,6 +252,29 @@ pub fn guarded(listener: TcpListener, max: usize) -> GuardedListener {
         inner: listener,
         slots: Slots::new(max),
         bounds: Bounds::DEFAULT,
+        peers: None,
+    }
+    .tap_io(untouched as fn(&mut Timed<TcpStream>))
+}
+
+/// [`guarded`], and at most `per_peer` connections of one peer at once.
+/// The bound applies to public peer addresses for which `exempt` says
+/// `false`: the caller exempts the proxies it trusts, which hold the
+/// connections of all their clients.
+pub fn guarded_per_peer(
+    listener: TcpListener,
+    max: usize,
+    per_peer: usize,
+    exempt: PeerFilter,
+) -> GuardedListener {
+    Guarded {
+        inner: listener,
+        slots: Slots::new(max),
+        bounds: Bounds::DEFAULT,
+        peers: Some(Peers::new(
+            per_peer,
+            Arc::new(move |ip| peer_is_bounded(ip, &exempt)),
+        )),
     }
     .tap_io(untouched as fn(&mut Timed<TcpStream>))
 }
@@ -163,8 +295,17 @@ impl Listener for Guarded {
             };
             match self.inner.accept().await {
                 Ok((io, addr)) => {
+                    let place = match self.peers.as_ref().map(|p| p.enter(addr.ip())) {
+                        // The peer holds all it may: this one is closed
+                        // at once, and its slot goes to the next.
+                        Some(Err(())) => continue,
+                        Some(Ok(place)) => place,
+                        None => None,
+                    };
                     let held = Some((slot, self.slots.clone()));
-                    return (Timed::new(io, self.bounds, held), addr);
+                    let mut timed = Timed::new(io, self.bounds, held);
+                    timed.peer = place;
+                    return (timed, addr);
                 }
                 Err(e) => {
                     drop(slot);
@@ -207,6 +348,8 @@ pub struct Timed<S> {
     wrote: Instant,
     timer: Pin<Box<Sleep>>,
     held: Option<(OwnedSemaphorePermit, Slots)>,
+    /// Its place in its peer's count, on a listener that keeps one.
+    peer: Option<PeerPlace>,
 }
 
 impl<S> Timed<S> {
@@ -221,6 +364,7 @@ impl<S> Timed<S> {
                 now + bounds.busy_idle.min(bounds.idle),
             )),
             held,
+            peer: None,
         }
     }
 
@@ -443,6 +587,7 @@ mod tests {
             inner: l,
             slots: Slots::new(1),
             bounds: Bounds::DEFAULT,
+            peers: None,
         };
         let _c1 = TcpStream::connect(addr).await.expect("c1");
         let _c2 = TcpStream::connect(addr).await.expect("c2");
@@ -452,5 +597,102 @@ mod tests {
         drop(first);
         let third = tokio::time::timeout(Duration::from_secs(5), g.accept()).await;
         assert!(third.is_ok(), "a closed connection frees its slot");
+    }
+
+    fn every_peer() -> PeerFilter {
+        Arc::new(|_| true)
+    }
+
+    #[test]
+    fn a_peer_holds_a_bounded_number_of_connections() {
+        let peers = Peers::new(2, every_peer());
+        let a: IpAddr = "203.0.113.7".parse().expect("address");
+        let b: IpAddr = "203.0.113.8".parse().expect("address");
+        let first = peers.enter(a).expect("first").expect("counted");
+        let _second = peers.enter(a).expect("second");
+        assert!(peers.enter(a).is_err(), "the third is over the bound");
+        // Another peer is not held back by it.
+        let _other = peers.enter(b).expect("another peer");
+        // A connection that ends gives its place back.
+        drop(first);
+        let _again = peers.enter(a).expect("room again");
+        assert!(peers.enter(a).is_err());
+        // The same address written as IPv4-mapped IPv6 is the same peer.
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().expect("address");
+        assert!(peers.enter(mapped).is_err());
+    }
+
+    #[test]
+    fn an_ipv6_peer_is_its_48_and_nothing_stays_counted_for_a_peer_that_left() {
+        let peers = Peers::new(1, every_peer());
+        let a: IpAddr = "2001:db8:1:1::1".parse().expect("address");
+        let same: IpAddr = "2001:db8:1:ffff::2".parse().expect("address");
+        let other: IpAddr = "2001:db8:2::1".parse().expect("address");
+        let held = peers.enter(a).expect("first");
+        assert!(peers.enter(same).is_err(), "one /48 is one peer");
+        let held_other = peers.enter(other).expect("another /48");
+        drop((held, held_other));
+        assert!(peers.open.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn proxies_and_addresses_that_are_not_public_are_not_bounded() {
+        let proxy: IpAddr = "198.51.100.4".parse().expect("address");
+        let exempt: PeerFilter = Arc::new(move |ip| ip == proxy);
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.17.0.1",
+            "192.168.1.1",
+            "100.64.0.9",
+            "::1",
+            "fd00::1",
+            "198.51.100.4",
+        ] {
+            let ip: IpAddr = ip.parse().expect("address");
+            assert!(!peer_is_bounded(ip, &exempt), "{ip}");
+        }
+        for ip in ["203.0.113.7", "198.51.100.5", "2001:db8::1"] {
+            let ip: IpAddr = ip.parse().expect("address");
+            assert!(peer_is_bounded(ip, &exempt), "{ip}");
+        }
+        // A peer the bound leaves alone is not counted at all.
+        let peers = Peers::new(1, Arc::new(|_| false));
+        for _ in 0..3 {
+            assert!(matches!(peers.enter(proxy), Ok(None)));
+        }
+        assert!(peers.open.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_connection_over_its_peers_bound_is_closed_and_takes_no_slot() {
+        let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = l.local_addr().expect("addr");
+        let mut g = Guarded {
+            inner: l,
+            slots: Slots::new(8),
+            bounds: Bounds::DEFAULT,
+            peers: Some(Peers::new(1, every_peer())),
+        };
+        let _c1 = TcpStream::connect(addr).await.expect("c1");
+        let (first, _) = g.accept().await;
+        assert!(first.peer.is_some());
+        // The same peer again: accepted by the kernel, closed by the
+        // listener, which goes on waiting for a connection it may keep.
+        let mut c2 = TcpStream::connect(addr).await.expect("c2");
+        let waiting = tokio::time::timeout(Duration::from_millis(300), g.accept()).await;
+        assert!(waiting.is_err(), "nothing is handed over for it");
+        let mut one = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(5), c2.read(&mut one)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "the connection over the bound is closed: {closed:?}"
+        );
+        assert_eq!(g.slots.free.available_permits(), 7, "and holds no slot");
+        // Once the first is gone the peer may connect again.
+        drop(first);
+        let _c3 = TcpStream::connect(addr).await.expect("c3");
+        let third = tokio::time::timeout(Duration::from_secs(5), g.accept()).await;
+        assert!(third.is_ok(), "a closed connection frees its peer's place");
     }
 }

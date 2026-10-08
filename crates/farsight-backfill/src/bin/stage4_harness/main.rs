@@ -1598,8 +1598,24 @@ async fn check_repair(h: &H, c: &mut Checks) -> Res<()> {
     let old: Vec<String> = (0..5).map(|i| did("rrb", i)).collect();
     let back = did("rrc", 1);
     let back_list = tid_now();
+    // Deleted during the gap: Farsight holds it active with a block; the
+    // relay lists it inactive, with an old rev. And an inactive account
+    // of which Farsight stores nothing.
+    let gone = did("rre", 1);
+    let stranger = did("rrf", 1);
+    h.put_repo(&gone, vec![]);
+    h.fh(
+        &gone,
+        Collection::Block,
+        &tid_now(),
+        block_v(&did("sub", 90)),
+    )
+    .await?;
+    h.edit_repo(&gone, |r| r.repo_error = Some("RepoNotFound".into()));
     {
         let mut wd = w(&h.world);
+        wd.status
+            .insert(gone.clone(), (false, Some("deleted".into())));
         wd.listed.clear();
         for d in &recent {
             wd.listed.push((d.clone(), tid_now(), true));
@@ -1610,6 +1626,8 @@ async fn check_repair(h: &H, c: &mut Checks) -> Res<()> {
         }
         // Reactivated during the gap: active at the relay, old rev.
         wd.listed.push((back.clone(), stale.clone(), true));
+        wd.listed.push((gone.clone(), stale.clone(), false));
+        wd.listed.push((stranger.clone(), stale.clone(), false));
     }
     for d in recent.iter().chain(&old) {
         h.put_repo(d, vec![]);
@@ -1700,9 +1718,29 @@ async fn check_repair(h: &H, c: &mut Checks) -> Res<()> {
     let recent_ok = recent.iter().all(listed);
     let old_skipped = !old.iter().any(listed);
     c.check(
-        "repair candidates: rev time ≥ from − slack (5 recent) plus the reactivated repo; old revs skipped",
-        source == "relay_repos" && total == Some(6) && recent_ok && old_skipped && listed(&back),
+        "repair candidates: rev time ≥ from − slack (5 recent) plus the reactivated repo and the one that went inactive; old revs skipped",
+        source == "relay_repos" && total == Some(7) && recent_ok && old_skipped && listed(&back),
         format!("source {source}, enumerated {total:?}, recent listed {recent_ok}, old skipped {old_skipped}, reactivated listed {}", listed(&back)),
+    );
+    let gone_status = h
+        .i64(&format!(
+            "SELECT status::BIGINT FROM actors WHERE did = '{gone}'"
+        ))
+        .await?;
+    let gone_purge = h
+        .i64(&format!(
+            "SELECT count(*) FROM account_purges p JOIN actors x ON x.id = p.actor_id WHERE x.did = '{gone}'"
+        ))
+        .await?;
+    let stranger_known = h
+        .i64(&format!(
+            "SELECT count(*) FROM actors WHERE did = '{stranger}'"
+        ))
+        .await?;
+    c.check(
+        "an account the relay lists inactive and Farsight holds active with rows is re-read by the repair: its deletion is recorded and its purge asked for; an inactive account with nothing stored is left alone",
+        gone_status == 4 && gone_purge == 1 && stranger_known == 0,
+        format!("status {gone_status}, purges asked {gone_purge}, stranger rows {stranger_known}"),
     );
     let state1 = h.track(back_lid).await?;
     let status = h

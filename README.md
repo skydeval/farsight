@@ -73,13 +73,14 @@ not under `app.nearhorizon.farsight.*`.
 ```sh
 echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
 docker compose up -d          # builds the image on first run
-docker logs farsight          # copy the setup token printed at startup
+docker compose logs farsight  # copy the setup token printed at startup
 # open http://<host>:8080 and walk the setup wizard
 ```
 
 The password is kept in `.env` beside `compose.yml`, where every later
-`docker compose` command reads it. Use letters and digits only: it is
-placed in a connection URL.
+`docker compose` command reads it. Compose stops with an error when it
+is missing. Use letters and digits only: it is placed in a connection
+URL.
 
 The wizard asks for the public hostname, the Jetstream source, backfill
 preferences, who may read the API and which web interfaces to serve,

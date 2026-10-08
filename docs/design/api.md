@@ -24,8 +24,11 @@ right.
   opaque keyset cursor from the previous page; a response without
   `cursor` is the last page. A cursor stays valid across writes: items
   inserted behind it are not returned, items deleted ahead of it are
-  skipped. Cursor contents are not part of the contract; a string that
-  Farsight did not hand out as a cursor is `InvalidRequest`.
+  skipped. Cursor contents are not part of the contract. A string that
+  does not have the shape of a cursor of the method is
+  `InvalidRequest`. Cursors are not signed: a well-formed one that
+  Farsight did not hand out is read as a position like any other, and
+  returns the rows after it.
 - **DIDs are compared in canonical form.** A `did:web` is the same
   account in any case of its hostname; requests accept any spelling
   and responses carry the lower-case one.
@@ -280,7 +283,17 @@ through the viewer's whole incoming set.
 - `blocksActor` are blocks held by `did` against `actor`;
   `blockedByActor` are blocks held by `actor` against `did`. `direct`
   says an `app.bsky.graph.block` record exists; `lists` are the lists
-  that name the blocked party and that the blocking party listblocks.
+  that name the blocked party and that the blocking party listblocks,
+  in URI order.
+- `lists` holds at most 100 URIs. When more lists carry the relation,
+  the object also has `"listsTruncated": true` and `lists` holds the
+  first 100. The field is absent otherwise. The relation itself is
+  reported either way.
+- One call weighs at most 1,000 lists per account (the actor and each
+  of the `others`). An account that holds listblocks on more is
+  `partial` with the reason `listblocks_truncated`: at response level
+  for the actor, in `partialFor` for one of the `others`
+  ([coverage.md](coverage.md#checkblocks-per-pair-coverage)).
 - `partialFor` is always present and may be empty. It names each of
   the `others` whose pair is not fully covered, with reasons from the
   same open enum as coverage reasons. The response-level

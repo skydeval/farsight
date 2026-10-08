@@ -195,8 +195,9 @@ Farsight ships as one container image with both binaries and a
   process when a re-read finds a record gone. The server runs the
   retention task. See [history.md](history.md).
 
-Quick start: `docker compose up -d`, open `http://<host>:8080`, read
-the setup token with `docker logs farsight`, and follow the wizard.
+Quick start: put `POSTGRES_PASSWORD` in `.env`, run
+`docker compose up -d`, open `http://<host>:8080`, read the setup
+token with `docker compose logs farsight`, and follow the wizard.
 The step-by-step guide is [../guide/setup.md](../guide/setup.md); disk
 and hardware sizing is in [../guide/storage.md](../guide/storage.md).
 

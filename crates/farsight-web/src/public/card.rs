@@ -660,17 +660,20 @@ async fn card(
     let Ok(did) = parse_did(path) else {
         return plain(cfg, who, StatusCode::BAD_REQUEST, "not a DID");
     };
-    // 2. Is this account shown here? One lookup, in a slot of the global
-    // read semaphore like any query; no render slot.
+    // 2. Is this account shown here? One lookup, in a query slot like
+    // any query; no render slot. A visitor's lookup takes its slot as an
+    // anonymous API call does, the operator's as a call with a token.
     let busy = || plain(cfg, who, StatusCode::SERVICE_UNAVAILABLE, "busy");
     let shown = {
-        let Ok(Ok(_permit)) = tokio::time::timeout(
-            farsight_api::PERMIT_WAIT,
-            st.api.query_permits.clone().acquire_owned(),
-        )
-        .await
-        else {
-            return busy();
+        let _slots = match who {
+            For::Public => match farsight_api::anonymous_query_slots(&st.api).await {
+                Some((anon, query)) => (Some(anon), query),
+                None => return busy(),
+            },
+            For::Admin => match crate::pages::permit(st).await {
+                Ok(query) => (None, query),
+                Err(_) => return busy(),
+            },
         };
         // The operator's tables show withheld accounts and the operator
         // may look at them; an account this instance does not hold gets

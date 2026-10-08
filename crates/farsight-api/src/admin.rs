@@ -140,8 +140,10 @@ pub async fn request_backfill(
             ));
         }
     };
-    let mut conn = st.pool.acquire().await?;
-    let s = backfill_api::status(&mut conn, &actor, !source.is_empty()).await?;
+    // The status read is a read like any other: under the query timeout.
+    let mut tx = st.read_tx().await?;
+    let s = backfill_api::status(&mut tx, &actor, !source.is_empty()).await?;
+    tx.rollback().await?;
     let mut m = status_json(&actor, &s);
     m.insert("enqueued".into(), json!(enqueued));
     m.insert("downgraded".into(), json!(downgraded));

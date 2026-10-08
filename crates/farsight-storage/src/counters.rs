@@ -496,4 +496,23 @@ mod tests {
         assert_eq!(next_mask("d:x", &at(cap * 96 / 100), 0, &limits), 0);
         assert_eq!(next_mask("d:x", &at(cap * 94 / 100), 1, &limits), 0);
     }
+
+    #[test]
+    fn the_unresolved_bucket_never_closes_for_interning() {
+        let limits = Limits::defaults();
+        let interned = |n: i64| HostDelta {
+            interned: n,
+            ..HostDelta::default()
+        };
+        let bit = CapKind::Interned.bit();
+        let bound = limits.bucket_cap("d:x", CapKind::Interned);
+        // A host bucket closes at the lifetime bound.
+        assert_eq!(next_mask("d:x", &interned(bound), 0, &limits), bit);
+        // The shared bucket does not, however much it has interned, and
+        // a bit it carries is cleared.
+        for n in [bound, bound * 1000, i64::MAX / 2] {
+            assert_eq!(next_mask("unresolved", &interned(n), 0, &limits), 0);
+            assert_eq!(next_mask("unresolved", &interned(n), bit, &limits), 0);
+        }
+    }
 }

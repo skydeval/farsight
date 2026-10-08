@@ -590,7 +590,27 @@ async fn mode_a(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
         .send(Control::KillSocket)
         .await
         .map_err(|e| e.to_string())?;
-    tokio::time::sleep(total / 2).await;
+    let settle = Duration::from_secs(20).min(total / 4);
+    tokio::time::sleep(total / 2 - settle).await;
+    // An event that fails every attempt and whose poison record fails
+    // too: the writer must leave a gap over it before it goes on.
+    let lost = model::synthetic_did(3);
+    for set in [&ingest.faults.poison_dids, &ingest.faults.unrecordable_dids] {
+        set.lock().unwrap().insert(lost.to_string());
+    }
+    let lost_before = ingest.stats.snapshot();
+    let lost_from = Utc::now();
+    ingest
+        .control
+        .send(Control::Inject(vec![synthetic_commit(
+            &lost,
+            1,
+            lost_from.timestamp_micros(),
+        )]))
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::time::sleep(settle).await;
+    let lost_after = ingest.stats.snapshot();
     let after = ingest.stats.snapshot();
     let late = scrape(&args.metrics).await?;
     let ingest = run.ingest.take().expect("running");
@@ -624,9 +644,10 @@ async fn mode_a(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
     let gaps = farsight_storage::firehose::all_gaps(&run.pool)
         .await
         .map_err(|e| e.to_string())?;
+    // The gap of cause `unapplied` is the one injected above.
     let resume_gaps: Vec<_> = gaps
         .iter()
-        .filter(|g| g.cause != GapCause::SyncUnavailable)
+        .filter(|g| !matches!(g.cause, GapCause::SyncUnavailable | GapCause::Unapplied))
         .collect();
     c.check(
         "3: no resume gap after a clean same-instance reconnect",
@@ -665,6 +686,36 @@ async fn mode_a(pg: &Pg, cfg: &Config, args: &Args, c: &mut Checks) -> Result<()
         "3: no seam window was given up as a gap",
         seam_gaps == 0,
         format!("{seam_gaps} gaps of cause SeamUnrepaired"),
+    );
+    let unapplied: Vec<_> = gaps
+        .iter()
+        .filter(|g| g.cause == GapCause::Unapplied)
+        .collect();
+    let st_now = farsight_storage::firehose::read_state(&run.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    c.check(
+        "poison without a record: one gap of cause unapplied over the event, no debt, and the stream went on past it",
+        lost_after.poisoned == lost_before.poisoned + 1
+            && lost_after.batches > lost_before.batches
+            && unapplied.len() == 1
+            && unapplied.iter().all(|g| {
+                g.healed_witness.is_none()
+                    && g.to_at.is_some_and(|to| {
+                        to > g.from_at && st_now.applied_through.is_some_and(|a| a >= g.from_at)
+                    })
+            })
+            && debt_of(&run.pool, &lost).await.is_none()
+            && queued(&run.pool, &lost).await.is_none(),
+        format!(
+            "poisoned {} → {}, batches {} → {}, gaps {unapplied:?}, debt {:?}, applied_through {:?}",
+            lost_before.poisoned,
+            lost_after.poisoned,
+            lost_before.batches,
+            lost_after.batches,
+            debt_of(&run.pool, &lost).await,
+            st_now.applied_through
+        ),
     );
     check_no_loss(c, "3", &tapped, &ref_events, &ref_intervals);
     check_model(&run.pool, c, "3", &tapped)

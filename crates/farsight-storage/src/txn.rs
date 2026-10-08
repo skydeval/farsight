@@ -52,17 +52,33 @@ impl Refusal {
     }
 }
 
-/// What an author (or requester) is charged against.
+/// What the rows a write interns are charged against: the write's author,
+/// or the requester of the job that found it. It says nothing about
+/// whether the write itself may be stored: [`Txn::gate`] decides that
+/// from the author alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cause {
     /// Cause key for rates: an admission key or a requester key.
     pub key: String,
     /// Buckets for host usage (empty for large hosts and requesters).
     pub buckets: Vec<String>,
-    /// Exempt from bucket caps and the budget gate.
+    /// No lifetime bound on interning: a large host, or a requester,
+    /// which has no bucket. The daily rate of `key` still applies.
     pub large: bool,
     /// OR of the buckets' `capped_mask`.
     pub mask: i16,
+}
+
+impl Cause {
+    /// A requester as a charging cause: its daily rate, no bucket.
+    pub fn requester(key: impl ToString) -> Cause {
+        Cause {
+            key: key.to_string(),
+            buckets: Vec::new(),
+            large: true,
+            mask: 0,
+        }
+    }
 }
 
 /// A record author, as seen by this transaction.
@@ -617,18 +633,21 @@ impl<'c> Txn<'c> {
         Ok(Ok(id))
     }
 
-    /// Global and bucket gates for a create/update of `kind`.
-    pub fn gate(&self, cause: &Cause, kind: CapKind) -> Option<Refusal> {
+    /// Global and bucket gates for a create/update of `kind` by `author`.
+    /// They go by the author whatever the write is charged to: a record
+    /// that discovery found is stored in its author's buckets like any
+    /// other, so the budget and the host caps hold for it too.
+    pub fn gate(&self, author: &AuthorInfo, kind: CapKind) -> Option<Refusal> {
         if self.gates.ceiling_refusing {
             return Some(Refusal::Refused(CapType::Ceiling));
         }
-        if cause.large {
+        if author.large {
             return None;
         }
         if self.gates.budget_refusing {
             return Some(Refusal::Refused(CapType::Budget));
         }
-        if cause.mask & kind.bit() != 0 {
+        if author.mask & kind.bit() != 0 {
             let cap = match kind {
                 CapKind::Blocks => CapType::HostBlocks,
                 CapKind::Items => CapType::HostListItems,

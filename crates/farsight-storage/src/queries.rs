@@ -13,7 +13,7 @@ use crate::codes::sql::{
 };
 use crate::ids::{ActorId, CycleId, ListId, OpErrorId};
 use farsight_core::{Did, ListPurpose};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
@@ -684,22 +684,34 @@ impl PartyList {
     }
 }
 
+/// Lists weighed per party of a `checkBlocks` call: the lists an account
+/// holds a listblock on are read in `lists.id` order up to this many.
+/// With up to 101 parties it bounds the rows one call reads and the work
+/// of putting its answer together. A party that listblocks more lists is
+/// reported in [`CheckRows::truncated`].
+pub const CHECK_LISTS_PER_PARTY: usize = 1_000;
+
 /// Everything `checkBlocks(X, others)` reads: direct blocks in both
-/// directions, the parties' listblocks joined with list states, and
-/// items naming a party on those lists.
+/// directions, the parties' listblocks joined with list states, and the
+/// items on those lists that name the other side of a pair.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckRows {
     /// `(author_id, subject_id)` of blocks between X and the others, in
     /// either direction, with the author's status.
     pub direct: Vec<(ActorId, ActorId, ActorStatus)>,
-    /// `author_id` → lists the author holds a listblock on.
+    /// `author_id` → lists the author holds a listblock on, at most
+    /// [`CHECK_LISTS_PER_PARTY`] of them.
     pub listblocks: HashMap<ActorId, Vec<ListId>>,
     /// Lists referenced by `listblocks`.
     pub lists: HashMap<ListId, PartyList>,
-    /// `(list_id, subject_id)` items on those lists naming a party.
-    pub items: Vec<(ListId, ActorId)>,
+    /// `(list_id, subject_id)` items on those lists: X on a list one of
+    /// the others listblocks, one of the others on a list X listblocks.
+    pub items: HashSet<(ListId, ActorId)>,
     /// Status of each party author (for hiding listblocks).
     pub status: HashMap<ActorId, ActorStatus>,
+    /// Parties that listblock more lists than `listblocks` holds for
+    /// them: what the lists left out say about their pairs is not known.
+    pub truncated: HashSet<ActorId>,
 }
 
 /// Reads [`CheckRows`] for viewer `x` and `others` (actor ids).
@@ -707,6 +719,17 @@ pub async fn check_rows(
     conn: &mut PgConnection,
     x: ActorId,
     others: &[ActorId],
+) -> Result<CheckRows> {
+    check_rows_capped(conn, x, others, CHECK_LISTS_PER_PARTY).await
+}
+
+/// [`check_rows`] with `per_party` in place of
+/// [`CHECK_LISTS_PER_PARTY`].
+pub async fn check_rows_capped(
+    conn: &mut PgConnection,
+    x: ActorId,
+    others: &[ActorId],
+    per_party: usize,
 ) -> Result<CheckRows> {
     let mut out = CheckRows::default();
     let parties: Vec<ActorId> = std::iter::once(x).chain(others.iter().copied()).collect();
@@ -748,19 +771,33 @@ pub async fn check_rows(
         i32,
         Option<DateTime<Utc>>,
     );
+    // Per party, its lists in id order, one more than are weighed: the
+    // extra row says that there are more. `list_blocks_by_author_list`
+    // hands them over in that order, so a party with many listblocks
+    // costs no more than one with `per_party`.
+    let cap = i64::try_from(per_party).unwrap_or(i64::MAX - 1);
     let rows: Vec<LRow> = sqlx::query_as(
-        "SELECT DISTINCT b.author_id, l.id, o.did, o.status, l.rkey, l.track_state,
+        "SELECT p.id, l.id, o.did, o.status, l.rkey, l.track_state,
                 l.record_state, l.capped, l.purge_then, l.listblock_count, l.fetched_witness
-         FROM list_blocks b
-         JOIN lists l ON l.id = b.list_id
+         FROM unnest($1::BIGINT[]) AS p(id)
+         CROSS JOIN LATERAL (
+           SELECT DISTINCT b.list_id FROM list_blocks b
+           WHERE b.author_id = p.id ORDER BY b.list_id LIMIT $2) s
+         JOIN lists l ON l.id = s.list_id
          JOIN actors o ON o.id = l.owner_id
-         WHERE b.author_id = ANY($1)",
+         ORDER BY p.id, l.id",
     )
     .bind(&parties)
+    .bind(cap.saturating_add(1))
     .fetch_all(&mut *conn)
     .await?;
     for r in rows {
-        out.listblocks.entry(r.0).or_default().push(r.1);
+        let of_party = out.listblocks.entry(r.0).or_default();
+        if of_party.len() >= per_party {
+            out.truncated.insert(r.0);
+            continue;
+        }
+        of_party.push(r.1);
         out.lists.entry(r.1).or_insert(PartyList {
             id: r.1,
             owner_did: r.2,
@@ -774,16 +811,38 @@ pub async fn check_rows(
             fetched_witness: r.10,
         });
     }
-    let list_ids: Vec<ListId> = out.lists.keys().copied().collect();
-    if !list_ids.is_empty() {
-        out.items = sqlx::query_as(
+    // Only the items a pair can turn on: X on the others' lists, the
+    // others on X's lists.
+    let x_lists: Vec<ListId> = out.listblocks.get(&x).cloned().unwrap_or_default();
+    let mut other_lists: Vec<ListId> = others
+        .iter()
+        .filter_map(|o| out.listblocks.get(o))
+        .flatten()
+        .copied()
+        .collect();
+    other_lists.sort_unstable();
+    other_lists.dedup();
+    if !other_lists.is_empty() {
+        let named: Vec<ListId> = sqlx::query_scalar(
+            "SELECT DISTINCT li.list_id FROM list_items li
+             WHERE li.subject_id = $1 AND li.list_id = ANY($2)",
+        )
+        .bind(x)
+        .bind(&other_lists)
+        .fetch_all(&mut *conn)
+        .await?;
+        out.items.extend(named.into_iter().map(|l| (l, x)));
+    }
+    if !x_lists.is_empty() && !others.is_empty() {
+        let named: Vec<(ListId, ActorId)> = sqlx::query_as(
             "SELECT DISTINCT li.list_id, li.subject_id FROM list_items li
              WHERE li.subject_id = ANY($1) AND li.list_id = ANY($2)",
         )
-        .bind(&parties)
-        .bind(&list_ids)
+        .bind(others)
+        .bind(&x_lists)
         .fetch_all(&mut *conn)
         .await?;
+        out.items.extend(named);
     }
     Ok(out)
 }

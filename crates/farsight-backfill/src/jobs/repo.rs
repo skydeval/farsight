@@ -312,8 +312,9 @@ impl GatePolicy {
 /// Whether a resolved PDS host is a large host (exempt from the budget
 /// gate and bucket caps).
 pub fn host_is_large(ctx: &Ctx, pds: &Pds) -> bool {
-    let bare = pds.host.split(':').next().unwrap_or(&pds.host);
-    ctx.cfg().limits.is_large_host(bare)
+    ctx.cfg()
+        .limits
+        .is_large_host(crate::net::bare_host(&pds.host))
 }
 
 /// Applies `batch`, then its reconciles alone for as long as they have

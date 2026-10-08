@@ -91,13 +91,25 @@ pub fn matches(submitted: &str, token: &SetupToken) -> bool {
     crate::common::ct_eq(&normalize(submitted), &normalize(&token.token))
 }
 
+/// Whether `token` has the shape of a setup token: 26 Crockford base32
+/// digits once normalized. An empty or cut-off line is not one, so a
+/// damaged token file never yields a token that an empty or guessable
+/// submission would match.
+pub fn well_formed(token: &str) -> bool {
+    let n = normalize(token);
+    n.len() == 26 && n.bytes().all(|b| ALPHABET.contains(&b))
+}
+
 /// Reads the token file: the token on its first line, its RFC 3339
 /// creation time on the second. `None` when the file is missing or does
-/// not have that shape.
+/// not have that shape; the caller then makes a new token.
 pub fn read(path: &Path) -> Option<SetupToken> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     let token = lines.next()?.trim().to_owned();
+    if !well_formed(&token) {
+        return None;
+    }
     let created = DateTime::parse_from_rfc3339(lines.next()?.trim())
         .ok()?
         .with_timezone(&Utc);
@@ -123,7 +135,8 @@ pub fn print(t: &SetupToken) {
     tracing::warn!(
         setup_token = %t.token,
         "Farsight is in setup mode. Open the web UI and enter this setup token. \
-         Re-print it with `docker logs farsight` or `docker exec farsight farsight setup-token`."
+         Re-print it with `docker compose logs farsight` or \
+         `docker compose exec farsight farsight setup-token`."
     );
 }
 
@@ -177,6 +190,33 @@ mod tests {
         assert!(matches(&t.token.replace('-', ""), &t));
         assert!(!matches("fst-00000-00000-00000-00000-000000", &t));
         assert_eq!(normalize("fst-o1l-I"), "0111");
+    }
+
+    #[test]
+    fn a_token_file_that_holds_no_token_is_read_as_no_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "farsight-setup-token-{}-{}",
+            std::process::id(),
+            farsight_api::auth::generate("t")
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join(".setup-token");
+        let t = generate();
+        write(&path, &t).expect("write");
+        assert_eq!(read(&path).map(|r| r.token), Some(t.token.clone()));
+        let stamp = t.created.to_rfc3339();
+        // An empty first line, a cut-off token, one with a character
+        // outside the alphabet: none is a token, and nothing submitted
+        // (an empty field least of all) is compared with it.
+        let cut = &t.token[..t.token.len() - 1];
+        let odd = format!("{cut}U");
+        for first in ["", "   ", "fst-", cut, odd.as_str(), "fst-00000"] {
+            std::fs::write(&path, format!("{first}\n{stamp}\n")).expect("write");
+            assert!(read(&path).is_none(), "{first:?}");
+            assert!(!well_formed(first), "{first:?}");
+        }
+        assert!(well_formed(&t.token) && well_formed(&t.token.to_lowercase()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

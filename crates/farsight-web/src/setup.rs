@@ -147,18 +147,21 @@ impl Wizard {
     }
 
     /// The connection string a storage form means. A field left as the
-    /// step showed it stands for the string that is held. A URL that was
-    /// edited around the redacted password (another host, say) keeps the
-    /// held password. Anything else is what was typed.
+    /// step showed it stands for the string that is held. A URL that
+    /// still shows the redacted password and names the same server as
+    /// the held one (scheme, user, host, port and parameters all as
+    /// held; only the database name may differ) keeps the held password.
+    /// Anything else is what was typed: the held password is never sent
+    /// to a server the operator did not give it for.
     fn dsn_typed(&self, typed: &str) -> String {
         let typed = typed.trim();
         if !self.dsn.is_empty() && typed == redact_dsn(&self.dsn) {
             return self.dsn.clone();
         }
-        let held = url::Url::parse(self.dsn.trim()).ok();
-        let held_password = held.as_ref().and_then(|u| u.password());
-        if let (Some(password), Ok(mut u)) = (held_password, url::Url::parse(typed))
+        if let (Ok(held), Ok(mut u)) = (url::Url::parse(self.dsn.trim()), url::Url::parse(typed))
+            && let Some(password) = held.password()
             && u.password() == Some("redacted")
+            && same_server(&held, &u)
             && u.set_password(Some(password)).is_ok()
         {
             return u.to_string();
@@ -604,6 +607,18 @@ fn secret_param(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "password" | "sslpassword" | "passfile" | "sslkey"
     )
+}
+
+/// Whether two connection URLs reach the same server as the same user in
+/// the same way: scheme, user, host, port and every parameter are equal.
+/// A parameter can name another host or switch TLS off, so none may
+/// differ. The path, which is the database name, is not compared.
+fn same_server(a: &url::Url, b: &url::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.username() == b.username()
+        && a.host() == b.host()
+        && a.port_or_known_default() == b.port_or_known_default()
+        && a.query() == b.query()
 }
 
 /// Hides the secrets of a Postgres connection string, in each form one
@@ -1949,11 +1964,27 @@ mod tests {
         assert!(!shown.contains("s3cret"), "{shown}");
         // Left as shown: the held string.
         assert_eq!(w.dsn_typed(&shown), w.dsn);
-        // Edited around the password: the held password stays.
+        // Another database on the same server: the held password stays.
         assert_eq!(
-            w.dsn_typed("postgres://farsight:redacted@db.internal:5432/farsight"),
-            "postgres://farsight:s3cret@db.internal:5432/farsight"
+            w.dsn_typed("postgres://farsight:redacted@postgres:5432/other"),
+            "postgres://farsight:s3cret@postgres:5432/other"
         );
+        // Another host, port, user or scheme, or a parameter (which can
+        // name a host or switch TLS off): the held password is not put
+        // into it, and nothing of it leaves for that server.
+        for elsewhere in [
+            "postgres://farsight:redacted@db.internal:5432/farsight",
+            "postgres://farsight:redacted@postgres:6543/farsight",
+            "postgres://other:redacted@postgres:5432/farsight",
+            "postgresql://farsight:redacted@postgres:5432/farsight",
+            "postgres://farsight:redacted@postgres:5432/farsight?host=db.internal",
+            "postgres://farsight:redacted@postgres:5432/farsight?sslmode=disable",
+            "postgres://farsight:redacted@POSTGRES.evil.example:5432/farsight",
+        ] {
+            let typed = w.dsn_typed(elsewhere);
+            assert_eq!(typed, elsewhere);
+            assert!(!typed.contains("s3cret"), "{typed}");
+        }
         // A new string is taken as typed.
         assert_eq!(
             w.dsn_typed(" postgres://other:new@db/f "),

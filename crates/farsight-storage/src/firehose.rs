@@ -414,6 +414,21 @@ pub async fn heal_gaps(
     healed_witness: DateTime<Utc>,
     repair_cycle_id: CycleId,
 ) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let n = heal_gaps_in(&mut tx, ids, healed_witness, repair_cycle_id).await?;
+    tx.commit().await?;
+    Ok(n)
+}
+
+/// [`heal_gaps`] inside the caller's transaction: a cycle marks its gaps
+/// healed in the transaction that completes it, so the two cannot come
+/// apart. The coverage notification is sent with the commit.
+pub async fn heal_gaps_in(
+    conn: &mut sqlx::PgConnection,
+    ids: &[GapId],
+    healed_witness: DateTime<Utc>,
+    repair_cycle_id: CycleId,
+) -> Result<u64> {
     let n = sqlx::query(
         "UPDATE firehose_gaps SET healed_at = now(), healed_witness = $2, repair_cycle_id = $3
          WHERE id = ANY($1) AND to_at IS NOT NULL AND healed_at IS NULL",
@@ -421,10 +436,12 @@ pub async fn heal_gaps(
     .bind(ids)
     .bind(healed_witness)
     .bind(repair_cycle_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
-    notify(pool).await?;
+    sqlx::query("SELECT pg_notify('farsight_coverage', '')")
+        .execute(&mut *conn)
+        .await?;
     Ok(n)
 }
 

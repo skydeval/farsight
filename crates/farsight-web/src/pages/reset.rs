@@ -116,8 +116,8 @@ pub(super) async fn reset_submit(
         nav: Nav::default(),
         title: "Configuration reset".into(),
         message: "The configuration, admin sessions, admin token and API keys are gone; the \
-                  database is kept. A new setup token is in the server log (docker logs \
-                  farsight). Farsight is switching to setup mode."
+                  database is kept. A new setup token is in the server log (docker \
+                  compose logs farsight). Farsight is switching to setup mode."
             .into(),
         link: Some(("/setup".into(), "Open setup".into())),
     });

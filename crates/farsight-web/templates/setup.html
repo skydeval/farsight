@@ -23,8 +23,8 @@
 <div class="card">
 <p>This instance has no configuration yet. Enter the setup token to continue. It is printed in
 the server log at start-up and every 10 minutes:</p>
-<pre>docker logs farsight</pre>
-<p class="muted">or print it again with <code>docker exec farsight farsight setup-token</code>
+<pre>docker compose logs farsight</pre>
+<p class="muted">or print it again with <code>docker compose exec farsight farsight setup-token</code>
 (add <code>--rotate</code> for a new one).</p>
 <form class="stack" method="post" action="/setup">
 <label for="token">Setup token</label>

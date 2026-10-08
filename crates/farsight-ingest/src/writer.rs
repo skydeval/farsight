@@ -179,19 +179,16 @@ struct SessionState {
 
 /// Whether an error is transient (retried forever, never a poison strike):
 /// connection loss, a restarting server, pool exhaustion, exhausted
-/// deadlock retries (never count toward poisoned-event handling). Every
-/// other error is permanent as far as the writer can tell: the same call
-/// would fail the same way.
+/// deadlock retries, and a database that takes no writes for now (out of
+/// disk, memory or connections, or read-only, as a primary is after it
+/// was demoted). None of these says anything about the call: it is the
+/// database that has to come back. Every other error is permanent as far
+/// as the writer can tell: the same call would fail the same way.
 pub fn is_transient(e: &StorageError) -> bool {
     match e {
         StorageError::DeadlockRetriesExhausted(_) => true,
         StorageError::Db(sqlx::Error::Database(db)) => {
-            let code = db.code().map(|c| c.into_owned()).unwrap_or_default();
-            code.starts_with("08")
-                || code.starts_with("57P")
-                || code == "53300"
-                || code == "40001"
-                || code == "40P01"
+            transient_sqlstate(&db.code().map(|c| c.into_owned()).unwrap_or_default())
         }
         StorageError::Db(
             sqlx::Error::Io(_)
@@ -203,6 +200,28 @@ pub fn is_transient(e: &StorageError) -> bool {
         ) => true,
         _ => false,
     }
+}
+
+/// Whether a SQLSTATE says the database could not take the call for now:
+/// class 08 (connection), class 53 (insufficient resources: disk full,
+/// out of memory, too many connections), class 57P (operator
+/// intervention: shutdown, crash recovery), 25006 (read-only
+/// transaction), 40001 and 40P01 (serialization failure, deadlock).
+pub fn transient_sqlstate(code: &str) -> bool {
+    code.starts_with("08")
+        || code.starts_with("53")
+        || code.starts_with("57P")
+        || code == "25006"
+        || code == "40001"
+        || code == "40P01"
+}
+
+/// The witness range, in µs, that covers `range` and `witness_us`.
+fn widen(range: Option<(i64, i64)>, witness_us: i64) -> Option<(i64, i64)> {
+    Some(match range {
+        None => (witness_us, witness_us),
+        Some((from, to)) => (from.min(witness_us), to.max(witness_us)),
+    })
 }
 
 fn op_label(op: &CommitOp) -> &'static str {
@@ -744,10 +763,29 @@ impl Writer {
         }
     }
 
+    /// Whether the record of a poisoned event of `did` is made to fail
+    /// (harness only).
+    #[cfg(feature = "harness")]
+    fn unrecordable(&self, did: &Did) -> bool {
+        self.faults
+            .unrecordable_dids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(did.as_str())
+    }
+
+    #[cfg(not(feature = "harness"))]
+    fn unrecordable(&self, _did: &Did) -> bool {
+        false
+    }
+
     /// Failing batch retried; then events applied one by one; an event
     /// failing 3 times alone is logged to `op_errors` and its DID gets a
-    /// `resync` debt and a tier-1 re-list. The batch's progress is then
-    /// persisted on its own.
+    /// `resync` debt and a tier-1 re-list. An event that could be neither
+    /// applied nor recorded that way is covered by a gap of cause
+    /// `unapplied`, written before the batch's progress: no event is
+    /// passed without one of the three on record. The batch's progress
+    /// is then persisted on its own.
     async fn apply_or_poison(&self, events: &[InEvent], batch: Batch) -> Option<ApplyReport> {
         let first = match self.apply_resilient(&batch).await {
             Ok(r) => return Some(r),
@@ -762,6 +800,8 @@ impl Writer {
             events.len()
         );
         let mut merged = ApplyReport::default();
+        // The witness range of the events left without a debt.
+        let mut unrecorded: Option<(i64, i64)> = None;
         let mut write_iter = batch.writes.iter();
         let mut event_iter = batch.events.iter();
         for ev in events {
@@ -801,22 +841,37 @@ impl Writer {
                 }
             }
             if strikes >= POISON_STRIKES {
-                if let Some(did) = event_did(ev) {
-                    let msg = format!("poisoned event (witness {}): {last_err}", ev.witness_us);
-                    tracing::error!(%did, "{msg}");
-                    // Given up, the event has no `resync` debt; the
-                    // operational error names its DID.
-                    self.call_or_record("record_poisoned", Some(did), || {
-                        record_poisoned(
-                            &self.pool,
-                            &self.limits,
-                            &self.counters,
-                            did,
-                            &msg,
-                            dt(ev.witness_us),
-                        )
-                    })
-                    .await;
+                let recorded = match event_did(ev) {
+                    Some(did) => {
+                        let msg = format!("poisoned event (witness {}): {last_err}", ev.witness_us);
+                        tracing::error!(%did, "{msg}");
+                        let record = || async {
+                            if self.unrecordable(did) {
+                                return Err(StorageError::Invariant(
+                                    "injected fault (harness)".into(),
+                                ));
+                            }
+                            record_poisoned(
+                                &self.pool,
+                                &self.limits,
+                                &self.counters,
+                                did,
+                                &msg,
+                                dt(ev.witness_us),
+                            )
+                            .await
+                        };
+                        self.call_or_record("record_poisoned", Some(did), record)
+                            .await
+                            .is_some()
+                    }
+                    None => false,
+                };
+                if !recorded {
+                    // Given up, the event has no `resync` debt, so nothing
+                    // would have its repository read again: the gap below
+                    // takes the debt's place.
+                    unrecorded = widen(unrecorded, ev.witness_us);
                 }
                 metrics::counter!(m::DROPPED, "reason" => "poisoned").increment(1);
                 self.stats.poisoned.fetch_add(1, Ordering::Relaxed);
@@ -827,8 +882,31 @@ impl Writer {
                 }
             }
         }
+        if let Some((from_us, to_us)) = unrecorded {
+            // Written before the progress, and the writer stops if it
+            // cannot be: the cursor then stays behind these events, and
+            // the next start reads them again.
+            tracing::error!(
+                from_us,
+                to_us,
+                "events could be neither applied nor given a debt; recording a gap over them"
+            );
+            let gap = self
+                .call_or_record("record_gap", None, || {
+                    firehose::record_gap(
+                        &self.pool,
+                        dt(from_us),
+                        dt(to_us.saturating_add(1)),
+                        GapCause::Unapplied,
+                    )
+                })
+                .await;
+            Self::gap_written("record_gap", gap.is_some());
+            self.stats.gaps.fetch_add(1, Ordering::Relaxed);
+            self.refresh_gauges().await;
+        }
         // Progress on its own, so the cursor never runs ahead of applied
-        // (or poison-recorded) events.
+        // (or poison-recorded, or gap-covered) events.
         if batch.firehose.is_none() {
             return Some(merged);
         }
@@ -913,5 +991,34 @@ mod tests {
         assert!(!is_transient(&StorageError::Db(
             sqlx::Error::ColumnNotFound("x".into())
         )));
+    }
+
+    #[test]
+    fn a_database_that_takes_no_writes_for_now_is_waited_for() {
+        // Disk full, out of memory, too many connections, a limit of the
+        // configuration; a read-only transaction; connection loss; a
+        // shutdown or a recovery; a serialization failure, a deadlock.
+        for code in [
+            "53000", "53100", "53200", "53300", "53400", "25006", "08006", "08P01", "57P01",
+            "57P03", "40001", "40P01",
+        ] {
+            assert!(transient_sqlstate(code), "{code}");
+        }
+        // A statement that was cancelled or timed out, a constraint, a
+        // missing table, a bad value, no code at all: the call is at
+        // fault and is not repeated without end.
+        for code in [
+            "57014", "23505", "23514", "42P01", "22003", "25P02", "XX000", "",
+        ] {
+            assert!(!transient_sqlstate(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn the_gap_over_unrecorded_events_covers_all_of_them() {
+        assert_eq!(widen(None, 7), Some((7, 7)));
+        assert_eq!(widen(Some((7, 7)), 9), Some((7, 9)));
+        assert_eq!(widen(Some((7, 9)), 3), Some((3, 9)));
+        assert_eq!(widen(Some((3, 9)), 5), Some((3, 9)));
     }
 }

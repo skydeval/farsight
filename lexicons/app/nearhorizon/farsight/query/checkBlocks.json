@@ -135,7 +135,12 @@
             "type": "string",
             "format": "at-uri"
           },
-          "description": "Lists naming the blocked party that the blocking party listblocks."
+          "maxLength": 100,
+          "description": "Lists naming the blocked party that the blocking party listblocks, in URI order, at most 100."
+        },
+        "listsTruncated": {
+          "type": "boolean",
+          "description": "Present and true when more than 100 lists carry the relation; `lists` then holds the first 100."
         }
       }
     },
@@ -170,7 +175,8 @@
               "list_deferred",
               "list_not_tracked",
               "discovery_truncated",
-              "party_debt"
+              "party_debt",
+              "listblocks_truncated"
             ],
             "description": "Why coverage is not `complete`, or what a `complete` scope excludes. Open enum."
           }

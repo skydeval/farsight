@@ -5,9 +5,12 @@ page has the rest.
 
 ## The setup token
 
-The setup token is re-printed every 10 minutes, and
-`docker exec farsight farsight setup-token` prints it on demand
-(`--rotate` replaces it). Replacing the token also ends every wizard
+The setup token is printed in the server log at start-up
+(`docker compose logs farsight`) and again every 10 minutes, and
+`docker compose exec farsight farsight setup-token` prints it on demand
+(`--rotate` replaces it). Both commands go by the service name in
+`compose.yml`, so they work whatever the container is called; run them
+in the directory that holds `compose.yml`. Replacing the token also ends every wizard
 session that was opened with the old one, so that is what to do if the
 token may have been seen by someone else. A wizard session lasts 12
 hours at most; enter the token again to go on.
@@ -58,16 +61,20 @@ Set `POSTGRES_PASSWORD` before the first start, in a file named `.env`
 beside `compose.yml` (`POSTGRES_PASSWORD=…` on a line of its own).
 Compose reads that file on every command, so a later
 `docker compose up -d` from another shell uses the same password. A
-password that is only exported in one shell is missing in the next,
-and compose then hands Farsight a connection string with the default
-password, which Postgres refuses. Use letters and digits only: the
-password is placed in a connection URL, where `/`, `#`, `?` and `%`
-mean something else. The compose file passes the matching connection
-string to Farsight, and the wizard's storage step is prefilled with it.
-Without a password set it is `farsight`, and Farsight logs a warning at
-every start for as long as it connects with that. The bundled Postgres is not published outside
-the compose network, but set a password of your own all the same. To
-change it later, change it in Postgres first
+password that is only exported in one shell is missing in the next.
+The compose file has no default for it: without a password every
+`docker compose` command stops with an error that names
+`POSTGRES_PASSWORD`, and nothing is started. Use letters and digits
+only: the password is placed in a connection URL, where `/`, `#`, `?`
+and `%` mean something else. The compose file passes the matching
+connection string to Farsight, and the wizard's storage step is
+prefilled with it. The storage step shows the string with its password
+redacted. Left as shown, or edited only in its database name, it keeps
+the password; a string that names another host, port, user or
+parameter must carry its own. The bundled Postgres is not published
+outside the compose network. A password of `farsight` for the user
+`farsight` is accepted, and Farsight logs a warning at every start for
+as long as it connects with that. To change the password later, change it in Postgres first
 (`ALTER ROLE farsight PASSWORD '…'`), then change `POSTGRES_PASSWORD`
 in `.env` and restart.
 

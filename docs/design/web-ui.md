@@ -114,11 +114,15 @@ or shell can read.
 - **Storage.** `.setup-token` beside the config file, mode 0600: the
   token and its creation time. It is plaintext so that it can be
   printed again; whoever can read the config volume already controls
-  the deployment.
+  the deployment. A file whose first line is not a token of that form
+  is read as no file, and a new token is made.
 - **Printing.** Logged at WARN on every setup-mode start and every 10
   minutes while in setup mode. It is the only secret Farsight logs.
   `farsight setup-token` prints it on demand and `--rotate` replaces
-  it.
+  it. In the compose deployment these are
+  `docker compose logs farsight` and
+  `docker compose exec farsight farsight setup-token`, which go by the
+  service name and work whatever the container is called.
 - **Lifetime.** 24 hours. It survives a restart while unexpired. On
   expiry (checked at start and every minute) a new token is generated,
   written and printed, and every setup session ends. Rotation is
@@ -190,6 +194,13 @@ A connection string is shown with its secrets redacted wherever it
 appears (the storage step, the review, Settings), in each form a
 secret can take: the password of a URL, `password` given as a URL
 parameter, and `password = …` of the keyword form.
+
+The storage step takes back what it showed. A field left as shown
+stands for the held string. A URL that still shows the redacted
+password keeps the held password only when it names the same server:
+scheme, user, host, port and parameters as held, with at most another
+database name. Any other string is used as typed, so the held password
+is never sent to a host the operator did not give it for.
 
 **The Access step** carries three decisions.
 
@@ -712,6 +723,9 @@ Page views are limited per client address
 (`public_ui.rate_limit_rps` / `rate_limit_burst`) and renders are
 bounded process-wide (`public_ui.query_concurrency`; a render that
 cannot get a slot within 2 seconds is a `503` with `Retry-After`).
+A page's queries take a query slot as an anonymous API call does, so
+pages never hold a slot kept for callers with a token
+([security.md](security.md#query-bounds)).
 One address (IPv6: one /48) has at most half of those slots under way
 at once, at least one; a request beyond that is the rate limit's
 `429`, so one visitor's slow pages do not turn everyone else's into
@@ -947,7 +961,8 @@ directions**:
 2. take the first `at://` entry of `alsoKnownAs`;
 3. resolve that handle forward (DNS TXT `_atproto.<handle>`, then
    `https://<handle>/.well-known/atproto-did`) and require the result
-   to equal the DID.
+   to equal the DID. TXT records that name different DIDs name none:
+   the handle is then asked over HTTPS alone.
 
 A handle that fails step 3 is not shown, on any page. A check that
 finds a handle is no longer the account's removes it at once, from

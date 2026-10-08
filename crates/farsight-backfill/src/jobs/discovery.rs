@@ -389,12 +389,7 @@ async fn record_subject_list(
             farsight_storage::keys::list_lock_key(list.authority.as_str(), list.rkey.as_str());
         t.lock_lists(&[(key, true)].into_iter().collect()).await?;
         t.lock_new_dids(&[&list.authority]).await?;
-        let cause = Cause {
-            key: requester.to_string(),
-            buckets: Vec::new(),
-            large: true,
-            mask: 0,
-        };
+        let cause = Cause::requester(requester);
         let stored = t
             .intern_list(&list.authority, &list.rkey, &cause)
             .await?

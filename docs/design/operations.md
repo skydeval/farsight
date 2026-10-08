@@ -135,7 +135,7 @@ farsight-backfill --version
   file**: restart `farsight` to apply.
 
 In the compose deployment the commands run inside the container, for
-example `docker exec farsight farsight admin-did`. Exit status: 0 on
+example `docker compose exec farsight farsight admin-did`. Exit status: 0 on
 success, 1 on failure, 2 on a usage error.
 
 ## Configuration
@@ -180,7 +180,7 @@ deployment supplies them in the environment.
 | `FARSIGHT_SETUP_BIND` | server | Restricts the listener while in setup mode, for example `127.0.0.1` or `127.0.0.1:8080`. A value that is neither an IP address nor an address with a port stops the start with an error. |
 | `RUST_LOG` | both processes | Log filter; the default is `info,sqlx=warn,hyper=warn`. |
 | `FARSIGHT_PORT` | `compose.yml` | Host side of the published web port (default `8080`). |
-| `POSTGRES_PASSWORD` | `compose.yml` | Password of the bundled Postgres, also placed in `FARSIGHT__STORAGE__DATABASE_URL`. Keep it in `.env` beside `compose.yml`, so that every `docker compose` command sees the same value, and use letters and digits only (it is part of a URL). Unset, it is `farsight`, and the server logs a warning at every start while the database is reached with that password. |
+| `POSTGRES_PASSWORD` | `compose.yml` | Password of the bundled Postgres, also placed in `FARSIGHT__STORAGE__DATABASE_URL`. Keep it in `.env` beside `compose.yml`, so that every `docker compose` command sees the same value, and use letters and digits only (it is part of a URL). It has no default: unset, every `docker compose` command stops with an error that names it. The server logs a warning at every start while the database is reached as `farsight` with the password `farsight`. |
 
 A key set from the environment is **locked**: the admin UI shows it
 but cannot change it, and an API procedure that would write it answers
@@ -260,7 +260,7 @@ Defaults are the values a key takes when it is absent.
 |---|---|---|
 | `database_url` | required | Postgres connection string. |
 | `budget_bytes` | `70_000_000_000` | Storage budget, compared with `pg_database_size`. At the budget the sweep and new list admissions are held back. Must be positive. See [security.md](security.md). |
-| `hard_ceiling_bytes` | `0` | Hard ceiling; `0` means 115% of `budget_bytes`. Must exceed the budget. |
+| `hard_ceiling_bytes` | `0` | Hard ceiling; `0` means 115% of `budget_bytes`. Must be at least 105% of the budget, the mark below which the ceiling's refusal ends. |
 | `tombstone_ttl` | `"7d"` | How long a deletion's tombstone is kept ([storage.md](storage.md)). At least `"72h"`, the time a listing may still be applied after it was read. |
 | `block_history_enabled` | `true` | Record removed blocks, listblocks and list memberships ([history.md](history.md)). |
 | `block_history_retention` | `"365d"` | How long history rows are kept, for all three history tables; `"0s"` keeps them forever. |
@@ -619,7 +619,20 @@ Every listener of both processes bounds what a client can hold:
 | `metrics.bind`, `metrics.backfill_bind` | 32 each |
 
 Connections beyond the bound wait in the accept queue and take no
-open file. A connection is closed when:
+open file.
+
+On `server.bind` and the setup listener one peer holds at most 128
+connections at once. A peer is an IPv4 address or an IPv6 /48. A
+further connection from it is closed as soon as it is accepted and
+takes no slot. The bound does not apply to a peer that stands for many
+clients: an address in `proxy.trusted` (and, in Cloudflare mode with
+`proxy.cloudflare_refresh`, the refreshed Cloudflare ranges), and any
+address that is not public, such as loopback, a private network or a
+container gateway. A reverse proxy with a public address must
+therefore be in `proxy.trusted`, or it is held to 128 connections. The
+metrics listeners have no per-peer bound.
+
+A connection is closed when:
 
 - no byte was read or written on it for 75 seconds;
 - it has waited for a request for 5 seconds while its listener holds

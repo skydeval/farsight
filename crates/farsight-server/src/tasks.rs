@@ -358,6 +358,34 @@ async fn go_candidates(
     .await
 }
 
+/// Fires `event` on one list for the budget monitor. A list whose event
+/// fails is logged and passed over, so that one list that fails every
+/// time does not end each pass at itself and keep every list after it
+/// from its own gate event. Returns whether the event was applied.
+async fn fire_or_skip(ctx: &TaskCtx, limits: &Limits, id: ListId, event: Event) -> bool {
+    match janitor::fire_event(
+        &ctx.pool,
+        limits,
+        &ctx.counters,
+        id,
+        event,
+        FireArgs::default(),
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                list = id.get(),
+                ?event,
+                error = %e,
+                "a gate event could not be applied to a list; going on with the others"
+            );
+            false
+        }
+    }
+}
+
 /// The budget monitor (every minute): measures `pg_database_size`, drives
 /// the gate state machine, publishes gates to every writer, records global
 /// refusal intervals, fires **GF** on unclaimed pending lists while
@@ -395,16 +423,7 @@ async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
             DeferCause::Budget
         };
         for id in gf_candidates(&ctx.pool, next.gates.ceiling_refusing).await? {
-            janitor::fire_event(
-                &ctx.pool,
-                &limits,
-                &ctx.counters,
-                id,
-                Event::GateFail(cause),
-                FireArgs::default(),
-            )
-            .await?;
-            fired += 1;
+            fired += usize::from(fire_or_skip(&ctx, &limits, id, Event::GateFail(cause)).await);
         }
     }
     let mut reopened = 0usize;
@@ -416,31 +435,13 @@ async fn budget_monitor(ctx: Arc<TaskCtx>) -> Result<String, TaskError> {
             continue;
         }
         for id in go_candidates(&ctx.pool, cause, GO_PER_PASS).await? {
-            janitor::fire_event(
-                &ctx.pool,
-                &limits,
-                &ctx.counters,
-                id,
-                Event::GateOpen,
-                FireArgs::default(),
-            )
-            .await?;
-            reopened += 1;
+            reopened += usize::from(fire_or_skip(&ctx, &limits, id, Event::GateOpen).await);
         }
     }
     // Lists deferred by a host cap or the lists cap, once the cap has
     // room again.
     for id in janitor::cap_go_candidates(&ctx.pool, &limits, GO_PER_PASS).await? {
-        janitor::fire_event(
-            &ctx.pool,
-            &limits,
-            &ctx.counters,
-            id,
-            Event::GateOpen,
-            FireArgs::default(),
-        )
-        .await?;
-        reopened += 1;
+        reopened += usize::from(fire_or_skip(&ctx, &limits, id, Event::GateOpen).await);
     }
     let growth = growth_warning(&ctx, bytes);
     ctx.status.update(|s| {

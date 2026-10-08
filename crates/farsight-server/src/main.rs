@@ -226,7 +226,7 @@ fn set_admin_did_command(args: &[String]) -> ExitCode {
         None => println!("Handle: none verified"),
     }
     println!();
-    println!("Restart farsight to apply (`docker restart farsight`).");
+    println!("Restart farsight to apply (`docker compose restart farsight`).");
     ExitCode::SUCCESS
 }
 

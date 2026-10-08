@@ -87,7 +87,8 @@
               "list_deferred",
               "list_not_tracked",
               "discovery_truncated",
-              "party_debt"
+              "party_debt",
+              "listblocks_truncated"
             ],
             "description": "Why coverage is not `complete`, or what a `complete` scope excludes. Open enum."
           }

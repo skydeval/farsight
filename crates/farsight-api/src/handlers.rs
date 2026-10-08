@@ -575,6 +575,9 @@ pub(crate) fn actor_side_coverage(
     if x_debt {
         c.partial("party_debt");
     }
+    if rows.truncated.contains(&x_id) {
+        c.partial(LISTBLOCKS_TRUNCATED);
+    }
     for l in rows
         .listblocks
         .get(&x_id)
@@ -600,6 +603,101 @@ pub(crate) fn actor_side_coverage(
 
 /// Maximum `others` per `checkBlocks` call.
 pub const MAX_OTHERS: usize = 100;
+
+/// Most list URIs one direction of a `checkBlocks` result names. A
+/// relation through more lists says `listsTruncated`.
+pub const MAX_RELATION_LISTS: usize = 100;
+
+/// The reason a `checkBlocks` party is `partial` for when it listblocks
+/// more lists than one call weighs
+/// ([`queries::CHECK_LISTS_PER_PARTY`]).
+pub const LISTBLOCKS_TRUNCATED: &str = "listblocks_truncated";
+
+/// One direction of a `checkBlocks` pair: the blocks one party holds
+/// against the other.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Relation {
+    /// A direct block record exists.
+    pub direct: bool,
+    /// The lists that name the blocked party and that the blocking party
+    /// listblocks, sorted, at most [`MAX_RELATION_LISTS`].
+    pub lists: Vec<String>,
+    /// More lists than `lists` holds carry the relation.
+    pub lists_truncated: bool,
+}
+
+impl Relation {
+    /// Whether the direction holds any block.
+    pub fn any(&self) -> bool {
+        self.direct || !self.lists.is_empty()
+    }
+
+    /// The `#relation` object. `listsTruncated` is present only when set.
+    pub fn json(&self) -> Value {
+        let mut m = Map::new();
+        m.insert("direct".into(), json!(self.direct));
+        m.insert("lists".into(), json!(self.lists));
+        if self.lists_truncated {
+            m.insert("listsTruncated".into(), json!(true));
+        }
+        Value::Object(m)
+    }
+}
+
+/// The rows of one `checkBlocks` call, indexed for its pairs. Every pair
+/// is answered with one lookup per list its blocking party listblocks,
+/// so the whole answer costs time in proportion to the rows read.
+pub(crate) struct PairIndex<'a> {
+    rows: &'a queries::CheckRows,
+    direct: std::collections::HashSet<(ActorId, ActorId)>,
+    inc: bool,
+}
+
+impl<'a> PairIndex<'a> {
+    /// Indexes `rows`; `inc` includes the blocks of hidden accounts.
+    pub fn new(rows: &'a queries::CheckRows, inc: bool) -> PairIndex<'a> {
+        PairIndex {
+            rows,
+            direct: rows.direct.iter().map(|(a, s, _)| (*a, *s)).collect(),
+            inc,
+        }
+    }
+
+    fn hidden(&self, id: ActorId) -> bool {
+        self.rows
+            .status
+            .get(&id)
+            .copied()
+            .unwrap_or(ActorStatus::Active)
+            .is_hidden()
+    }
+
+    /// The blocks `author` holds against `subject`.
+    pub fn relation(&self, author: ActorId, subject: ActorId) -> Relation {
+        if !self.inc && self.hidden(author) {
+            return Relation::default();
+        }
+        let mut lists: Vec<String> = self
+            .rows
+            .listblocks
+            .get(&author)
+            .into_iter()
+            .flatten()
+            .filter(|l| self.rows.items.contains(&(**l, subject)))
+            .filter_map(|l| self.rows.lists.get(l))
+            .filter(|l| l.blocks(self.inc))
+            .map(|l| uri(&l.owner_did, Collection::List, &l.rkey))
+            .collect();
+        lists.sort();
+        let lists_truncated = lists.len() > MAX_RELATION_LISTS;
+        lists.truncate(MAX_RELATION_LISTS);
+        Relation {
+            direct: self.direct.contains(&(author, subject)),
+            lists,
+            lists_truncated,
+        }
+    }
+}
 
 /// `query.checkBlocks` (per-result coverage).
 pub async fn check_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcError> {
@@ -644,43 +742,17 @@ pub async fn check_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcE
     };
     tx.rollback().await?;
 
-    let hidden = |id: ActorId| {
-        rows.status
-            .get(&id)
-            .copied()
-            .unwrap_or(ActorStatus::Active)
-            .is_hidden()
-    };
-    let direct = |a: ActorId, s: ActorId| {
-        rows.direct.iter().any(|(au, su, _)| *au == a && *su == s) && (inc || !hidden(a))
-    };
-    let names = |l: ListId, s: ActorId| rows.items.iter().any(|(li, si)| *li == l && *si == s);
-    let empty = Vec::new();
-    let lists_of = |a: ActorId| rows.listblocks.get(&a).unwrap_or(&empty);
-    let list_uris = |a: ActorId, s: ActorId| -> Vec<String> {
-        if !inc && hidden(a) {
-            return Vec::new();
-        }
-        let mut v: Vec<String> = lists_of(a)
-            .iter()
-            .filter_map(|l| rows.lists.get(l))
-            .filter(|l| l.blocks(inc) && names(l.id, s))
-            .map(|l| uri(&l.owner_did, Collection::List, &l.rkey))
-            .collect();
-        v.sort();
-        v
-    };
-
+    let pairs = PairIndex::new(&rows, inc);
     let mut results = Vec::new();
     for d in &others {
         let Some(o) = oa.get(d) else { continue };
-        let (o_x_direct, o_x_lists) = (direct(o.id, x_id), list_uris(o.id, x_id));
-        let (x_o_direct, x_o_lists) = (direct(x_id, o.id), list_uris(x_id, o.id));
-        if o_x_direct || x_o_direct || !o_x_lists.is_empty() || !x_o_lists.is_empty() {
+        let blocks_actor = pairs.relation(o.id, x_id);
+        let blocked_by_actor = pairs.relation(x_id, o.id);
+        if blocks_actor.any() || blocked_by_actor.any() {
             results.push(json!({
                 "did": d,
-                "blocksActor": { "direct": o_x_direct, "lists": o_x_lists },
-                "blockedByActor": { "direct": x_o_direct, "lists": x_o_lists },
+                "blocksActor": blocks_actor.json(),
+                "blockedByActor": blocked_by_actor.json(),
             }));
         }
     }
@@ -697,8 +769,14 @@ pub async fn check_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcE
         if debts.get(&o.id).is_some_and(|d| !d.is_empty()) {
             reasons.insert("party_debt");
         }
-        for l in lists_of(o.id)
-            .iter()
+        if rows.truncated.contains(&o.id) {
+            reasons.insert(LISTBLOCKS_TRUNCATED);
+        }
+        for l in rows
+            .listblocks
+            .get(&o.id)
+            .into_iter()
+            .flatten()
             .filter_map(|l| rows.lists.get(l))
             .filter(|l| relevant(l))
         {
@@ -709,7 +787,7 @@ pub async fn check_blocks(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcE
                 reasons.insert(r);
             }
             if matches!(l.track_state, TrackState::Ready | TrackState::Retained)
-                && names(l.id, x_id)
+                && rows.items.contains(&(l.id, x_id))
                 && !v.covered(l.fetched_witness)
             {
                 reasons.insert(v.uncovered_reason());
@@ -871,6 +949,121 @@ mod tests {
             purge_then: None,
             admitted_at: None,
         }
+    }
+
+    /// Rows in which each of `parties` listblocks every one of `lists`
+    /// lists, and every list names every party and `x`.
+    fn dense_rows(x: ActorId, parties: &[ActorId], lists: i64) -> queries::CheckRows {
+        let mut rows = queries::CheckRows::default();
+        for l in 0..lists {
+            let id = ListId::new(l);
+            rows.lists.insert(
+                id,
+                queries::PartyList {
+                    id,
+                    owner_did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    owner_status: ActorStatus::Active,
+                    rkey: format!("l{l:08}"),
+                    track_state: TrackState::Ready,
+                    record_state: RecordState::Present,
+                    capped: false,
+                    purge_then: None,
+                    listblock_count: 1,
+                    fetched_witness: None,
+                },
+            );
+            rows.items.insert((id, x));
+            for p in parties {
+                rows.items.insert((id, *p));
+            }
+        }
+        let all: Vec<ListId> = (0..lists).map(ListId::new).collect();
+        for p in parties.iter().chain(std::iter::once(&x)) {
+            rows.listblocks.insert(*p, all.clone());
+            rows.status.insert(*p, ActorStatus::Active);
+        }
+        rows
+    }
+
+    #[test]
+    fn a_pair_is_answered_from_the_lists_and_blocks_between_its_two_parties() {
+        let (x, a, b) = (ActorId::new(1), ActorId::new(2), ActorId::new(3));
+        let mut rows = dense_rows(x, &[a], 3);
+        // `b` listblocks one list, which names nobody of the call.
+        rows.listblocks.insert(b, vec![ListId::new(7)]);
+        rows.status.insert(b, ActorStatus::Active);
+        rows.direct.push((b, x, ActorStatus::Active));
+        let pairs = PairIndex::new(&rows, false);
+        let r = pairs.relation(a, x);
+        assert!(!r.direct && !r.lists_truncated);
+        assert_eq!(
+            r.lists,
+            [0, 1, 2].map(|l| format!(
+                "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.graph.list/l{l:08}"
+            ))
+        );
+        assert_eq!(pairs.relation(x, a).lists.len(), 3);
+        let r = pairs.relation(b, x);
+        assert!(r.direct && r.lists.is_empty() && r.any());
+        assert!(!pairs.relation(x, b).any());
+        assert_eq!(
+            r.json(),
+            json!({ "direct": true, "lists": [] }),
+            "listsTruncated is absent unless set"
+        );
+        // A hidden author's blocks are left out unless asked for.
+        rows.status.insert(b, ActorStatus::Takendown);
+        assert!(!PairIndex::new(&rows, false).relation(b, x).any());
+        assert!(PairIndex::new(&rows, true).relation(b, x).direct);
+    }
+
+    #[test]
+    fn a_relation_names_a_bounded_number_of_lists_and_says_when_there_are_more() {
+        let (x, a) = (ActorId::new(1), ActorId::new(2));
+        let at = MAX_RELATION_LISTS as i64;
+        let rows = dense_rows(x, &[a], at);
+        let r = PairIndex::new(&rows, false).relation(a, x);
+        assert_eq!(
+            (r.lists.len(), r.lists_truncated),
+            (MAX_RELATION_LISTS, false)
+        );
+        let rows = dense_rows(x, &[a], at + 1);
+        let r = PairIndex::new(&rows, false).relation(a, x);
+        assert_eq!(
+            (r.lists.len(), r.lists_truncated),
+            (MAX_RELATION_LISTS, true)
+        );
+        assert_eq!(r.json()["listsTruncated"], json!(true));
+        // The lists named are the first in URI order, whatever order the
+        // rows came in.
+        assert!(r.lists.windows(2).all(|w| w[0] < w[1]));
+        assert!(r.lists[0].ends_with("/l00000000"));
+    }
+
+    #[test]
+    fn the_cost_of_an_answer_grows_with_its_rows_and_not_with_their_square() {
+        // 100 others and the viewer listblock the same lists, each of
+        // which names all of them. With one scan of the items per list
+        // and pair this size takes hours; indexed it is 4 million set
+        // lookups.
+        let x = ActorId::new(1);
+        let others: Vec<ActorId> = (2..102).map(ActorId::new).collect();
+        let lists = 20_000;
+        let rows = dense_rows(x, &others, lists);
+        let started = std::time::Instant::now();
+        let pairs = PairIndex::new(&rows, false);
+        let mut named = 0;
+        for o in &others {
+            let (to, from) = (pairs.relation(*o, x), pairs.relation(x, *o));
+            assert!(to.lists_truncated && from.lists_truncated);
+            named += to.lists.len() + from.lists.len();
+        }
+        assert_eq!(named, 2 * 100 * MAX_RELATION_LISTS);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(60),
+            "assembling took {took:?}"
+        );
     }
 
     #[test]

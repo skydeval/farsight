@@ -1,11 +1,13 @@
 # Farsight deployment: server, backfill worker, Postgres.
-# Quick start: docker compose up -d, open http://<host>:8080,
-# get the setup token with: docker logs farsight
+# Quick start: put POSTGRES_PASSWORD in .env (below), docker compose up -d,
+# open http://<host>:8080, get the setup token with:
+# docker compose logs farsight
 #
 # POSTGRES_PASSWORD belongs in a file named .env beside this one, which
 # compose reads on every command. Exported in one shell only, it is
-# missing in the next, and the server is then started with a connection
-# string Postgres refuses. Letters and digits only: it is part of a URL.
+# missing in the next. There is no default: without it every compose
+# command stops with an error that names it. Letters and digits only: it
+# is part of a URL.
 #
 # Disk: the farsight-pgdata volume holds the index. Plan for roughly
 # 30-56 GB after the first full sweep plus 18-20 GB/year of growth;
@@ -26,7 +28,7 @@ x-farsight-common: &farsight-common
     - path: farsight.env
       required: false
   environment:
-    FARSIGHT__STORAGE__DATABASE_URL: postgres://farsight:${POSTGRES_PASSWORD:-farsight}@postgres:5432/farsight
+    FARSIGHT__STORAGE__DATABASE_URL: postgres://farsight:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env beside compose.yml}@postgres:5432/farsight
     # Metrics listen on loopback unless told otherwise. Here the ports are
     # not published, so every interface means the compose network.
     FARSIGHT__METRICS__BIND: 0.0.0.0:9464
@@ -73,7 +75,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: farsight
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-farsight}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env beside compose.yml}
       POSTGRES_DB: farsight
     command:
       - postgres

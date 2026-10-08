@@ -9,6 +9,113 @@ database schema; each entry says so where it does.
 
 ## [Unreleased]
 
+### Fixed
+
+- `checkBlocks` no longer spends time in proportion to the square of
+  the lists its accounts subscribe to. A call with 100 accounts that
+  each listblock thousands of shared lists could hold a server thread
+  for minutes and stall every other request, `/health` included. The
+  answer is now put together in time proportional to the rows read,
+  and the rows read are bounded (see Changed).
+- Firehose: a database that takes no writes for a while (disk full,
+  out of memory, read-only after a failover) no longer costs events.
+  The writer treated those errors as a fault of the event, gave up on
+  every event of the batch and moved the cursor past them with nothing
+  on record. It now waits for the database, as it does for a lost
+  connection, and the cursor stays where it is.
+- Firehose: an event that fails every attempt and whose `resync` debt
+  cannot be written either is now covered by a gap (cause `unapplied`,
+  code 7) before the cursor moves past it. Coverage shows
+  `firehose_gap` until a repair heals it. If the gap cannot be written
+  the server exits and reads the events again at the next start.
+- Records found by backlink discovery, and list records found by the
+  record check, now pass the same gates as any other write of their
+  author: the storage budget, the hard ceiling and the host caps. A
+  job requested with an API key stored records of authors on ordinary
+  hosts while the budget gate was closed, and `limits.host_lists` was
+  never applied to a list record found by the record check.
+- The shared `unresolved` bucket no longer has a lifetime bound on
+  interning. On a live network it would have reached
+  `limits.host_interned_lifetime` and from then on refused, for good,
+  every write of a not yet resolved account that named a new account
+  or list.
+- A PDS whose address is an IPv6 literal now gets the address bucket of
+  its /48, and a PDS at any literal address a domain bucket, an
+  admission key and an outbound pace by its address block. Each
+  address used to count as a host of its own, so a holder of a /64 had
+  as many sets of host caps as it cared to use.
+- A repair cycle marks its gaps healed in the transaction that
+  completes it. A database error between the two steps left the gaps
+  claimed by a finished cycle, unhealed, and coverage at `partial`
+  with `firehose_gap` until a full sweep.
+- A repair cycle also re-reads every account the relay lists as
+  inactive while Farsight holds it active with records stored. A
+  deletion, takedown or deactivation whose event was lost in a gap
+  left the account's rows visible, and the gap was marked healed.
+- Public pages take their query slot from the slots open to anonymous
+  callers. Together with anonymous API calls they could fill every
+  slot, the quarter kept for callers with a token included.
+- Firehose: after a refused cursor (`CursorTooOld`), an instance that
+  also no longer knows the bundled zstd dictionary is read
+  uncompressed from the live tail. The reconnect used to fail the same
+  way every time.
+- Setup wizard: the storage step puts the held database password back
+  into a connection string only when the string names the same
+  server (scheme, user, host, port and parameters; the database name
+  may differ). A string that named another host and still showed
+  `redacted` was tested with the real password, which sent it to that
+  host.
+- A list whose gate event fails no longer ends the budget monitor's
+  pass: it is logged and the pass goes on to the other lists.
+- A `.setup-token` file whose first line is empty or is not a token is
+  read as no file, and a new token is made. An empty first line used
+  to be a token that an empty submission matched.
+- Handle lookup on the admin pages and at sign-in: `_atproto` TXT
+  records that name different DIDs name none, as the handle
+  specification says. The first one used to win.
+- The safe outbound client refuses IPv4-translated addresses
+  (`::ffff:0:0:0/96`).
+- `admin.requestBackfill` reads the status it answers with under the
+  query timeout, like every other read.
+
+### Changed
+
+- `checkBlocks` weighs at most 1,000 lists per account. An account
+  that holds listblocks on more is `partial` with the new reason
+  `listblocks_truncated`: at response level for `actor`, in
+  `partialFor` for one of the `others`. A relation names at most 100
+  lists, in URI order; when more carry it, the relation object has
+  `"listsTruncated": true`. Both are in the lexicon and in
+  `docs/design/api.md`. Answers for accounts under these bounds are
+  unchanged.
+- One address (IPv6: one /48) holds at most 128 connections on
+  `server.bind` and on the setup listener; a further one is closed at
+  once. Addresses in `proxy.trusted` and addresses that are not public
+  (loopback, private networks, a container gateway) are not bounded. A
+  reverse proxy with a public address must be in `proxy.trusted`.
+- `storage.hard_ceiling_bytes`, when set, must be at least 105% of
+  `storage.budget_bytes`. Below that the ceiling's refusal started at
+  the ceiling and ended on the next measurement, every minute. A
+  configuration with a lower ceiling does not load; raise it or set it
+  to `0` (115%).
+- `compose.yml` has no default for `POSTGRES_PASSWORD`. Without it in
+  `.env` every `docker compose` command stops with an error that names
+  it, where it used to start Postgres with the password `farsight`.
+  The quick start is unchanged: it writes `.env` first.
+- The setup-mode log line, the wizard's token page, the reset page and
+  the guides name the commands by compose service
+  (`docker compose logs farsight`,
+  `docker compose exec farsight farsight setup-token`,
+  `docker compose restart farsight`), which work whatever the
+  container is called.
+- A list record found by the record check and refused by the budget
+  gate or the hard ceiling defers its list with that gate
+  (`deferred_by` 1 or 2), so the budget monitor reopens it. It used to
+  be recorded as deferred by the lists cap.
+- `docs/design/api.md` says what a cursor check does: a string that is
+  not shaped like a cursor is `InvalidRequest`; cursors are not
+  signed.
+
 ## [0.6.1] - 2026-10-08
 
 ### Added

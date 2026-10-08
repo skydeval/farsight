@@ -148,8 +148,10 @@ pub struct StorageConfig {
     pub database_url: String,
     /// Storage budget in bytes (`pg_database_size`).
     pub budget_bytes: u64,
-    /// Hard ceiling in bytes; 0 means 115% of `budget_bytes`. Must exceed
-    /// the budget after defaulting.
+    /// Hard ceiling in bytes; 0 means 115% of `budget_bytes`. Must be at
+    /// least 105% of the budget after defaulting: the ceiling's refusal
+    /// ends below 105%, so a ceiling under that mark would start and end
+    /// it on alternate passes of the budget monitor.
     pub hard_ceiling_bytes: u64,
     /// How long a deletion's tombstone is kept before the janitor deletes
     /// it.
@@ -174,6 +176,15 @@ impl Default for StorageConfig {
 }
 
 impl StorageConfig {
+    /// Whether the hard ceiling, after defaulting, is above the budget
+    /// and at or above 105% of it, the mark below which its refusal
+    /// ends.
+    pub fn ceiling_clears_release_mark(&self) -> bool {
+        let ceiling = self.effective_hard_ceiling();
+        ceiling > self.budget_bytes
+            && u128::from(ceiling) * 100 >= u128::from(self.budget_bytes) * 105
+    }
+
     /// The hard ceiling after defaulting (0 ⇒ 115% of the budget).
     pub fn effective_hard_ceiling(&self) -> u64 {
         if self.hard_ceiling_bytes == 0 {
@@ -1186,15 +1197,15 @@ pub(crate) fn is_public_net(net: &IpNet) -> bool {
     }
 }
 
-/// Warning logged at start when the database is reached with the
-/// password `compose.yml` falls back to.
-pub const DEFAULT_DB_PASSWORD_WARNING: &str = "storage.database_url uses the bundled Postgres's default password (`farsight`): \
-     POSTGRES_PASSWORD was not set before the first start. Postgres is not published by \
-     compose.yml, so only the compose network can reach it; set a password of your own all \
-     the same (ALTER ROLE farsight PASSWORD …, then POSTGRES_PASSWORD, then restart)";
+/// Warning logged at start when the database is reached as `farsight`
+/// with the password `farsight`.
+pub const DEFAULT_DB_PASSWORD_WARNING: &str = "storage.database_url signs in to Postgres as `farsight` with the password `farsight`, \
+     which anyone can guess. Postgres is not published by compose.yml, so only the compose \
+     network can reach it; set a password of your own all the same (ALTER ROLE farsight \
+     PASSWORD …, then POSTGRES_PASSWORD in .env, then restart)";
 
 /// Whether `database_url` signs in as `farsight` with the password
-/// `farsight`: what `compose.yml` uses when `POSTGRES_PASSWORD` is unset.
+/// `farsight`: the user's own name, the first password anyone would try.
 fn has_default_db_password(database_url: &str) -> bool {
     url::Url::parse(database_url)
         .is_ok_and(|u| u.username() == "farsight" && u.password() == Some("farsight"))
@@ -1282,11 +1293,11 @@ impl Config {
         if self.storage.budget_bytes == 0 {
             return Err(invalid("storage.budget_bytes", "must be positive"));
         }
-        if self.storage.effective_hard_ceiling() <= self.storage.budget_bytes {
+        if !self.storage.ceiling_clears_release_mark() {
             return Err(invalid(
                 "storage.hard_ceiling_bytes",
                 format!(
-                    "{} must exceed storage.budget_bytes ({})",
+                    "{} must be at least 105% of storage.budget_bytes ({})",
                     self.storage.effective_hard_ceiling(),
                     self.storage.budget_bytes
                 ),
@@ -2098,8 +2109,17 @@ gap_threshold = "300s"
         let mut c = complete();
         c.storage.hard_ceiling_bytes = c.storage.budget_bytes;
         assert!(matches!(c.validate(), Err(ConfigError::Invalid { .. })));
-        c.storage.hard_ceiling_bytes = c.storage.budget_bytes + 1;
-        assert!(c.validate().is_ok());
+        // Between the budget and 105% of it the ceiling's refusal would
+        // start at the ceiling and end at once, below 105%.
+        let mark = c.storage.budget_bytes / 100 * 105;
+        for under in [c.storage.budget_bytes + 1, mark - 1] {
+            c.storage.hard_ceiling_bytes = under;
+            assert!(matches!(c.validate(), Err(ConfigError::Invalid { .. })));
+        }
+        for at_or_over in [mark, mark + 1, c.storage.budget_bytes * 2] {
+            c.storage.hard_ceiling_bytes = at_or_over;
+            assert!(c.validate().is_ok());
+        }
         c.storage.hard_ceiling_bytes = 0;
         assert!(c.validate().is_ok());
         c.storage.budget_bytes = 1;

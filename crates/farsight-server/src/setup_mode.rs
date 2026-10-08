@@ -125,8 +125,16 @@ pub async fn run(
     let mut stop = shutdown.clone();
     let mut done = completed.clone();
     let (stopping_tx, stopping_rx) = tokio::sync::oneshot::channel::<()>();
+    // No proxy is known before the wizard has run. A proxy in front of
+    // the wizard is on the operator's own network, or holds far fewer
+    // connections than the bound for one operator's browser.
     let server = axum::serve(
-        listen::guarded(listener, listen::MAX_CONNECTIONS),
+        listen::guarded_per_peer(
+            listener,
+            listen::MAX_CONNECTIONS,
+            listen::MAX_PER_PEER,
+            std::sync::Arc::new(|_| false),
+        ),
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {

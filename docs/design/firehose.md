@@ -158,9 +158,14 @@ to its record, its deletion included.
 
 ### Poisoned events
 
-A database error that is transient (a lost connection, a restarting
-server, pool exhaustion, a serialisation failure, exhausted deadlock
-retries) is retried without limit and is never held against an event.
+A database error that is transient is retried without limit and is
+never held against an event: a lost connection, a restarting server,
+pool exhaustion, a serialisation failure, exhausted deadlock retries,
+and a database that takes no writes for now. That last group is
+SQLSTATE class 53 (disk full, out of memory, too many connections) and
+`25006` (a read-only transaction, as on a primary that was demoted).
+None of these says anything about the event. The writer waits, the
+cursor stays where it is, and nothing is lost.
 
 For any other failure:
 
@@ -172,11 +177,21 @@ For any other failure:
    `farsight_ingest_dropped_total{reason="poisoned"}` and in
    `pendingResyncs` until a clean re-list clears the debt. An hourly
    task turns a `resync` debt that is 7 days old into `unreachable`.
-4. The batch's cursor and `applied_through` are then persisted in a
+4. A poisoned event whose record in step 3 could not be written has
+   no debt, so nothing would read its repository again. The writer
+   records a gap of cause `unapplied` over the witness times of those
+   events. The gap makes coverage `partial` with `firehose_gap` until
+   a repair cycle heals it, like any other gap. If the gap cannot be
+   written either, the writer stops, which ends the process: the
+   cursor is still behind the events, and the next start reads them
+   again.
+5. The batch's cursor and `applied_through` are then persisted in a
    transaction of their own.
 
 So a single event that the code cannot apply never blocks the stream,
 and what it would have changed is recovered by reading the repository.
+No event is passed without one of three things on record: its effect,
+a `resync` debt for its account, or a gap that covers it.
 
 ### Storage calls outside a batch
 
@@ -195,7 +210,7 @@ What going on leaves behind:
 
 | Call (`op`) | Left behind |
 |---|---|
-| `record_poisoned` | The event has no `resync` debt. The operational error names its DID; `admin.requestBackfill` re-reads the repository. |
+| `record_poisoned` | The event has no `resync` debt. The operational error names its DID, and a gap of cause `unapplied` is recorded over the event before the cursor moves past it ([Poisoned events](#poisoned-events)). |
 | `record_gap`, `open_sync_unavailable`, `close_sync_unavailable`, `open_seam` | Nothing: these are not passed over. Coverage is claimed from the recorded gaps, and a seam window is what is known to need a second read, so one that cannot be written stops the writer, which ends the process (see below); the next start resumes from the stored cursor and meets the gap or the seam again. |
 | `close_seams` | The seam window stays open. The next session that catches up or ends closes it, and so does the next start. |
 | `finish_seams` | The seam window stays on record and is read again. |
@@ -407,8 +422,9 @@ CREATE TABLE firehose_gaps (
 | 4 | sync unavailable | an interval was spent on v1 (below) |
 | 5 | seam unrepaired | the re-read of a seam window could not be finished (below) |
 | 6 | unreadable | frames that could not be read on any attempt were stepped past |
+| 7 | unapplied | events were read but could be neither applied nor given a `resync` debt ([Poisoned events](#poisoned-events)) |
 
-Gaps of causes 1 to 3, 5 and 6 are recorded closed. Recording, closing or
+Gaps of causes 1 to 3 and 5 to 7 are recorded closed. Recording, closing or
 healing a gap sends `NOTIFY farsight_coverage`.
 
 ### What a gap does
@@ -645,7 +661,7 @@ speaks; see the [setup guide](../guide/setup.md).
 | `farsight_firehose_pending_seams` | seam windows on record whose re-read has not been applied yet |
 | `farsight_ingest_batch_seconds` | batch duration |
 | `farsight_ingest_buffer_depth` | events waiting in the channel |
-| `farsight_ingest_dropped_total{reason}` | `invalid`, `foreign_listitem`, `poisoned` |
+| `farsight_ingest_dropped_total{reason}` | `invalid`, `foreign_listitem`, `poisoned`, `unreadable` |
 | `farsight_ingest_storage_errors_total{op}` | storage calls outside a batch that failed permanently and were given up |
 
 `getStats` reports the same state in its `firehose` object:

@@ -340,12 +340,7 @@ pub async fn request(
 async fn request_in(t: &mut Txn<'_>, req: &Request<'_>) -> Result<RequestOutcome> {
     let did = req.actor.as_str();
     t.lock_new_dids(&[req.actor]).await?;
-    let cause = Cause {
-        key: req.requester.key.to_string(),
-        buckets: Vec::new(),
-        large: true,
-        mask: 0,
-    };
+    let cause = Cause::requester(req.requester.key);
     let actor_id = match t.intern_actor(req.actor, &cause).await? {
         Ok(id) => id,
         Err(Refusal::Capped(_) | Refusal::Refused(_)) => return Ok(RequestOutcome::InternRefused),

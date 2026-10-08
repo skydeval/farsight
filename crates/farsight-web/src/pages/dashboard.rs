@@ -43,6 +43,7 @@ pub fn reason_words(r: &str) -> &'static str {
         "list_not_tracked" => "nobody listblocks this list, so its members are not stored",
         "discovery_truncated" => "backlink discovery stopped at its reference cap",
         "party_debt" => "an account in this answer is waiting for a re-list",
+        "listblocks_truncated" => "an account listblocks more lists than one answer weighs",
         _ => "an unrecognized condition (treated as partial)",
     }
 }

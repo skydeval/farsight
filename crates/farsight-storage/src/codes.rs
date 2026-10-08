@@ -265,6 +265,9 @@ code_enum! {
         /// Frames that could not be read at one position, stepped past
         /// after repeated attempts.
         Unreadable = 6,
+        /// Events that were read but could be neither applied nor given a
+        /// `resync` debt.
+        Unapplied = 7,
     }
 }
 
@@ -278,6 +281,7 @@ impl GapCause {
             GapCause::SyncUnavailable => "SyncUnavailable",
             GapCause::SeamUnrepaired => "SeamUnrepaired",
             GapCause::Unreadable => "Unreadable",
+            GapCause::Unapplied => "Unapplied",
         }
     }
 }
@@ -1001,6 +1005,7 @@ mod tests {
                 (G::SyncUnavailable, 4),
                 (G::SeamUnrepaired, 5),
                 (G::Unreadable, 6),
+                (G::Unapplied, 7),
             ],
         );
         pin(

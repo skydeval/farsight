@@ -651,10 +651,71 @@ async fn run(
     }
 }
 
+/// The query slots of a read made for an anonymous visitor, by a caller
+/// that is not the XRPC router (a public page): one of the slots open to
+/// anonymous callers, then one of the read semaphore, each waited for
+/// [`PERMIT_WAIT`] at most. Taken through here, public pages share the
+/// anonymous pool with anonymous API calls and never hold a slot kept
+/// for callers with a token. `None` when no slot came free in time.
+pub async fn anonymous_query_slots(
+    st: &ApiState,
+) -> Option<(
+    tokio::sync::OwnedSemaphorePermit,
+    tokio::sync::OwnedSemaphorePermit,
+)> {
+    anonymous_slots_of(&st.anon_permits, &st.query_permits, PERMIT_WAIT).await
+}
+
+async fn anonymous_slots_of(
+    anon: &Arc<Semaphore>,
+    query: &Arc<Semaphore>,
+    wait: Duration,
+) -> Option<(
+    tokio::sync::OwnedSemaphorePermit,
+    tokio::sync::OwnedSemaphorePermit,
+)> {
+    let take = |sem: &Arc<Semaphore>| {
+        let sem = sem.clone();
+        async move {
+            tokio::time::timeout(wait, sem.acquire_owned())
+                .await
+                .ok()?
+                .ok()
+        }
+    };
+    let anon = take(anon).await?;
+    let query = take(query).await?;
+    Some((anon, query))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::KeyInfo;
+
+    #[tokio::test]
+    async fn public_pages_leave_the_reserved_slots_to_callers_with_a_token() {
+        let slots = 8;
+        let query = Arc::new(Semaphore::new(slots as usize));
+        let anon = Arc::new(Semaphore::new(anon_slots(slots)));
+        let wait = Duration::from_millis(50);
+        // Pages take every slot open to anonymous callers.
+        let mut held = Vec::new();
+        for _ in 0..anon_slots(slots) {
+            held.push(
+                anonymous_slots_of(&anon, &query, wait)
+                    .await
+                    .expect("a slot"),
+            );
+        }
+        // The next one waits and gives up; the reserved slots are free.
+        assert!(anonymous_slots_of(&anon, &query, wait).await.is_none());
+        assert_eq!(query.available_permits(), reserved_slots(slots));
+        assert!(reserved_slots(slots) >= 1);
+        // A page that ends gives both of its slots back.
+        held.pop();
+        assert!(anonymous_slots_of(&anon, &query, wait).await.is_some());
+    }
 
     fn key(scopes: &[&str]) -> Caller {
         Caller::Key(KeyInfo {

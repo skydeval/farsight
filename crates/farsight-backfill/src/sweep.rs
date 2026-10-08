@@ -604,8 +604,12 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
     }
 }
 
-/// Repos changed since `from − slack − lag`, and repos the relay
-/// reports active that Farsight holds inactive.
+/// Repos changed since `from − slack − lag`, repos the relay reports
+/// active that Farsight holds inactive, and repos the relay reports
+/// inactive that Farsight holds active with rows stored. An account
+/// event carries no rev, so one lost in the gap (a deletion, a takedown,
+/// a reactivation) shows only in this difference of status; without the
+/// last group the rows of an account deleted during a gap would stay.
 async fn repair_candidates(ctx: &Ctx, c: &Cycle, repos: Vec<xrpc::ListedRepo>) -> Res<Vec<Member>> {
     let cfg = ctx.cfg();
     let lag: i64 = sqlx::query_scalar(
@@ -631,15 +635,36 @@ async fn repair_candidates(ctx: &Ctx, c: &Cycle, repos: Vec<xrpc::ListedRepo>) -
     .bind(&active)
     .fetch_all(&ctx.pool)
     .await?;
+    let inactive: Vec<String> = repos
+        .iter()
+        .filter(|r| !r.active)
+        .map(|r| r.did.clone())
+        .collect();
+    let held_active: std::collections::HashSet<String> = if inactive.is_empty() {
+        Default::default()
+    } else {
+        sqlx::query_scalar::<_, String>(&format!(
+            "SELECT a.did FROM actors a
+             WHERE a.did = ANY($1) AND a.status = {ACTOR_ACTIVE}
+               AND (a.authored_blocks > 0 OR a.authored_listblocks > 0
+                    OR a.authored_lists > 0 OR a.owned_items > 0)"
+        ))
+        .bind(&inactive)
+        .fetch_all(&ctx.pool)
+        .await?
+        .into_iter()
+        .collect()
+    };
     let mut out = Vec::new();
     for r in repos {
         let reactivated = r.active && held_inactive.contains(&r.did);
+        let deactivated = !r.active && held_active.contains(&r.did);
         let changed = r
             .rev
             .as_deref()
             .and_then(|v| Tid::parse(v).ok())
             .is_none_or(|t| i64::try_from(t.micros()).unwrap_or(i64::MAX) >= from_us);
-        if changed || reactivated {
+        if changed || reactivated || deactivated {
             out.push(Member {
                 did: r.did,
                 reactivated,
@@ -836,13 +861,16 @@ async fn maybe_complete(ctx: &Ctx, c: &Cycle) -> Res<()> {
             .execute(&mut *tx)
             .await?;
     }
+    // The gaps are healed with the completion. Done after it, a failure
+    // in between would leave them claimed by a cycle that is over, which
+    // no later repair takes up.
+    if !gaps.is_empty() {
+        farsight_storage::firehose::heal_gaps_in(&mut tx, &gaps, witness, c.id).await?;
+    }
     sqlx::query("SELECT pg_notify('farsight_coverage', '')")
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    if !gaps.is_empty() {
-        farsight_storage::firehose::heal_gaps(pool, &gaps, witness, c.id).await?;
-    }
     tracing::info!(
         cycle = c.id.get(),
         kind = c.kind.code(),
