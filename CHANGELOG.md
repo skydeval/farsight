@@ -9,6 +9,13 @@ database schema; each entry says so where it does.
 
 ## [Unreleased]
 
+### Added
+
+- For contributors: a workflow builds the container image and, when a
+  tag `v<version>` is pushed, publishes it to `ghcr.io` under that
+  version (`.github/workflows/image.yml`). Run by hand it builds the
+  image and pushes nothing unless asked to.
+
 ## [0.6.2] - 2026-10-08
 
 ### Fixed

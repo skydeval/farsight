@@ -1,0 +1,112 @@
+name: image
+
+# Builds the container image and, for a release, pushes it to
+# ghcr.io/<owner>/farsight under the version it was built from.
+#
+# A release is a tag `v<version>` pushed to the repository: the version
+# must be the one in Cargo.toml, and the image is tagged with it (0.6.2
+# for v0.6.2). There is no `latest` tag: compose.yml names a version.
+#
+# Run by hand, the workflow builds the image and pushes nothing unless
+# `push` is ticked, so the build can be tried without a release.
+#
+# A package this workflow creates is private. It is made public once, by
+# hand, in the package's settings; nothing here changes its visibility.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the image (tagged with the version in Cargo.toml)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+# One build at a time for a given ref.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+# Every action is named by the commit it runs, with the tag that commit
+# was read from in a comment: a tag can be moved, a commit cannot.
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Read the version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # The workspace version: the first `version = "…"` under
+          # [workspace.package].
+          version="$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{gsub(/[" ]/,"",$0); sub(/^version=/,"",$0); print; exit}' Cargo.toml)"
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::no version found in Cargo.toml"; exit 1 ;;
+          esac
+          # A release tag must name the version it is pushed on.
+          if [ "$REF_TYPE" = tag ] && [ "$REF_NAME" != "v$version" ]; then
+            echo "::error::tag $REF_NAME was pushed on a tree whose version is $version"
+            exit 1
+          fi
+          # And compose.yml must name the image this run produces.
+          if ! grep -q "ghcr.io/$OWNER/farsight:$version\$" compose.yml; then
+            echo "::error::compose.yml does not name ghcr.io/$OWNER/farsight:$version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$OWNER/farsight" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Sign in to the registry
+        if: github.ref_type == 'tag' || inputs.push
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.ref_type == 'tag' || inputs.push == true }}
+          tags: ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=Farsight
+            org.opencontainers.image.description=A self-hostable ATProto index of who blocks whom
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PUSHED: ${{ github.ref_type == 'tag' || inputs.push == true }}
+        run: |
+          {
+            echo "### Image"
+            if [ "$PUSHED" = true ]; then
+              echo "Pushed \`$IMAGE:$VERSION\`"
+              echo
+              echo "Digest: \`$DIGEST\`"
+            else
+              echo "Built \`$IMAGE:$VERSION\` and pushed nothing."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
