@@ -74,7 +74,7 @@ in `.env` and restart.
 ## The image
 
 The compose file names the image by version
-(`ghcr.io/skydeval/farsight:0.6.0`), not `latest`, and builds it from
+(`ghcr.io/skydeval/farsight:0.6.1`), not `latest`, and builds it from
 the checkout when it is not there. A checkout and its compose file
 therefore always run the version they describe; to move to another
 version, check it out and run `docker compose up -d --build`. The

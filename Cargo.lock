@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "farsight-api"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "farsight-backfill"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "chrono",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "farsight-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "chrono",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "farsight-ingest"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "chrono",
  "farsight-core",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "farsight-server"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -611,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "farsight-storage"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "chrono",
  "farsight-core",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "farsight-web"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "askama",
  "axum",
