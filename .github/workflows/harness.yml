@@ -126,12 +126,14 @@ jobs:
             pass: '^RESULT: PASS '
             unverified: 2
             browser: true
-          # --skip-live: no handles from the real PLC directory and DNS.
+          # --skip-live: no handles from the real PLC directory and DNS
+          # (two checks). A third reads frames from a v2 Jetstream on this
+          # machine, and a runner has none.
           - stage: 8
             bin: farsight-stage8-harness
             args: "--skip-live --browser"
             pass: '^RESULT: PASS '
-            unverified: 2
+            unverified: 3
             browser: true
           - stage: 9
             bin: farsight-stage9-harness
