@@ -2,23 +2,57 @@
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
-/// Removes control characters and bidirectional-override characters from
-/// text that comes from records anyone can write (list names, handles) or
-/// from the operator's free text. The result is still escaped by the
-/// template; this only keeps a name from reordering or hiding the text
-/// around it.
+/// Whether `c` takes no room on the page: zero-width space, non-joiner
+/// and joiner, word joiner, and the byte-order mark.
+fn zero_width(c: char) -> bool {
+    matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}')
+}
+
+/// Whether a zero-width character between `before` and `after` is part
+/// of the text: a joiner or non-joiner inside a run of a script that
+/// writes with them, or of an emoji sequence. Next to ASCII, to a space
+/// or at either end it shapes nothing and only makes two different names
+/// look the same.
+fn joins(c: char, before: Option<char>, after: Option<char>) -> bool {
+    let inside = |n: Option<char>| n.is_some_and(|n| !n.is_ascii() && !n.is_whitespace());
+    matches!(c, '\u{200C}' | '\u{200D}') && inside(before) && inside(after)
+}
+
+/// Removes control characters, bidirectional-override characters and
+/// invisible characters from text that comes from records anyone can
+/// write (list names, handles) or from the operator's free text. The
+/// result is still escaped by the template; this only keeps a name from
+/// reordering or hiding the text around it, and from passing for another
+/// name by characters nobody can see. A joiner that a script or an emoji
+/// sequence needs stays ([`joins`]).
 pub fn clean(s: &str) -> String {
-    s.chars()
+    let visible: Vec<char> = s
+        .chars()
         .filter(|c| {
             !c.is_control()
                 && !matches!(
                     c,
                     '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'
                         ..='\u{202E}' | '\u{2066}'
-                        ..='\u{2069}'
+                        ..='\u{2069}' | '\u{200B}' | '\u{2060}' | '\u{FEFF}'
                 )
         })
-        .collect()
+        .collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in visible.iter().enumerate() {
+        if zero_width(*c) {
+            // What stands before is what was kept; what stands after is
+            // the next character that takes room.
+            let before = out.chars().next_back();
+            let after = visible[i + 1..].iter().copied().find(|n| !zero_width(*n));
+            // One joiner joins; a second one in a row adds nothing.
+            if before.is_some_and(zero_width) || !joins(*c, before, after) {
+                continue;
+            }
+        }
+        out.push(*c);
+    }
+    out
 }
 
 /// Paragraphs of operator text: blank lines separate them; each is
@@ -213,6 +247,21 @@ mod tests {
     fn strips_controls_and_bidi() {
         assert_eq!(clean("a\u{202E}b\u{0007}c\u{2066}d"), "abcd");
         assert_eq!(clean("<b>x</b>"), "<b>x</b>");
+        // Characters nobody can see do not make one name pass for another.
+        assert_eq!(clean("mod\u{200B}list"), "modlist");
+        assert_eq!(clean("\u{FEFF}spam\u{2060} list\u{200D}"), "spam list");
+        assert_eq!(clean("pay\u{200C}pal \u{200D}blocks"), "paypal blocks");
+        assert_eq!(clean("\u{200B}\u{200D}\u{2060}"), "");
+        // A joiner that the text needs stays: an emoji sequence, and a
+        // non-joiner inside a Persian word.
+        assert_eq!(
+            clean("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"),
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"
+        );
+        assert_eq!(clean("می\u{200C}خواهم"), "می\u{200C}خواهم");
+        // …but not doubled, and not at the edge of such a run.
+        assert_eq!(clean("می\u{200C}\u{200C}خواهم"), "می\u{200C}خواهم");
+        assert_eq!(clean("می\u{200C} x"), "می x");
         assert_eq!(clean("naïve — ok"), "naïve — ok");
     }
 

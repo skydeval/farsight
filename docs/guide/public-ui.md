@@ -151,7 +151,12 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
   shown as its DID. The result of every check is stored (table
   `handle_cache`) and survives a restart. A handle verified more than
   seven days ago is still shown and is verified again in the
-  background; if that fails, the old handle stays. To start over,
+  background. If that check cannot reach the hosts, the old handle
+  stays. If it shows that the handle is no longer the account's (the
+  account's document names another handle or none, or the handle now
+  resolves to another account), the handle is removed at once and the
+  row shows the DID: handles change hands, and an account's blocks are
+  never shown under a name someone else may now hold. To start over,
   `DELETE FROM handle_cache;`. With `handle_warming_enabled = false`
   nothing does that background work: no row is held back, an account
   not seen before shows as a DID (unless its own page or card is
@@ -211,6 +216,21 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
 - Pages are safe to cache at the edge (they do not depend on the
   visitor), carry a strict Content-Security-Policy with no inline
   script, and need no JavaScript to read.
+- **Load from one visitor is bounded.** A table's count is read at
+  most once in 30 seconds, whatever address the page is asked for
+  under, and one visitor's address renders at most half of
+  `query_concurrency` pages at once; past that it gets "Too many
+  requests" while other visitors are served.
+- **Names are shown without invisible characters.** Control
+  characters, text-direction overrides and zero-width characters are
+  left out of list names, descriptions and handles as they are shown,
+  so two names cannot be made to look alike with characters nobody
+  can see. (A joiner that an emoji sequence or a script needs stays.)
+- **Images only from public hosts.** An avatar or a list's image is
+  named only on an `https` server with a public domain name. An
+  account that names a private address or a local name as its server
+  gets a card without an image, so a page never makes a visitor's
+  browser contact something inside the visitor's own network.
 
 ## Settings
 

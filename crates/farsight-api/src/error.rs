@@ -10,6 +10,9 @@ use crate::ratelimit::RateHeaders;
 
 /// SQLSTATE of a statement cancelled by `statement_timeout`.
 pub const QUERY_CANCELED: &str = "57014";
+/// SQLSTATEs Postgres raises for text it cannot take in:
+/// `character_not_in_repertoire` and `untranslatable_character`.
+pub const UNSTORABLE_TEXT: [&str; 2] = ["22021", "22P05"];
 
 /// An XRPC error response.
 #[derive(Debug, Clone)]
@@ -109,6 +112,13 @@ impl From<farsight_storage::StorageError> for XrpcError {
                 if d.code().as_deref() == Some(QUERY_CANCELED) =>
             {
                 XrpcError::overloaded("query timed out")
+            }
+            // Text the database cannot store (a NUL byte, an invalid
+            // encoding) can only have come in with the request.
+            farsight_storage::StorageError::Db(sqlx::Error::Database(d))
+                if d.code().is_some_and(|c| UNSTORABLE_TEXT.contains(&&*c)) =>
+            {
+                XrpcError::invalid("a parameter holds text that cannot be read")
             }
             _ => XrpcError::internal(e),
         }

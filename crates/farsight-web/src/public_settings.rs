@@ -29,7 +29,7 @@ use farsight_core::config::{
 use farsight_core::{ConfigDuration, Did};
 
 use crate::common::{random_id, render_private};
-use crate::pages::{Admin, Nav, WebState, check_form, gate, nav};
+use crate::pages::{Admin, Nav, Return, WebState, check_form, gate, nav, step_up};
 use crate::public::PendingEnable;
 
 /// How long a confirmation page stays valid.
@@ -263,16 +263,18 @@ pub fn parse_excluded(text: &str) -> Result<Vec<String>, SettingsError> {
         if d.is_empty() {
             continue;
         }
-        if Did::parse(d).is_err() {
+        // Stored in canonical form, which is the form every stored DID
+        // has: an entry written in another case names the same account.
+        let Ok(did) = Did::parse(d).map(Did::into_string) else {
             let shown: String = d.chars().take(80).collect();
             return Err(SettingsError::Field(format!(
                 "Excluded accounts, line {}: {shown:?} is not a DID. Enter one DID per line \
                  (did:plc:… or did:web:…); handles are not accepted.",
                 i + 1
             )));
-        }
-        if seen.insert(d.to_owned()) {
-            out.push(d.to_owned());
+        };
+        if seen.insert(did.clone()) {
+            out.push(did);
         }
     }
     if out.len() > MAX_EXCLUDED_DIDS {
@@ -454,7 +456,13 @@ pub enum Change {
     /// The Public UI form.
     Form(Box<Settings>),
     /// The whole file, from the raw editor (secrets already put back).
-    File(String),
+    File {
+        /// The text to store.
+        text: String,
+        /// SHA-256 of the file the editor's text was made from. The
+        /// change is stored only while the file is still that one.
+        base: [u8; 32],
+    },
 }
 
 /// What the confirmation page says will become reachable.
@@ -518,7 +526,7 @@ fn dry_run(st: &WebState, change: &Change) -> Result<Config, SettingsError> {
         return Err(SettingsError::ManagedExternally);
     }
     let text = match change {
-        Change::File(t) => t.clone(),
+        Change::File { text, .. } => text.clone(),
         Change::Form(s) => {
             let current = store.file_text()?;
             let mut table: toml::Table = current.parse()?;
@@ -531,7 +539,20 @@ fn dry_run(st: &WebState, change: &Change) -> Result<Config, SettingsError> {
         .map_err(SettingsError::from)
 }
 
-async fn commit(st: &WebState, change: &Change) -> Result<EditReport, SettingsError> {
+/// Whether `change` would alter a key that needs a fresh sign-in
+/// (`farsight_api::config_store::sensitive_changes`). A change that does
+/// not load is not sensitive: it is refused when it is stored, with the
+/// loader's message.
+pub(crate) fn is_sensitive(st: &WebState, change: &Change) -> bool {
+    dry_run(st, change).is_ok_and(|next| {
+        !farsight_api::config_store::sensitive_changes(&st.api.config.current().config, &next)
+            .is_empty()
+    })
+}
+
+/// Stores `change` and does what follows a stored edit
+/// (`pages::after_store`).
+pub(crate) async fn commit(st: &WebState, change: &Change) -> Result<EditReport, SettingsError> {
     let store = &st.api.config;
     let r = match change {
         Change::Form(s) => {
@@ -539,9 +560,9 @@ async fn commit(st: &WebState, change: &Change) -> Result<EditReport, SettingsEr
                 .edit(|t| s.apply(t).map_err(|e| EditError::Invalid(e.to_string())))
                 .await
         }
-        Change::File(text) => store.replace(text).await,
+        Change::File { text, base } => store.replace_from(Some(base), text).await,
     }?;
-    let _ = farsight_api::config_store::notify_config(&st.api.pool).await;
+    crate::pages::after_store(st, &r).await;
     Ok(r)
 }
 
@@ -596,6 +617,7 @@ fn outcome(
     note: Option<String>,
 ) -> Response {
     let mut page = crate::pages::settings_base(st, admin);
+    let mut signed_out = false;
     match result {
         Ok(report) => {
             let mut notice = if report.changed.is_empty() {
@@ -607,6 +629,12 @@ fn outcome(
                 notice.push(' ');
                 notice.push_str(&n);
             }
+            // A confirmed change can be a whole file from the raw editor.
+            signed_out = crate::pages::token_changed(&report);
+            if signed_out {
+                notice.push(' ');
+                notice.push_str(crate::pages::SIGNED_OUT);
+            }
             page.notice = Some(notice);
             page.restart = report.restart_required;
         }
@@ -617,7 +645,11 @@ fn outcome(
             }
         }
     }
-    render_private(&page)
+    let mut r = render_private(&page);
+    if signed_out {
+        crate::pages::clear_admin_cookie(&mut r);
+    }
+    r
 }
 
 /// `POST /admin/settings/public-ui`: saves the Public UI form, or — when it
@@ -647,6 +679,12 @@ pub async fn save(
         )
     });
     let change = Change::Form(Box::new(settings));
+    // Switching the public UI on widens access: a fresh sign-in first.
+    if is_sensitive(&st, &change)
+        && let Err(r) = step_up(&admin, Return::Settings)
+    {
+        return r;
+    }
     match confirmation(&st, &admin, change.clone()) {
         Err(e) => outcome(&st, &admin, Err(e), Some(typed), None),
         Ok(Some(confirm)) => confirm,
@@ -696,6 +734,12 @@ pub async fn confirm(
             return r;
         }
     };
+    // The confirmation page can be older than the sign-in was fresh.
+    if is_sensitive(&st, &change)
+        && let Err(r) = step_up(&admin, Return::Settings)
+    {
+        return r;
+    }
     let r = commit(&st, &change).await;
     outcome(&st, &admin, r, None, None)
 }
@@ -727,6 +771,11 @@ mod tests {
                 .contains("at most")
         );
         assert!(parse_excluded("").unwrap().is_empty());
+        // Every spelling of a did:web is the one account.
+        assert_eq!(
+            parse_excluded("did:web:Example.COM\ndid:web:example.com\n").unwrap(),
+            [D2]
+        );
     }
 
     #[test]

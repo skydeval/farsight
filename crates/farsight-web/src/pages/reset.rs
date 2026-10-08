@@ -8,8 +8,8 @@ use axum::extract::{Form, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
 
-use super::{ADMIN_COOKIE, MessagePage, Nav, WebState, check_form, gate, nav};
-use crate::common::{NO_STORE, cookie, render_private};
+use super::{MessagePage, Nav, WebState, check_form, clear_admin_cookie, gate, nav};
+use crate::common::{NO_STORE, render_private};
 
 /// The reset page.
 #[derive(Template)]
@@ -61,6 +61,8 @@ pub enum ResetError {
 pub async fn perform_reset(st: &WebState) -> Result<(), ResetError> {
     farsight_storage::auth::delete_all_sessions(&st.api.pool).await?;
     farsight_storage::auth::revoke_all_tokens(&st.api.pool).await?;
+    // The keys stop working now, not at the next refresh.
+    st.api.keys.evict_all();
     std::fs::remove_file(st.api.config.path())?;
     let t = crate::setup_token::rotate(&st.token_path)?;
     crate::setup_token::print(&t);
@@ -112,10 +114,7 @@ pub(super) async fn reset_submit(
             .into(),
         link: Some(("/setup".into(), "Open setup".into())),
     });
-    r.headers_mut().append(
-        header::SET_COOKIE,
-        cookie(ADMIN_COOKIE, "", "/", false, Some(0)),
-    );
+    clear_admin_cookie(&mut r);
     r.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static(NO_STORE));
     r

@@ -16,11 +16,14 @@
 //!   `refresh_token`);
 //! - 5: DPoP nonces; 6: the callback's checks, in order;
 //! - 7: flow lifetime; 8: `gate` and `/robots.txt` by configuration;
-//! - 9: rate limits; 10: Settings;
+//! - 9: rate limits; 10: Settings; 10b: the fresh sign-in that sensitive
+//!   actions ask for, the directory pinned at start, sessions ended by a
+//!   changed admin token;
 //! - 11: no admin DID; 12: the CLI, and a changed admin DID;
 //! - 13: what is logged and what never is;
 //! - 14: the browser (`--browser`): the session cookie after the callback
-//!   page, in Chromium, Firefox and WebKit.
+//!   page, and signing in again before a sensitive action, in Chromium,
+//!   Firefox and WebKit.
 //!
 //! `--keep` keeps the Postgres container.
 
@@ -1780,6 +1783,425 @@ async fn check_settings(c: &mut Checks, ctx: &Ctx, a: &Srv, cookie: &str) -> Res
     Ok(())
 }
 
+// ------------------------------------------ 10b. a fresh sign-in first
+
+/// What a POST that was refused for want of a fresh sign-in looks like:
+/// `303` to the sign-in page, naming the page to come back to.
+fn asks_again(r: &Resp, page: &str) -> bool {
+    r.status == 303 && r.header("location").as_deref() == Some(&format!("/enter?again={page}"))
+}
+
+async fn check_step_up(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), String> {
+    c.section("10b. a fresh sign-in before sensitive actions");
+    let s = Srv::with_config("stepup", cfg, &[]).await?;
+    let host = s.loopback();
+    let http = ctx.fresh();
+    let signed = ctx.sign_in(&s, &http, &host).await?;
+    let cookie = set_cookie(&signed, "farsight_admin").unwrap_or_default();
+    let key_of = |cookie: &str| {
+        farsight_web::pages::oauth_session_key(cookie.split_once('=').map_or("", |x| x.1), D1)
+    };
+    let old_key = key_of(&cookie);
+    let settings = format!("{}/admin/settings", s.base);
+    let csrf_now = |cookie: String| {
+        let (http, settings) = (http.clone(), settings.clone());
+        async move {
+            let page = http.get(&settings, &[("cookie", &cookie)]).await?;
+            Ok::<_, String>(csrf_of(&page.text).unwrap_or_default())
+        }
+    };
+    let file = || std::fs::read_to_string(s.config_path()).map_err(|e| e.to_string());
+    let keys = || ctx.n("SELECT count(*) FROM api_tokens");
+    let post = |path: &'static str, cookie: String, form: Vec<(&'static str, String)>| {
+        let (http, base) = (http.clone(), s.base.clone());
+        async move {
+            let form: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            http.post_form(&format!("{base}{path}"), &[("cookie", &cookie)], &form)
+                .await
+        }
+    };
+
+    // A session that has just signed in does everything.
+    let csrf = csrf_now(cookie.clone()).await?;
+    let keys_before = keys().await?;
+    let made = post(
+        "/admin/ops/keys-create",
+        cookie.clone(),
+        vec![
+            ("csrf", csrf.clone()),
+            ("name", "fresh-session".into()),
+            ("scope", "read".into()),
+        ],
+    )
+    .await?;
+    c.check(
+        "a session that signed in just now creates an API key: 200, the key shown once, one row more",
+        made.status == 200
+            && made.text.contains("created.")
+            && made.text.contains("fsk_")
+            && keys().await? == keys_before + 1,
+        made.short(),
+    );
+
+    // Eleven minutes later it is the same session, no longer fresh.
+    sqlx::query(
+        "UPDATE admin_sessions SET created_at = now() - interval '11 minutes' WHERE id_sha256 = $1",
+    )
+    .bind(&old_key[..])
+    .execute(&ctx.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let before = file()?;
+    let raw = |text: String| {
+        post(
+            "/admin/settings",
+            cookie.clone(),
+            vec![("csrf", csrf.clone()), ("config", text)],
+        )
+    };
+    let harmless = raw(before.replace("mailto:ops@", "mailto:later@")).await?;
+    let narrowed = raw(file()?.replace("reads = \"public\"", "reads = \"api_key\"")).await?;
+    c.check(
+        "eleven minutes after signing in the session still saves ordinary settings, and one that narrows access (reads public → api_key)",
+        harmless.status == 200
+            && banner(&harmless.text).contains("Saved. Changed: server.contact")
+            && narrowed.status == 200
+            && banner(&narrowed.text).contains("Saved. Changed: access.reads"),
+        format!("{} / {}", banner(&harmless.text), banner(&narrowed.text)),
+    );
+    let base = file()?;
+    let other_hash = hex(&farsight_api::auth::sha256("stage7-another-admin-token"));
+    let old_hash = hex(&farsight_api::auth::sha256("stage7-admin-token"));
+    let keys_before = keys().await?;
+    let mut wrong = Vec::new();
+    for (what, text) in [
+        (
+            "backfill.plc_url",
+            base.replace(
+                &format!("plc_url = \"{}\"", ctx.standin.base),
+                "plc_url = \"https://plc.attacker.example\"",
+            ),
+        ),
+        (
+            "backfill.relay_url",
+            base.replace(
+                "[backfill]\n",
+                "[backfill]\nrelay_url = \"https://relay.attacker.example\"\n",
+            ),
+        ),
+        (
+            "net.allow_http_hosts",
+            base.replace(
+                &format!("allow_http_hosts = [\"{STANDIN_ADDR}\"]"),
+                &format!("allow_http_hosts = [\"{STANDIN_ADDR}\", \"198.51.100.2\"]"),
+            ),
+        ),
+        (
+            "auth.admin_token_sha256",
+            base.replace(&old_hash, &other_hash),
+        ),
+        (
+            "access.reads widened",
+            base.replace("reads = \"api_key\"", "reads = \"public\""),
+        ),
+    ] {
+        if text == base {
+            wrong.push(format!(
+                "{what}: the edit changed nothing in the harness's config"
+            ));
+            continue;
+        }
+        let r = raw(text).await?;
+        if !(asks_again(&r, "settings") && file()? == base) {
+            wrong.push(format!("{what}: {}", r.short()));
+        }
+    }
+    c.check(
+        "the same session's raw-editor save that changes backfill.plc_url, backfill.relay_url, net.allow_http_hosts or auth.admin_token_sha256, or widens access.reads ⇒ 303 to /enter?again=settings, and config.toml is byte for byte what it was",
+        wrong.is_empty(),
+        format!("{wrong:?}"),
+    );
+    let rotate = post(
+        "/admin/settings/token",
+        cookie.clone(),
+        vec![("csrf", csrf.clone())],
+    )
+    .await?;
+    let create = post(
+        "/admin/ops/keys-create",
+        cookie.clone(),
+        vec![
+            ("csrf", csrf.clone()),
+            ("name", "stale-session".into()),
+            ("scope", "read".into()),
+        ],
+    )
+    .await?;
+    c.check(
+        "rotating the admin token ⇒ 303 to /enter?again=settings with the token unchanged and the session kept; creating an API key ⇒ 303 to /enter?again=ops and no row",
+        asks_again(&rotate, "settings")
+            && file()? == base
+            && ctx.has_session_key(&old_key).await?
+            && asks_again(&create, "ops")
+            && keys().await? == keys_before
+            && !rotate.text.contains("fsa_")
+            && !create.text.contains("fsk_"),
+        format!("{} / {}", rotate.short(), create.short()),
+    );
+    // Without a form token the answer is the form check's, before anything else.
+    let forged = post(
+        "/admin/settings/token",
+        cookie.clone(),
+        vec![("csrf", "0".repeat(64))],
+    )
+    .await?;
+    c.check(
+        "the form token is checked first: a rotation with a wrong token is 403, not a redirect to sign in",
+        forged.status == 403,
+        forged.short(),
+    );
+
+    // The sign-in page says why.
+    let enter = |query: &'static str, cookie: Option<String>| {
+        let (http, base) = (http.clone(), s.base.clone());
+        async move {
+            let headers: Vec<(&str, &str)> = match &cookie {
+                Some(c) => vec![("cookie", c.as_str())],
+                None => Vec::new(),
+            };
+            http.get(&format!("{base}/enter{query}"), &headers).await
+        }
+    };
+    let again = enter("?again=settings", Some(cookie.clone())).await?;
+    let again_ops = enter("?again=ops", Some(cookie.clone())).await?;
+    let elsewhere = enter("?again=//evil.example", Some(cookie.clone())).await?;
+    let anonymous = enter("?again=settings", None).await?;
+    c.check(
+        "/enter?again=settings with the session: 200, the banner \"Sign in again to change this setting.\" with \"Nothing was changed\", a form that carries next=settings and a \"Sign in again with ATProto\" button, under the page policy (no inline script or style)",
+        again.status == 200
+            && again.text.contains("<strong>Sign in again to change this setting.</strong> Nothing was changed.")
+            && again.text.contains("you are back on Settings")
+            && again.text.contains("<input type=\"hidden\" name=\"next\" value=\"settings\">")
+            && again.text.contains("Sign in again with ATProto")
+            && again_ops.text.contains("<input type=\"hidden\" name=\"next\" value=\"ops\">")
+            && again_ops.text.contains("you are back on Operations")
+            && again.header("content-security-policy").is_some_and(|p| {
+                p.contains("script-src 'self'") && p.contains("style-src 'self'") && !p.contains("unsafe")
+            })
+            && !again.text.contains("<style")
+            && !again.text.contains(" style=\""),
+        again.short(),
+    );
+    c.check(
+        "a page name that is not one of the two is ignored (the session goes to /admin as before), and without a session /enter?again=… is the plain sign-in page",
+        elsewhere.status == 303
+            && elsewhere.header("location").as_deref() == Some("/admin")
+            && anonymous.status == 200
+            && !anonymous.text.contains("Sign in again")
+            && !anonymous.text.contains("name=\"next\"")
+            && anonymous.text.contains("Sign in with ATProto"),
+        format!("{} / {}", elsewhere.short(), anonymous.status),
+    );
+
+    // Signing in again: the same flow, started by the session.
+    ctx.pace().await;
+    ctx.standin.take_events();
+    let sessions_before = ctx.n("SELECT count(*) FROM admin_sessions").await?;
+    let started = http
+        .post_form(
+            &format!("{}/enter", s.base),
+            &[("host", host.as_str()), ("cookie", cookie.as_str())],
+            &[("next", "settings")],
+        )
+        .await?;
+    let flow_cookie = set_cookie(&started, "farsight_flow").unwrap_or_default();
+    ctx.secret(flow_cookie.split_once('=').map_or("", |x| x.1));
+    let authorize = started.header("location").unwrap_or_default();
+    let par = ctx
+        .standin
+        .take_events()
+        .into_iter()
+        .rfind(|e| e.kind == "par");
+    c.check(
+        "POST /enter with the session and next=settings starts an ordinary flow: 303 to the authorization server, a pushed request with login_hint = the admin DID, a flow cookie",
+        started.status == 303
+            && authorize.starts_with(&format!("{}/oauth/authorize?", ctx.standin.base))
+            && par.as_ref().is_some_and(|e| {
+                e.status == 201 && e.form.get("login_hint").map(String::as_str) == Some(D1)
+            })
+            && !flow_cookie.is_empty(),
+        started.short(),
+    );
+    if let Some(e) = &par {
+        ctx.secret(e.form.get("state").map_or("", String::as_str));
+    }
+    let cb = ctx.approve(&authorize).await?;
+    // The callback is a cross-site navigation: the browser sends the flow
+    // cookie and not the SameSite=Strict session cookie.
+    let done = ctx.callback(&s, &http, &cb, Some(&flow_cookie)).await?;
+    let new_cookie = set_cookie(&done, "farsight_admin").unwrap_or_default();
+    let new_key = key_of(&new_cookie);
+    c.check(
+        "the callback answers 200 with a page that continues to /admin/settings (meta refresh and Continue link), and sets a new session cookie",
+        done.status == 200
+            && done.text.contains("<meta http-equiv=\"refresh\" content=\"0;url=/admin/settings\">")
+            && done.text.contains("<a class=\"button\" href=\"/admin/settings\">Continue</a>")
+            && !new_cookie.is_empty()
+            && new_cookie != cookie,
+        done.short(),
+    );
+    let old_page = http.get(&settings, &[("cookie", &cookie)]).await?;
+    c.check(
+        "the new session replaces the one that asked: its row is gone, the new one is there, the count is unchanged, and the old cookie is sent to /enter",
+        !ctx.has_session_key(&old_key).await?
+            && ctx.has_session_key(&new_key).await?
+            && ctx.n("SELECT count(*) FROM admin_sessions").await? == sessions_before
+            && old_page.status == 303
+            && old_page.header("location").as_deref() == Some("/enter"),
+        format!("old cookie: {}", old_page.status),
+    );
+
+    // Back on the page, the action is repeated and now goes through.
+    let csrf2 = csrf_now(new_cookie.clone()).await?;
+    let widened = post(
+        "/admin/settings",
+        new_cookie.clone(),
+        vec![
+            ("csrf", csrf2.clone()),
+            (
+                "config",
+                file()?.replace("reads = \"api_key\"", "reads = \"public\""),
+            ),
+        ],
+    )
+    .await?;
+    let keys_before = keys().await?;
+    let created = post(
+        "/admin/ops/keys-create",
+        new_cookie.clone(),
+        vec![
+            ("csrf", csrf2.clone()),
+            ("name", "after-step-up".into()),
+            ("scope", "read".into()),
+        ],
+    )
+    .await?;
+    c.check(
+        "repeated in the new session, the same changes are made: access.reads is public again, and the API key is created",
+        widened.status == 200
+            && banner(&widened.text).contains("Saved. Changed: access.reads")
+            && file()?.contains("reads = \"public\"")
+            && created.status == 200
+            && created.text.contains("fsk_")
+            && keys().await? == keys_before + 1,
+        format!("{} / {}", banner(&widened.text), created.status),
+    );
+    // A posted form is never replayed: nothing named `stale-session` exists.
+    let replayed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM api_tokens WHERE name = 'stale-session'")
+            .fetch_one(&ctx.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    c.check(
+        "the form that was refused is not replayed after the sign-in: no key of that name exists",
+        replayed == 0,
+        format!("{replayed}"),
+    );
+    ctx.retire(s);
+
+    // A second server, whose sign-in has not looked anything up yet.
+    let pin = Srv::with_config("pin", cfg, &[]).await?;
+    let admin = support::admin_session(&ctx.pool, D1).await?;
+    let page = ctx
+        .fresh()
+        .get(
+            &format!("{}/admin/settings", pin.base),
+            &[("cookie", &admin)],
+        )
+        .await?;
+    let csrf = csrf_of(&page.text).unwrap_or_default();
+    let pin_file = std::fs::read_to_string(pin.config_path()).map_err(|e| e.to_string())?;
+    let moved = ctx
+        .fresh()
+        .post_form(
+            &format!("{}/admin/settings", pin.base),
+            &[("cookie", &admin)],
+            &[
+                ("csrf", csrf.as_str()),
+                (
+                    "config",
+                    pin_file
+                        .replace(
+                            &format!("plc_url = \"{}\"", ctx.standin.base),
+                            &format!("plc_url = \"http://{STANDIN_ADDR}:9\""),
+                        )
+                        .as_str(),
+                ),
+            ],
+        )
+        .await?;
+    let start = ctx.start(&pin, &ctx.fresh(), &pin.loopback()).await?;
+    c.check(
+        "the admin DID is resolved through the PLC directory named at start: after a fresh session saved another backfill.plc_url (one that answers nothing), a first sign-in on that server still reaches the admin's own authorization server",
+        banner(&moved.text).contains("Saved. Changed: backfill.plc_url")
+            && start.resp.status == 303
+            && start
+                .location
+                .as_deref()
+                .is_some_and(|l| l.starts_with(&format!("{}/oauth/authorize?", ctx.standin.base))),
+        format!("{} / {}", banner(&moved.text), start.resp.short()),
+    );
+    // The admin token's hash written by hand in the raw editor.
+    let pin_file = std::fs::read_to_string(pin.config_path()).map_err(|e| e.to_string())?;
+    let page = ctx
+        .fresh()
+        .get(
+            &format!("{}/admin/settings", pin.base),
+            &[("cookie", &admin)],
+        )
+        .await?;
+    let csrf = csrf_of(&page.text).unwrap_or_default();
+    let sessions = ctx.n("SELECT count(*) FROM admin_sessions").await?;
+    let rehashed = ctx
+        .fresh()
+        .post_form(
+            &format!("{}/admin/settings", pin.base),
+            &[("cookie", &admin)],
+            &[
+                ("csrf", csrf.as_str()),
+                ("config", pin_file.replace(&old_hash, &other_hash).as_str()),
+            ],
+        )
+        .await?;
+    let cleared: Vec<String> = rehashed
+        .headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_owned))
+        .collect();
+    let after = ctx
+        .fresh()
+        .get(
+            &format!("{}/admin/settings", pin.base),
+            &[("cookie", &admin)],
+        )
+        .await?;
+    c.check(
+        "a raw-editor save that changes auth.admin_token_sha256 ends every session, like the rotate button: the save says so, admin_sessions is empty, the cookie is cleared, and the session that saved is sent to /enter",
+        sessions >= 1
+            && rehashed.status == 200
+            && banner(&rehashed.text).contains("Saved. Changed: auth.admin_token_sha256.")
+            && banner(&rehashed.text).contains("every session was signed out")
+            && ctx.n("SELECT count(*) FROM admin_sessions").await? == 0
+            && cleared.iter().any(|c| c.starts_with("farsight_admin=;") && c.contains("Max-Age=0"))
+            && after.status == 303
+            && after.header("location").as_deref() == Some("/enter"),
+        format!("{sessions} sessions before; {}", banner(&rehashed.text)),
+    );
+    ctx.retire(pin);
+    Ok(())
+}
+
 // ------------------------------------------------------- 11. no admin DID
 
 async fn check_unconfigured(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
@@ -2042,7 +2464,10 @@ async fn check_browser(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), Strin
     let mut n = 0;
     // One configuration: the admin UI is on or it is not there.
     {
-        let s = Srv::with_config("browser", cfg, &[]).await?;
+        // The sign-in stops being fresh after 12 s on this server, so the
+        // probes can watch it happen.
+        let s =
+            Srv::with_config("browser", cfg, &[("FARSIGHT_HARNESS_STEP_UP_SECS", "12")]).await?;
         let script = format!(
             "cd /work && ([ -d node_modules/playwright ] || npm install --no-save --no-audit --no-fund playwright@1.48.0 >npm.log 2>&1) && node probes.mjs '{}' '{}'",
             s.base, ctx.standin.base
@@ -2150,6 +2575,7 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
     check_settings(c, &ctx, &a, &admin_cookie).await?;
     // The CLI section restarts A on its directory and retires it.
     check_cli(c, &ctx, a, &admin_cookie).await?;
+    check_step_up(c, &ctx, &cfg_a).await?;
     check_unhostable(c, &ctx).await?;
     check_local_only(c, &ctx).await?;
     check_lifetime(c, &ctx, &cfg_a).await?;

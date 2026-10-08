@@ -325,7 +325,8 @@ CREATE TABLE firehose_seams (
   is turned into a point on the witness clock.
 - `firehose_gaps`: intervals of the witness clock during which events
   may have been lost. `cause` is 1 `cursor_too_old`, 2 `heuristic`,
-  3 `failover`, 4 `sync_unavailable`, 5 `seam_unrepaired`; `to_at` is
+  3 `failover`, 4 `sync_unavailable`, 5 `seam_unrepaired`,
+  6 `unreadable`; `to_at` is
   NULL while the gap is open; `healed_*` are set by the repair that
   covered it.
 - `firehose_seams`: the seam windows that still have to be read again,

@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use askama::Template;
 use axum::extract::{Form, State};
-use axum::http::{HeaderMap, header};
+use axum::http::HeaderMap;
 use axum::response::Response;
 
-use super::{ADMIN_COOKIE, Admin, Nav, WebState, check_form, gate, nav};
-use crate::common::{cookie, render_private};
+use super::{Admin, Nav, Return, WebState, check_form, clear_admin_cookie, gate, nav, step_up};
+use crate::common::render_private;
 use crate::public_settings::SettingsError;
 use farsight_api::config_store::EditError;
 
@@ -25,6 +25,10 @@ pub struct SettingsPage {
     pub csrf: String,
     /// The config file, secrets redacted.
     pub text: String,
+    /// SHA-256 of the config file as it is shown, in hex: the raw
+    /// editor's form posts it back, and a save is stored only while the
+    /// file is still that one.
+    pub base: String,
     /// Keys set from the environment (locked).
     pub env_keys: Vec<String>,
     /// The config comes from the environment alone
@@ -116,15 +120,12 @@ fn unredact(submitted: &str, current: &str) -> Result<String, SettingsError> {
 
 pub(crate) fn settings_base(st: &WebState, s: &Admin) -> SettingsPage {
     let cur = st.api.config.current();
+    let file = st.api.config.file_text().unwrap_or_default();
     SettingsPage {
         nav: nav(&Some(s.clone())),
         csrf: s.csrf.clone(),
-        text: st
-            .api
-            .config
-            .file_text()
-            .map(|t| redact_file(&t))
-            .unwrap_or_default(),
+        text: redact_file(&file),
+        base: farsight_api::auth::hex(&farsight_api::auth::sha256(&file)),
         env_keys: cur.env_keys.clone(),
         env_managed: cur.from_env_only,
         notice: None,
@@ -148,7 +149,7 @@ pub(super) async fn settings_page(State(st): State<Arc<WebState>>, headers: Head
             let cur = st.api.config.current();
             if !cur.config.access.admin_did.is_empty() {
                 st.oauth
-                    .handle(&st.safe, &cur.config, &cur.config.access.admin_did)
+                    .handle(&st.safe, &cur.config.access.admin_did)
                     .await;
             }
             render_private(&settings_base(&st, &s))
@@ -171,42 +172,88 @@ pub(super) async fn settings_save(
     }
     let submitted = form.get("config").cloned().unwrap_or_default();
     let current = st.api.config.file_text().unwrap_or_default();
+    // The file the editor showed: the one named by the form, or, for a
+    // form without that field, the file as it is now.
+    let base = form
+        .get("base")
+        .and_then(|b| farsight_api::auth::unhex(b))
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .unwrap_or_else(|| farsight_api::auth::sha256(&current));
     let result = match unredact(&submitted, &current) {
-        // Turning the public UI on needs the operator's confirmation,
-        // whichever editor asks for it.
-        Ok(text) => match crate::public_settings::confirmation(
-            &st,
-            &s,
-            crate::public_settings::Change::File(text.clone()),
-        ) {
-            Ok(Some(confirm)) => return confirm,
-            Ok(None) => st
-                .api
-                .config
-                .replace(&text)
-                .await
-                .map_err(SettingsError::from),
-            Err(e) => Err(e),
-        },
+        Ok(text) => {
+            let change = crate::public_settings::Change::File { text, base };
+            // An edit that touches a sensitive key is stored only after a
+            // fresh sign-in.
+            if crate::public_settings::is_sensitive(&st, &change)
+                && let Err(r) = step_up(&s, Return::Settings)
+            {
+                return r;
+            }
+            // Turning the public UI on needs the operator's confirmation,
+            // whichever editor asks for it.
+            match crate::public_settings::confirmation(&st, &s, change.clone()) {
+                Ok(Some(confirm)) => return confirm,
+                Ok(None) => crate::public_settings::commit(&st, &change).await,
+                Err(e) => Err(e),
+            }
+        }
         Err(e) => Err(SettingsError::NotToml(Box::new(e))),
     };
     let mut page = settings_base(&st, &s);
     match result {
         Ok(report) => {
-            let _ = farsight_api::config_store::notify_config(&st.api.pool).await;
+            let signed_out = token_changed(&report);
             page.notice = Some(if report.changed.is_empty() {
                 "No changes.".into()
+            } else if signed_out {
+                format!(
+                    "Saved. Changed: {}. {SIGNED_OUT}",
+                    report.changed.join(", ")
+                )
             } else {
                 format!("Saved. Changed: {}.", report.changed.join(", "))
             });
             page.restart = report.restart_required;
+            let mut r = render_private(&page);
+            if signed_out {
+                clear_admin_cookie(&mut r);
+            }
+            r
         }
         Err(e) => {
             page.error = Some(e.to_string());
+            // The editor keeps what was typed, and stays tied to the
+            // file that text was made from.
             page.text = submitted;
+            page.base = farsight_api::auth::hex(&base);
+            render_private(&page)
         }
     }
-    render_private(&page)
+}
+
+/// What a save says when it ended the sessions.
+pub(crate) const SIGNED_OUT: &str =
+    "The admin token changed, so every session was signed out; sign in again to continue.";
+
+/// Whether a stored edit changed the admin token's hash.
+pub(crate) fn token_changed(report: &farsight_api::config_store::EditReport) -> bool {
+    report
+        .changed
+        .iter()
+        .any(|k| k == farsight_api::config_store::ADMIN_TOKEN_KEY)
+}
+
+/// What follows every edit stored from the admin UI: the backfill process
+/// is told, and if the admin token's hash changed, however the edit was
+/// made, every admin session ends. Whoever held a session while the token
+/// was replaced does not keep it.
+pub(crate) async fn after_store(st: &WebState, report: &farsight_api::config_store::EditReport) {
+    let _ = farsight_api::config_store::notify_config(&st.api.pool).await;
+    if token_changed(report)
+        && let Err(e) = farsight_storage::auth::delete_all_sessions(&st.api.pool).await
+    {
+        tracing::error!(error = %e, "the admin token changed but the sessions could not be ended");
+    }
 }
 
 fn set_admin_token(t: &mut toml::Table, hash: String) -> Result<(), EditError> {
@@ -231,30 +278,29 @@ pub(super) async fn settings_token(
     if let Err(r) = check_form(&s, &headers, &form) {
         return r;
     }
+    if let Err(r) = step_up(&s, Return::Settings) {
+        return r;
+    }
     let token = farsight_api::auth::generate(farsight_api::auth::ADMIN_PREFIX);
     let hash = farsight_api::auth::hex(&farsight_api::auth::sha256(&token));
     let mut page = settings_base(&st, &s);
-    if let Err(e) = st.api.config.edit(|t| set_admin_token(t, hash)).await {
-        page.error = Some(e.to_string());
-        return render_private(&page);
-    }
-    let _ = farsight_api::config_store::notify_config(&st.api.pool).await;
-    // Rotation revokes every session; this page shows the token once,
-    // then the operator logs in again.
-    let _ = farsight_storage::auth::delete_all_sessions(&st.api.pool).await;
-    page.text = st
-        .api
-        .config
-        .file_text()
-        .map(|t| redact_file(&t))
-        .unwrap_or_default();
+    let report = match st.api.config.edit(|t| set_admin_token(t, hash)).await {
+        Ok(r) => r,
+        Err(e) => {
+            page.error = Some(e.to_string());
+            return render_private(&page);
+        }
+    };
+    // Rotation ends every session; this page shows the token once, then
+    // the operator signs in again.
+    after_store(&st, &report).await;
+    let file = st.api.config.file_text().unwrap_or_default();
+    page.text = redact_file(&file);
+    page.base = farsight_api::auth::hex(&farsight_api::auth::sha256(&file));
     page.notice = Some("Admin token rotated. All sessions were signed out.".into());
     page.new_token = Some(token);
     let mut r = render_private(&page);
-    r.headers_mut().append(
-        header::SET_COOKIE,
-        cookie(ADMIN_COOKIE, "", "/", false, Some(0)),
-    );
+    clear_admin_cookie(&mut r);
     r
 }
 

@@ -68,6 +68,81 @@ database schema; each entry says so where it does.
   `account_purges`, and indexes on `backfill_queue`, `backfill_state`,
   `list_fetch_runs`, `subject_lists`, `op_errors` and `sweep_cycles`.
   Schema version 1.
+- Admin UI: some changes now ask you to **sign in again** if you
+  signed in more than 10 minutes ago. They are: a settings save that
+  changes `auth.*`, `net.*`, `backfill.plc_url` or
+  `backfill.relay_url`, or that opens access further (`access.reads`
+  towards `public`, `access.cors` or the public UI switched on);
+  rotating the admin token; and creating an API key. The change is not
+  made: the sign-in page opens with "Sign in again to change this
+  setting", and after signing in you are back on Settings or
+  Operations, where you make the change again. What was typed into
+  the form is not kept. Everything else, and every change that closes
+  access, works as before. The reason is that each of these changes
+  would let whoever held a stolen session keep control after the
+  session ended.
+- Admin sign-in resolves the admin DID through the PLC directory that
+  `backfill.plc_url` named when the server started. A changed
+  `plc_url` still applies to handles and backfill at once, and to the
+  sign-in after a restart.
+- A change of the admin token signs every admin session out however it
+  was made, also when `auth.admin_token_sha256` is written in the
+  `config.toml` editor.
+- The admin session cookie is named `__Host-farsight_admin` when the
+  request arrived over HTTPS (as a trusted proxy reports it), and
+  `farsight_admin` over plain HTTP.
+- The `config.toml` editor refuses a save when the file has changed
+  since the page was loaded (another tab, an Operations control), and
+  asks you to reload. The same holds on the public UI's confirmation
+  page.
+- Setup: a wizard session ends when the setup token is replaced, also
+  by `farsight setup-token --rotate`, and 12 hours after it was
+  opened.
+- API: one caller holds only part of the query slots. A quarter of
+  `rate_limit.query_concurrency` is kept from anonymous callers; one
+  anonymous address (IPv6: one `/48`) has at most a quarter of the
+  rest in flight, one API key at most half of all. A request beyond
+  that waits for one of its caller's own places and, like any request
+  that finds no slot within 2 seconds, gets `503 Overloaded`. With the
+  defaults that is 6 requests at a time for an anonymous address and
+  16 for a key.
+- Rate limits: an anonymous IPv6 caller is limited by its `/64` as
+  before and now also by its `/48`, at 4 times the limit, and its
+  `/32`, at 16 times. At most 100,000 rate-limit buckets are kept.
+- API: a `did:web` is stored and returned with its hostname in lower
+  case, and every spelling of it is the same account in a request, in
+  `public_ui.excluded_dids` and in the index.
+- API: a cursor that Farsight did not hand out is `InvalidRequest`;
+  one holding a NUL byte was an `InternalError` before. The lexicons
+  list `InternalError` among every method's errors, and
+  `admin.createApiKey` counts a name's 200 characters as characters,
+  not bytes.
+- Public UI: a table's count is read at most once in 30 seconds for
+  the same table and filters, whatever address the page is asked for
+  under, and one address (IPv6: one `/48`) renders at most half of
+  `public_ui.query_concurrency` pages at once; a request beyond that
+  gets the "Too many requests" page.
+- Public and admin pages show names without invisible characters:
+  zero-width spaces, word joiners and byte-order marks are left out
+  of list names, descriptions and handles, and a zero-width joiner or
+  non-joiner stays only where an emoji sequence or a script needs it.
+- Firehose: on a failover with a measured lag the new instance is
+  asked for `firehose.tuning.gap_threshold` more than the rewind, and
+  a first event later than the rewind itself records a gap. Gaps have
+  a new cause, `Unreadable` (see Fixed), and
+  `farsight_ingest_dropped_total` a new `reason`, `unreadable`.
+- `server.hostname` and `server.contact` must be one line of text; a
+  control character in either is refused when the config is loaded or
+  saved.
+- The compose file names the image by version
+  (`ghcr.io/skydeval/farsight:0.6.0`), not `latest`. The Dockerfile
+  names its base images by digest. The server logs a warning at
+  start while the database is reached with the compose file's default
+  password.
+- For contributors: the GitHub Actions workflows name every action by
+  commit, and the stage 3 harness names its `busybox` image by digest.
+- Schema: `firehose_gaps.cause` accepts the new code 6. Schema
+  version 1.
 
 ### Fixed
 
@@ -338,6 +413,86 @@ database schema; each entry says so where it does.
   few statements, and so is a reconcile.
 - A list of a reactivated account that had timed out at the same
   moment could be re-admitted without its lock being held.
+- Public UI: a handle that had passed to another account stayed on
+  the first account's rows until the handle pass looked at it, and for
+  good with the pass off. A check that finds the handle now resolves
+  to another account, or that the account's document names another
+  handle or none, removes the handle at once, from memory and from
+  `handle_cache`. A check that cannot reach the hosts still keeps it.
+- Public UI: an account or list page whose own handle could not be
+  checked (no budget left, or no answer in 2 seconds) was cached for
+  30 seconds without its handle. Such a page is `no-store`.
+- Public UI: pressing Enter in a table's filter box with a whole
+  handle drew on the instance's handle budget at the rate of page
+  views. The lookup is charged to the visitor's lookup class
+  (`rate_limit.ui_lookup_rps`) first.
+- Public UI: a list page built its image's address from whatever host
+  the owner's identity named, a private address or a local name
+  included, so a visitor's browser could be made to request a host on
+  the visitor's own network. An image is named only on an `https`
+  server with a public domain name; this holds for avatars too.
+- API: `getListsNaming` read the subject's list items from the start
+  for every page. A later page now starts where the last one ended.
+- API: a revoked API key could work again for up to 30 seconds when a
+  refresh of the key table that had started before the revocation
+  finished after it. A revoked key stops at once and stays out.
+- A proxy that writes `X-Forwarded-For` entries with a port
+  (`203.0.113.7:4711`) made Farsight skip its entry and take the
+  client's own claim as the client address. Such an entry is read; an
+  entry that is not an address at all ends the walk, and the nearest
+  proxy that was read stands in.
+- The periodic sweep of rate-limit buckets dropped buckets that were
+  not full, which gave a caller of a class that does not refill a new
+  allowance. It drops only buckets that are full again.
+- With `proxy.cloudflare_refresh`, a fetched range list was trusted as
+  it came. A list with a range broader than `/8` (IPv4) or `/24`
+  (IPv6), a private range or more than 500 ranges is refused whole
+  and the previous set stays in force.
+- A line break or another control character in `server.contact` or
+  `server.hostname` made the server exit at every start.
+- Settings and setup showed a database password in clear when it was
+  given as a URL parameter (`?password=`) or in the keyword form
+  (`password=…`). Both are shown redacted.
+- Setup: the wizard could finish with a connection string whose test
+  had failed, if the storage step had passed earlier with another
+  one. A failed test, or a test of another string, takes the step
+  back.
+- Setup: the count of wrong setup tokens per client grew without
+  bound and gave every IPv6 address a count of its own. It counts by
+  `/64` and holds at most 10,000 clients.
+- Setup: the Jetstream test's 10-second limit did not cover
+  connecting.
+- Firehose: a frame that could not be read ended the session, and one
+  that was unreadable every time came first again on every resume, on
+  every instance. After three sessions in a row have ended at the
+  same position, the next one steps past the frames it cannot read
+  there (at most 64) and records a gap of the new cause `Unreadable`,
+  which a repair then covers.
+- Firehose: on a failover, a new instance that started up to
+  `gap_threshold` later than asked took that time out of the rewind
+  without a gap.
+- Firehose: the zstd dictionary was prepared again for every message.
+  It is prepared once. A frame may ask for a window of at most 16
+  MiB, the size a frame may expand to.
+- Admin UI: the list lookup showed "Complete" coverage above the
+  members of a list whose owner is hidden, where the API reports the
+  list as unavailable. It shows the same coverage as the API.
+- Backfill: a discovery run that found a list it could not record,
+  because a cap refused the list's placeholder row, still confirmed
+  subject coverage. Such a run is marked `truncated`.
+- Backfill: a record on a `listRecords` page that was not valid left
+  an older stored version of it in place. The stored version is
+  removed by the page's reconcile, as on the firehose.
+- Backfill: a job's 10-minute lease on its account was renewed only
+  when it read a page, so a job that waited longer between two pages
+  could lose it to a second job. The scheduler renews the leases of
+  running jobs every minute.
+- A purge of a list's items that met a deadlock with the firehose
+  writer failed the whole purge pass. It is tried again like every
+  other transaction that takes those locks.
+- Backfill: the table of request counts per host, from which the
+  `host` metric label's 50 busiest hosts are chosen, grew to 100,000
+  hosts before it was cut. It holds at most 4,096.
 
 ## [0.6.0] - 2026-10-06
 

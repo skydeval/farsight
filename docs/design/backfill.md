@@ -95,8 +95,12 @@ its own writers once a minute (see [security.md](security.md)).
 All kinds share one lease per DID in `job_leases(did, lease_owner,
 lease_until)`, so at most one job runs for a DID at a time. The table
 is keyed by the DID text, so a lease does not need an `actors` row. A
-lease lasts 10 minutes and is renewed after every page; a job that
-dies leaves a lease that expires. Each job holds its leases under its
+lease lasts 10 minutes. A job renews its own after every page, and
+the scheduler renews the leases of all running jobs once a minute, so
+a job that spends longer than a lease between two pages (resolving,
+waiting for a host's budget, purging) does not lose it and a second
+job cannot start on the same DID. A job that dies leaves a lease that
+nobody renews and that expires. Each job holds its leases under its
 own name (the process name and the job's number), so two jobs of one
 process exclude each other like jobs of two processes, and a job
 releases only its own lease.
@@ -171,7 +175,12 @@ For a DID `D`:
      itself and the rest of the page is used. The URI authority must
      be `D`, the collection the one asked for, and the record must be
      valid. An invalid record is dropped and counted against the host
-     (`pds_hosts.errors_total`); its key still counts as listed.
+     (`pds_hosts.errors_total`). Its key still counts for the order of
+     the listing, but it is not among the keys the reconcile below
+     keeps: the repository holds nothing Farsight indexes under that
+     key, so a version stored under it from before this listing is
+     removed, as the firehose removes one when an update turns a
+     record invalid ([firehose.md](firehose.md#validation)).
    - **Apply** each record as an upsert with stamp `R` and no witness
      time. Last-write-wins decides against what is stored
      ([storage.md](storage.md)).
@@ -947,8 +956,11 @@ normal way.
   answer the read) may be real, so the run is marked `truncated` too.
 - Every list found in step 2 is recorded in `subject_lists(X, L)`
   whatever its state; coverage uses it to know which pending lists
-  could still add a block on `X`. An untruncated run replaces the
-  set: lists an earlier run found and this one did not are removed.
+  could still add a block on `X`. A list without a row gets a
+  placeholder, charged to the requester; if a cap refuses the
+  placeholder, the list cannot be recorded and the run is marked
+  `truncated`. An untruncated run replaces the set: lists an earlier
+  run found and this one did not are removed.
 - State is in `discovery_state`: `state`, `started_at`,
   `discovered_witness`, `completed_at`, `truncated`, `refs_found`,
   `source`, `last_error`.

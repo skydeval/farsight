@@ -434,6 +434,12 @@ struct CreateKeyInput {
     read_rps: Option<u32>,
 }
 
+/// Whether a key's name, already trimmed, has 1–200 characters. The
+/// bound counts characters, as the error says, not bytes.
+fn key_name_ok(name: &str) -> bool {
+    (1..=200).contains(&name.chars().count())
+}
+
 /// Creates an API key; returns `(id, token)`. The token is shown once.
 pub async fn create_key(
     st: &ApiState,
@@ -442,7 +448,7 @@ pub async fn create_key(
     read_rps: Option<u32>,
 ) -> Result<(i32, String), XrpcError> {
     let name = name.trim();
-    if name.is_empty() || name.len() > 200 {
+    if !key_name_ok(name) {
         return Err(XrpcError::invalid("`name` must be 1–200 characters"));
     }
     if scopes.is_empty() {
@@ -463,7 +469,12 @@ pub async fn create_key(
         read_rps.map(|r| r as f32),
     )
     .await?;
-    st.keys.refresh(&st.pool).await?;
+    // The key exists from here on, and this is the one time its token
+    // can be shown. If the table cannot be read now, the periodic
+    // refresh installs the key within half a minute.
+    if let Err(e) = st.keys.refresh(&st.pool).await {
+        tracing::warn!(error = %e, key = id, "a new API key is not live yet: the key table could not be refreshed");
+    }
     Ok((id, token))
 }
 
@@ -480,10 +491,39 @@ struct RevokeInput {
     id: i32,
 }
 
+/// Revokes API key `id`; returns whether a live key was revoked. The key
+/// stops working before this returns, whether or not the table can be
+/// read again right now.
+pub async fn revoke_key(st: &ApiState, id: i32) -> Result<bool, XrpcError> {
+    let revoked = farsight_storage::auth::revoke_token(&st.pool, id).await?;
+    if revoked {
+        st.keys.evict(id);
+    }
+    if let Err(e) = st.keys.refresh(&st.pool).await {
+        tracing::warn!(error = %e, "the key table could not be refreshed after a revocation");
+    }
+    Ok(revoked)
+}
+
 /// `admin.revokeApiKey`.
 pub async fn revoke_api_key(st: &Arc<ApiState>, body: &Bytes) -> Result<Reply, XrpcError> {
     let input: RevokeInput = parse_body(body)?;
-    let revoked = farsight_storage::auth::revoke_token(&st.pool, input.id).await?;
-    st.keys.refresh(&st.pool).await?;
+    let revoked = revoke_key(st, input.id).await?;
     Ok(Reply::ok(json!({ "revoked": revoked })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_name_is_measured_in_characters() {
+        assert!(key_name_ok("a"));
+        assert!(key_name_ok(&"x".repeat(200)));
+        assert!(!key_name_ok(&"x".repeat(201)));
+        assert!(!key_name_ok(""));
+        // 200 characters of three bytes each are 200 characters.
+        assert!(key_name_ok(&"鍵".repeat(200)));
+        assert!(!key_name_ok(&"鍵".repeat(201)));
+    }
 }

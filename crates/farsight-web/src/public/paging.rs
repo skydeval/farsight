@@ -28,6 +28,9 @@ pub const TAKEN_DOWN: &str = "takendown";
 pub const FIND: &str = "find";
 /// Longest filter text.
 pub const MAX_FIND: usize = 100;
+/// The parameter the filter box adds when the visitor pressed Enter:
+/// `go=1` asks for the typed handle to be looked up.
+pub const GO: &str = "go";
 
 /// What the filter box says, if anything.
 pub fn find(q: &Params) -> Option<&str> {
@@ -130,13 +133,20 @@ pub fn past_end(total: Total, page: i64, size: i64) -> Option<i64> {
     }
 }
 
+/// Whether the address asks for the filter's handle to be looked up:
+/// `go=1` next to a filter.
+pub fn go(q: &Params) -> bool {
+    q.get(GO) == Some("1") && find(q).is_some()
+}
+
 /// Where a request should have gone instead, if its address is not the
 /// canonical one: for one, it names page 1 of a section outright. The
 /// other sections keep their pages.
 ///
 /// `tabs` are the page's tables, the first being the one shown without a
 /// `tab` parameter: naming it, or a table the page does not have, is
-/// not canonical either.
+/// not canonical either. A parameter the page does not read is left
+/// alone: it changes nothing the page shows or counts.
 pub fn canonical(q: &Params, keys: &[&str], tabs: &[&str]) -> Option<String> {
     let first = keys.iter().any(|k| q.get(k) == Some("1"));
     let tab = q.get(TAB);
@@ -431,6 +441,10 @@ mod tests {
         let c = |s: &str| canonical(&Params::parse(s), &keys, &tabs);
         assert_eq!(c("lists=3&utm=x"), None);
         assert_eq!(c("page=1&lists=3").as_deref(), Some("lists=3"));
+        // The lookup switch counts only next to a filter.
+        assert!(go(&Params::parse("find=alice.example&go=1")));
+        assert!(!go(&Params::parse("go=1&page=2")));
+        assert!(!go(&Params::parse("find=alice&go=yes")));
         // The tab: kept when it names another table, dropped when it
         // names the first or none.
         assert_eq!(c("tab=lists&lists=2"), None);

@@ -1150,7 +1150,9 @@ pub fn validate_trusted_proxy(net: &IpNet) -> Result<(), String> {
     }
 }
 
-fn is_public_net(net: &IpNet) -> bool {
+/// Whether `net` is outside the private, loopback, link-local and
+/// carrier-grade NAT ranges.
+pub(crate) fn is_public_net(net: &IpNet) -> bool {
     match net {
         IpNet::V4(n) => {
             let a = n.network();
@@ -1162,6 +1164,20 @@ fn is_public_net(net: &IpNet) -> bool {
             !(a.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80)
         }
     }
+}
+
+/// Warning logged at start when the database is reached with the
+/// password `compose.yml` falls back to.
+pub const DEFAULT_DB_PASSWORD_WARNING: &str = "storage.database_url uses the bundled Postgres's default password (`farsight`): \
+     POSTGRES_PASSWORD was not set before the first start. Postgres is not published by \
+     compose.yml, so only the compose network can reach it; set a password of your own all \
+     the same (ALTER ROLE farsight PASSWORD …, then POSTGRES_PASSWORD, then restart)";
+
+/// Whether `database_url` signs in as `farsight` with the password
+/// `farsight`: what `compose.yml` uses when `POSTGRES_PASSWORD` is unset.
+fn has_default_db_password(database_url: &str) -> bool {
+    url::Url::parse(database_url)
+        .is_ok_and(|u| u.username() == "farsight" && u.password() == Some("farsight"))
 }
 
 /// The most workers `backfill.concurrency` accepts: each holds a
@@ -1208,6 +1224,19 @@ impl Config {
         );
         if !missing.is_empty() {
             return Err(ConfigError::MissingKeys(missing));
+        }
+        // Both go into the `User-Agent` of every outbound request, and
+        // onto pages: one line of text each.
+        for (key, value) in [
+            ("server.hostname", &self.server.hostname),
+            ("server.contact", &self.server.contact),
+        ] {
+            if value.chars().any(char::is_control) {
+                return Err(invalid(
+                    key,
+                    "must be one line of text without control characters",
+                ));
+            }
         }
         if !self.access.admin_did.is_empty() && !valid_admin_did(&self.access.admin_did) {
             return Err(invalid(
@@ -1364,6 +1393,9 @@ impl Config {
                 "proxy.mode is set but proxy.trusted is empty: forwarding headers are ignored"
                     .to_owned(),
             );
+        }
+        if has_default_db_password(&self.storage.database_url) {
+            warnings.push(DEFAULT_DB_PASSWORD_WARNING.to_owned());
         }
         Ok(warnings)
     }
@@ -1862,6 +1894,49 @@ gap_threshold = "300s"
         let mut c = complete();
         c.proxy.trusted = vec!["10.0.0.0/8".parse().unwrap()];
         assert!(c.validate().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_default_database_password_is_warned_about() {
+        let mut c = complete();
+        assert!(c.validate().unwrap().is_empty());
+        c.storage.database_url = "postgres://farsight:farsight@postgres:5432/farsight".into();
+        assert_eq!(c.validate().unwrap(), [DEFAULT_DB_PASSWORD_WARNING]);
+        // Another user, or no password in the URL: nothing to say.
+        c.storage.database_url = "postgres://other:farsight@postgres:5432/farsight".into();
+        assert!(c.validate().unwrap().is_empty());
+        c.storage.database_url = "postgres://farsight@postgres:5432/farsight".into();
+        assert!(c.validate().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hostname_and_contact_are_one_line_of_text() {
+        type Edit = fn(&mut Config);
+        let refused: [(&str, Edit); 4] = [
+            ("server.contact", |c| {
+                c.server.contact = "mailto:ops@farsight.test\nX-Injected: 1".into()
+            }),
+            ("server.contact", |c| c.server.contact = "ops\u{0}".into()),
+            ("server.hostname", |c| {
+                c.server.hostname = "farsight.test\r".into()
+            }),
+            ("server.hostname", |c| {
+                c.server.hostname = "farsight\u{7f}.test".into()
+            }),
+        ];
+        for (key, edit) in refused {
+            let mut c = complete();
+            edit(&mut c);
+            let e = c.validate().unwrap_err().to_string();
+            assert!(
+                e.contains(key) && e.contains("control characters"),
+                "{key}: {e}"
+            );
+        }
+        // Text in any script is fine.
+        let mut c = complete();
+        c.server.contact = "Kontakt: börje@exempel.example".into();
+        assert!(c.validate().is_ok());
     }
 
     #[test]

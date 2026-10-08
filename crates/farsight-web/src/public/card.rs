@@ -60,7 +60,7 @@ use url::Url;
 use super::handles::{self, claimed_handle};
 use super::metrics::{self as m, Page};
 use super::text::{Stamp, clean};
-use super::{Cache, client_key, finish, parse_did};
+use super::{Cache, client_addr, finish, parse_did};
 use crate::pages::{WebState, handle_to_did};
 
 /// The deadline of all of a card's fetches together.
@@ -132,8 +132,10 @@ struct CardView {
     /// `unknown` (did:web) or `unavailable` (the fetch failed).
     created_words: &'static str,
     note: Option<&'static str>,
-    /// The host of the account's PDS, as its identity names it. Not
-    /// printed in the card: the account page's header reads it.
+    /// The host of the account's PDS, as its identity names it, if it
+    /// is one a browser may be pointed at ([`public_host`]). Not printed
+    /// in the card: the account page's header reads it, and the list
+    /// page's script fetches the list's image from it.
     pds_host: Option<String>,
 }
 
@@ -313,12 +315,43 @@ pub fn read_did_document(body: &[u8]) -> Option<Identity> {
     })
 }
 
+/// Last labels of names that are only ever resolved inside a private
+/// network.
+const PRIVATE_SUFFIXES: [&str; 10] = [
+    "local",
+    "localhost",
+    "localdomain",
+    "internal",
+    "intranet",
+    "lan",
+    "home",
+    "corp",
+    "private",
+    "arpa",
+];
+
+/// Whether `host` is a name a visitor's browser may be pointed at: a
+/// domain name of two or more labels, not an IP address, and not under a
+/// suffix that exists only inside private networks. An account's
+/// identity is written by the account, so its "server" can be any text:
+/// `192.168.1.1`, `printer`, `nas.local`. A page that named such a host
+/// in an image address would make every visitor's browser knock on
+/// their own network.
+pub fn public_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    farsight_core::did::is_valid_hostname(&host)
+        && host
+            .rsplit('.')
+            .next()
+            .is_some_and(|tld| !PRIVATE_SUFFIXES.contains(&tld))
+}
+
 /// The PDS endpoint as a base an image may be named on: an `https` URL
-/// with a host and no userinfo, query or fragment.
+/// with a [`public_host`] and no userinfo, query or fragment.
 pub fn avatar_base(endpoint: &str) -> Option<Url> {
     let u = Url::parse(endpoint).ok()?;
     (u.scheme() == "https"
-        && u.host_str().is_some_and(|h| !h.is_empty())
+        && u.host_str().is_some_and(public_host)
         && u.username().is_empty()
         && u.password().is_none()
         && u.query().is_none()
@@ -503,24 +536,22 @@ async fn handle(
             Cached::None => None,
         });
     }
-    let Some(claim) = claim else {
-        m::handle_resolution(handles::Outcome::Failed);
-        return Ok(handles::settle(st, cfg, did, None).await);
+    // The account's identity was read: no claim means it names no
+    // handle, and a claim that resolves to another account is not its
+    // handle either. Both drop a handle shown until now.
+    let back = match claim {
+        Some(c) => match tokio::time::timeout_at(deadline, handle_to_did(&st.safe, c)).await {
+            Ok(back) => Some(back),
+            Err(_) => {
+                m::handle_resolution(handles::Outcome::Failed);
+                return Err(());
+            }
+        },
+        None => None,
     };
-    match tokio::time::timeout_at(deadline, handle_to_did(&st.safe, claim)).await {
-        Ok(Ok(back)) if back == *did => {
-            m::handle_resolution(handles::Outcome::Resolved);
-            Ok(handles::settle(st, cfg, did, Some(claim.to_owned())).await)
-        }
-        Ok(_) => {
-            m::handle_resolution(handles::Outcome::Unverified);
-            Ok(handles::settle(st, cfg, did, None).await)
-        }
-        Err(_) => {
-            m::handle_resolution(handles::Outcome::Failed);
-            Err(())
-        }
-    }
+    let (outcome, found) = handles::classify(did, claim.map(str::to_owned), back);
+    m::handle_resolution(outcome);
+    Ok(handles::settle(st, cfg, did, found).await)
 }
 
 async fn identity(
@@ -614,7 +645,7 @@ async fn card(
     if let Err((_, retry)) = st
         .api
         .limiter
-        .check(Class::PublicCard, &client_key(client), limit)
+        .check_ip(Class::PublicCard, client_addr(client), limit)
     {
         farsight_api::metrics::rate_limited(Class::PublicCard);
         m::card(Outcome::RateLimited);
@@ -711,10 +742,12 @@ async fn card(
         created: ident.created.map(Stamp::of),
         created_words: "unknown",
         note: None,
+        // The page's script names the list's image on this host, so it
+        // is given only a host an image may be named on.
         pds_host: ident
             .pds
             .as_deref()
-            .and_then(|p| Url::parse(p).ok())
+            .and_then(avatar_base)
             .and_then(|u| u.host_str().map(clean)),
     };
     if failed {
@@ -915,6 +948,28 @@ mod tests {
         ] {
             assert!(avatar_base(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn an_image_is_never_named_on_a_private_host() {
+        for bad in [
+            "https://192.168.1.1",
+            "https://10.0.0.5:8443",
+            "https://[fd00::1]",
+            "https://127.0.0.1",
+            "https://localhost",
+            "https://printer",
+            "https://nas.local",
+            "https://pds.internal",
+            "https://router.LAN",
+            "https://1.168.192.in-addr.arpa",
+        ] {
+            assert!(avatar_base(bad).is_none(), "{bad}");
+        }
+        assert!(public_host("pds.example"));
+        assert!(public_host("Shiitake.us-east.host.bsky.network"));
+        assert!(!public_host("203.0.113.7"));
+        assert!(!public_host(""));
     }
 
     #[test]

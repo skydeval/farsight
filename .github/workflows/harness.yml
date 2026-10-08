@@ -13,6 +13,9 @@ on:
 permissions:
   contents: read
 
+# Every action is named by the commit it runs, with the tag that commit
+# was read from in a comment (see ci.yml).
+
 # One run at a time: a run started while another is in progress waits for it.
 concurrency:
   group: harness
@@ -25,6 +28,8 @@ env:
   # its own step. The harnesses name the same images in their sources.
   POSTGRES_IMAGE: postgres:16
   BROWSER_IMAGE: mcr.microsoft.com/playwright:v1.48.0-jammy
+  # The stage 3 harness names this image, digest included, in its source.
+  BUSYBOX_IMAGE: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
 
 jobs:
   # Builds every binary once, with the harness features, and hands the ones
@@ -39,9 +44,11 @@ jobs:
       # of the size.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: harness
       - run: cargo build --locked --workspace --bins --features "$HARNESS_FEATURES"
@@ -56,7 +63,7 @@ jobs:
             farsight-stage6-harness farsight-stage7-harness \
             farsight-stage8-harness farsight-stage9-harness
           ls -l "$RUNNER_TEMP/harness-binaries.tar.zst"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: harness-binaries
           path: ${{ runner.temp }}/harness-binaries.tar.zst
@@ -113,7 +120,7 @@ jobs:
             pass: '^RESULT: PASS '
             browser: true
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: harness-binaries
           path: ${{ runner.temp }}
@@ -130,7 +137,7 @@ jobs:
       # its own.
       - name: Pull busybox
         if: matrix.stage == 3
-        run: docker pull --quiet busybox
+        run: docker pull --quiet "$BUSYBOX_IMAGE"
       - name: Pull the browser image
         if: matrix.browser
         run: docker pull --quiet "$BROWSER_IMAGE"
@@ -183,7 +190,7 @@ jobs:
             mkdir -p "$d"
             cp "$f" "$d/" || true
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: stage${{ matrix.stage }}-log

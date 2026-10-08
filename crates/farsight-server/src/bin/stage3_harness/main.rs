@@ -34,6 +34,10 @@ use crate::support::{
 
 const NS: &str = "app.nearhorizon.farsight";
 const HOSTNAME: &str = "farsight.test";
+/// The image whose `wget` plays a client on a network of its own, named
+/// by digest (the nightly workflow pulls the same reference).
+const BUSYBOX_IMAGE: &str =
+    "busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e";
 
 fn x(base: &str, method: &str, query: &str) -> String {
     if query.is_empty() {
@@ -379,6 +383,25 @@ async fn check_lexicons(
         "invalid cursor ⇒ InvalidRequest",
         r.status == 400 && r.error_name() == Some("InvalidRequest"),
         r.short(),
+    );
+    // A cursor of the right shape whose record key holds a NUL byte:
+    // base64url of `[1,"a\u0000b"]`. The database would refuse the text.
+    let nul = "WzEsImFcdTAwMDBiIl0";
+    let mut wrong = Vec::new();
+    for query in [
+        format!("query.getIncomingBlocks?actor={s}&cursor={nul}"),
+        format!("query.getIncomingListBlocks?actor={s}&cursor=WzEsMSwiYVx1MDAwMGIiXQ"),
+    ] {
+        let (method, params) = query.split_once('?').unwrap_or((&query, ""));
+        let r = ctx.http.get(&x(base, method, params), &[]).await?;
+        if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
+            wrong.push(format!("{method}: {}", r.short()));
+        }
+    }
+    c.check(
+        "a cursor that holds a NUL byte where a record key belongs ⇒ 400 InvalidRequest, not 500",
+        wrong.is_empty(),
+        format!("{wrong:?}"),
     );
     for (m, get) in [
         ("admin.requestBackfill", false),
@@ -869,6 +892,58 @@ async fn check_semaphore(
         "the held requests themselves complete",
         ok == concurrency,
         format!("{ok}/{concurrency} returned 200"),
+    );
+    // One caller holds only part of the slots. With 4 slots: one is kept
+    // from anonymous callers, and one anonymous address has one request
+    // in flight at a time.
+    let from = |n: u8| Http::new(Some(std::net::IpAddr::from([127, 0, 3, n])));
+    let held = |http: Http| {
+        let url = x(base, "query.getStats", "_sleep=2.6");
+        tokio::spawn(async move { http.get(&url, &[]).await })
+    };
+    let first = from(1);
+    let holder = held(first.clone());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second = first.get(&x(base, "query.getStats", ""), &[]).await?;
+    let other = from(2).get(&x(base, "query.getStats", ""), &[]).await?;
+    let held_ok = matches!(holder.await, Ok(Ok(r)) if r.status == 200);
+    c.check(
+        "an anonymous address with a request in flight has its second one wait for its own place (one of the three anonymous slots, here) and get 503 Overloaded after ≥ 2 s although two anonymous slots are free; another address is served at once, and the first request completes",
+        second.status == 503
+            && second.error_name() == Some("Overloaded")
+            && second.header("retry-after").as_deref() == Some("1")
+            && second.elapsed >= Duration::from_millis(1950)
+            && other.status == 200
+            && other.elapsed < Duration::from_millis(1500)
+            && held_ok,
+        format!("{} after {:?} / {}", second.short(), second.elapsed, other.status),
+    );
+    // Three addresses hold the three anonymous slots; the fourth slot is
+    // not theirs to take.
+    let holders: Vec<_> = (11..14).map(|n| held(from(n))).collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (late, stats) = (from(20), x(base, "query.getStats", ""));
+    let with_token = [("authorization", auth.as_str())];
+    let (anon, token) = tokio::join!(late.get(&stats, &[]), ctx.http.get(&stats, &with_token));
+    let (anon, token) = (anon?, token?);
+    let mut ok = 0;
+    for h in holders {
+        if matches!(h.await, Ok(Ok(r)) if r.status == 200) {
+            ok += 1;
+        }
+    }
+    c.check(
+        "with every anonymous slot held (3 of 4), a further anonymous caller gets 503 Overloaded after ≥ 2 s, while a caller with a token is answered at once from the slot kept for tokens",
+        anon.status == 503
+            && anon.error_name() == Some("Overloaded")
+            && anon.elapsed >= Duration::from_millis(1950)
+            && token.status == 200
+            && token.elapsed < Duration::from_millis(1500)
+            && ok == 3,
+        format!(
+            "anonymous: {} after {:?}; token: {} after {:?}; {ok}/3 holders returned 200",
+            anon.status, anon.elapsed, token.status, token.elapsed
+        ),
     );
     let r = ctx
         .http
@@ -2103,7 +2178,7 @@ async fn phase_cloudflare(c: &mut Checks, ctx: &Ctx, pg: &Pg) -> Result<(), Stri
             "--rm",
             "--network",
             net,
-            "busybox",
+            BUSYBOX_IMAGE,
             "sh",
             "-c",
             &format!("for i in $(seq 1 30); do wget -q -O /dev/null {url} || true; done"),

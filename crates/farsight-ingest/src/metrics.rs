@@ -26,6 +26,9 @@ pub const BATCH_SECONDS: &str = "farsight_ingest_batch_seconds";
 pub const BUFFER_DEPTH: &str = "farsight_ingest_buffer_depth";
 /// `farsight_ingest_dropped_total{reason}` (counter).
 pub const DROPPED: &str = "farsight_ingest_dropped_total";
+/// Its `reason` for a frame that could not be read on any attempt and
+/// was stepped past (a gap covers it).
+pub const DROPPED_UNREADABLE: &str = "unreadable";
 /// `farsight_ingest_storage_errors_total{op}` (counter): storage calls
 /// of the writer that failed permanently and were given up.
 pub const STORAGE_ERRORS: &str = "farsight_ingest_storage_errors_total";
@@ -98,7 +101,7 @@ pub fn describe() {
     );
     describe_counter!(
         DROPPED,
-        "events dropped before apply by reason (invalid, foreign_listitem, poisoned)"
+        "events dropped before apply by reason (invalid, foreign_listitem, poisoned, unreadable)"
     );
     describe_counter!(
         STORAGE_ERRORS,
@@ -126,7 +129,12 @@ pub const STORAGE_OPS: [&str; 11] = [
 /// Registers every known label set at zero, so dashboards and the
 /// harness see each series before its first event.
 pub fn register_zeroes() {
-    for reason in ["invalid", "foreign_listitem", "poisoned"] {
+    for reason in [
+        "invalid",
+        "foreign_listitem",
+        "poisoned",
+        DROPPED_UNREADABLE,
+    ] {
         metrics::counter!(DROPPED, "reason" => reason).increment(0);
     }
     for reason in [

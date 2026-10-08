@@ -19,8 +19,13 @@ proxy, rate-limit (except the query concurrency) and backfill keys apply immedia
 need a restart. Writes are atomic and notify the backfill process.</p>
 <p class="muted">The admin UI itself is switched with <code>access.admin_ui</code> in config.toml, at restart; a save
 here that would change it is refused.</p>
+<p class="muted" id="step-up-note">A save that changes <code>auth.*</code>, <code>net.*</code>, <code>backfill.plc_url</code> or
+<code>backfill.relay_url</code>, or that opens <code>access.reads</code>, <code>access.cors</code> or
+<code>access.public_ui</code> further, is made only within ten minutes of signing in. Later than that, the save is not
+stored: you sign in again and make the change once more.</p>
 {% if !env_keys.is_empty() %}<p>Locked by environment variables: {% for k in env_keys %}<code>{{ k }}</code> {% endfor %}</p>{% endif %}
 <input type="hidden" name="csrf" value="{{ csrf }}">
+<input type="hidden" name="base" value="{{ base }}">
 <textarea class="mono" name="config" spellcheck="false">{{ text }}</textarea>
 <div class="row"><button type="submit">Save configuration</button></div>
 </form>
@@ -37,7 +42,7 @@ a restart; a cache in front of Farsight keeps serving its copies for up to a min
 <a href="/" target="_blank" rel="noopener">Open the public UI in a new tab ↗</a>{% if !p.enabled %} (it answers 404 while switched off){% endif %}.</p>
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label><input type="checkbox" name="enabled"{% if p.enabled %} checked{% endif %}> Serve the public UI (<code>access.public_ui</code>)</label>
-<div class="hint">Needs <code>access.reads = "public"</code>. Turning it on asks for confirmation on a page that lists what becomes reachable without login.</div>
+<div class="hint">Needs <code>access.reads = "public"</code>. Turning it on asks for confirmation on a page that lists what becomes reachable without login, and for a new sign-in if yours is more than ten minutes old.</div>
 
 <label for="instance_description">Description</label>
 <textarea id="instance_description" name="instance_description" maxlength="2000">{{ p.instance_description }}</textarea>
@@ -169,7 +174,8 @@ in the container, then restart farsight; sessions of the previous DID end at tha
 <span>Admin token</span>
 </h2>
 <input type="hidden" name="csrf" value="{{ csrf }}">
-<p class="muted">Rotating invalidates the current admin token and signs out every session.</p>
+<p class="muted">Rotating invalidates the current admin token and signs out every session. It asks you to sign in
+again first if you signed in more than ten minutes ago.</p>
 <div class="row"><button class="danger" type="submit">Rotate admin token</button></div>
 </form>
 

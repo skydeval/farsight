@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use farsight_core::record::parse_record;
-use farsight_core::{AtUri, Collection, Did, RecordKey, Tid};
+use farsight_core::{AtUri, Collection, Did, Record, RecordKey, Tid};
 use farsight_storage::apply::{self, ApplyCtx, Batch, Origin, Reconcile, Write, WriteAction};
 use farsight_storage::codes::{ActorStatus, DebtReason, JobKind, Priority, RequesterKey, Tier};
 use farsight_storage::ids::{ListId, RepoRunId, RunId, Stamp};
@@ -299,6 +299,18 @@ async fn apply_through(
     Ok(first)
 }
 
+/// The record a listing page holds under a key, if it is one Farsight
+/// indexes: `None` for a value whose text could not be parsed and for a
+/// record that is not valid for its collection. Such a key is listed in
+/// the repo and holds nothing to store.
+pub fn listed_record(
+    did: &Did,
+    k: Collection,
+    value: Option<&serde_json::Value>,
+) -> Option<Record> {
+    value.and_then(|v| parse_record(did, k, v).ok())
+}
+
 /// Lists one collection of `did` with stamp `R` through its own cursor rows
 /// and applies each page with range reconcile. Every page is taken from
 /// `budget`; when none is left the listing stops with [`Stop::Yield`].
@@ -378,24 +390,30 @@ pub async fn list_collection(
                 order_broken = true;
                 break;
             }
-            if let Mode::Seen(s) = &mut mode {
-                s.insert(hasher.hash_one(rk.as_str()));
-            }
+            // The key counts for the order of the listing whatever its
+            // record is.
+            let seen_hash = hasher.hash_one(rk.as_str());
             last = Some(rk);
-            keys.push(uri.rkey.clone());
-            // A record whose text could not be parsed has a key and no
-            // value: the key is listed, so a stored version stays.
-            let parsed = r.value.as_ref().map(|v| parse_record(did, k, v));
-            match parsed {
-                Some(Ok(rec)) => writes.push(Write {
-                    author: did.clone(),
-                    collection: k,
-                    rkey: uri.rkey.clone(),
-                    stamp: stamp.rev,
-                    witness: None,
-                    action: WriteAction::Upsert(rec),
-                }),
-                Some(Err(_)) | None => invalid += 1,
+            match listed_record(did, k, r.value.as_ref()) {
+                Some(rec) => {
+                    if let Mode::Seen(s) = &mut mode {
+                        s.insert(seen_hash);
+                    }
+                    keys.push(uri.rkey.clone());
+                    writes.push(Write {
+                        author: did.clone(),
+                        collection: k,
+                        rkey: uri.rkey.clone(),
+                        stamp: stamp.rev,
+                        witness: None,
+                        action: WriteAction::Upsert(rec),
+                    });
+                }
+                // The key holds nothing Farsight indexes: it is not among
+                // the keys the reconcile keeps, so a version stored under
+                // it from before this listing is removed, as the firehose
+                // removes one when an update turns a record invalid.
+                None => invalid += 1,
             }
         }
         if invalid > 0 {
@@ -1239,6 +1257,27 @@ async fn list_repo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listed_key_is_kept_only_with_a_record_to_index() {
+        let did = Did::parse("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let block = serde_json::json!({
+            "subject": "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+            "createdAt": "2026-01-01T00:00:00Z"
+        });
+        assert!(matches!(
+            listed_record(&did, Collection::Block, Some(&block)),
+            Some(Record::Block(_))
+        ));
+        // A value that is not a block, and a value whose text could not
+        // be parsed at all: the key holds nothing to store.
+        let not_a_block = serde_json::json!({"subject": "not a DID"});
+        assert_eq!(
+            listed_record(&did, Collection::Block, Some(&not_a_block)),
+            None
+        );
+        assert_eq!(listed_record(&did, Collection::Block, None), None);
+    }
 
     fn answer(active: bool, stated: bool, status: Option<&str>) -> xrpc::RepoStatus {
         xrpc::RepoStatus {

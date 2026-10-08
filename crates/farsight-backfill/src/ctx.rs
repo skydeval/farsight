@@ -90,7 +90,7 @@ impl Ctx {
     /// the other's lease.
     pub fn lease_owner(&self) -> String {
         match JOB.try_with(|n| *n) {
-            Ok(n) => format!("{}{LEASE_JOB_SEP}{n}", self.process),
+            Ok(n) => crate::jobs::job_lease_owner(&self.process, n),
             Err(_) => self.process.clone(),
         }
     }

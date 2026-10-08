@@ -33,7 +33,10 @@ included) until the restart.
   and "Subscribers".
 - **Operations.** Queue a backfill, restart the firehose, pause the
   sweep; API keys; recent errors. And gap repair: see below.
-- **Settings.**
+- **Settings.** The `config.toml` editor refuses a save when the file
+  has changed since the page was loaded (another tab, or a control on
+  Operations): reload and make the edit again. It would otherwise
+  undo that change.
 
 Times on every admin page are shown in the browser's timezone.
 
@@ -99,6 +102,39 @@ The account's server must be reachable from Farsight at a public
 address: like every request Farsight makes to an address it learned
 from the network, sign-in refuses private, loopback and link-local
 addresses.
+
+## Signing in again
+
+Some changes are made only within **10 minutes of signing in**:
+
+- saving a setting under `[auth]` or `[net]`, `backfill.plc_url` or
+  `backfill.relay_url`;
+- opening access further: `access.reads` towards `public`, `access.cors`
+  or the public UI switched on;
+- rotating the admin token;
+- creating an API key.
+
+Later than that, the change is not made. You are sent to the sign-in
+page, which says "Sign in again to change this setting". Sign in as
+usual, on the hostname or on `127.0.0.1`, whichever you used; you come
+back to Settings or Operations, and make the change again there. What
+you typed into the form is not kept across the sign-in, so copy a long
+edit of `config.toml` before you save it if you signed in a while ago.
+
+The reason is that a session lasts up to seven days and a session
+cookie can be stolen. Each of those changes would let whoever holds
+your session keep control after you sign out: a token they know, a key
+they made, a directory of their own. Everything else, and every change
+that closes access, needs no second sign-in.
+
+Two things follow from the same rule:
+
+- A change of the admin token signs every session out, whether you
+  rotated it or wrote `auth.admin_token_sha256` in the editor. Sign in
+  again afterwards.
+- A changed `backfill.plc_url` is used for handles and backfill at
+  once, but the sign-in keeps resolving your DID through the directory
+  that was configured when Farsight started, until the next restart.
 
 Things to know:
 

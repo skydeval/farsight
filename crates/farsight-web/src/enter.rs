@@ -6,6 +6,12 @@
 //! `/enter` serves depends on the config's [`AdminAuth`] state: the
 //! sign-in page, or a note that no admin is configured.
 //!
+//! A session that asks for a sensitive action after its sign-in is no
+//! longer fresh is sent here as `/enter?again=<page>`
+//! (`pages::step_up`): the page says why, the sign-in runs as any other,
+//! the new session replaces the one that started it, and the browser
+//! returns to the page it came from.
+//!
 //! Logged: a successful sign-in (INFO, with the DID and address), a
 //! completed flow for another account (WARN, at most one a minute).
 //! Never logged: codes, states, tokens, cookies, keys.
@@ -16,19 +22,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use askama::Template;
-use axum::extract::{Query, State};
+use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use farsight_api::clientip::ClientIp;
-use farsight_api::ratelimit::{Class, ip_key};
+use farsight_api::ratelimit::Class;
 use farsight_core::Did;
 use farsight_core::config::{AdminAuth, LoadedConfig};
 
-use crate::common::{self, NO_STORE, cookie, random_id, read_cookie, render_private};
+use crate::common::{self, NO_STORE, random_id, read_cookie, render_private};
 use crate::oauth::{self, Taken};
 use crate::pages::{
-    ADMIN_COOKIE, MessagePage, Nav, SESSION_ABSOLUTE, WebState, admin, metrics_rate_limited,
-    oauth_session_key,
+    MessagePage, Nav, Return, SESSION_ABSOLUTE, WebState, admin, admin_cookie_value,
+    metrics_rate_limited, oauth_session_key, session_key, set_admin_cookie,
 };
 
 /// The flow cookie: ties an OAuth callback to the browser that started
@@ -57,12 +63,19 @@ pub struct EnterPage {
     /// Why the last attempt did not complete, shown in a banner above
     /// the card; `None` on a plain view.
     pub error: Option<String>,
+    /// A signed-in admin is asked to sign in again before a sensitive
+    /// action: the page to return to afterwards.
+    pub again: Option<Return>,
 }
 
 /// The page that ends a successful sign-in.
 #[derive(Template)]
 #[template(path = "enter_done.html")]
-pub struct DonePage {}
+pub struct DonePage {
+    /// Where the page continues to: `/admin`, or the admin page a
+    /// repeated sign-in was started from. One of a fixed set of paths.
+    pub next: &'static str,
+}
 
 fn host_header(headers: &HeaderMap) -> &str {
     headers
@@ -96,6 +109,7 @@ fn sign_in_page(
     headers: &HeaderMap,
     local: bool,
     error: Option<String>,
+    again: Option<Return>,
 ) -> Response {
     let hostname = cfg.config.server.hostname.clone();
     let kind = if oauth::client_for(&hostname, host_header(headers), local).is_some() {
@@ -109,6 +123,7 @@ fn sign_in_page(
         hostname,
         hosted_url: hosted_url(cfg),
         error,
+        again,
     });
     // The form on this page is answered with a redirect to the account's
     // authorization server.
@@ -126,6 +141,7 @@ fn unconfigured_page(cfg: &LoadedConfig) -> Response {
         hostname: cfg.config.server.hostname.clone(),
         hosted_url: hosted_url(cfg),
         error: None,
+        again: None,
     })
 }
 
@@ -134,6 +150,7 @@ pub async fn page(
     State(st): State<Arc<WebState>>,
     headers: HeaderMap,
     client: Option<axum::Extension<ClientIp>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let cfg = st.api.config.current();
     let local = is_local(client.as_ref().map(|c| &c.0));
@@ -141,12 +158,28 @@ pub async fn page(
         AdminAuth::Disabled => common::not_found(),
         AdminAuth::Unconfigured => unconfigured_page(&cfg),
         AdminAuth::Configured(_) => {
-            if admin(&st, &headers).await.is_some() {
+            let signed_in = admin(&st, &headers).await.is_some();
+            // Only a session is ever asked to sign in again; without one
+            // this is the plain sign-in page.
+            let again = q
+                .get("again")
+                .and_then(|a| Return::parse(a))
+                .filter(|_| signed_in);
+            if signed_in && again.is_none() {
                 return common::redirect("/admin");
             }
-            sign_in_page(&cfg, &headers, local, None)
+            sign_in_page(&cfg, &headers, local, None, again)
         }
     }
+}
+
+/// The `next` field of the sign-in form: the admin page to return to.
+/// It counts only from a browser that holds a session, which is the one
+/// case the sign-in page puts it in the form.
+fn form_return(form: &HashMap<String, String>, signed_in: bool) -> Option<Return> {
+    form.get("next")
+        .and_then(|n| Return::parse(n))
+        .filter(|_| signed_in)
 }
 
 fn too_many(page: Response, class: Class, retry: u64) -> Response {
@@ -200,9 +233,13 @@ pub async fn submit(
     State(st): State<Arc<WebState>>,
     headers: HeaderMap,
     client: Option<axum::Extension<ClientIp>>,
+    form: Result<Form<HashMap<String, String>>, axum::extract::rejection::FormRejection>,
 ) -> Response {
     let cfg = st.api.config.current();
     let client = client.map(|c| c.0);
+    // The plain sign-in form has no fields; a body that is not a form
+    // names no page to return to.
+    let form = form.map(|f| f.0).unwrap_or_default();
     let did = match cfg.admin_auth() {
         AdminAuth::Disabled => return common::not_found(),
         AdminAuth::Unconfigured => {
@@ -214,25 +251,33 @@ pub async fn submit(
         return common::forbidden("cross-origin request refused");
     }
     let local = is_local(client.as_ref());
+    // A repeated sign-in: the session that asks for it, which the new
+    // session replaces, and the page to return to.
+    let replaces = match admin_cookie_value(&headers) {
+        Some(raw) if admin(&st, &headers).await.is_some() => session_key(&cfg, &raw),
+        _ => None,
+    };
+    let again = form_return(&form, replaces.is_some());
     let Some(oauth_client) =
         oauth::client_for(&cfg.config.server.hostname, host_header(&headers), local)
     else {
         return status(
-            sign_in_page(&cfg, &headers, local, None),
+            sign_in_page(&cfg, &headers, local, None, again),
             StatusCode::BAD_REQUEST,
         );
     };
     let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
-    if let Err((_, retry)) = st.api.limiter.check(
-        Class::UiLogin,
-        &ip_key(ip),
-        Class::UiLogin.limit(&cfg.config, None),
-    ) {
+    if let Err((_, retry)) =
+        st.api
+            .limiter
+            .check_ip(Class::UiLogin, ip, Class::UiLogin.limit(&cfg.config, None))
+    {
         let page = sign_in_page(
             &cfg,
             &headers,
             local,
             Some("Too many sign-in attempts; wait a minute.".into()),
+            again,
         );
         return too_many(page, Class::UiLogin, retry);
     }
@@ -251,6 +296,7 @@ pub async fn submit(
             &headers,
             local,
             Some("Sign-in is busy; try again in a few seconds.".into()),
+            again,
         );
         return too_many(page, Class::UiLoginStart, retry);
     }
@@ -262,6 +308,7 @@ pub async fn submit(
                 &headers,
                 local,
                 Some("The admin account's server could not be reached. Try again shortly.".into()),
+                again,
             ),
             StatusCode::BAD_GATEWAY,
         )
@@ -269,13 +316,13 @@ pub async fn submit(
     let Ok(parsed) = Did::parse(&did) else {
         return unreachable("access.admin_did does not parse");
     };
-    let server = match st.oauth.server(&st.safe, &cfg.config, &parsed).await {
+    let server = match st.oauth.server(&st.safe, &parsed).await {
         Ok(s) => s,
         Err(e) => return unreachable(&e.to_string()),
     };
     let state = oauth::new_secret();
     let cookie_value = oauth::new_secret();
-    let (flow, to) = match oauth::start(
+    let (mut flow, to) = match oauth::start(
         &st.safe,
         &server,
         oauth_client,
@@ -288,6 +335,8 @@ pub async fn submit(
         Ok(x) => x,
         Err(e) => return unreachable(&e.to_string()),
     };
+    flow.back = again.map_or("/admin", Return::path);
+    flow.replaces = replaces;
     st.oauth.flows.insert(state, flow);
     let Ok(location) = HeaderValue::from_str(to.as_str()) else {
         return unreachable("the authorization URL is not a header value");
@@ -345,11 +394,11 @@ pub async fn callback(
     };
     let client = client.map(|c| c.0);
     let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
-    if let Err((_, retry)) = st.api.limiter.check(
-        Class::UiLogin,
-        &ip_key(ip),
-        Class::UiLogin.limit(&cfg.config, None),
-    ) {
+    if let Err((_, retry)) =
+        st.api
+            .limiter
+            .check_ip(Class::UiLogin, ip, Class::UiLogin.limit(&cfg.config, None))
+    {
         return too_many(
             refused(StatusCode::TOO_MANY_REQUESTS),
             Class::UiLogin,
@@ -401,6 +450,7 @@ pub async fn callback(
         }
     };
     let expected = flow.did.clone();
+    let (back, replaces) = (flow.back, flow.replaces);
     let sub = match oauth::redeem(&st.safe, flow, code).await {
         Ok(sub) => sub,
         Err(e) => {
@@ -438,21 +488,26 @@ pub async fn callback(
         tracing::error!(error = %e, "creating admin session failed");
         return refused(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    // A repeated sign-in ends the session it was started from: the
+    // browser now holds the new one.
+    if let Some(old) = replaces
+        && let Err(e) = farsight_storage::auth::delete_session(&st.api.pool, &old).await
+    {
+        tracing::warn!(error = %e, "the session a repeated sign-in replaces could not be ended");
+    }
     remember_sign_in(&st, ip);
-    tracing::info!(did = admin_did, ip = %ip, "admin signed in");
+    tracing::info!(did = admin_did, ip = %ip, again = replaces.is_some(), "admin signed in");
     let secure = client.is_some_and(|c| c.https);
     // 200, not a redirect: this response ends a cross-site redirect
     // chain, and a `SameSite=Strict` cookie set here would not be sent on
     // a redirect that continues it. The page starts a same-site
-    // navigation to `/admin`.
-    let mut r = render_private(&DonePage {});
+    // navigation to `/admin`, or to the page a repeated sign-in came
+    // from.
+    let mut r = render_private(&DonePage { next: back });
     no_referrer(&mut r);
-    let h = r.headers_mut();
-    h.append(
-        header::SET_COOKIE,
-        cookie(ADMIN_COOKIE, &raw, "/", secure, None),
-    );
-    h.append(header::SET_COOKIE, flow_cookie(None, secure));
+    set_admin_cookie(&mut r, &raw, secure);
+    r.headers_mut()
+        .append(header::SET_COOKIE, flow_cookie(None, secure));
     r
 }
 
@@ -497,6 +552,51 @@ mod tests {
         assert_eq!(
             flow_cookie(None, false),
             "farsight_flow=; Path=/enter; HttpOnly; SameSite=Lax; Max-Age=0"
+        );
+    }
+
+    #[test]
+    fn only_a_session_names_the_page_to_return_to() {
+        let form = |next: &str| HashMap::from([("next".to_owned(), next.to_owned())]);
+        assert_eq!(form_return(&form("settings"), true), Some(Return::Settings));
+        assert_eq!(form_return(&form("ops"), true), Some(Return::Ops));
+        assert_eq!(form_return(&form("settings"), false), None);
+        assert_eq!(form_return(&form("//evil.example"), true), None);
+        assert_eq!(form_return(&HashMap::new(), true), None);
+    }
+
+    #[test]
+    fn the_session_cookie_is_host_prefixed_over_https() {
+        let mut r = StatusCode::OK.into_response();
+        set_admin_cookie(&mut r, "abc", true);
+        assert_eq!(
+            r.headers()[header::SET_COOKIE],
+            "__Host-farsight_admin=abc; Path=/; HttpOnly; SameSite=Strict; Secure"
+        );
+        let mut r = StatusCode::OK.into_response();
+        set_admin_cookie(&mut r, "abc", false);
+        assert_eq!(
+            r.headers()[header::SET_COOKIE],
+            "farsight_admin=abc; Path=/; HttpOnly; SameSite=Strict"
+        );
+        // The prefixed cookie wins when a browser sends both.
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            "farsight_admin=plain; __Host-farsight_admin=host"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(admin_cookie_value(&h).as_deref(), Some("host"));
+        let mut r = StatusCode::OK.into_response();
+        crate::pages::clear_admin_cookie(&mut r);
+        let cleared: Vec<_> = r.headers().get_all(header::SET_COOKIE).iter().collect();
+        assert_eq!(
+            cleared,
+            [
+                "farsight_admin=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+                "__Host-farsight_admin=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0",
+            ]
         );
     }
 

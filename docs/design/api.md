@@ -24,7 +24,11 @@ right.
   opaque keyset cursor from the previous page; a response without
   `cursor` is the last page. A cursor stays valid across writes: items
   inserted behind it are not returned, items deleted ahead of it are
-  skipped. Cursor contents are not part of the contract.
+  skipped. Cursor contents are not part of the contract; a string that
+  Farsight did not hand out as a cursor is `InvalidRequest`.
+- **DIDs are compared in canonical form.** A `did:web` is the same
+  account in any case of its hostname; requests accept any spelling
+  and responses carry the lower-case one.
 - **Repeated parameters.** An array parameter is given by repeating
   it: `others=did:plc:a&others=did:plc:b`.
 - **Booleans** are `true` or `false`; absent means false.
@@ -528,7 +532,7 @@ hand afterwards; to have repairs start by themselves again, set
 
 | Field | Type | |
 |---|---|---|
-| `name` | string, 1 to 200 characters, required | A label for the key. |
+| `name` | string, 1 to 200 characters (counted as characters, not bytes), required | A label for the key. |
 | `scopes` | array, at least one, required | Of `read`, `backfill`, `backfill:high`. An unknown scope is `InvalidRequest`. |
 | `readRps` | positive integer | Per-key read rate, replacing `rate_limit.key_rps`. |
 
@@ -618,12 +622,23 @@ The web UI has classes of its own (page views, lookups, profile cards,
 sign-in); the full table is in
 [security.md](security.md#rate-limit-classes).
 
+An anonymous IPv6 caller draws on three buckets at once: its `/64` at
+the limit above, its `/48` at 4 times and its `/32` at 16 times, and a
+request needs a token in each. `RateLimit` reports the `/64`; a
+refusal reports the bucket that refused.
+
 Two further bounds apply to every caller, the admin token included:
 
 - **Concurrency.** A global semaphore admits
   `rate_limit.query_concurrency` (32) requests at a time. A request
   that waits more than 2 seconds for a slot gets `503 Overloaded` with
-  `Retry-After: 1`.
+  `Retry-After: 1`. A quarter of the slots (8) is never given to
+  anonymous callers. One caller holds only part of them: an anonymous
+  address (IPv6: a `/48`) a quarter of the anonymous slots (6), an API
+  key half of all slots (16). A request over that waits for one of
+  its caller's own places, and after 2 seconds gets `503 Overloaded`
+  like any request that found no slot; the admin token has no such
+  bound.
 - **Time.** Read queries run in a read-only transaction with
   `statement_timeout` set to `rate_limit.query_timeout` (5 s). A query
   that hits it gets `503 Overloaded`.

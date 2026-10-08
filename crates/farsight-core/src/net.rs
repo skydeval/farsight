@@ -56,12 +56,21 @@ impl SafeClientConfig {
             max_redirects: MAX_REDIRECTS,
             timeout: REQUEST_TIMEOUT,
             max_body_bytes: MAX_BODY_BYTES,
-            user_agent: format!(
-                "farsight/{version} (+https://{}; {})",
-                config.server.hostname, config.server.contact
-            ),
+            user_agent: user_agent(version, &config.server.hostname, &config.server.contact),
         }
     }
+}
+
+/// The `User-Agent` of outbound requests:
+/// `farsight/<version> (+https://<hostname>; <contact>)`. Control
+/// characters are left out: a header value may not hold them, and a
+/// client built with one would not build. The loader refuses such a
+/// hostname or contact; this covers a config made in code.
+pub fn user_agent(version: &str, hostname: &str, contact: &str) -> String {
+    format!("farsight/{version} (+https://{hostname}; {contact})")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
 /// Why an outbound request was refused or failed.
@@ -620,5 +629,19 @@ mod tests {
             c.user_agent,
             "farsight/1.0.0 (+https://farsight.test; mailto:ops@farsight.test)"
         );
+    }
+
+    #[tokio::test]
+    async fn a_control_character_in_the_contact_does_not_stop_the_client_from_building() {
+        let mut config = Config::default();
+        config.server.hostname = "farsight.test".to_owned();
+        config.server.contact = "ops@farsight.test\r\nX-Injected: 1\u{0}".to_owned();
+        let c = SafeClientConfig::from_config(&config, "1.0.0");
+        assert_eq!(
+            c.user_agent,
+            "farsight/1.0.0 (+https://farsight.test; ops@farsight.testX-Injected: 1)"
+        );
+        // Building the client is what a start does first.
+        let _ = SafeClient::new(c);
     }
 }

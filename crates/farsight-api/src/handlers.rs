@@ -369,8 +369,23 @@ pub fn list_report(info: Option<&ListInfo>, any_owner: bool) -> ListReport {
     }
 }
 
+/// The state a list's coverage is worked out from. Coverage describes
+/// the members a response returns, and a hidden owner's list returns
+/// none under either rule of [`list_report`]: its coverage is that of an
+/// `unavailable` list even where its stored state is the one reported.
+/// "Complete" over members that are withheld would read as a list known
+/// to be empty.
+pub fn scope_state(info: Option<&ListInfo>, reported: TrackState) -> TrackState {
+    if info.is_some_and(|i| i.owner_status.is_hidden()) {
+        TrackState::Unavailable
+    } else {
+        reported
+    }
+}
+
 /// List scope: the coverage of one list's membership, from the state it
-/// is reported in ([`list_report`]). `info` is `None` for a list Farsight
+/// is reported in ([`list_report`]) or, for a hidden owner's list, from
+/// [`scope_state`]. `info` is `None` for a list Farsight
 /// has no row for. A `ready` or `retained` list is complete since its
 /// fetch, unless the firehose has not covered the time since or the
 /// session lacks sync events; a list that is not tracked falls back to
@@ -477,7 +492,7 @@ async fn list_members(st: &Arc<ApiState>, p: &Params, any_owner: bool) -> Result
         _ => Vec::new(),
     };
     tx.rollback().await?;
-    let cov = list_scope(&v, info.as_ref(), state);
+    let cov = list_scope(&v, info.as_ref(), scope_state(info.as_ref(), state));
     // The list's own facts, unless its owner hides it.
     let facts = info.as_ref().filter(|_| report.facts);
     let mut body = Map::new();
@@ -890,8 +905,23 @@ mod tests {
                 assert_eq!(own.state, i.reported_state());
                 assert!(own.facts);
                 assert_eq!(own.serves, r.serves);
+                // Under either rule the coverage is that of the members
+                // returned: of an unavailable list when the owner is
+                // hidden, never "complete" over members that are withheld.
+                for reported in [r.state, own.state] {
+                    let scoped = scope_state(Some(&i), reported);
+                    if status.is_hidden() {
+                        assert_eq!(scoped, TrackState::Unavailable, "{status:?} {state:?}");
+                    } else {
+                        assert_eq!(scoped, reported);
+                    }
+                }
             }
         }
+        assert_eq!(
+            scope_state(None, TrackState::Untracked),
+            TrackState::Untracked
+        );
         assert_eq!(
             list_report(None, false),
             ListReport {

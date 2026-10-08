@@ -1,5 +1,6 @@
 //! Admin sessions: the session cookie's key, the access rule of the
-//! pages under `/admin`, the form check and logout.
+//! pages under `/admin`, the form check, the fresh sign-in that sensitive
+//! actions ask for, and logout.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use farsight_api::auth::hex;
 use farsight_api::ratelimit::Class;
 use farsight_core::config::{AdminAuth, LoadedConfig};
 
-use super::{ADMIN_COOKIE, SESSION_ABSOLUTE, SESSION_IDLE, WebState};
+use super::{ADMIN_COOKIE, ADMIN_COOKIE_HOST, SESSION_ABSOLUTE, SESSION_IDLE, WebState};
 use crate::common::{self, cookie, ct_eq, read_cookie};
 
 /// A logged-in admin.
@@ -20,6 +21,71 @@ pub struct Admin {
     /// The session's form token in hex: every state-changing form posts
     /// it back as `csrf`, and `check_form` compares it in constant time.
     pub csrf: String,
+    /// How long ago the sign-in that made this session completed.
+    pub signed_in: std::time::Duration,
+}
+
+impl Admin {
+    /// Whether the sign-in is recent enough for a sensitive action
+    /// ([`super::STEP_UP_WINDOW`]).
+    pub fn fresh(&self) -> bool {
+        self.signed_in <= super::step_up_window()
+    }
+}
+
+/// The admin page a repeated sign-in returns to. The sign-in carries one
+/// of these names, never a path, so it cannot be sent anywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Return {
+    /// `/admin/settings`.
+    Settings,
+    /// `/admin/ops`.
+    Ops,
+}
+
+impl Return {
+    /// The name in `/enter?again=<name>` and in the sign-in form.
+    pub fn name(self) -> &'static str {
+        match self {
+            Return::Settings => "settings",
+            Return::Ops => "ops",
+        }
+    }
+
+    /// The page's path.
+    pub fn path(self) -> &'static str {
+        match self {
+            Return::Settings => "/admin/settings",
+            Return::Ops => "/admin/ops",
+        }
+    }
+
+    /// What the sign-in page calls the page.
+    pub fn title(self) -> &'static str {
+        match self {
+            Return::Settings => "Settings",
+            Return::Ops => "Operations",
+        }
+    }
+
+    /// The page with this name; `None` for anything else.
+    pub fn parse(name: &str) -> Option<Return> {
+        [Return::Settings, Return::Ops]
+            .into_iter()
+            .find(|r| r.name() == name)
+    }
+}
+
+/// The rule in front of a sensitive action (see `docs/design/web-ui.md`):
+/// it runs only in a session whose sign-in is fresh. Otherwise nothing is
+/// done and the answer sends the browser to the sign-in page, which says
+/// why and returns to `back` afterwards. The posted form is not carried
+/// along: the admin repeats the action on the page.
+pub(crate) fn step_up(admin: &Admin, back: Return) -> Result<(), Response> {
+    if admin.fresh() {
+        return Ok(());
+    }
+    Err(common::redirect(&format!("/enter?again={}", back.name())))
 }
 
 /// The stored key of an OAuth session: SHA-256 of the cookie value, a
@@ -43,14 +109,52 @@ pub fn session_key(cfg: &LoadedConfig, cookie: &str) -> Option<[u8; 32]> {
     }
 }
 
+/// The session cookie's value: the `__Host-` cookie when the browser
+/// sent one, otherwise the plain one.
+pub(crate) fn admin_cookie_value(headers: &HeaderMap) -> Option<String> {
+    read_cookie(headers, ADMIN_COOKIE_HOST).or_else(|| read_cookie(headers, ADMIN_COOKIE))
+}
+
+/// Sets the session cookie on `r`: `Path=/`, `HttpOnly`,
+/// `SameSite=Strict`; over HTTPS also `Secure`, under the `__Host-` name.
+/// Whether the request was HTTPS is what the listener or a trusted proxy
+/// said (`ClientIp::https`): behind a proxy that is not in
+/// `proxy.trusted` the cookie is set without `Secure`.
+pub(crate) fn set_admin_cookie(r: &mut Response, value: &str, secure: bool) {
+    let name = if secure {
+        ADMIN_COOKIE_HOST
+    } else {
+        ADMIN_COOKIE
+    };
+    r.headers_mut()
+        .append(header::SET_COOKIE, cookie(name, value, "/", secure, None));
+}
+
+/// Removes the session cookie under both of its names. The `__Host-` one
+/// is cleared with `Secure`, without which a browser ignores the header.
+pub(crate) fn clear_admin_cookie(r: &mut Response) {
+    let h = r.headers_mut();
+    h.append(
+        header::SET_COOKIE,
+        cookie(ADMIN_COOKIE, "", "/", false, Some(0)),
+    );
+    h.append(
+        header::SET_COOKIE,
+        cookie(ADMIN_COOKIE_HOST, "", "/", true, Some(0)),
+    );
+}
+
 pub(crate) async fn admin(st: &WebState, headers: &HeaderMap) -> Option<Admin> {
-    let raw = read_cookie(headers, ADMIN_COOKIE)?;
+    let raw = admin_cookie_value(headers)?;
     let id = session_key(&st.api.config.current(), &raw)?;
     let s =
         farsight_storage::auth::touch_session(&st.api.pool, &id, SESSION_IDLE, SESSION_ABSOLUTE)
             .await
             .ok()??;
-    Some(Admin { csrf: hex(&s.csrf) })
+    Some(Admin {
+        csrf: hex(&s.csrf),
+        signed_in: std::time::Duration::from_secs(s.age_secs),
+    })
 }
 
 pub(crate) fn login_redirect() -> Response {
@@ -122,15 +226,57 @@ pub(super) async fn logout(
     if let Err(r) = check_form(&session, &headers, &form) {
         return r;
     }
-    if let Some(raw) = read_cookie(&headers, ADMIN_COOKIE)
+    if let Some(raw) = admin_cookie_value(&headers)
         && let Some(key) = session_key(&st.api.config.current(), &raw)
     {
         let _ = farsight_storage::auth::delete_session(&st.api.pool, &key).await;
     }
     let mut r = common::redirect("/enter");
-    r.headers_mut().append(
-        header::SET_COOKIE,
-        cookie(ADMIN_COOKIE, "", "/", false, Some(0)),
-    );
+    clear_admin_cookie(&mut r);
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pages::STEP_UP_WINDOW;
+
+    fn admin(secs: u64) -> Admin {
+        Admin {
+            csrf: String::new(),
+            signed_in: std::time::Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn a_sensitive_action_needs_a_sign_in_inside_the_window() {
+        let window = STEP_UP_WINDOW.as_secs();
+        assert!(step_up(&admin(0), Return::Settings).is_ok());
+        assert!(step_up(&admin(window), Return::Settings).is_ok());
+        for (back, to) in [
+            (Return::Settings, "/enter?again=settings"),
+            (Return::Ops, "/enter?again=ops"),
+        ] {
+            let r = step_up(&admin(window + 1), back).unwrap_err();
+            assert_eq!(r.status(), axum::http::StatusCode::SEE_OTHER);
+            assert_eq!(r.headers()[header::LOCATION], to);
+        }
+    }
+
+    #[test]
+    fn a_sign_in_returns_only_to_a_named_page() {
+        assert_eq!(Return::parse("settings"), Some(Return::Settings));
+        assert_eq!(Return::parse("ops"), Some(Return::Ops));
+        for bad in [
+            "",
+            "/admin",
+            "//evil.example",
+            "https://evil.example",
+            "Settings",
+        ] {
+            assert_eq!(Return::parse(bad), None, "{bad}");
+        }
+        assert_eq!(Return::Settings.path(), "/admin/settings");
+        assert_eq!(Return::Ops.path(), "/admin/ops");
+    }
 }

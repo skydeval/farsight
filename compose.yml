@@ -9,8 +9,11 @@
 name: farsight
 
 x-farsight-common: &farsight-common
-  image: ghcr.io/skydeval/farsight:latest
-  # Until an image is published, compose builds it from this checkout.
+  # The tag is the version this file belongs to, never `latest`: a pull
+  # gets the release the checkout describes, not whatever was published
+  # last. Until an image is published, compose builds it from this
+  # checkout and gives it this name.
+  image: ghcr.io/skydeval/farsight:0.6.0
   build: .
   restart: unless-stopped
   user: "10001:10001"

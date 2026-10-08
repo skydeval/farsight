@@ -787,6 +787,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_aborted_transaction_is_run_again_and_any_other_error_is_not() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Aborted twice, then through: the caller sees the result.
+            let mut calls = 0;
+            let r = retry_deadlocks(|| {
+                calls += 1;
+                let n = calls;
+                async move {
+                    if n < 3 {
+                        Err(StorageError::LockSetChanged)
+                    } else {
+                        Ok(n)
+                    }
+                }
+            })
+            .await;
+            assert_eq!(r.unwrap(), 3);
+            // An error that running again does not cure is returned at once.
+            let mut calls = 0;
+            let r: Result<()> = retry_deadlocks(|| {
+                calls += 1;
+                async { Err(StorageError::Invariant("broken".into())) }
+            })
+            .await;
+            assert!(matches!(r, Err(StorageError::Invariant(_))));
+            assert_eq!(calls, 1);
+            // Aborted every time: given up after the bound.
+            let mut calls = 0;
+            let r: Result<()> = retry_deadlocks(|| {
+                calls += 1;
+                async { Err(StorageError::LockSetChanged) }
+            })
+            .await;
+            assert!(matches!(
+                r,
+                Err(StorageError::DeadlockRetriesExhausted(n)) if n == crate::apply::MAX_DEADLOCK_ATTEMPTS
+            ));
+            assert_eq!(calls, crate::apply::MAX_DEADLOCK_ATTEMPTS);
+        });
+    }
+
+    #[test]
     fn lww_rule() {
         let s = Stamp::new;
         assert!(lww_upsert_wins(s(5), None, None));

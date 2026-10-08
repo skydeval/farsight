@@ -60,6 +60,7 @@ Repairs {% if repair_auto %}start by themselves when a gap closes{% else %}do no
 </table>{% endif %}
 <form class="stack u-divided" method="post" action="/admin/ops/keys-create">
 <h3 class="u-mt-0">Create API Key</h3>
+<p class="muted">Creating a key asks you to sign in again first if you signed in more than ten minutes ago.</p>
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="name">Name</label><input type="text" id="name" name="name" placeholder="app-name or integration-id">
 <label>Scopes</label>

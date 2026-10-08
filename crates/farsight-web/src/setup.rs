@@ -37,6 +37,19 @@ pub const FAILURES_PER_MIN: usize = 5;
 pub const FAILURE_DELAY: Duration = Duration::from_secs(2);
 /// Delayed responses held at once (beyond: immediate 429).
 pub const MAX_DELAYED: usize = 64;
+/// Clients whose wrong tokens are counted at once. Beyond it, further
+/// clients are counted together under one key, so the count stays
+/// bounded and a flood of addresses is throttled as one.
+pub const MAX_FAILURE_CLIENTS: usize = 10_000;
+/// A setup session ends this long after its token was accepted, however
+/// active it is. Running the wizard takes minutes.
+pub const SESSION_MAX: Duration = Duration::from_secs(12 * 3600);
+/// The key further clients are counted under once
+/// [`MAX_FAILURE_CLIENTS`] are being counted.
+const FAILURE_OVERFLOW: &str = "others";
+
+/// Index of the storage step in [`STEPS`].
+const STORAGE_STEP: usize = 7;
 
 /// The ten steps, by URL slug.
 pub const STEPS: [(&str, &str); 10] = [
@@ -216,9 +229,17 @@ impl Wizard {
 }
 
 /// One setup session: a browser that has presented the setup token. In
-/// memory only; a token rotation ends every one.
+/// memory only. It is bound to the token it was opened with: once the
+/// token file holds another token, whoever replaced it (the minute
+/// check here, or `farsight setup-token --rotate` in another process),
+/// the session is over. It also ends [`SESSION_MAX`] after it was
+/// opened.
 #[derive(Debug)]
 pub struct SetupSession {
+    /// When the token was accepted.
+    pub created: Instant,
+    /// SHA-256 of the token it was accepted for, in its normalized form.
+    pub token_sha256: [u8; 32],
     /// When the session's cookie last came with a request. A session
     /// seen within the last hour postpones the token's expiry.
     pub last_seen: Instant,
@@ -241,8 +262,9 @@ pub struct SetupState {
     pub env: Vec<(String, String)>,
     /// Verified sessions by hashed id.
     pub sessions: Mutex<HashMap<[u8; 32], SetupSession>>,
-    /// Recent token failures per resolved client.
-    pub failures: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+    /// Recent token failures per resolved client (IPv6 by /64), at most
+    /// [`MAX_FAILURE_CLIENTS`] of them.
+    pub failures: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// Bound on delayed failure responses.
     pub delayed: Arc<Semaphore>,
     /// Set to true once `config.toml` is written.
@@ -277,13 +299,16 @@ impl SetupState {
     }
 
     /// Whether a verified session was active in the last hour (postpones
-    /// rotation).
+    /// rotation). A session past its lifetime does not count.
     pub fn session_active(&self) -> bool {
         self.sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .any(|s| s.last_seen.elapsed() < setup_token::ACTIVE_WINDOW)
+            .any(|s| {
+                s.created.elapsed() < SESSION_MAX
+                    && s.last_seen.elapsed() < setup_token::ACTIVE_WINDOW
+            })
     }
 
     /// The token in force, rotating it if expired (a new token is printed
@@ -302,10 +327,28 @@ impl SetupState {
 
     fn session_id(&self, headers: &HeaderMap) -> Option<[u8; 32]> {
         let raw = read_cookie(headers, SESSION_COOKIE)?;
-        let id = common::sha256(&raw);
+        self.live_session(common::sha256(&raw), Instant::now())
+    }
+
+    /// The session `id` if it is still good at `now`: younger than
+    /// [`SESSION_MAX`], and opened with the token the file holds now.
+    /// The file is read on every request, because another process may
+    /// have replaced the token. A session that fails either test is
+    /// removed.
+    fn live_session(&self, id: [u8; 32], now: Instant) -> Option<[u8; 32]> {
+        let current = setup_token::read(&self.token_path).map(|t| token_hash(&t));
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let s = sessions.get_mut(&id)?;
-        s.last_seen = Instant::now();
+        let good = now.saturating_duration_since(s.created) < SESSION_MAX
+            && current.is_some_and(|c| {
+                use subtle::ConstantTimeEq;
+                bool::from(c.ct_eq(&s.token_sha256))
+            });
+        if !good {
+            sessions.remove(&id);
+            return None;
+        }
+        s.last_seen = now;
         Some(id)
     }
 
@@ -315,18 +358,40 @@ impl SetupState {
     }
 
     fn record_failure(&self, ip: IpAddr) -> usize {
+        self.record_failure_at(ip, Instant::now())
+    }
+
+    /// Counts a wrong token from `ip` and returns how many it has sent
+    /// in the last minute. An IPv6 client is counted by its /64, so it
+    /// does not get a fresh count from every address it holds.
+    fn record_failure_at(&self, ip: IpAddr, now: Instant) -> usize {
+        let minute = Duration::from_secs(60);
+        let fresh = |t: &Instant| now.saturating_duration_since(*t) <= minute;
+        let mut key = farsight_api::ratelimit::ip_key(ip);
         let mut f = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-        let q = f.entry(ip).or_default();
-        let now = Instant::now();
-        while q
-            .front()
-            .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60))
-        {
+        if !f.contains_key(&key) && f.len() >= MAX_FAILURE_CLIENTS {
+            // Make room from clients whose failures have all aged out.
+            f.retain(|_, q| q.back().is_some_and(fresh));
+            if f.len() >= MAX_FAILURE_CLIENTS {
+                key = FAILURE_OVERFLOW.to_owned();
+            }
+        }
+        let q = f.entry(key).or_default();
+        while q.front().is_some_and(|t| !fresh(t)) {
             q.pop_front();
         }
-        q.push_back(now);
+        // The count is all that matters past the threshold.
+        if q.len() < FAILURES_PER_MIN * 20 {
+            q.push_back(now);
+        }
         q.len()
     }
+}
+
+/// SHA-256 of a setup token in its normalized form: what a session
+/// remembers of the token it was opened with.
+fn token_hash(t: &SetupToken) -> [u8; 32] {
+    common::sha256(&setup_token::normalize(&t.token))
 }
 
 /// The setup router: `/setup/*` and static assets.
@@ -507,15 +572,108 @@ pub fn redacted_toml(c: &Config) -> String {
     farsight_core::config::to_toml(&c).unwrap_or_default()
 }
 
-/// Hides the password of a Postgres URL.
+/// The connection parameters that hold a secret.
+fn secret_param(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "password" | "sslpassword" | "passfile" | "sslkey"
+    )
+}
+
+/// Hides the secrets of a Postgres connection string, in each form one
+/// can be written in: the password of a URL (`postgres://u:secret@…`),
+/// a secret given as a URL parameter (`…?password=secret`), and the
+/// `password = secret` of the keyword form. A string with no secret is
+/// returned as it is.
 pub fn redact_dsn(dsn: &str) -> String {
-    match url::Url::parse(dsn) {
-        Ok(mut u) if u.password().is_some() => {
-            let _ = u.set_password(Some("redacted"));
-            u.to_string()
-        }
-        _ => dsn.to_owned(),
+    let lower = dsn.trim_start().to_ascii_lowercase();
+    if !(lower.starts_with("postgres://") || lower.starts_with("postgresql://")) {
+        return redact_keywords(dsn);
     }
+    let Ok(mut u) = url::Url::parse(dsn.trim_start()) else {
+        // Not readable as a URL: show nothing that could be a secret.
+        return "<unreadable connection string>".to_owned();
+    };
+    let in_query = u.query_pairs().any(|(k, _)| secret_param(&k));
+    if u.password().is_none() && !in_query {
+        return dsn.to_owned();
+    }
+    if u.password().is_some() {
+        let _ = u.set_password(Some("redacted"));
+    }
+    if in_query {
+        let pairs: Vec<(String, String)> = u
+            .query_pairs()
+            .map(|(k, v)| {
+                let v = if secret_param(&k) {
+                    "redacted".to_owned()
+                } else {
+                    v.into_owned()
+                };
+                (k.into_owned(), v)
+            })
+            .collect();
+        u.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    u.to_string()
+}
+
+/// [`redact_dsn`] for the keyword form (`host=db user=u password=secret`):
+/// each secret's value, bare or in single quotes, becomes `redacted`.
+fn redact_keywords(dsn: &str) -> String {
+    let chars: Vec<char> = dsn.chars().collect();
+    let mut out = String::with_capacity(dsn.len());
+    let mut found = false;
+    let mut i = 0;
+    while i < chars.len() {
+        // Whitespace between pairs is kept as written.
+        if chars[i].is_whitespace() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i] != '=' && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        let name: String = chars[start..i].iter().collect();
+        let mut j = i;
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+        if j >= chars.len() || chars[j] != '=' {
+            // A word without a value.
+            out.push_str(&name);
+            continue;
+        }
+        j += 1;
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+        let value_start = j;
+        if j < chars.len() && chars[j] == '\'' {
+            j += 1;
+            while j < chars.len() && chars[j] != '\'' {
+                j += if chars[j] == '\\' { 2 } else { 1 };
+            }
+            j = (j + 1).min(chars.len());
+        } else {
+            while j < chars.len() && !chars[j].is_whitespace() {
+                j += if chars[j] == '\\' { 2 } else { 1 };
+            }
+            j = j.min(chars.len());
+        }
+        out.push_str(&name);
+        out.push('=');
+        if secret_param(&name) {
+            found = true;
+            out.push_str("redacted");
+        } else {
+            out.extend(&chars[value_start..j]);
+        }
+        i = j;
+    }
+    if found { out } else { dsn.to_owned() }
 }
 
 fn expiry_warning(state: &SetupState) -> Option<String> {
@@ -661,6 +819,8 @@ async fn submit_token(
             .insert(
                 id,
                 SetupSession {
+                    created: Instant::now(),
+                    token_sha256: token_hash(&token),
                     last_seen: Instant::now(),
                     csrf: random_id(),
                     wizard,
@@ -1199,7 +1359,7 @@ async fn resolve_admin_did(
     let safe = SafeClient::new(SafeClientConfig::from_config(&cfg, st.version));
     match tokio::time::timeout(
         Duration::from_secs(15),
-        crate::oauth::identity(&safe, &cfg, &did),
+        crate::oauth::identity(&safe, &cfg.backfill.plc_url, &did),
     )
     .await
     {
@@ -1209,33 +1369,57 @@ async fn resolve_admin_did(
 }
 
 /// Subscribes to `url` for at most `limit` and reports events, lag and v2
-/// support.
+/// support. The limit covers everything: resolving the name, connecting
+/// (each attempt, v2 then v1), the handshake and the reading. The URL is
+/// the operator's own, typed in a setup session, and is connected to
+/// directly, not through the safe outbound client: a firehose on a
+/// private network is a legitimate source. So the test can tell whoever
+/// holds the setup token whether a port inside the network answers,
+/// which is why it is reachable only from a setup session.
 pub async fn test_firehose(url: &str, limit: Duration) -> (Vec<String>, bool) {
     use farsight_ingest::conn::{self, ConnectError};
     use farsight_ingest::frame::{Frame, Protocol};
     use farsight_ingest::resume::Cursor;
     let mut lines = Vec::new();
-    let (session, v2) = match conn::connect(url, Protocol::V2, Cursor::Live, true).await {
-        Ok(s) => (Some(s), true),
-        Err(ConnectError::NotOffered(code)) => {
+    let started = Instant::now();
+    let timed_out = |lines: &mut Vec<String>| {
+        lines.push(format!(
+            "{url}: no connection within {:.0} s",
+            limit.as_secs_f64().max(1.0)
+        ));
+    };
+    let v2 = tokio::time::timeout(limit, conn::connect(url, Protocol::V2, Cursor::Live, true));
+    let (session, v2) = match v2.await {
+        Ok(Ok(s)) => (Some(s), true),
+        Ok(Err(ConnectError::NotOffered(code))) => {
             lines.push(format!("{url}: v2 not offered (HTTP {code}); trying v1"));
-            match conn::connect(url, Protocol::V1, Cursor::Live, true).await {
-                Ok(s) => (Some(s), false),
-                Err(e) => {
+            let left = limit.saturating_sub(started.elapsed());
+            let v1 =
+                tokio::time::timeout(left, conn::connect(url, Protocol::V1, Cursor::Live, true));
+            match v1.await {
+                Ok(Ok(s)) => (Some(s), false),
+                Ok(Err(e)) => {
                     lines.push(format!("{url}: v1 failed: {e}"));
+                    (None, false)
+                }
+                Err(_) => {
+                    timed_out(&mut lines);
                     (None, false)
                 }
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             lines.push(format!("{url}: connection failed: {e}"));
+            (None, false)
+        }
+        Err(_) => {
+            timed_out(&mut lines);
             (None, false)
         }
     };
     let Some(mut s) = session else {
         return (lines, false);
     };
-    let started = Instant::now();
     let mut events = 0u64;
     let mut last_lag: Option<f64> = None;
     while started.elapsed() < limit {
@@ -1400,6 +1584,20 @@ async fn farsight_storage_schema_version(
         .await
 }
 
+/// Stores the outcome of a connection test in the wizard. A test that
+/// failed, or one of another connection string than the step was saved
+/// with, takes the step's "done" mark away: the wizard cannot finish
+/// with a connection string that did not pass, and the step is saved
+/// again first.
+fn record_storage_test(w: &mut Wizard, dsn: String, report: Vec<String>, ok: bool) {
+    if !ok || dsn != w.dsn {
+        w.done[STORAGE_STEP] = false;
+    }
+    w.dsn = dsn;
+    w.storage_report = report;
+    w.storage_ok = ok;
+}
+
 async fn storage_test(
     State(st): State<Arc<SetupState>>,
     headers: HeaderMap,
@@ -1421,11 +1619,7 @@ async fn storage_test(
     } else {
         test_storage(&dsn).await
     };
-    st.with_session(&id, |s| {
-        s.wizard.dsn = dsn;
-        s.wizard.storage_report = report;
-        s.wizard.storage_ok = ok;
-    });
+    st.with_session(&id, |s| record_storage_test(&mut s.wizard, dsn, report, ok));
     render_step(&st, &id, "storage", None)
 }
 
@@ -1504,6 +1698,10 @@ async fn finish(
     if let Some(j) = (1..8).find(|j| !w.done[*j]) {
         return common::redirect(&format!("/setup/{}", STEPS[j].0));
     }
+    // The connection string written is one whose test passed.
+    if !w.storage_ok {
+        return common::redirect("/setup/storage");
+    }
     let config = w.build_config();
     let text = match farsight_core::config::to_toml(&config) {
         Ok(t) => t,
@@ -1579,6 +1777,161 @@ mod tests {
         assert!(valid_server_host("farsight-box"));
         assert!(!valid_server_host("https://x.example"));
         assert!(!valid_server_host("x.example/path"));
+    }
+
+    #[test]
+    fn a_connection_string_shows_no_secret_in_any_form() {
+        // The URL form.
+        assert_eq!(
+            redact_dsn("postgres://u:secret@db/f"),
+            "postgres://u:redacted@db/f"
+        );
+        // A secret among the URL's parameters.
+        let q = redact_dsn("postgres://u@db/f?sslmode=require&password=secret");
+        assert_eq!(q, "postgres://u@db/f?sslmode=require&password=redacted");
+        let both = redact_dsn("postgresql://u:one@db/f?PASSWORD=two&sslpassword=three");
+        assert!(!both.contains("one") && !both.contains("two") && !both.contains("three"));
+        // The keyword form, bare and quoted, with escapes.
+        assert_eq!(
+            redact_dsn("host=db user=u password=secret dbname=f"),
+            "host=db user=u password=redacted dbname=f"
+        );
+        assert_eq!(
+            redact_dsn("host=db password = 'se cr\\'et' dbname=f"),
+            "host=db password=redacted dbname=f"
+        );
+        assert_eq!(
+            redact_dsn("password=a\\ b host=db"),
+            "password=redacted host=db"
+        );
+        // Nothing secret: as written.
+        for plain in [
+            "postgres://u@db/f",
+            "postgres://u@db/f?sslmode=require",
+            "host=db user=u dbname=f",
+            "",
+        ] {
+            assert_eq!(redact_dsn(plain), plain);
+        }
+        // Redaction is stable: what the page shows redacts to itself.
+        for dsn in [
+            "postgres://u:secret@db/f?password=x",
+            "host=db password='a b'",
+        ] {
+            let shown = redact_dsn(dsn);
+            assert_eq!(redact_dsn(&shown), shown);
+        }
+    }
+
+    fn state(name: &str) -> Arc<SetupState> {
+        let dir =
+            std::env::temp_dir().join(format!("farsight-setup-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        SetupState::new(dir.join("config.toml"), Vec::new(), "test").0
+    }
+
+    fn open_session(st: &SetupState, token: &SetupToken, created: Instant) -> [u8; 32] {
+        let id = common::sha256(&random_id());
+        st.sessions.lock().unwrap().insert(
+            id,
+            SetupSession {
+                created,
+                token_sha256: token_hash(token),
+                last_seen: created,
+                csrf: random_id(),
+                wizard: Wizard::new(&[]),
+            },
+        );
+        id
+    }
+
+    #[test]
+    fn a_session_ends_when_another_process_replaces_the_token() {
+        let st = state("rotate");
+        let (token, _) = st.check_token().unwrap();
+        let now = Instant::now();
+        let id = open_session(&st, &token, now);
+        assert_eq!(st.live_session(id, now), Some(id));
+        // What `farsight setup-token --rotate` does: it only rewrites the
+        // file.
+        let next = setup_token::rotate(&st.token_path).unwrap();
+        assert_ne!(next.token, token.token);
+        assert_eq!(st.live_session(id, now), None);
+        assert!(st.sessions.lock().unwrap().is_empty());
+        // A session opened with the new token is good.
+        let id = open_session(&st, &next, now);
+        assert_eq!(st.live_session(id, now), Some(id));
+        // No token file: no session.
+        setup_token::delete(&st.token_path);
+        assert_eq!(st.live_session(id, now), None);
+        let _ = std::fs::remove_dir_all(st.token_path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_session_has_an_absolute_lifetime() {
+        let st = state("lifetime");
+        let (token, _) = st.check_token().unwrap();
+        let t0 = Instant::now();
+        let id = open_session(&st, &token, t0);
+        let almost = t0 + SESSION_MAX - Duration::from_secs(1);
+        assert_eq!(st.live_session(id, almost), Some(id));
+        // Just used, and still over once the lifetime has passed.
+        assert_eq!(st.live_session(id, t0 + SESSION_MAX), None);
+        assert!(st.sessions.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(st.token_path.parent().unwrap());
+    }
+
+    #[test]
+    fn token_failures_are_counted_per_64_and_the_count_is_bounded() {
+        let st = state("failures");
+        let t0 = Instant::now();
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        assert_eq!(st.record_failure_at(a, t0), 1);
+        assert_eq!(st.record_failure_at(b, t0), 2);
+        assert_eq!(st.record_failure_at("192.0.2.1".parse().unwrap(), t0), 1);
+        // A minute later the count starts again.
+        assert_eq!(st.record_failure_at(a, t0 + Duration::from_secs(61)), 1);
+        // The map stops growing at its bound; further clients share a count.
+        let st = state("failures-bound");
+        for i in 0..MAX_FAILURE_CLIENTS as u32 {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+            assert_eq!(st.record_failure_at(ip, t0), 1);
+        }
+        let late = |n: u8| IpAddr::from([203, 0, 113, n]);
+        assert_eq!(st.record_failure_at(late(1), t0), 1);
+        assert_eq!(st.record_failure_at(late(2), t0), 2);
+        assert_eq!(st.failures.lock().unwrap().len(), MAX_FAILURE_CLIENTS + 1);
+        // Once the old failures have aged out there is room again.
+        let later = t0 + Duration::from_secs(120);
+        assert_eq!(st.record_failure_at(late(3), later), 1);
+        assert_eq!(st.failures.lock().unwrap().len(), 1);
+        for s in ["failures", "failures-bound"] {
+            let _ = std::fs::remove_dir_all(
+                std::env::temp_dir()
+                    .join(format!("farsight-setup-test-{s}-{}", std::process::id())),
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_connection_test_takes_the_storage_step_back() {
+        let mut w = Wizard::new(&[]);
+        w.dsn = "postgres://u:p@db/a".into();
+        w.storage_ok = true;
+        w.done[STORAGE_STEP] = true;
+        assert_eq!(STEPS[STORAGE_STEP].0, "storage");
+        // The same string tested again and passing changes nothing.
+        record_storage_test(&mut w, "postgres://u:p@db/a".into(), Vec::new(), true);
+        assert!(w.done[STORAGE_STEP] && w.storage_ok);
+        // Another string that passes must be saved again.
+        record_storage_test(&mut w, "postgres://u:p@db/b".into(), Vec::new(), true);
+        assert!(!w.done[STORAGE_STEP] && w.storage_ok);
+        // A failed test: not done, not ok, whatever was saved before.
+        w.done[STORAGE_STEP] = true;
+        record_storage_test(&mut w, "postgres://u:p@db/b".into(), Vec::new(), false);
+        assert!(!w.done[STORAGE_STEP] && !w.storage_ok);
     }
 
     #[test]

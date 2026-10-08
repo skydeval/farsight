@@ -7,7 +7,7 @@
 //! | first start (nothing applied) | live tail | none |
 //! | instance with its own cursor, v2 → v2 | `seq + 1` (exact) | gap `[from, first event]` if the instance announces a clamp (`#info OutdatedCursor`), answers with a `seq` below the one asked for (its sequence started again; the stored cursor is dropped), or its first event is more than `gap_threshold` after the stored cursor |
 //! | instance with its own cursor, v1 (or v1 → v2) | `cursor_us − 120 s` | gap `[from, first event]` if a clamp is announced or the first event is later than the stored cursor: the instance no longer holds what it sent before |
-//! | instance without a cursor (failover), lag known and ≤ `failover_max_lag` | `applied − max(failover_rewind_min, lag + 5 min)` | gap `[applied − 30 min, first event]` if a clamp is announced or the first event is more than `gap_threshold` after the cursor |
+//! | instance without a cursor (failover), lag known and ≤ `failover_max_lag` | `applied − max(failover_rewind_min, lag + 5 min) − gap_threshold` | gap `[applied − 30 min, first event]` if a clamp is announced or the first event is more than `gap_threshold` after the cursor, that is, later than `applied − max(failover_rewind_min, lag + 5 min)` |
 //! | instance without a cursor, lag unknown or too large | `applied − 30 min` | always gap `[applied − 30 min, first event]` |
 //!
 //! `from` is `applied_through` when the last applied batch came from the
@@ -21,6 +21,11 @@
 //! unconditional gap is never empty: when the first event is not after
 //! `from`, the two clocks disagree, and the gap is the 30 minutes before
 //! that event.
+//!
+//! The failover cursor asks for `gap_threshold` more than the rewind the
+//! change of instance needs. A clamp shorter than `gap_threshold`
+//! cannot be told from a quiet stream and records no gap; it then eats
+//! only that extra, never the rewind.
 //!
 //! `applied_through` is taken as at most the current time wherever a
 //! position is computed for another instance, so a witness clock that
@@ -209,11 +214,17 @@ pub fn plan(
             let rewind = t
                 .failover_rewind_min
                 .max(l.saturating_add(FAILOVER_LAG_MARGIN));
-            let requested = base.saturating_sub(us(rewind));
+            // The rewind is what the change of instance needs. A clamp
+            // can only be told from a quiet stream when it is longer than
+            // `gap_threshold`, so that much more is asked for: a clamp
+            // too short to see then costs only the extra, and a first
+            // event later than the rewind itself is always a gap.
+            let needed_from = base.saturating_sub(us(rewind));
+            let requested = needed_from.saturating_sub(us(t.gap_threshold));
             Plan {
                 cursor: Cursor::TimeUs(requested),
                 gap: GapRule::IfClamped {
-                    clamp_after_us: requested.saturating_add(us(t.gap_threshold)),
+                    clamp_after_us: needed_from,
                     from_us: failover_from,
                     cause: GapCause::Failover,
                 },
@@ -463,8 +474,9 @@ mod tests {
             &T,
             NOW,
         );
-        // max(10 min, 1 min + 5 min) = 10 min.
-        assert_eq!(p.cursor, Cursor::TimeUs(10_000 * S - 600 * S));
+        // max(10 min, 1 min + 5 min) = 10 min, and the 5 min of the
+        // threshold on top.
+        assert_eq!(p.cursor, Cursor::TimeUs(10_000 * S - 600 * S - 300 * S));
         let p = plan(
             &elsewhere(Protocol::V2),
             B,
@@ -473,12 +485,47 @@ mod tests {
             &T,
             NOW,
         );
-        // max(10 min, 15 min + 5 min) = 20 min.
-        assert_eq!(p.cursor, Cursor::TimeUs(10_000 * S - 1200 * S));
-        assert_eq!(gap(p.gap, Some(1), 9_000 * S, false), None);
+        // max(10 min, 15 min + 5 min) = 20 min, and the threshold on top.
+        assert_eq!(p.cursor, Cursor::TimeUs(10_000 * S - 1200 * S - 300 * S));
+        assert_eq!(gap(p.gap, Some(1), 8_600 * S, false), None);
         assert_eq!(
             gap(p.gap, Some(1), 20_000 * S, false),
             Some((10_000 * S - 1800 * S, 20_000 * S, GapCause::Failover))
+        );
+    }
+
+    #[test]
+    fn a_failover_clamp_never_eats_the_rewind_without_a_gap() {
+        let p = plan(
+            &elsewhere(Protocol::V2),
+            B,
+            Protocol::V2,
+            Some(Duration::from_secs(900)),
+            &T,
+            NOW,
+        );
+        // The change of instance needs the 20 minutes before the position.
+        let needed_from = 10_000 * S - 1200 * S;
+        let asked = needed_from - 300 * S;
+        assert_eq!(p.cursor, Cursor::TimeUs(asked));
+        // A first event anywhere in the extra five minutes: a clamp that
+        // short, or a quiet stream. The whole rewind was replayed.
+        for first in [asked, asked + 150 * S, needed_from] {
+            assert_eq!(gap(p.gap, Some(1), first, false), None, "{first}");
+        }
+        // One microsecond into the rewind: part of it was not replayed,
+        // and that is a gap, however little.
+        assert_eq!(
+            gap(p.gap, Some(1), needed_from + 1, false),
+            Some((10_000 * S - 1800 * S, needed_from + 1, GapCause::Failover))
+        );
+        assert_eq!(
+            gap(p.gap, Some(1), needed_from + 200 * S, false),
+            Some((
+                10_000 * S - 1800 * S,
+                needed_from + 200 * S,
+                GapCause::Failover
+            ))
         );
     }
 
@@ -544,7 +591,7 @@ mod tests {
             now,
         );
         // The cursor is rewound from the clock, not from the position.
-        assert_eq!(lagging.cursor, Cursor::TimeUs(now - 600 * S));
+        assert_eq!(lagging.cursor, Cursor::TimeUs(now - 600 * S - 300 * S));
         let blind = plan(&elsewhere(Protocol::V2), B, Protocol::V2, None, &T, now);
         assert_eq!(blind.cursor, Cursor::TimeUs(now - 1800 * S));
         assert_eq!(
@@ -724,6 +771,17 @@ mod tests {
                         } else {
                             prop_assert_eq!(cause, GapCause::Failover);
                             prop_assert!(lag.is_some_and(|l| l <= t.failover_max_lag));
+                            // The cursor asks for the threshold more than
+                            // the rewind, so a clamp too short to see
+                            // costs none of the rewind.
+                            let rewind = t
+                                .failover_rewind_min
+                                .max(lag.unwrap_or_default().saturating_add(FAILOVER_LAG_MARGIN));
+                            prop_assert_eq!(clamp_after_us, sub(applied.min(now), rewind));
+                            prop_assert_eq!(
+                                plan.cursor,
+                                Cursor::TimeUs(sub(clamp_after_us, t.gap_threshold))
+                            );
                         }
                     }
                     GapRule::Always { from_us, cause } => {

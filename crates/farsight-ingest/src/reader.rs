@@ -6,6 +6,7 @@
 
 #[cfg(feature = "harness")]
 use farsight_storage::codes::sql::PROTOCOL_V2;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -298,6 +299,90 @@ impl ReconnectReason {
     }
 }
 
+/// Sessions in a row that may end on a frame that cannot be read, at the
+/// same position of the same instance, before the next session steps
+/// past it. The first ends are taken for what they usually are, a fault
+/// in transit that a reconnect clears; a frame that is unreadable every
+/// time would otherwise come first on every resume, for good.
+pub const UNREADABLE_RETRIES: u32 = 3;
+/// Most frames a session steps past at one position. Past that the
+/// stream itself is unreadable, which stepping does not cure.
+pub const UNREADABLE_SKIP_MAX: u32 = 64;
+
+/// The position a session resumes from, as a number that is the same on
+/// every resume from that position: the `seq` or the time asked for.
+/// `None` at the live tail.
+fn resume_key(cursor: Cursor) -> Option<i64> {
+    match cursor {
+        Cursor::Live => None,
+        Cursor::Seq(n) => Some(n),
+        Cursor::TimeUs(t) => Some(t),
+    }
+}
+
+/// The [`resume_key`] of the resume that follows a session whose last
+/// delivered event is `ev`: its `seq` plus one on v2, its witness time
+/// less the replay on v1 (see [`resume::plan`]).
+fn key_after(ev: &InEvent) -> i64 {
+    match ev.seq {
+        Some(seq) => seq.saturating_add(1),
+        None => ev.witness_us.saturating_sub(resume::us(resume::V1_REPLAY)),
+    }
+}
+
+/// Positions at which sessions ended on a frame that could not be read:
+/// per instance, the position and how many sessions in a row ended there.
+#[derive(Debug, Default)]
+struct Stuck(HashMap<String, (i64, u32)>);
+
+impl Stuck {
+    /// A session on `url` ended on an unreadable frame at `key`. Returns
+    /// how many in a row have now ended there.
+    fn failed(&mut self, url: &str, key: i64) -> u32 {
+        let e = self.0.entry(url.to_owned()).or_insert((key, 0));
+        if e.0 != key {
+            *e = (key, 0);
+        }
+        e.1 = e.1.saturating_add(1);
+        e.1
+    }
+
+    /// The position the next session on `url` steps past unreadable
+    /// frames at, once [`UNREADABLE_RETRIES`] sessions have ended there.
+    fn skip_at(&self, url: &str) -> Option<i64> {
+        self.0
+            .get(url)
+            .filter(|(_, n)| *n >= UNREADABLE_RETRIES)
+            .map(|(key, _)| *key)
+    }
+
+    /// A session on `url` got past the position.
+    fn cleared(&mut self, url: &str) {
+        self.0.remove(url);
+    }
+}
+
+/// Whether a frame that cannot be read is stepped past: only at the
+/// position sessions kept ending at (`skip_at`), and only
+/// [`UNREADABLE_SKIP_MAX`] times in one session. `at` is where the
+/// session stands: after its last delivered event, or where it resumed.
+fn steps_past(at: Option<i64>, skip_at: Option<i64>, skipped: u32) -> bool {
+    at.is_some() && at == skip_at && skipped < UNREADABLE_SKIP_MAX
+}
+
+/// Where a session resumed, for the handling of unreadable frames.
+#[derive(Debug, Clone, Copy, Default)]
+struct ResumedAt {
+    /// The [`resume_key`] of the cursor sent.
+    key: Option<i64>,
+    /// Where a loss on this resume starts, witness µs
+    /// ([`resume::Plan::refused_from_us`]).
+    from_us: Option<i64>,
+    /// The position to step past unreadable frames at, if sessions kept
+    /// ending there.
+    skip_at: Option<i64>,
+}
+
 /// Jetstream `#info` name: the cursor asked for was older than what the
 /// instance keeps, and it resumed from its floor.
 const INFO_OUTDATED_CURSOR: &str = "OutdatedCursor";
@@ -317,6 +402,18 @@ struct Seen {
     /// Whether the session's seam window is on record and still open:
     /// the session has not caught up with the live tail yet.
     seam_open: bool,
+    /// The [`resume_key`] of a resume after the last delivered event.
+    next_key: Option<i64>,
+    /// The session ended on a frame that could not be read, at this
+    /// position.
+    failed_at: Option<i64>,
+    /// Unreadable frames stepped past and not yet covered by a gap.
+    skipped: u32,
+    /// Unreadable frames stepped past in the whole session.
+    skipped_total: u32,
+    /// The session delivered an event after stepping past: the position
+    /// is behind it.
+    stepped: bool,
 }
 
 /// Which instance the reader is on, and how its attempts have gone.
@@ -391,13 +488,14 @@ impl Reader {
         }
     }
 
-    /// Detects the protocol and connects. Returns the session and the gap
-    /// rule for its first event.
+    /// Detects the protocol and connects. Returns the session, the gap
+    /// rule for its first event, whether anything was applied before,
+    /// and where it resumed.
     async fn open(
         &self,
         url: &str,
         lag: Option<Duration>,
-    ) -> Result<(Session, GapRule, bool), ConnectError> {
+    ) -> Result<(Session, GapRule, bool, ResumedAt), ConnectError> {
         let p = self.persisted(url).await;
         let t = &self.cfg.tuning;
         let mut compress = self.cfg.compress && !self.plain.load(Ordering::Relaxed);
@@ -405,7 +503,14 @@ impl Reader {
         while let Some(proto) = protocols.first().copied() {
             let plan = resume::plan(&p, url, proto, lag, t, now_us());
             match conn::connect(url, proto, plan.cursor, compress).await {
-                Ok(s) => return Ok((s, plan.gap, p.applied_through_us.is_some())),
+                Ok(s) => {
+                    let at = ResumedAt {
+                        key: resume_key(plan.cursor),
+                        from_us: plan.refused_from_us,
+                        skip_at: None,
+                    };
+                    return Ok((s, plan.gap, p.applied_through_us.is_some(), at));
+                }
                 Err(ConnectError::NotOffered(code)) if proto == Protocol::V2 => {
                     tracing::debug!(url, code, "v2 not offered; falling back to v1");
                     protocols.remove(0);
@@ -424,7 +529,9 @@ impl Reader {
                     tracing::warn!(url, %msg, "CursorTooOld; resuming at the live tail");
                     ReconnectReason::CursorTooOld.count();
                     let s = conn::connect(url, proto, Cursor::Live, compress).await?;
-                    return Ok((s, plan.refused(), p.applied_through_us.is_some()));
+                    // At the live tail there is no position to be stuck at.
+                    let at = ResumedAt::default();
+                    return Ok((s, plan.refused(), p.applied_through_us.is_some(), at));
                 }
                 Err(e) => return Err(e),
             }
@@ -443,6 +550,7 @@ impl Reader {
         let mut current_url: Option<String> = None;
         // Sessions in a row that stalled without one event (see `patience`).
         let mut silent_stalls = 0u32;
+        let mut stuck = Stuck::default();
         loop {
             // Drain the pipeline so the persisted cursor reflects every
             // event already read (a dropped connection reconnects from
@@ -484,7 +592,7 @@ impl Reader {
                 };
             let opened = self.open(&url, failover_lag).await;
             let failover = current_url.as_deref().is_some_and(|u| u != url.as_str());
-            let (mut session, rule, prior) = match opened {
+            let (mut session, rule, prior, mut resumed_at) = match opened {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!(url, error = %e, "connect failed");
@@ -526,6 +634,7 @@ impl Reader {
             let started = Instant::now();
             let stall = patience(self.cfg.stall_timeout, silent_stalls);
             let mut seen = Seen::default();
+            resumed_at.skip_at = stuck.skip_at(&url);
             let end = self
                 .read_session(
                     &mut session,
@@ -534,11 +643,26 @@ impl Reader {
                     failover,
                     &mut at.lag,
                     stall,
+                    resumed_at,
                     &mut seen,
                 )
                 .await;
             let delivered = seen.delivered;
             let lasted = started.elapsed();
+            if seen.stepped {
+                stuck.cleared(&url);
+            }
+            if let Some(key) = seen.failed_at {
+                let times = stuck.failed(&url, key);
+                if times >= UNREADABLE_RETRIES {
+                    tracing::warn!(
+                        url,
+                        times,
+                        "sessions keep ending on a frame that cannot be read at the same \
+                         position; the next one steps past it and records a gap"
+                    );
+                }
+            }
             // A session that ends before it caught up leaves its seam
             // window open: it is closed where the session got to.
             if let (true, Some(through_us)) = (seen.seam_open, seen.position_us)
@@ -616,6 +740,7 @@ impl Reader {
         failover: bool,
         lag: &mut LagTracker,
         stall: Duration,
+        resumed_at: ResumedAt,
         seen: &mut Seen,
     ) -> End {
         let mut clamped_notice = false;
@@ -667,6 +792,23 @@ impl Reader {
                              continuing uncompressed"
                         );
                     }
+                    // A message that arrived whole and cannot be read, as
+                    // opposed to a socket that broke.
+                    if matches!(e, ReadError::Frame(_) | ReadError::Decompress(_)) {
+                        let at = seen.next_key.or(resumed_at.key);
+                        if steps_past(at, resumed_at.skip_at, seen.skipped_total) {
+                            seen.skipped += 1;
+                            seen.skipped_total += 1;
+                            metrics::counter!(m::DROPPED, "reason" => m::DROPPED_UNREADABLE)
+                                .increment(1);
+                            tracing::warn!(
+                                error = %e,
+                                "a frame that could not be read on any attempt is stepped past"
+                            );
+                            continue;
+                        }
+                        seen.failed_at = at;
+                    }
                     return End::Reconnect(ReconnectReason::Error);
                 }
                 Ok(Some(Ok(f))) => f,
@@ -685,10 +827,18 @@ impl Reader {
                 }
                 Frame::Event(ev) => ev,
             };
+            // Frames stepped past are a loss between the position the
+            // session stood at and this event, unless the resume itself
+            // records a gap over it just below.
+            let stepped_from = (seen.skipped > 0)
+                .then(|| seen.position_us.or(resumed_at.from_us))
+                .flatten();
+            let mut gap_recorded = false;
             if !seen.delivered {
                 seen.delivered = true;
                 let resumed = resume::first_event(rule, ev.seq, ev.witness_us, clamped_notice);
                 if let Some((from_us, to_us, cause)) = resumed.gap {
+                    gap_recorded = true;
                     tracing::warn!(from_us, to_us, ?cause, "resume gap");
                     if self
                         .tx
@@ -732,6 +882,22 @@ impl Reader {
                     seen.seam_open = true;
                 }
             }
+            if seen.skipped > 0 {
+                let frames = std::mem::take(&mut seen.skipped);
+                seen.stepped = true;
+                if let (false, Some(from)) = (gap_recorded, stepped_from) {
+                    let (from_us, to_us) = stepped_gap(from, ev.witness_us);
+                    tracing::warn!(from_us, to_us, frames, "gap over frames stepped past");
+                    let gap = Item::Gap {
+                        from_us,
+                        to_us,
+                        cause: farsight_storage::codes::GapCause::Unreadable,
+                    };
+                    if self.tx.send(gap).await.is_err() {
+                        return End::Shutdown;
+                    }
+                }
+            }
             if let Body::Commit(op) = &ev.body {
                 lag.record(ev.witness_us, i64::try_from(op.rev.micros()).unwrap_or(0));
             }
@@ -770,6 +936,7 @@ impl Reader {
             #[cfg(feature = "harness")]
             let tapped = ev.clone();
             let witness_us = ev.witness_us;
+            let next_key = key_after(&ev);
             let tx = self.tx.clone();
             let send = tx.send(Item::Event(ev));
             tokio::pin!(send);
@@ -800,6 +967,7 @@ impl Reader {
                 let _ = tap.send(tapped);
             }
             seen.position_us = Some(witness_us);
+            seen.next_key = Some(next_key);
             for ev in std::mem::take(&mut self.pending_inject) {
                 let ev = at_position(ev, seen.position_us);
                 if self.tx.send(Item::Event(ev)).await.is_err() {
@@ -807,6 +975,18 @@ impl Reader {
                 }
             }
         }
+    }
+}
+
+/// The gap over frames stepped past: from where the session stood to
+/// the first event read after them. If that event is not later (two
+/// clocks, or a replay), the gap is the second before it: a gap is never
+/// empty.
+fn stepped_gap(from_us: i64, first_us: i64) -> (i64, i64) {
+    if from_us < first_us {
+        (from_us, first_us)
+    } else {
+        (first_us.saturating_sub(1_000_000), first_us)
     }
 }
 
@@ -825,6 +1005,73 @@ mod tests {
 
     const LONG: Duration = Duration::from_secs(3600);
     const SHORT: Duration = Duration::from_secs(2);
+
+    fn event(seq: Option<i64>, witness_us: i64) -> InEvent {
+        InEvent {
+            seq,
+            witness_us,
+            body: Body::OtherCommit,
+        }
+    }
+
+    #[test]
+    fn a_position_has_the_same_key_however_the_session_got_there() {
+        // v2: a session that delivered seq 500 and one resumed after it.
+        assert_eq!(key_after(&event(Some(500), 9)), 501);
+        assert_eq!(resume_key(Cursor::Seq(501)), Some(501));
+        // v1: the resume asks for the replay before the last event.
+        let w = 10_000_000_000;
+        let replay = resume::us(resume::V1_REPLAY);
+        assert_eq!(key_after(&event(None, w)), w - replay);
+        assert_eq!(resume_key(Cursor::TimeUs(w - replay)), Some(w - replay));
+        assert_eq!(resume_key(Cursor::Live), None);
+    }
+
+    #[test]
+    fn a_frame_unreadable_at_one_position_is_stepped_past_after_three_sessions() {
+        let mut stuck = Stuck::default();
+        let (a, b) = ("wss://a.example", "wss://b.example");
+        // Two sessions end at the same position: still taken for a fault
+        // in transit.
+        assert_eq!(stuck.failed(a, 501), 1);
+        assert_eq!(stuck.skip_at(a), None);
+        assert_eq!(stuck.failed(a, 501), 2);
+        assert_eq!(stuck.skip_at(a), None);
+        // The third: the next session steps past, there and only there.
+        assert_eq!(stuck.failed(a, 501), 3);
+        assert_eq!(stuck.skip_at(a), Some(501));
+        assert_eq!(stuck.skip_at(b), None);
+        assert!(steps_past(Some(501), stuck.skip_at(a), 0));
+        assert!(!steps_past(Some(777), stuck.skip_at(a), 0));
+        assert!(!steps_past(None, stuck.skip_at(a), 0));
+        assert!(!steps_past(None, None, 0));
+        // A failover in between does not forget the position.
+        assert_eq!(stuck.failed(b, 90), 1);
+        assert_eq!(stuck.skip_at(a), Some(501));
+        // A failure somewhere else on the instance starts the count again.
+        assert_eq!(stuck.failed(a, 640), 1);
+        assert_eq!(stuck.skip_at(a), None);
+        // Getting past clears it.
+        for _ in 0..3 {
+            stuck.failed(a, 640);
+        }
+        assert_eq!(stuck.skip_at(a), Some(640));
+        stuck.cleared(a);
+        assert_eq!(stuck.skip_at(a), None);
+        // A stream that is unreadable frame after frame is not stepped
+        // through.
+        assert!(steps_past(Some(1), Some(1), UNREADABLE_SKIP_MAX - 1));
+        assert!(!steps_past(Some(1), Some(1), UNREADABLE_SKIP_MAX));
+    }
+
+    #[test]
+    fn the_gap_over_stepped_frames_is_never_empty() {
+        assert_eq!(stepped_gap(100, 5_000_000), (100, 5_000_000));
+        // The first readable event is not later than the position: the
+        // second before it.
+        assert_eq!(stepped_gap(9_000_000, 5_000_000), (4_000_000, 5_000_000));
+        assert_eq!(stepped_gap(5_000_000, 5_000_000), (4_000_000, 5_000_000));
+    }
 
     #[test]
     fn silent_stalls_double_the_patience_up_to_a_bound() {

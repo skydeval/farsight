@@ -27,8 +27,13 @@ fn int(v: &Value) -> Result<i64, XrpcError> {
         .ok_or_else(|| XrpcError::invalid("invalid cursor"))
 }
 
-fn text(v: &Value) -> Result<String, XrpcError> {
+/// A record key from a cursor. Every cursor Farsight hands out holds a
+/// stored record key, so anything that is not one (a NUL byte, which
+/// the database would refuse with an error, among them) was not handed
+/// out and is an invalid cursor.
+fn rkey(v: &Value) -> Result<String, XrpcError> {
     v.as_str()
+        .filter(|s| farsight_core::RecordKey::parse(s).is_ok())
         .map(str::to_owned)
         .ok_or_else(|| XrpcError::invalid("invalid cursor"))
 }
@@ -37,7 +42,7 @@ fn text(v: &Value) -> Result<String, XrpcError> {
 pub fn id_rkey(cursor: Option<&str>) -> Result<Option<(i64, String)>, XrpcError> {
     let Some(c) = cursor else { return Ok(None) };
     match decode_raw(c)?.as_slice() {
-        [a, b] => Ok(Some((int(a)?, text(b)?))),
+        [a, b] => Ok(Some((int(a)?, rkey(b)?))),
         _ => Err(XrpcError::invalid("invalid cursor")),
     }
 }
@@ -46,7 +51,7 @@ pub fn id_rkey(cursor: Option<&str>) -> Result<Option<(i64, String)>, XrpcError>
 pub fn id_id_rkey(cursor: Option<&str>) -> Result<Option<(i64, i64, String)>, XrpcError> {
     let Some(c) = cursor else { return Ok(None) };
     match decode_raw(c)?.as_slice() {
-        [a, b, r] => Ok(Some((int(a)?, int(b)?, text(r)?))),
+        [a, b, r] => Ok(Some((int(a)?, int(b)?, rkey(r)?))),
         _ => Err(XrpcError::invalid("invalid cursor")),
     }
 }
@@ -97,6 +102,22 @@ mod tests {
         assert!(id(Some(&encode(&[json!("x")]))).is_err());
         assert!(id_rkey(Some(&encode(&[json!(1), json!(2)]))).is_err());
         assert!(id_id_rkey(Some(&encode(&[json!(1), json!("r")]))).is_err());
+    }
+
+    #[test]
+    fn a_cursor_holds_a_record_key_and_nothing_else() {
+        for bad in ["a\u{0}b", "", ".", "..", "a b", "a/b", "é", "a\nb"] {
+            assert!(
+                id_rkey(Some(&encode(&[json!(1), json!(bad)]))).is_err(),
+                "{bad:?}"
+            );
+            assert!(
+                id_id_rkey(Some(&encode(&[json!(1), json!(2), json!(bad)]))).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(id_rkey(Some(&encode(&[json!(1), json!("x".repeat(513))]))).is_err());
+        assert!(id_rkey(Some(&encode(&[json!(1), json!("3l2x:a.b_c~d-e")]))).is_ok());
     }
 
     mod properties {
@@ -152,12 +173,12 @@ mod tests {
             }
 
             /// What is encoded is what is decoded, for every integer and
-            /// every string, with or without space around the cursor.
+            /// every record key, with or without space around the cursor.
             #[test]
             fn encoded_keys_round_trip(
                 a in any::<i64>(),
                 b in any::<i64>(),
-                r in any::<String>(),
+                r in "[A-Za-z0-9._:~-]{1,64}".prop_filter("a record key", |r| r != "." && r != ".."),
                 pad in "[ \\t\\n]{0,3}",
             ) {
                 let wrap = |c: String| format!("{pad}{c}{pad}");
@@ -172,6 +193,17 @@ mod tests {
                 let c = wrap(encode(&[json!(a), json!(b)]));
                 prop_assert_eq!(micros_id(Some(&c)).unwrap(), Some((a, b)));
                 prop_assert!(id_rkey(Some(&c)).is_err() && id_id_rkey(Some(&c)).is_err());
+            }
+
+            /// A string where a record key belongs is accepted only if
+            /// it is one.
+            #[test]
+            fn a_key_is_taken_only_as_a_record_key(a in any::<i64>(), r in any::<String>()) {
+                let c = encode(&[json!(a), json!(r)]);
+                let valid = farsight_core::RecordKey::parse(&r).is_ok();
+                prop_assert_eq!(id_rkey(Some(&c)).is_ok(), valid);
+                let c = encode(&[json!(a), json!(a), json!(r)]);
+                prop_assert_eq!(id_id_rkey(Some(&c)).is_ok(), valid);
             }
 
             /// A cursor holding anything where an id belongs is accepted

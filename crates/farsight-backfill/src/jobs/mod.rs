@@ -155,6 +155,34 @@ pub async fn renew_lease(pool: &PgPool, did: &str, owner: &str) -> Result<(), sq
     Ok(())
 }
 
+/// The lease owner's name of job number `job` of `process`
+/// ([`crate::ctx::Ctx::lease_owner`]).
+pub fn job_lease_owner(process: &str, job: u64) -> String {
+    format!("{process}{}{job}", crate::ctx::LEASE_JOB_SEP)
+}
+
+/// Extends every lease held by one of `owners` to [`LEASE`] from now: the
+/// scheduler calls it on a timer for the jobs that are running. A job
+/// renews its own lease as it lists pages, but it can spend longer than a
+/// lease between two pages (resolving, waiting for a host's budget,
+/// purging), and a lease that ran out under a running job would let a
+/// second job start on the same DID. A lease whose job is gone is not
+/// among `owners` and runs out by itself.
+pub async fn renew_leases(pool: &PgPool, owners: &[String]) -> Result<u64, sqlx::Error> {
+    if owners.is_empty() {
+        return Ok(0);
+    }
+    Ok(sqlx::query(
+        "UPDATE job_leases SET lease_until = now() + make_interval(secs => $2)
+         WHERE lease_owner = ANY($1)",
+    )
+    .bind(owners)
+    .bind(LEASE.as_secs_f64())
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 /// Deletes the lease if `owner` holds it. A failure is ignored: the lease
 /// then runs out by itself.
 pub async fn release_lease(pool: &PgPool, did: &str, owner: &str) {

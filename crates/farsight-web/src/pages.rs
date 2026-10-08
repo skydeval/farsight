@@ -49,15 +49,23 @@ use ops::{ops_action, ops_page};
 pub use reset::{ResetError, ResetPage, perform_reset};
 use reset::{reset_page, reset_submit};
 use session::logout;
-pub use session::{Admin, oauth_session_key, session_key};
-pub(crate) use session::{admin, check_form, gate, metrics_rate_limited};
+pub use session::{Admin, Return, oauth_session_key, session_key};
+pub(crate) use session::{
+    admin, admin_cookie_value, check_form, clear_admin_cookie, gate, metrics_rate_limited,
+    set_admin_cookie, step_up,
+};
 pub use settings::SettingsPage;
-pub(crate) use settings::settings_base;
+pub(crate) use settings::{SIGNED_OUT, after_store, settings_base, token_changed};
 use settings::{settings_page, settings_save, settings_token};
 
-/// Name of the admin session cookie. Its value is looked up only as a
-/// hash bound to the admin DID (`session::oauth_session_key`).
+/// Name of the admin session cookie on a plain-HTTP origin (loopback
+/// sign-in). Its value is looked up only as a hash bound to the admin DID
+/// (`session::oauth_session_key`).
 pub const ADMIN_COOKIE: &str = "farsight_admin";
+/// Its name when the request arrived over HTTPS. A browser accepts a
+/// `__Host-` cookie only with `Secure`, `Path=/` and no `Domain`, so no
+/// other host of the same site can set or replace it.
+pub const ADMIN_COOKIE_HOST: &str = "__Host-farsight_admin";
 /// A session not used for this long is no longer accepted; every
 /// accepted request starts the wait again.
 pub const SESSION_IDLE: Duration = Duration::from_secs(12 * 3600);
@@ -65,6 +73,30 @@ pub const SESSION_IDLE: Duration = Duration::from_secs(12 * 3600);
 /// used. Also how long an address stays exempt from the process-wide
 /// sign-in bucket after a successful sign-in.
 pub const SESSION_ABSOLUTE: Duration = Duration::from_secs(7 * 24 * 3600);
+/// A sensitive action is carried out only in a session whose sign-in
+/// completed at most this long ago; an older session is asked to sign in
+/// again first. Sensitive: a settings change that touches `auth.*`,
+/// `net.*`, `backfill.plc_url` or `backfill.relay_url` or that widens
+/// `access.*` (`farsight_api::config_store::sensitive_changes`), rotating
+/// the admin token, and creating an API key.
+pub const STEP_UP_WINDOW: Duration = Duration::from_secs(600);
+
+/// [`STEP_UP_WINDOW`] as the running process applies it.
+#[cfg(feature = "harness")]
+pub fn step_up_window() -> Duration {
+    // Harness only: lets a browser probe watch a sign-in stop being
+    // fresh without waiting ten minutes.
+    std::env::var("FARSIGHT_HARNESS_STEP_UP_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(STEP_UP_WINDOW, Duration::from_secs)
+}
+
+/// [`STEP_UP_WINDOW`] as the running process applies it.
+#[cfg(not(feature = "harness"))]
+pub fn step_up_window() -> Duration {
+    STEP_UP_WINDOW
+}
 
 /// Status the server's background tasks publish for the dashboard.
 #[derive(Debug, Default)]

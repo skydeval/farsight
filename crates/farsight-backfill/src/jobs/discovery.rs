@@ -290,9 +290,8 @@ async fn run_inner(
     // row is interned as a placeholder charged to the requester.
     let mut named = Vec::with_capacity(lists.len());
     for list in &lists {
-        if let Some(id) = record_subject_list(ctx, x_id, list, requester).await? {
-            named.push(id);
-        }
+        let stored = record_subject_list(ctx, x_id, list, requester).await?;
+        run.truncated |= !note_list(stored, &mut named);
     }
     // (c) Listblocks on those lists (verified listblocks admit lists the
     // normal way).
@@ -348,6 +347,27 @@ async fn run_inner(
     })
 }
 
+/// Takes note of one list found naming the subject: `stored` is its id
+/// if it has a row now. Returns whether it does. A list whose placeholder
+/// a cap refused is a list the run found and could not record, so the
+/// run did not record everything: it is truncated, confirms no coverage,
+/// and removes nothing an earlier run recorded.
+fn note_list(
+    stored: Option<farsight_storage::ids::ListId>,
+    named: &mut Vec<farsight_storage::ids::ListId>,
+) -> bool {
+    match stored {
+        Some(id) => {
+            named.push(id);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Records that `list` names the subject `x_id`, interning the list as a
+/// placeholder if it has no row. `None` when a cap refused the
+/// placeholder: nothing is recorded.
 async fn record_subject_list(
     ctx: &Ctx,
     x_id: ActorId,
@@ -393,6 +413,22 @@ mod tests {
     use crate::net::NetError;
     use crate::resolve::ResolveError;
     use serde_json::json;
+
+    #[test]
+    fn a_list_that_could_not_be_recorded_truncates_the_run() {
+        use farsight_storage::ids::ListId;
+        let mut named = Vec::new();
+        let mut truncated = false;
+        // Two lists name the subject; a cap refuses the second one's row.
+        for stored in [Some(ListId::new(7)), None] {
+            truncated |= !note_list(stored, &mut named);
+        }
+        assert_eq!(named, [ListId::new(7)]);
+        assert!(truncated);
+        // Every list recorded: the run stays whole.
+        let mut named = Vec::new();
+        assert!(note_list(Some(ListId::new(1)), &mut named));
+    }
 
     #[test]
     fn only_an_answer_settles_a_reference() {

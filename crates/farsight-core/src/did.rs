@@ -41,7 +41,9 @@ pub enum DidError {
     InvalidWeb(String),
 }
 
-/// A validated `did:plc` or `did:web` DID.
+/// A validated `did:plc` or `did:web` DID, in its canonical form: a
+/// `did:web` hostname is held in lower case, whatever case it was
+/// written in.
 ///
 /// Ordering and equality are bytewise on the canonical string, which is
 /// what Postgres `COLLATE "C"` keys use, so a sorted `Vec<Did>` matches the
@@ -87,7 +89,7 @@ impl Did {
             }
             "web" => {
                 validate_web_id(id).map_err(|_| DidError::InvalidWeb(s.to_owned()))?;
-                Ok(Did(s.to_owned()))
+                Ok(Did(canonical_web(id)))
             }
             other => Err(DidError::UnsupportedMethod(other.to_owned())),
         }
@@ -120,6 +122,24 @@ impl Did {
         let host = host.split("%3a").next().unwrap_or(host);
         Some(host.to_ascii_lowercase())
     }
+}
+
+/// The canonical form of a valid `did:web` identifier: the hostname in
+/// lower case (a hostname names the same host in any case) and the port
+/// separator, if there is one, as `%3A`. Every spelling of one account's
+/// DID is therefore one [`Did`], one `actors` row and one entry of an
+/// exclusion list.
+fn canonical_web(id: &str) -> String {
+    let (host, port) = match id.find('%') {
+        Some(i) => (&id[..i], Some(&id[i + 3..])),
+        None => (id, None),
+    };
+    let mut out = format!("did:web:{}", host.to_ascii_lowercase());
+    if let Some(port) = port {
+        out.push_str("%3A");
+        out.push_str(port);
+    }
+    out
 }
 
 fn validate_web_id(id: &str) -> Result<(), ()> {
@@ -300,10 +320,29 @@ mod tests {
             [
                 "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
                 "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
-                "did:web:A.example",
+                "did:web:a.example",
                 "did:web:b.example",
             ]
         );
+    }
+
+    #[test]
+    fn every_spelling_of_a_did_web_is_one_did() {
+        let canonical = Did::parse("did:web:alice.example").unwrap();
+        for spelling in ["did:web:Alice.Example", "did:web:ALICE.EXAMPLE"] {
+            let d = Did::parse(spelling).unwrap();
+            assert_eq!(d, canonical);
+            assert_eq!(d.as_str(), "did:web:alice.example");
+        }
+        // The development form keeps its port, with one separator.
+        let local = Did::parse("did:web:LocalHost%3a2583").unwrap();
+        assert_eq!(local.as_str(), "did:web:localhost%3A2583");
+        assert_eq!(local, Did::parse("did:web:localhost%3A2583").unwrap());
+        assert_eq!(local.web_host().as_deref(), Some("localhost"));
+        // A did:plc has one spelling: upper case is not one.
+        assert!(Did::parse("did:plc:Z72I7HDYNMK6R22Z27H6TVUR").is_err());
+        // The method name is not folded either.
+        assert!(Did::parse("did:WEB:alice.example").is_err());
     }
 
     #[test]
@@ -318,8 +357,9 @@ mod tests {
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
 
         /// Any string at all: parsing returns, and what it accepts is the
-        /// input itself, within the length bound, in ASCII, of a method
-        /// the accessors agree on.
+        /// input in canonical form (itself, but for the case of a did:web
+        /// hostname and port separator), within the length bound, in
+        /// ASCII, of a method the accessors agree on.
         #[test]
         fn parsing_is_total_and_accepted_dids_round_trip(
             s in proptest::prop_oneof![
@@ -330,8 +370,15 @@ mod tests {
             ],
         ) {
             let Ok(did) = Did::parse(&s) else { return Ok(()) };
-            proptest::prop_assert_eq!(did.as_str(), s.as_str());
-            proptest::prop_assert_eq!(did.to_string(), s.clone());
+            proptest::prop_assert!(did.as_str().eq_ignore_ascii_case(&s));
+            let as_written = did.method() == DidMethod::Plc
+                || (s.bytes().all(|b| !b.is_ascii_uppercase()) && !s.contains("%3a"));
+            if as_written {
+                proptest::prop_assert_eq!(did.as_str(), s.as_str());
+            }
+            // The canonical form parses to itself.
+            proptest::prop_assert_eq!(Did::parse(did.as_str()), Ok(did.clone()));
+            proptest::prop_assert_eq!(did.to_string(), did.as_str());
             proptest::prop_assert_eq!(s.parse::<Did>(), Ok(did.clone()));
             proptest::prop_assert!(s.len() <= MAX_DID_LEN && s.is_ascii());
             match did.method() {

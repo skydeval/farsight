@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="0;url=/admin">
+<meta http-equiv="refresh" content="0;url={{ next|safe }}">
 <meta name="referrer" content="no-referrer">
 <title>Farsight</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{ crate::common::asset_version() }}">
@@ -13,7 +13,7 @@
 <header class="top"><span class="brand">Farsight</span></header>
 <main>
 <h1>Signed in</h1>
-<div class="card"><p><a class="button" href="/admin">Continue</a></p></div>
+<div class="card"><p><a class="button" href="{{ next|safe }}">Continue</a></p></div>
 </main>
 </body>
 </html>

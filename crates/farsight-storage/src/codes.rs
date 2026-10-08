@@ -262,6 +262,9 @@ code_enum! {
         SyncUnavailable = 4,
         /// A seam window whose re-read could not be finished.
         SeamUnrepaired = 5,
+        /// Frames that could not be read at one position, stepped past
+        /// after repeated attempts.
+        Unreadable = 6,
     }
 }
 
@@ -274,6 +277,7 @@ impl GapCause {
             GapCause::Failover => "Failover",
             GapCause::SyncUnavailable => "SyncUnavailable",
             GapCause::SeamUnrepaired => "SeamUnrepaired",
+            GapCause::Unreadable => "Unreadable",
         }
     }
 }
@@ -994,6 +998,7 @@ mod tests {
                 (G::Failover, 3),
                 (G::SyncUnavailable, 4),
                 (G::SeamUnrepaired, 5),
+                (G::Unreadable, 6),
             ],
         );
         pin(
@@ -1127,6 +1132,7 @@ mod tests {
             (GapCause::Failover, "Failover"),
             (GapCause::SyncUnavailable, "SyncUnavailable"),
             (GapCause::SeamUnrepaired, "SeamUnrepaired"),
+            (GapCause::Unreadable, "Unreadable"),
         ] {
             assert_eq!(c.api_name(), name);
             // The name is the variant's, as `getStats` has always shown it.

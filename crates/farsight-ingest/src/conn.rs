@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::dict::{self, LEGACY_DICT, V2_DICT};
+use crate::dict::{self, Dictionary, V2_DICT};
 use crate::frame::{self, Frame, Protocol};
 use crate::resume::Cursor;
 
@@ -114,7 +114,7 @@ pub struct Session {
     /// this.
     pub protocol: Protocol,
     /// Dictionary for binary frames, if compression was requested.
-    dict: Option<&'static [u8]>,
+    dict: Option<Dictionary>,
     /// The full endpoint URL connected to, query string (collections,
     /// cursor, compression) included.
     pub url: String,
@@ -183,8 +183,8 @@ pub async fn connect(
     };
     let dict = match (compress, protocol) {
         (false, _) => None,
-        (true, Protocol::V1) => Some(LEGACY_DICT),
-        (true, Protocol::V2) => Some(V2_DICT),
+        (true, Protocol::V1) => Some(Dictionary::Legacy),
+        (true, Protocol::V2) => Some(Dictionary::V2),
     };
     Ok(Session {
         ws,

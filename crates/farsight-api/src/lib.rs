@@ -55,6 +55,32 @@ pub const NSID_PREFIX: &str = "app.nearhorizon.farsight.";
 /// Longest a read waits for a query slot before `503 Overloaded`.
 pub const PERMIT_WAIT: Duration = Duration::from_secs(2);
 
+/// Query slots anonymous callers can never hold: a quarter of
+/// `rate_limit.query_concurrency`, at least one (none when there is only
+/// one slot). Callers with a token always find these free of anonymous
+/// load.
+pub fn reserved_slots(query_concurrency: u32) -> usize {
+    let n = query_concurrency.max(1) as usize;
+    if n < 2 { 0 } else { (n / 4).max(1) }
+}
+
+/// Query slots open to anonymous callers.
+pub fn anon_slots(query_concurrency: u32) -> usize {
+    query_concurrency.max(1) as usize - reserved_slots(query_concurrency)
+}
+
+/// Requests one anonymous address (IPv6: one /48) may have in flight: a
+/// quarter of the anonymous slots, at least one.
+pub fn anon_in_flight(query_concurrency: u32) -> usize {
+    (anon_slots(query_concurrency) / 4).max(1)
+}
+
+/// Requests one API key may have in flight: half of the slots, at least
+/// one.
+pub fn key_in_flight(query_concurrency: u32) -> usize {
+    (query_concurrency.max(1) as usize / 2).max(1)
+}
+
 /// The link to the running ingest.
 #[derive(Debug, Clone)]
 pub struct IngestLink {
@@ -83,6 +109,12 @@ pub struct ApiState {
     pub limiter: Arc<RateLimiter>,
     /// The global read-query semaphore.
     pub query_permits: Arc<Semaphore>,
+    /// The part of it open to anonymous callers ([`anon_slots`]): an
+    /// anonymous read takes a place here first, then a query slot.
+    pub anon_permits: Arc<Semaphore>,
+    /// Requests in flight per caller ([`anon_in_flight`],
+    /// [`key_in_flight`]).
+    pub in_flight: ratelimit::InFlight,
     /// The refreshed Cloudflare ranges that extend `proxy.trusted`.
     pub trust: Arc<ProxyTrust>,
     /// Cloudflare-share detector.
@@ -266,29 +298,56 @@ pub async fn client_ip_middleware(
     next.run(req).await
 }
 
+/// Whose bucket a request draws on.
+enum LimitKey {
+    /// An anonymous caller's address.
+    Ip(std::net::IpAddr),
+    /// A token's own key.
+    Named(String),
+}
+
 fn caller_limit(
-    st: &ApiState,
     ep: Endpoint,
     caller: &Caller,
     client: &ClientIp,
-) -> Option<(Class, String, Option<f32>)> {
+) -> Option<(Class, LimitKey, Option<f32>)> {
     match (ep.kind(), caller) {
         (Kind::Read | Kind::Stats, Caller::Anonymous) => {
-            Some((Class::AnonRead, ratelimit::ip_key(client.ip), None))
+            Some((Class::AnonRead, LimitKey::Ip(client.ip), None))
         }
-        (Kind::Read | Kind::Stats | Kind::BackfillStatus, Caller::Key(k)) => {
-            Some((Class::KeyRead, format!("key:{}", k.id), k.read_rps))
-        }
-        (Kind::RequestBackfill, Caller::Key(k)) => {
-            Some((Class::KeyBackfill, format!("key:{}", k.id), None))
-        }
-        (Kind::RequestBackfill, Caller::Admin) => {
-            Some((Class::AdminBackfill, "admin".to_owned(), None))
-        }
-        _ => {
-            let _ = st;
-            None
-        }
+        (Kind::Read | Kind::Stats | Kind::BackfillStatus, Caller::Key(k)) => Some((
+            Class::KeyRead,
+            LimitKey::Named(format!("key:{}", k.id)),
+            k.read_rps,
+        )),
+        (Kind::RequestBackfill, Caller::Key(k)) => Some((
+            Class::KeyBackfill,
+            LimitKey::Named(format!("key:{}", k.id)),
+            None,
+        )),
+        (Kind::RequestBackfill, Caller::Admin) => Some((
+            Class::AdminBackfill,
+            LimitKey::Named("admin".to_owned()),
+            None,
+        )),
+        _ => None,
+    }
+}
+
+/// The count a caller's requests in flight are kept under, and its
+/// bound. The admin token has none.
+fn flight_bound(
+    caller: &Caller,
+    client: &ClientIp,
+    query_concurrency: u32,
+) -> Option<(String, usize)> {
+    match caller {
+        Caller::Anonymous => Some((
+            format!("anon:{}", ratelimit::site_key(client.ip)),
+            anon_in_flight(query_concurrency),
+        )),
+        Caller::Key(k) => Some((format!("key:{}", k.id), key_in_flight(query_concurrency))),
+        Caller::Admin => None,
     }
 }
 
@@ -508,9 +567,13 @@ async fn run(
     }
     let caller = auth::authenticate(headers, &cfg.config, &st.keys)?;
     authorize(ep.kind(), &caller, cfg.config.access.reads)?;
-    if let Some((class, key, rps)) = caller_limit(st, ep, &caller, client) {
+    if let Some((class, key, rps)) = caller_limit(ep, &caller, client) {
         let limit = class.limit(&cfg.config, rps);
-        match st.limiter.check(class, &key, limit) {
+        let checked = match &key {
+            LimitKey::Ip(ip) => st.limiter.check_ip(class, *ip, limit),
+            LimitKey::Named(k) => st.limiter.check(class, k, limit),
+        };
+        match checked {
             Ok(h) => *rate = Some(h),
             Err((h, retry)) => {
                 ::metrics::counter!(m::RATE_LIMITED, "class" => class.label()).increment(1);
@@ -522,12 +585,34 @@ async fn run(
     if ep == Endpoint::RestartFirehose {
         return admin::restart_firehose(st).await;
     }
-    let _permit =
-        match tokio::time::timeout(PERMIT_WAIT, st.query_permits.clone().acquire_owned()).await {
-            Ok(Ok(p)) => p,
-            Ok(Err(_)) => return Err(XrpcError::overloaded("shutting down")),
-            Err(_) => return Err(XrpcError::overloaded("too many concurrent queries")),
-        };
+    // One caller holds a bounded number of slots, so a burst from one
+    // address or one key cannot occupy them all: its further requests
+    // wait for one of its own, as long as any request waits for a slot.
+    let slots = cfg.config.rate_limit.query_concurrency;
+    let _flight = match flight_bound(&caller, client, slots) {
+        Some((key, max)) => match st.in_flight.enter(&key, max, PERMIT_WAIT).await {
+            Some(f) => Some(f),
+            None => return Err(XrpcError::overloaded("too many concurrent queries")),
+        },
+        None => None,
+    };
+    let wait = |sem: &Arc<Semaphore>| {
+        let sem = sem.clone();
+        async move {
+            match tokio::time::timeout(PERMIT_WAIT, sem.acquire_owned()).await {
+                Ok(Ok(p)) => Ok(p),
+                Ok(Err(_)) => Err(XrpcError::overloaded("shutting down")),
+                Err(_) => Err(XrpcError::overloaded("too many concurrent queries")),
+            }
+        }
+    };
+    // Anonymous callers share a smaller pool, so that they cannot take
+    // the slots kept for callers with a token.
+    let _anon = match caller {
+        Caller::Anonymous => Some(wait(&st.anon_permits).await?),
+        _ => None,
+    };
+    let _permit = wait(&st.query_permits).await?;
     match ep {
         Endpoint::GetIncomingBlocks => handlers::get_incoming_blocks(st, &params).await,
         Endpoint::GetIncomingListBlocks => handlers::get_incoming_list_blocks(st, &params).await,
@@ -560,6 +645,40 @@ mod tests {
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             read_rps: None,
         })
+    }
+
+    #[test]
+    fn slots_are_divided_between_anonymous_callers_and_tokens() {
+        // (slots, reserved, anonymous, per address, per key)
+        for (n, reserved, anon, per_addr, per_key) in [
+            (32, 8, 24, 6, 16),
+            (8, 2, 6, 1, 4),
+            (4, 1, 3, 1, 2),
+            (2, 1, 1, 1, 1),
+            (1, 0, 1, 1, 1),
+            (0, 0, 1, 1, 1),
+        ] {
+            assert_eq!(reserved_slots(n), reserved, "{n}");
+            assert_eq!(anon_slots(n), anon, "{n}");
+            assert_eq!(anon_in_flight(n), per_addr, "{n}");
+            assert_eq!(key_in_flight(n), per_key, "{n}");
+        }
+        let client = |ip: &str| ClientIp {
+            ip: ip.parse().unwrap(),
+            peer: ip.parse().unwrap(),
+            trusted_peer: false,
+            https: false,
+        };
+        // An IPv6 caller is counted by its /48.
+        assert_eq!(
+            flight_bound(&Caller::Anonymous, &client("2001:db8:1:2::9"), 32),
+            Some(("anon:2001:db8:1::/48".to_owned(), 6))
+        );
+        assert_eq!(
+            flight_bound(&key(&["read"]), &client("192.0.2.1"), 32),
+            Some(("key:1".to_owned(), 16))
+        );
+        assert_eq!(flight_bound(&Caller::Admin, &client("192.0.2.1"), 32), None);
     }
 
     #[test]

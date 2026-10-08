@@ -63,6 +63,7 @@ use tokio::sync::Notify;
 use self::metrics::Page;
 use crate::pages::WebState;
 use farsight_storage::ids::ActorId;
+use farsight_storage::ui_rows::Find;
 
 /// Rows per page of every public table. There is no `limit` parameter.
 pub const PAGE_ROWS: i64 = 50;
@@ -71,6 +72,11 @@ pub const PAGE_ROWS: i64 = 50;
 /// running to the query timeout. Beyond it: "more than 5,000,000", and
 /// page controls without a last page.
 pub const COUNT_CAP: i64 = 5_000_000;
+/// How long a section's count answers the views that follow the one
+/// that read it: as long as a cache in front of Farsight keeps the page.
+pub const COUNT_MEMO: Duration = Duration::from_secs(30);
+/// Counts remembered at once.
+pub const COUNT_MEMO_MAX: usize = 4096;
 /// Longest a page waits for a render slot before `503`.
 pub const RENDER_WAIT: Duration = Duration::from_secs(2);
 /// How long the ids of `public_ui.excluded_dids` are reused before they
@@ -128,6 +134,136 @@ pub struct RenderGate {
 #[derive(Debug)]
 pub struct RenderSlot<'a> {
     gate: &'a RenderGate,
+}
+
+/// What a page holds while it renders: its render slot and its address's
+/// place among the renders under way. Dropping it frees both.
+#[derive(Debug)]
+pub struct Rendering<'a> {
+    _slot: RenderSlot<'a>,
+    _flight: farsight_api::ratelimit::Flight,
+}
+
+/// What a remembered count is of.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Which {
+    /// A section (`Counted` as a number), its key, and whether
+    /// taken-down accounts count.
+    Section(u8, i64, bool),
+    /// The lists naming an account.
+    NamingLists(i64),
+    /// The listblock records on the lists naming an account.
+    NamingListblocks(i64),
+}
+
+/// A remembered count's key: what was counted, under which exclusion
+/// list, with which filter.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CountKey {
+    which: Which,
+    /// The exclusion list's identity: a refreshed list is another key.
+    excluded: usize,
+    find: Option<(Vec<i64>, Option<String>)>,
+}
+
+impl CountKey {
+    /// The key of a count of `which` under `w`, filtered by `find`.
+    pub fn new(which: Which, w: &Withheld, find: Option<&Find>) -> CountKey {
+        CountKey {
+            which,
+            excluded: Arc::as_ptr(&w.ids) as usize,
+            find: find.map(|f| (f.ids.iter().map(|i| i.get()).collect(), f.pattern.clone())),
+        }
+    }
+}
+
+/// Section counts read in the last [`COUNT_MEMO`]. Counting a section
+/// scans its index, which for a large account is the most expensive
+/// thing a page does; a page that is viewed often, or asked for under
+/// many addresses, counts once in that time.
+#[derive(Debug)]
+pub struct CountMemo {
+    counts: Mutex<HashMap<CountKey, (Instant, i64)>>,
+    ttl: Duration,
+}
+
+impl Default for CountMemo {
+    fn default() -> Self {
+        CountMemo::new(count_memo_ttl())
+    }
+}
+
+#[cfg(feature = "harness")]
+fn count_memo_ttl() -> Duration {
+    // Harness only: a harness that changes rows between two views of a
+    // page sets 0 to read every count afresh.
+    std::env::var("FARSIGHT_HARNESS_COUNT_MEMO_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(COUNT_MEMO, Duration::from_secs)
+}
+
+#[cfg(not(feature = "harness"))]
+fn count_memo_ttl() -> Duration {
+    COUNT_MEMO
+}
+
+impl CountMemo {
+    /// A memo that keeps a count for `ttl`.
+    pub fn new(ttl: Duration) -> CountMemo {
+        CountMemo {
+            counts: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// The count under `key`, if it was read within the lifetime.
+    pub fn get(&self, key: &CountKey) -> Option<i64> {
+        self.get_at(key, Instant::now())
+    }
+
+    fn get_at(&self, key: &CountKey, now: Instant) -> Option<i64> {
+        let m = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(key)
+            .filter(|(at, _)| now.saturating_duration_since(*at) < self.ttl)
+            .map(|(_, n)| *n)
+    }
+
+    /// Remembers a count just read.
+    pub fn put(&self, key: CountKey, n: i64) {
+        self.put_at(key, n, Instant::now());
+    }
+
+    fn put_at(&self, key: CountKey, n: i64, now: Instant) {
+        if self.ttl.is_zero() {
+            return;
+        }
+        let mut m = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() >= COUNT_MEMO_MAX && !m.contains_key(&key) {
+            m.retain(|_, (at, _)| now.saturating_duration_since(*at) < self.ttl);
+            // Still full of live counts: start over rather than grow.
+            if m.len() >= COUNT_MEMO_MAX {
+                m.clear();
+            }
+        }
+        m.insert(key, (now, n));
+    }
+
+    /// Counts held now, expired ones not yet dropped included.
+    pub fn len(&self) -> usize {
+        self.counts.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Whether no count is held.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Renders one address (IPv6: one /48) may have under way: half of the
+/// render slots, at least one. The rest stay free for other visitors.
+pub fn renders_per_address(slots: usize) -> usize {
+    (slots / 2).max(1)
 }
 
 impl Drop for RenderSlot<'_> {
@@ -258,6 +394,10 @@ pub struct PublicState {
     pub pending: Mutex<HashMap<String, PendingEnable>>,
     /// How far the handle pass has got.
     pub progress: pass::Progress,
+    /// Section counts read in the last half minute.
+    pub counts: CountMemo,
+    /// Page renders under way per client address.
+    pub rendering: farsight_api::ratelimit::InFlight,
 }
 
 impl PublicState {
@@ -276,12 +416,21 @@ impl PublicState {
                 return Ok(c.withheld.clone());
             }
         }
-        let list = &cfg.config.public_ui.excluded_dids;
+        // In canonical form, as the stored DIDs they are compared with
+        // are: a hand-edited list may spell a did:web host in another
+        // case.
+        let list: Vec<String> = cfg
+            .config
+            .public_ui
+            .excluded_dids
+            .iter()
+            .map(|d| Did::parse(d).map_or_else(|_| d.clone(), Did::into_string))
+            .collect();
         let ids = if list.is_empty() {
             Vec::new()
         } else {
             let mut conn = pool.acquire().await?;
-            farsight_storage::public::actor_ids(&mut conn, list)
+            farsight_storage::public::actor_ids(&mut conn, &list)
                 .await
                 .map_err(|e| match e {
                     farsight_storage::StorageError::Db(e) => e,
@@ -289,7 +438,7 @@ impl PublicState {
                 })?
         };
         let withheld = Withheld {
-            dids: Arc::new(list.iter().cloned().collect()),
+            dids: Arc::new(list.into_iter().collect()),
             ids: Arc::new(ids),
         };
         *self.excluded.lock().unwrap_or_else(|e| e.into_inner()) = Some(ExcludedCache {
@@ -598,11 +747,14 @@ pub struct Req<'a> {
     pub st: &'a WebState,
     /// The config in force for this request.
     pub cfg: Arc<LoadedConfig>,
+    /// The client address the request was limited by.
+    pub addr: IpAddr,
 }
 
-pub(crate) fn client_key(client: Option<ClientIp>) -> String {
-    let ip = client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip);
-    farsight_api::ratelimit::ip_key(ip)
+/// The address a request is limited by; the unspecified address when the
+/// listener attached none.
+pub(crate) fn client_addr(client: Option<ClientIp>) -> IpAddr {
+    client.map_or(IpAddr::from([0, 0, 0, 0]), |c| c.ip)
 }
 
 /// Applies the toggle and the page's rate class, keyed by client address
@@ -617,11 +769,12 @@ fn gate<'a>(
         return Err((cfg, Fail::Absent));
     }
     let limit = class.limit(&cfg.config, None);
-    if let Err((_, retry)) = st.api.limiter.check(class, &client_key(client), limit) {
+    let addr = client_addr(client);
+    if let Err((_, retry)) = st.api.limiter.check_ip(class, addr, limit) {
         farsight_api::metrics::rate_limited(class);
         return Err((cfg, Fail::Limited(retry)));
     }
-    Ok(Req { st, cfg })
+    Ok(Req { st, cfg, addr })
 }
 
 impl Req<'_> {
@@ -633,14 +786,26 @@ impl Req<'_> {
 
     /// Takes a render slot and a slot of the global read semaphore for the
     /// page's queries (which run one at a time), each waiting at most 2 s.
+    /// One address holds at most [`renders_per_address`] of the render
+    /// slots; beyond that the answer is the rate limit's `429`, so one
+    /// visitor's slow pages do not turn everyone else's into `503`.
     pub async fn render_slots(
         &self,
-    ) -> Result<(RenderSlot<'_>, tokio::sync::OwnedSemaphorePermit), Fail> {
+    ) -> Result<(Rendering<'_>, tokio::sync::OwnedSemaphorePermit), Fail> {
         let cfg = self.config();
         let limit = cfg
             .public_ui
             .query_concurrency
             .min(cfg.rate_limit.query_concurrency) as usize;
+        let flight = self
+            .st
+            .public
+            .rendering
+            .try_enter(
+                &farsight_api::ratelimit::site_key(self.addr),
+                renders_per_address(limit),
+            )
+            .ok_or(Fail::Limited(1))?;
         let slot = self
             .st
             .public
@@ -655,7 +820,13 @@ impl Req<'_> {
         .await
         .map_err(|_| Fail::Busy)?
         .map_err(|_| Fail::Busy)?;
-        Ok((slot, permit))
+        Ok((
+            Rendering {
+                _slot: slot,
+                _flight: flight,
+            },
+            permit,
+        ))
     }
 
     /// The exclusion list for this request's config
@@ -851,6 +1022,69 @@ pub fn router() -> Router<Arc<WebState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_count_is_remembered_for_its_lifetime_and_per_filter() {
+        let memo = CountMemo::new(Duration::from_secs(30));
+        let w = Withheld {
+            dids: Arc::default(),
+            ids: Arc::default(),
+        };
+        let key = |taken_down, find: Option<&Find>| {
+            CountKey::new(Which::Section(0, 7, taken_down), &w, find)
+        };
+        let t0 = Instant::now();
+        memo.put_at(key(false, None), 41, t0);
+        assert_eq!(memo.get_at(&key(false, None), t0), Some(41));
+        assert_eq!(
+            memo.get_at(&key(false, None), t0 + Duration::from_secs(29)),
+            Some(41)
+        );
+        assert_eq!(
+            memo.get_at(&key(false, None), t0 + Duration::from_secs(30)),
+            None
+        );
+        // Another switch, another filter, another exclusion list: other
+        // counts.
+        assert_eq!(memo.get_at(&key(true, None), t0), None);
+        let find = Find {
+            ids: Vec::new(),
+            pattern: Some("%alice%".into()),
+        };
+        assert_eq!(memo.get_at(&key(false, Some(&find)), t0), None);
+        let other = Withheld {
+            dids: Arc::default(),
+            ids: Arc::new(vec![ActorId::new(1)]),
+        };
+        assert_eq!(
+            memo.get_at(
+                &CountKey::new(Which::Section(0, 7, false), &other, None),
+                t0
+            ),
+            None
+        );
+        assert_eq!(
+            memo.get_at(&CountKey::new(Which::NamingLists(7), &w, None), t0),
+            None
+        );
+        // The memo does not grow past its bound.
+        for i in 0..(COUNT_MEMO_MAX as i64 + 10) {
+            memo.put_at(CountKey::new(Which::NamingLists(i), &w, None), i, t0);
+        }
+        assert!(memo.len() <= COUNT_MEMO_MAX);
+        // A lifetime of zero remembers nothing.
+        let off = CountMemo::new(Duration::ZERO);
+        off.put_at(key(false, None), 1, t0);
+        assert!(off.is_empty());
+    }
+
+    #[test]
+    fn one_address_renders_at_most_half_the_slots() {
+        assert_eq!(renders_per_address(8), 4);
+        assert_eq!(renders_per_address(3), 1);
+        assert_eq!(renders_per_address(1), 1);
+        assert_eq!(renders_per_address(0), 1);
+    }
 
     #[test]
     fn robots_follow_the_settings() {

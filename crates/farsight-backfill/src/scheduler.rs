@@ -254,6 +254,14 @@ impl Work {
     }
 }
 
+/// The lease owners' names of the running jobs `jobs` of `process`, in
+/// order.
+fn lease_owners(process: &str, jobs: impl Iterator<Item = u64>) -> Vec<String> {
+    let mut owners: Vec<String> = jobs.map(|n| jobs::job_lease_owner(process, n)).collect();
+    owners.sort_unstable();
+    owners
+}
+
 /// A dispatched job's hold on the pool: one worker of its tier, its
 /// in-flight markers, its meter and the renewal of its claim. Dropping it
 /// gives them back and wakes the dispatcher, so they are returned when the
@@ -633,11 +641,21 @@ impl Scheduler {
         }
     }
 
-    /// Renews the claims on the queue entries of the jobs that run.
+    /// Renews what the jobs that run hold: the claims on their queue
+    /// entries, and their DID leases.
     async fn renew_claims(&self) {
-        let ids: Vec<QueueId> = self.st().claims.iter().copied().collect();
+        let (ids, owners): (Vec<QueueId>, Vec<String>) = {
+            let s = self.st();
+            (
+                s.claims.iter().copied().collect(),
+                lease_owners(&self.ctx.process, s.jobs.keys().copied()),
+            )
+        };
         if let Err(e) = queue::renew(&self.ctx.pool, &ids, &self.ctx.process).await {
             tracing::warn!(error = %e, "renewing queue claims failed");
+        }
+        if let Err(e) = jobs::renew_leases(&self.ctx.pool, &owners).await {
+            tracing::warn!(error = %e, "renewing job leases failed");
         }
     }
 
@@ -920,7 +938,7 @@ impl Scheduler {
         if let Err(e) = recorded {
             tracing::warn!(error = e, "recording a panicked job failed");
         }
-        let lease = format!("{}{}{job}", ctx.process, crate::ctx::LEASE_JOB_SEP);
+        let lease = jobs::job_lease_owner(&ctx.process, job);
         let _ = sqlx::query("DELETE FROM job_leases WHERE lease_owner = $1")
             .bind(&lease)
             .execute(&ctx.pool)
@@ -1152,6 +1170,17 @@ fn storage_as_sqlx(e: farsight_storage::StorageError) -> sqlx::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_leases_renewed_are_those_of_the_jobs_that_run() {
+        assert_eq!(
+            lease_owners("backfill-1", [12, 3].into_iter()),
+            ["backfill-1#12", "backfill-1#3"]
+        );
+        assert!(lease_owners("p", std::iter::empty()).is_empty());
+        // The name a job takes its lease under.
+        assert_eq!(jobs::job_lease_owner("p", 7), "p#7");
+    }
 
     #[test]
     fn tier3_pacing_starts_empty_and_holds_one_job_at_least() {

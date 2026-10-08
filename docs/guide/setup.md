@@ -7,7 +7,12 @@ page has the rest.
 
 The setup token is re-printed every 10 minutes, and
 `docker exec farsight farsight setup-token` prints it on demand
-(`--rotate` replaces it). To keep the wizard off the network until it is
+(`--rotate` replaces it). Replacing the token also ends every wizard
+session that was opened with the old one, so that is what to do if the
+token may have been seen by someone else. A wizard session lasts 12
+hours at most; enter the token again to go on.
+
+To keep the wizard off the network until it is
 done, publish the port on loopback only and use an SSH tunnel:
 
 ```sh
@@ -37,6 +42,13 @@ The wizard asks for:
 - reverse-proxy trust (it has a preset for Cloudflare);
 - the Postgres connection string.
 
+The Jetstream and Postgres tests connect to whatever address you
+enter, private addresses included, since both may well be on your own
+network. Each attempt is limited to 10 seconds, and both can be run
+only by someone who has entered the setup token. That is one more
+reason to keep the wizard off the network, as above, until it is
+done.
+
 It then writes `/etc/farsight/config.toml` and switches Farsight to
 normal mode in-process: it runs migrations, connects to the firehose and
 starts serving the API. A config reset (Settings → Reset) returns it to
@@ -44,7 +56,23 @@ the wizard; the database is kept.
 
 Set `POSTGRES_PASSWORD` in the environment before the first start; the
 compose file passes the matching connection string to Farsight, and the
-wizard's storage step is prefilled with it.
+wizard's storage step is prefilled with it. Without it the password is
+`farsight`, and Farsight logs a warning at every start for as long as
+it connects with that. The bundled Postgres is not published outside
+the compose network, but set a password of your own all the same. To
+change it later, change it in Postgres first
+(`ALTER ROLE farsight PASSWORD '…'`), then set `POSTGRES_PASSWORD` and
+restart.
+
+## The image
+
+The compose file names the image by version
+(`ghcr.io/skydeval/farsight:0.6.0`), not `latest`, and builds it from
+the checkout when it is not there. A checkout and its compose file
+therefore always run the version they describe; to move to another
+version, check it out and run `docker compose up -d --build`. The
+Dockerfile names its two base images by digest, so a rebuild starts
+from the same images until the Dockerfile changes.
 
 ## The backfill container
 

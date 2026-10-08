@@ -25,6 +25,7 @@ use askama::Template;
 use axum::http::StatusCode;
 use axum::response::Response;
 use farsight_api::params::Params;
+use farsight_api::ratelimit::Class;
 use farsight_api::{handlers, public_ui};
 use farsight_core::{Did, RecordKey};
 use farsight_storage::codes::ActorStatus;
@@ -41,8 +42,8 @@ use super::search::{self, Authority, Target};
 use super::text::{Stamp, card_href, clean, did_href, list_href, list_uri, paragraphs, thousands};
 use super::warming::{Asked, Known};
 use super::{
-    COUNT_CAP, Cache, Chrome, Fail, OG_ACCOUNT, OG_INSTANCE, OG_LIST, PAGE_ROWS, Req, Withheld,
-    chrome, metrics as m, page, redirect,
+    COUNT_CAP, Cache, Chrome, CountKey, Fail, OG_ACCOUNT, OG_INSTANCE, OG_LIST, PAGE_ROWS, Req,
+    Which, Withheld, chrome, metrics as m, page, redirect,
 };
 use crate::pages::handle_to_did;
 use farsight_storage::ids::ActorId;
@@ -399,6 +400,9 @@ impl Shown<'_> {
 /// section's size costs: about a tenth of a second for 40,000 rows.
 /// [`Total::Unknown`] when the query fails or times out; the section
 /// still renders.
+///
+/// A count that was read is kept for [`super::COUNT_MEMO`] and answers
+/// every view of the same section with the same filters in that time.
 async fn total(
     r: &Req<'_>,
     what: Counted,
@@ -407,6 +411,10 @@ async fn total(
     taken_down: bool,
     find: Option<&Find>,
 ) -> Total {
+    let memo = CountKey::new(Which::Section(what as u8, key.get(), taken_down), w, find);
+    if let Some(n) = r.st.public.counts.get(&memo) {
+        return total_of(Some(n));
+    }
     let n = async {
         let mut tx = r.st.api.read_tx().await.ok()?;
         let n = store::bounded_count(&mut tx, what, key, &w.ids, taken_down, find, COUNT_CAP)
@@ -414,8 +422,12 @@ async fn total(
             .ok()?;
         let _ = tx.rollback().await;
         Some(n)
-    };
-    total_of(n.await)
+    }
+    .await;
+    if let Some(n) = n {
+        r.st.public.counts.put(memo, n);
+    }
+    total_of(n)
 }
 
 /// What a table of accounts says about its length: the count of the rows
@@ -485,16 +497,25 @@ async fn counts(
 /// The listblock records on the lists naming an account, added up;
 /// `None` when the query fails or times out.
 async fn naming_listblocks(r: &Req<'_>, subject: ActorId, w: &Withheld) -> Option<i64> {
+    let memo = CountKey::new(Which::NamingListblocks(subject.get()), w, None);
+    if let Some(n) = r.st.public.counts.get(&memo) {
+        return Some(n);
+    }
     let mut tx = r.st.api.read_tx().await.ok()?;
     let n = farsight_storage::ui_rows::lists_naming_listblocks(&mut tx, subject, &w.ids)
         .await
         .ok()?;
     let _ = tx.rollback().await;
+    r.st.public.counts.put(memo, n);
     Some(n)
 }
 
 /// The same for the lists naming an account.
 async fn naming_total(r: &Req<'_>, subject: ActorId, w: &Withheld, find: Option<&Find>) -> Total {
+    let memo = CountKey::new(Which::NamingLists(subject.get()), w, find);
+    if let Some(n) = r.st.public.counts.get(&memo) {
+        return total_of(Some(n));
+    }
     let n = async {
         let mut tx = r.st.api.read_tx().await.ok()?;
         let n = farsight_storage::ui_rows::lists_naming_count(
@@ -504,8 +525,12 @@ async fn naming_total(r: &Req<'_>, subject: ActorId, w: &Withheld, find: Option<
         .ok()?;
         let _ = tx.rollback().await;
         Some(n)
-    };
-    total_of(n.await)
+    }
+    .await;
+    if let Some(n) = n {
+        r.st.public.counts.put(memo, n);
+    }
+    total_of(n)
 }
 
 /// Parameters for a handler that is called for its freshness only: the
@@ -520,9 +545,12 @@ fn freshness_params(pairs: &[(&str, &str)]) -> Params {
 }
 
 /// A complete page may be kept for half a minute. One that held rows
-/// back is about to change and is not kept at all.
-fn cache_for(held: usize) -> Cache {
-    if held == 0 {
+/// back is about to change and is not kept at all; nor is one whose own
+/// handle could not be checked this time (`handle_settled` false), which
+/// would otherwise be served without its handle to everyone for as long
+/// as the copy lives.
+fn cache_for(held: usize, handle_settled: bool) -> Cache {
+    if held == 0 && handle_settled {
         Cache::Public(30)
     } else {
         Cache::NoStore
@@ -583,9 +611,21 @@ async fn finder(r: &Req<'_>, q: &Params) -> Result<Option<Finder>, Fail> {
     }
     let mut ids = Vec::new();
     let whole = text.to_ascii_lowercase();
-    if q.get("go") == Some("1")
+    // A lookup of a typed handle is charged to the visitor's own lookup
+    // class first, like a search: the page class alone would let one
+    // address spend the process-wide handle budget.
+    if paging::go(q)
         && whole.contains('.')
         && farsight_core::did::is_valid_hostname(&whole)
+        && r.st
+            .api
+            .limiter
+            .check_ip(
+                Class::UiLookup,
+                r.addr,
+                Class::UiLookup.limit(r.config(), None),
+            )
+            .is_ok()
         && take_budget(r.st, r.config())
     {
         let found =
@@ -1029,9 +1069,12 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     }
     // One resolution per page view at most, only for a known subject, and
     // before the render slot so a slow host holds none.
-    let handle = match actor {
-        Some(_) => page_handle(r.st, cfg, did).await.map(|h| clean(&h)),
-        None => None,
+    let (handle, handle_settled) = match actor {
+        Some(_) => {
+            let h = page_handle(r.st, cfg, did).await;
+            (h.handle.map(|h| clean(&h)), h.settled)
+        }
+        None => (None, true),
     };
     // The History tab reads the PLC directory: only when it is the tab
     // asked for, only for a known subject, and before the render slot.
@@ -1361,7 +1404,13 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
         blocking_lists,
         updated: last_updated(&fresh),
     };
-    Ok(page(&t, StatusCode::OK, cfg, cache_for(held), true))
+    Ok(page(
+        &t,
+        StatusCode::OK,
+        cfg,
+        cache_for(held, handle_settled),
+        true,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1481,7 +1530,9 @@ pub async fn list(
             link: None,
         });
     };
-    let handle = page_handle(r.st, cfg, owner).await.map(|h| clean(&h));
+    let owner_handle = page_handle(r.st, cfg, owner).await;
+    let handle_settled = owner_handle.settled;
+    let handle = owner_handle.handle.map(|h| clean(&h));
     let about = {
         let mut conn = r.st.api.pool.acquire().await?;
         queries::list_about(&mut conn, info.id).await?
@@ -1682,7 +1733,13 @@ pub async fn list(
         updated: last_updated(&fresh),
         uri,
     };
-    Ok(page(&t, StatusCode::OK, cfg, cache_for(held), true))
+    Ok(page(
+        &t,
+        StatusCode::OK,
+        cfg,
+        cache_for(held, handle_settled),
+        true,
+    ))
 }
 
 #[cfg(test)]
@@ -1725,6 +1782,14 @@ mod tests {
             state_words("quarantined"),
             ("State: quarantined.".to_owned(), false)
         );
+    }
+
+    #[test]
+    fn only_a_complete_page_is_kept_by_a_cache() {
+        assert!(matches!(cache_for(0, true), Cache::Public(30)));
+        // Rows held back, or the page's own handle not checked this time.
+        assert!(matches!(cache_for(3, true), Cache::NoStore));
+        assert!(matches!(cache_for(0, false), Cache::NoStore));
     }
 
     #[test]

@@ -451,6 +451,7 @@ lost. Gaps are rows of `firehose_gaps` with a cause:
 | `failover` | 3 | A change of Jetstream instance that was clamped, or had no safe rewind. |
 | `sync_unavailable` | 4 | An interval spent on a v1 Jetstream. |
 | `seam_unrepaired` | 5 | The re-read of a seam window failed 5 times: the gap is the window. |
+| `unreadable` | 6 | Three sessions in a row ended on a frame that could not be read at the same position, and the next one stepped past it: the gap runs from that position to the first event read after it. |
 
 A disconnected or lagging stream needs no row: it is the synthetic gap
 of the [gap predicate](#the-gap-predicate), and it ends by itself when

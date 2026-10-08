@@ -138,14 +138,23 @@ afresh for the new subject, `witnessed_at` is stamped as for an insert
 set to the author's current key. The removal of the old row is
 recorded in history.
 
-If the new version of an update is **refused** (by
-`limits.listblocks_per_author`, `limits.host_listblocks` or the intern
-rate; exceeding the trigger cap or the admission rate stores the row
-uncounted, which is not a refusal), the old row is deleted and a
-refusal tombstone with rev `E − 1` is written, where `E` is the rev of
-the update. Farsight therefore never keeps reporting the superseded
-target, and a later listing at rev ≥ `E` can still apply the new
-version (tombstones are in [storage.md](storage.md#tombstones)).
+If the new version of a **subject-changing** update is **refused** (by
+`limits.listblocks_per_author`, `limits.host_listblocks`, the intern
+rate, the storage budget or the hard ceiling; exceeding the trigger
+cap or the admission rate stores the row uncounted, which is not a
+refusal), the old row is deleted and a refusal tombstone with rev
+`E − 1` is written, where `E` is the rev of the update. Farsight
+therefore never keeps reporting the superseded target, and a later
+listing at rev ≥ `E` can still apply the new version (tombstones are
+in [storage.md](storage.md#tombstones)).
+
+An update that names the **same** target and is refused by a gate (a
+closed host bucket, the budget, the ceiling) leaves the stored row as
+it is. The row still says what the repository says: the target did
+not change, only its `createdAt` and rev are not brought up to date.
+The refusal is counted and recorded as a `refused` debt like any
+other. The same holds for a block that names the same subject and a
+listitem that names the same list and subject.
 
 There is one exception to stickiness. A clean run of an author who
 holds a `capped` debt re-evaluates that author's uncounted rows in

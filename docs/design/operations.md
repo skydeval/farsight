@@ -105,7 +105,7 @@ farsight-backfill --version
 |---|---|
 | `farsight` | Runs the server. |
 | `farsight setup-token` | Prints the setup token, creating one if none exists. Refuses (exit 1) when a configuration file exists: a configured instance has no setup token. |
-| `farsight setup-token --rotate` | Replaces the setup token and prints the new one. |
+| `farsight setup-token --rotate` | Replaces the setup token and prints the new one. Every open wizard session ends at its next request: a session is good only for the token it was opened with. |
 | `farsight admin-did` | Prints the admin DID in force and where it comes from: the environment (`FARSIGHT__ACCESS__ADMIN_DID`) or the file. Makes no network request. |
 | `farsight set-admin-did <did>` | Sets `access.admin_did` in the configuration file. This is the way to change the admin account, and the recovery when the account is lost or was mistyped. |
 | `farsight --version`, `-V` | Prints the version. |
@@ -170,7 +170,7 @@ deployment supplies them in the environment.
 | `FARSIGHT_SETUP_BIND` | server | Restricts the listener while in setup mode, for example `127.0.0.1` or `127.0.0.1:8080`. |
 | `RUST_LOG` | both processes | Log filter; the default is `info,sqlx=warn,hyper=warn`. |
 | `FARSIGHT_PORT` | `compose.yml` | Host side of the published web port (default `8080`). |
-| `POSTGRES_PASSWORD` | `compose.yml` | Password of the bundled Postgres, also placed in `FARSIGHT__STORAGE__DATABASE_URL`. |
+| `POSTGRES_PASSWORD` | `compose.yml` | Password of the bundled Postgres, also placed in `FARSIGHT__STORAGE__DATABASE_URL`. Unset, it is `farsight`, and the server logs a warning at every start while the database is reached with that password. |
 
 A key set from the environment is **locked**: the admin UI shows it
 but cannot change it, and an API procedure that would write it answers
@@ -197,6 +197,19 @@ reports which of the changed keys still need a restart.
 | `access.admin_ui` | at start only; an edit from the running server that would change it is refused |
 | `access.admin_did` | at start only; set with `farsight set-admin-did`, then restart |
 | `server.bind`, `server.hostname`, `[storage]`, `[firehose]`, `[limits]`, `[net]`, `[metrics]`, `rate_limit.query_concurrency` | restart `farsight` |
+
+One use of `backfill.plc_url` is start-only in the server as well: the
+admin sign-in resolves the admin DID through the directory that was
+named when the process started, whatever a later save says
+([web-ui.md](web-ui.md#the-oauth-flow)). Handles and profile cards
+follow the saved value at once.
+
+From the admin UI, a save that changes `[auth]`, `[net]`,
+`backfill.plc_url` or `backfill.relay_url`, or that opens `[access]`
+further, is stored only in a session that signed in within the last
+10 minutes
+([web-ui.md](web-ui.md#a-fresh-sign-in-for-sensitive-actions)). A
+stored change of `auth.admin_token_sha256` ends every admin session.
 
 `access.admin_ui` is start-only for two reasons: an edit made in the
 admin UI would remove the page it was made from, and a change waiting
@@ -228,8 +241,8 @@ Defaults are the values a key takes when it is absent.
 | Key | Default | Meaning |
 |---|---|---|
 | `bind` | `"0.0.0.0:8080"` | Listen address of the API and the web UI. |
-| `hostname` | required | Public hostname: absolute links, the OAuth client identity, the outbound `User-Agent`. |
-| `contact` | required | Operator contact, shown in `getStats` and sent in the outbound `User-Agent`. |
+| `hostname` | required | Public hostname: absolute links, the OAuth client identity, the outbound `User-Agent`. One line of text: a control character is refused. |
+| `contact` | required | Operator contact, shown in `getStats` and sent in the outbound `User-Agent`. One line of text: a control character is refused. |
 
 ### `[storage]`
 
@@ -259,8 +272,8 @@ endpoint. An instance that offers only v1 works, but caps coverage at
 
 | Key | Default | Meaning |
 |---|---|---|
-| `gap_threshold` | `"300s"` | On a failover, a first event later than the requested cursor by more than this counts as a clamp (the instance no longer had the position) and opens a gap. On a resume by `seq`, a first event later than the stored cursor by more than this means the stream did not continue, and opens a gap too. |
-| `failover_rewind_min` | `"10m"` | Smallest rewind on failover: the new instance is asked for the applied position minus the larger of this and its lag plus 5 minutes. |
+| `gap_threshold` | `"300s"` | On a failover, a first event later than the requested cursor by more than this counts as a clamp (the instance no longer had the position) and opens a gap. The failover cursor is set this much before the rewind, so a clamp too short to detect costs none of the rewind. On a resume by `seq`, a first event later than the stored cursor by more than this means the stream did not continue, and opens a gap too. |
+| `failover_rewind_min` | `"10m"` | Smallest rewind on failover: the new instance is asked for the applied position minus the larger of this and its lag plus 5 minutes, and minus `gap_threshold`. |
 | `failover_max_lag` | `"30m"` | Largest lag of the new instance for which such a rewind is trusted. |
 | `synthetic_gap_lag` | `"5m"` | Applied-through lag beyond which coverage treats the stream as behind, as it does while disconnected. |
 | `stall_timeout` | `"60s"` | Silence that ends a session. |
@@ -466,7 +479,7 @@ refused write are explained in
 | `admin_backfill_rps` | `20` | `requestBackfill` per second with the admin token (burst 100). |
 | `key_backfill_rps` | `5` | `requestBackfill` per second per API key (burst 20). |
 | `ui_lookup_rps` | `1` | Public UI searches per second per client address (burst 5). |
-| `query_concurrency` | `32` | Concurrent API requests; also sizes the API connection pool. |
+| `query_concurrency` | `32` | Concurrent API requests; also sizes the API connection pool. A quarter of the slots is kept from anonymous callers, one anonymous address holds at most a quarter of the rest, and one API key at most half of all ([security.md](security.md#query-bounds)). |
 | `query_timeout` | `"5s"` | `statement_timeout` of a read query. |
 
 ### `[metrics]`
@@ -661,7 +674,7 @@ of the API contract.
 | `farsight_firehose_open_gaps` | gauge | |
 | `farsight_ingest_batch_seconds` | histogram | |
 | `farsight_ingest_buffer_depth` | gauge | |
-| `farsight_ingest_dropped_total` | counter | `reason` (`invalid`, `foreign_listitem`, `poisoned`) |
+| `farsight_ingest_dropped_total` | counter | `reason` (`invalid`, `foreign_listitem`, `poisoned`, `unreadable`) |
 | `farsight_ingest_storage_errors_total` | counter | `op` (`mark_connected`, `set_connected`, `record_gap`, `read_state`, `open_sync_unavailable`, `close_sync_unavailable`, `purge_account`, `record_poisoned`, `open_seam`, `close_seams`, `finish_seams`, `forget_instance_seq`): storage calls of the ingest writer that failed permanently and were given up ([firehose.md](firehose.md#storage-calls-outside-a-batch)) |
 
 ### API (server)
@@ -707,8 +720,10 @@ request. These counts are in memory only.
 | `farsight_backfill_plc_request_seconds` | histogram | |
 
 The `host` label names the 50 hosts with the most requests and puts
-the rest under `other`, so it has at most 51 values. Series not
-updated for 15 minutes are dropped. Full per-host figures are on the
+the rest under `other`, so it has at most 51 values. Request counts
+are kept for at most 4,096 hosts to choose those 50 from; when that
+table is full, the less busy half is dropped. Series not updated for
+15 minutes are dropped. Full per-host figures are on the
 admin dashboard.
 
 ### Web UI (server)

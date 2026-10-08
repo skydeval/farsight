@@ -329,7 +329,9 @@ pub struct ListNaming {
 
 /// Ready or retained lists with a present record naming `subject_id`,
 /// once per list, ordered by list id. Hidden owners are excluded unless
-/// `include_inactive`.
+/// `include_inactive`. The page starts after list `after`: that bound is
+/// applied where the subject's items are read, so a later page does not
+/// read the items of the pages before it again.
 pub async fn lists_naming(
     conn: &mut PgConnection,
     subject_id: ActorId,
@@ -351,14 +353,14 @@ pub async fn lists_naming(
     let rows: Vec<Row> = sqlx::query_as(&format!(
         "SELECT l.id, o.did, l.rkey, l.purpose, l.name, l.listblock_count, x.created_at, x.rkey
          FROM (SELECT DISTINCT ON (li.list_id) li.list_id, li.rkey, li.created_at
-               FROM list_items li WHERE li.subject_id = $1
+               FROM list_items li
+               WHERE li.subject_id = $1 AND ($4::bigint IS NULL OR li.list_id > $4)
                ORDER BY li.list_id, li.rkey) x
          JOIN lists l ON l.id = x.list_id
          JOIN actors o ON o.id = l.owner_id
          WHERE l.track_state IN {TRACK_SERVED} AND l.record_state = {RECORD_PRESENT}
            AND ($2 OR o.status NOT IN {HIDDEN})
            AND ($3::smallint IS NULL OR l.purpose = $3)
-           AND ($4::bigint IS NULL OR l.id > $4)
          ORDER BY l.id LIMIT $5"
     ))
     .bind(subject_id)

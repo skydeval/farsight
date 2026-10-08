@@ -244,7 +244,7 @@ fn resolve_for_cli(
         let safe = SafeClient::new(SafeClientConfig::from_config(cfg, VERSION));
         match tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            farsight_web::oauth::identity(&safe, cfg, &parsed),
+            farsight_web::oauth::identity(&safe, &cfg.backfill.plc_url, &parsed),
         )
         .await
         {
@@ -358,4 +358,18 @@ fn main() -> ExitCode {
         }
     };
     rt.block_on(run())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn compose_names_the_image_of_this_version() {
+        let compose = include_str!("../../../compose.yml");
+        let want = format!("image: ghcr.io/skydeval/farsight:{}", super::VERSION);
+        assert!(
+            compose.lines().any(|l| l.trim() == want),
+            "compose.yml must name `{want}`"
+        );
+        assert!(!compose.contains("farsight:latest"));
+    }
 }

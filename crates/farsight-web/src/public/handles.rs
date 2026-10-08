@@ -19,9 +19,14 @@
 //! the `handle_cache` table, which a restart does not empty. A read
 //! looks in memory, then in the table ([`recall`]); a check writes both
 //! ([`settle`]). A stored handle verified more than [`STALE_AFTER`] ago
-//! is still shown, and is verified again in the background; if that
-//! fails, it stays. A stored "no handle to show" is checked again after
-//! [`NONE_STALE_AFTER`].
+//! is still shown, and is verified again in the background. If that
+//! check establishes nothing (a host that does not answer), the handle
+//! stays. If it establishes that the handle is no longer the account's
+//! (the document names none or another one, or the handle now resolves
+//! to another account), the handle is dropped at once, from memory and
+//! from the table: a name that someone else may hold is never shown on
+//! this account's rows. A stored "no handle to show" is checked again
+//! after [`NONE_STALE_AFTER`].
 //!
 //! With warming on, a public table leaves out an account that has no
 //! answer yet and says how many it left out; the page's script reads
@@ -103,14 +108,16 @@ pub fn take_budget(st: &WebState, cfg: &Config) -> bool {
         .is_ok()
 }
 
-/// The URL of a DID's document.
+/// The URL of a DID's document, with the PLC directory the config names.
 pub fn document_url(cfg: &Config, did: &Did) -> Option<url::Url> {
+    document_url_at(&cfg.backfill.plc_url, did)
+}
+
+/// The URL of a DID's document: did:plc in the directory at `plc_url`,
+/// did:web on its own host.
+pub fn document_url_at(plc_url: &str, did: &Did) -> Option<url::Url> {
     let s = match did.method() {
-        DidMethod::Plc => format!(
-            "{}/{}",
-            cfg.backfill.plc_url.trim_end_matches('/'),
-            did.as_str()
-        ),
+        DidMethod::Plc => format!("{}/{}", plc_url.trim_end_matches('/'), did.as_str()),
         DidMethod::Web => format!("https://{}/.well-known/did.json", did.web_host()?),
     };
     url::Url::parse(&s).ok()
@@ -128,26 +135,60 @@ pub fn claimed_handle(doc: &serde_json::Value) -> Option<String> {
     farsight_core::did::is_valid_hostname(&h).then_some(h)
 }
 
-/// Verifies the handle of `did` in both directions (steps 1–3 above).
-pub(crate) async fn verify(
-    safe: &SafeClient,
-    cfg: &Config,
+/// What a verification established about an account's handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verified {
+    /// The document names this handle and it resolves back to the DID.
+    Handle(String),
+    /// The account has no handle to show, for certain: its directory
+    /// says the DID is gone, its document names no handle, or the handle
+    /// it names resolves to another account.
+    Gone,
+    /// The document names this handle, which could not be resolved back.
+    /// Whatever else was shown for the account is no longer its handle.
+    Unresolved(String),
+    /// Nothing was established: the document could not be read.
+    Unknown,
+}
+
+/// Classifies what was read: the document (or why there is none) and,
+/// if it names a handle, what that handle resolved to.
+pub(crate) fn classify(
     did: &Did,
-) -> (Outcome, Option<String>) {
+    claim: Option<String>,
+    back: Option<Result<Did, crate::pages::HandleError>>,
+) -> (Outcome, Verified) {
+    let Some(claim) = claim else {
+        return (Outcome::Failed, Verified::Gone);
+    };
+    match back {
+        Some(Ok(b)) if b == *did => (Outcome::Resolved, Verified::Handle(claim)),
+        // The handle is someone else's now.
+        Some(Ok(_)) => (Outcome::Unverified, Verified::Gone),
+        _ => (Outcome::Unverified, Verified::Unresolved(claim)),
+    }
+}
+
+/// Verifies the handle of `did` in both directions (steps 1–3 above).
+pub(crate) async fn verify(safe: &SafeClient, cfg: &Config, did: &Did) -> (Outcome, Verified) {
     let Some(url) = document_url(cfg, did) else {
-        return (Outcome::Failed, None);
+        return (Outcome::Failed, Verified::Unknown);
     };
     let doc = match safe.get(&url).await {
-        Ok(r) if r.status == 200 => serde_json::from_slice::<serde_json::Value>(&r.body).ok(),
-        _ => None,
+        Ok(r) if r.status == 200 => match serde_json::from_slice::<serde_json::Value>(&r.body) {
+            Ok(doc) => doc,
+            Err(_) => return (Outcome::Failed, Verified::Unknown),
+        },
+        // The directory knows no such DID, or its tombstone.
+        Ok(r) if matches!(r.status, 404 | 410) => return (Outcome::Failed, Verified::Gone),
+        _ => return (Outcome::Failed, Verified::Unknown),
     };
-    let Some(handle) = doc.as_ref().and_then(claimed_handle) else {
-        return (Outcome::Failed, None);
+    let claim = claimed_handle(&doc);
+    let back = match &claim {
+        Some(handle) => Some(handle_to_did(safe, handle).await),
+        None => None,
     };
-    match handle_to_did(safe, &handle).await {
-        Ok(back) if back == *did => (Outcome::Resolved, Some(handle)),
-        _ => (Outcome::Unverified, None),
-    }
+    classify(did, claim, back)
 }
 
 /// Whether an answer checked at `resolved_at` is older than `after`.
@@ -221,74 +262,109 @@ pub(crate) async fn cached(st: &WebState, cfg: &Config, did: &Did) -> Option<Cac
 }
 
 /// Records how a verification of `did` ended and returns the handle to
-/// show. A verified handle goes to the memory cache and to the table. A
-/// failure is remembered in memory for [`NEGATIVE_TTL`]: as the handle
-/// shown until now if there is one (a stale handle is better than the
-/// DID), as "nothing to show" otherwise — and then in the table too, so
-/// that the account's rows show its DID from now on instead of waiting
-/// for a check on every view.
+/// show.
+///
+/// - A verified handle goes to the memory cache and to the table.
+/// - [`Verified::Gone`] removes whatever was shown: memory and table say
+///   "nothing to show" from now on.
+/// - [`Verified::Unresolved`] keeps a shown handle only if it is the one
+///   the document still names (its host may only be unreachable); any
+///   other shown handle is removed like a gone one.
+/// - [`Verified::Unknown`] is remembered in memory for [`NEGATIVE_TTL`]:
+///   as the handle shown until now if there is one, as "nothing to show"
+///   otherwise — and then in the table too, so that the account's rows
+///   show its DID from now on instead of waiting for a check on every
+///   view.
 pub(crate) async fn settle(
     st: &WebState,
     cfg: &Config,
     did: &Did,
-    handle: Option<String>,
+    found: Verified,
 ) -> Option<String> {
+    use farsight_storage::handles as stored;
     let cache = &st.public.handles;
-    let Some(handle) = handle else {
-        let kept = cache.get(did.as_str());
-        cache.insert(did.as_str(), kept.clone(), NEGATIVE_TTL);
-        if kept.is_none() {
-            let written = match st.api.pool.acquire().await {
-                Ok(mut conn) => farsight_storage::handles::store_none(&mut conn, did).await,
-                Err(e) => Err(e.into()),
-            };
-            if let Err(e) = written {
-                tracing::warn!(error = %e, "a handle check could not be stored");
-            }
-        }
-        return kept;
+    let kept = cache.get(did.as_str());
+    let (shown, ttl) = match &found {
+        Verified::Handle(h) => (Some(h.clone()), cfg.public_ui.handle_cache_ttl.get()),
+        Verified::Gone => (None, cfg.public_ui.handle_cache_ttl.get()),
+        Verified::Unresolved(claim) => (kept.clone().filter(|k| k == claim), NEGATIVE_TTL),
+        Verified::Unknown => (kept.clone(), NEGATIVE_TTL),
     };
-    cache.insert(
-        did.as_str(),
-        Some(handle.clone()),
-        cfg.public_ui.handle_cache_ttl.get(),
-    );
+    cache.insert(did.as_str(), shown.clone(), ttl);
     let written = match st.api.pool.acquire().await {
-        Ok(mut conn) => farsight_storage::handles::store(&mut conn, did, &handle).await,
+        Ok(mut conn) => match &found {
+            Verified::Handle(h) => stored::store(&mut conn, did, h).await,
+            Verified::Gone => stored::store_gone(&mut conn, did).await,
+            // A stored handle other than the claim is replaced by
+            // "nothing to show", whether or not memory still held it;
+            // the claim itself is left as it is.
+            Verified::Unresolved(claim) => {
+                match stored::store_unresolved(&mut conn, did, claim).await {
+                    Ok(()) if shown.is_none() => stored::store_none(&mut conn, did).await,
+                    other => other,
+                }
+            }
+            Verified::Unknown if kept.is_none() => stored::store_none(&mut conn, did).await,
+            Verified::Unknown => Ok(()),
+        },
         Err(e) => Err(e.into()),
     };
     if let Err(e) = written {
-        tracing::warn!(error = %e, "a verified handle could not be stored");
+        tracing::warn!(error = %e, "a handle check could not be stored");
     }
-    Some(handle)
+    shown
+}
+
+/// What a page knows about the handle of its subject or list owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageHandle {
+    /// The verified handle, if there is one to show.
+    pub handle: Option<String>,
+    /// Whether that is an answer: `false` when nothing could be checked
+    /// (the budget was empty, or the check ran out of time). The page
+    /// then shows the DID alone for now, and must not be kept by a cache
+    /// as if that were the account's state.
+    pub settled: bool,
 }
 
 /// The verified handle of a page's subject or list owner, resolving it if
 /// it is not cached and the budget allows. The caller has checked that
 /// the DID has an `actors` row and is not withheld, and calls this before
 /// taking a render slot, so a slow host holds no slot.
-pub async fn page_handle(st: &WebState, cfg: &Config, did: &Did) -> Option<String> {
+pub async fn page_handle(st: &WebState, cfg: &Config, did: &Did) -> PageHandle {
     if let Some(c) = cached(st, cfg, did).await {
         m::handle_resolution(Outcome::Cached);
-        return match c {
-            Cached::Handle(h) => Some(h),
-            Cached::None => None,
+        return PageHandle {
+            handle: match c {
+                Cached::Handle(h) => Some(h),
+                Cached::None => None,
+            },
+            settled: true,
         };
     }
     if !take_budget(st, cfg) {
         m::handle_resolution(Outcome::Skipped);
-        return None;
+        return PageHandle {
+            handle: None,
+            settled: false,
+        };
     }
     match tokio::time::timeout(RESOLVE_WAIT, verify(&st.safe, cfg, did)).await {
-        Ok((outcome, handle)) => {
+        Ok((outcome, found)) => {
             m::handle_resolution(outcome);
-            settle(st, cfg, did, handle).await
+            PageHandle {
+                handle: settle(st, cfg, did, found).await,
+                settled: true,
+            }
         }
         // Too slow: the page renders with the DID alone and nothing is
         // cached.
         Err(_) => {
             m::handle_resolution(Outcome::Failed);
-            None
+            PageHandle {
+                handle: None,
+                settled: false,
+            }
         }
     }
 }
@@ -309,6 +385,38 @@ mod tests {
         assert_eq!(
             claimed_handle(&json!({"alsoKnownAs": ["at://<script>"]})),
             None
+        );
+    }
+
+    #[test]
+    fn a_handle_that_resolves_to_another_account_is_gone() {
+        use crate::pages::HandleError;
+        let me = Did::parse("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let other = Did::parse("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let claim = || Some("alice.example".to_owned());
+        assert_eq!(
+            classify(&me, claim(), Some(Ok(me.clone()))),
+            (Outcome::Resolved, Verified::Handle("alice.example".into()))
+        );
+        // Someone else holds the name now: certain, not a failure to
+        // reach a host.
+        assert_eq!(
+            classify(&me, claim(), Some(Ok(other))),
+            (Outcome::Unverified, Verified::Gone)
+        );
+        // The document names no handle at all.
+        assert_eq!(classify(&me, None, None), (Outcome::Failed, Verified::Gone));
+        // The handle's host did not say: the claim stands unproven.
+        assert_eq!(
+            classify(
+                &me,
+                claim(),
+                Some(Err(HandleError::NotADid("alice.example".into())))
+            ),
+            (
+                Outcome::Unverified,
+                Verified::Unresolved("alice.example".into())
+            )
         );
     }
 

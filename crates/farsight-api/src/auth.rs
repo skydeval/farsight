@@ -55,8 +55,10 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+/// The bytes a hex string stands for; `None` unless it is an even
+/// number of hex digits.
+pub fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.is_ascii() || !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -132,19 +134,41 @@ impl Caller {
 
 /// The in-memory table of live API keys, keyed by hash. Refreshed from
 /// `api_tokens` periodically and after every create/revoke.
+///
+/// A revoked key stops working at once and stays out: [`KeyTable::evict`]
+/// removes it and remembers its id, and a refresh never puts a
+/// remembered id back, so one that read the table before the revocation
+/// cannot bring the key back. Refreshes run one at a time.
 #[derive(Debug, Default)]
 pub struct KeyTable {
     keys: RwLock<HashMap<[u8; 32], KeyInfo>>,
     used: Mutex<HashSet<i32>>,
+    /// Ids revoked through this process. Taken before `keys` wherever
+    /// both are held.
+    revoked: Mutex<HashSet<i32>>,
+    refreshing: tokio::sync::Mutex<()>,
 }
 
 impl KeyTable {
     /// Replaces the table with the rows of `api_tokens` that are not
     /// revoked. A row whose stored hash is not 32 bytes is skipped.
     pub async fn refresh(&self, pool: &PgPool) -> Result<(), farsight_storage::StorageError> {
+        // One refresh at a time: the later one reads later rows and is
+        // the one whose result stays.
+        let _one = self.refreshing.lock().await;
         let rows = farsight_storage::auth::active_tokens(pool).await?;
+        self.install(rows);
+        Ok(())
+    }
+
+    /// Makes `rows` the table, leaving out every key revoked here.
+    fn install(&self, rows: Vec<farsight_storage::auth::ApiToken>) {
+        let revoked = self.revoked.lock().unwrap_or_else(|e| e.into_inner());
         let mut map = HashMap::new();
         for t in rows {
+            if revoked.contains(&t.id) {
+                continue;
+            }
             let Ok(h) = <[u8; 32]>::try_from(t.sha256.as_slice()) else {
                 continue;
             };
@@ -159,7 +183,25 @@ impl KeyTable {
             );
         }
         *self.keys.write().unwrap_or_else(|e| e.into_inner()) = map;
-        Ok(())
+    }
+
+    /// Removes key `id` now and for good: called as soon as the key is
+    /// revoked in `api_tokens`, before any refresh.
+    pub fn evict(&self, id: i32) {
+        let mut revoked = self.revoked.lock().unwrap_or_else(|e| e.into_inner());
+        revoked.insert(id);
+        self.keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, k| k.id != id);
+    }
+
+    /// Removes every key now and for good (config reset).
+    pub fn evict_all(&self) {
+        let mut revoked = self.revoked.lock().unwrap_or_else(|e| e.into_inner());
+        let mut keys = self.keys.write().unwrap_or_else(|e| e.into_inner());
+        revoked.extend(keys.values().map(|k| k.id));
+        keys.clear();
     }
 
     /// The key whose hash is `h` (the hash is of a 256-bit token, so the
@@ -242,6 +284,39 @@ mod tests {
             &format!("fsa_{}", "!".repeat(43)),
             ADMIN_PREFIX
         ));
+    }
+
+    #[test]
+    fn a_revoked_key_is_gone_at_once_and_a_stale_refresh_does_not_bring_it_back() {
+        let row = |id: i32, token: &str| farsight_storage::auth::ApiToken {
+            id,
+            name: format!("k{id}"),
+            sha256: sha256(token).to_vec(),
+            scopes: vec![SCOPE_READ.to_owned()],
+            read_rps: None,
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        let t = KeyTable::default();
+        // What a refresh read before the revocation.
+        let before = vec![row(1, "one"), row(2, "two")];
+        t.install(before.clone());
+        assert!(t.lookup(&sha256("one")).is_some());
+        t.evict(1);
+        assert!(t.lookup(&sha256("one")).is_none());
+        assert!(t.lookup(&sha256("two")).is_some());
+        // That refresh finishes afterwards with its old rows.
+        t.install(before.clone());
+        assert!(t.lookup(&sha256("one")).is_none());
+        assert!(t.lookup(&sha256("two")).is_some());
+        // A reset removes all of them, and they stay out.
+        t.evict_all();
+        t.install(before);
+        assert!(t.lookup(&sha256("two")).is_none());
+        // A key created later is installed as usual.
+        t.install(vec![row(3, "three")]);
+        assert!(t.lookup(&sha256("three")).is_some());
     }
 
     #[test]

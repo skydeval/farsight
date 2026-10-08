@@ -262,52 +262,13 @@ pub async fn process_purges(
             continue;
         };
         let owner_did = Did::parse(&owner).map_err(|e| StorageError::Invariant(e.to_string()))?;
-        let mut tx = pool.begin().await?;
-        let (report, deltas, deleted, finished) = {
-            let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
-            t.lock_authors(&[keys::author_lock_key(&owner)].into_iter().collect())
-                .await?;
-            t.lock_lists(
-                &[(keys::list_lock_key(&owner, &rkey), true)]
-                    .into_iter()
-                    .collect(),
-            )
-            .await?;
-            let state = t.list_tracking(list_id).await?.state;
-            let mut deleted = 0u64;
-            let mut finished = false;
-            if state == TrackState::Purging {
-                let author = t.author(&owner_did).await?;
-                // In the order of `list_items_by_list`, so the batch is the
-                // head of an index scan. Which items go first does not
-                // matter: the list is drained to the end.
-                let rkeys: Vec<String> = sqlx::query_scalar(
-                    "SELECT rkey FROM list_items WHERE list_id = $1
-                     ORDER BY subject_id, rkey LIMIT $2",
-                )
-                .bind(list_id)
-                .bind(PURGE_BATCH)
-                .fetch_all(&mut *t.conn)
-                .await?;
-                // Recorded only while the list's record is deleted and its
-                // owner is not; `item_delete_rows` checks both. Every other
-                // drain is a change of tracking.
-                let drained = Removal::listing(Cause::ListDeleted);
-                deleted = item_delete_rows(&mut t, &author, &rkeys, None, Some(&drained)).await?;
-                if (rkeys.len() as i64) < PURGE_BATCH {
-                    t.fire(list_id, Event::PurgeDone, FireArgs::default())
-                        .await?;
-                    finished = true;
-                }
-            }
-            if t.notify {
-                t.send_notify().await?;
-            }
-            let (report, deltas) = t.finish();
-            (report, deltas, deleted, finished)
-        };
-        tx.commit().await?;
-        counters.add(deltas);
+        // The batch holds the owner's author lock and the list's lock
+        // while the firehose writes under the same ones: a deadlock
+        // aborts the batch, not the pass.
+        let (report, deleted, finished) = retry_deadlocks(|| {
+            purge_list_batch_once(pool, limits, counters, list_id, &owner, &rkey, &owner_did)
+        })
+        .await?;
         out.items_deleted += deleted;
         if finished {
             out.finished.push(list_id);
@@ -315,6 +276,66 @@ pub async fn process_purges(
         out.report.transitions.extend(report.transitions);
     }
     Ok(out)
+}
+
+/// One batch of one `purging` list, in one transaction: what was fired,
+/// how many items were deleted, and whether the purge finished.
+async fn purge_list_batch_once(
+    pool: &PgPool,
+    limits: &Limits,
+    counters: &CounterSink,
+    list_id: ListId,
+    owner: &str,
+    rkey: &str,
+    owner_did: &Did,
+) -> Result<(ApplyReport, u64, bool)> {
+    let mut tx = pool.begin().await?;
+    let (report, deltas, deleted, finished) = {
+        let mut t = Txn::start(&mut tx, limits, Gates::default()).await?;
+        t.lock_authors(&[keys::author_lock_key(owner)].into_iter().collect())
+            .await?;
+        t.lock_lists(
+            &[(keys::list_lock_key(owner, rkey), true)]
+                .into_iter()
+                .collect(),
+        )
+        .await?;
+        let state = t.list_tracking(list_id).await?.state;
+        let mut deleted = 0u64;
+        let mut finished = false;
+        if state == TrackState::Purging {
+            let author = t.author(owner_did).await?;
+            // In the order of `list_items_by_list`, so the batch is the
+            // head of an index scan. Which items go first does not
+            // matter: the list is drained to the end.
+            let rkeys: Vec<String> = sqlx::query_scalar(
+                "SELECT rkey FROM list_items WHERE list_id = $1
+                 ORDER BY subject_id, rkey LIMIT $2",
+            )
+            .bind(list_id)
+            .bind(PURGE_BATCH)
+            .fetch_all(&mut *t.conn)
+            .await?;
+            // Recorded only while the list's record is deleted and its
+            // owner is not; `item_delete_rows` checks both. Every other
+            // drain is a change of tracking.
+            let drained = Removal::listing(Cause::ListDeleted);
+            deleted = item_delete_rows(&mut t, &author, &rkeys, None, Some(&drained)).await?;
+            if (rkeys.len() as i64) < PURGE_BATCH {
+                t.fire(list_id, Event::PurgeDone, FireArgs::default())
+                    .await?;
+                finished = true;
+            }
+        }
+        if t.notify {
+            t.send_notify().await?;
+        }
+        let (report, deltas) = t.finish();
+        (report, deltas, deleted, finished)
+    };
+    tx.commit().await?;
+    counters.add(deltas);
+    Ok((report, deleted, finished))
 }
 
 /// Fires **GE** on `retained` lists whose grace ended.

@@ -320,6 +320,13 @@ from a backlink index — goes through one client
   process's open-file limit;
 - identifies itself:
   `farsight/<version> (+https://<server.hostname>; <server.contact>)`.
+  Both values must be one line of text; a config with a control
+  character in either does not load.
+
+The setup wizard's two connection tests are the exception: they
+connect to the Jetstream and Postgres addresses the operator types,
+private ones included, and are open only to a setup session
+([web-ui.md](web-ui.md#the-wizard)).
 
 ### DNS rebinding
 
@@ -359,8 +366,18 @@ elif mode == cloudflare and CF-Connecting-IP parses:
 elif X-Forwarded-For present:  walk right to left, skip entries in trusted;
                                client := first entry not in trusted
                                (if all are trusted: the leftmost)
+                               an entry that is not an address ends the walk:
+                               client := the entry to its right, or the peer
 else:                          client := peer
 ```
+
+- An `X-Forwarded-For` entry may carry a port (`203.0.113.7:4711`,
+  `[2001:db8::1]:4711`), as some proxies write it. An entry that is
+  not an address at all is never skipped: everything to its right was
+  written by trusted proxies, everything to its left may have been
+  written by the client, so stepping over it would let the client name
+  its own address. The walk stops there, and the nearest proxy that
+  was read stands in; the clients behind it share one rate-limit key.
 
 - An IPv4-mapped IPv6 peer is treated as its IPv4 address.
 - From a peer that is not trusted, the headers `Forwarded`,
@@ -380,8 +397,13 @@ else:                          client := peer
 The Cloudflare preset of the setup wizard sets `mode = "cloudflare"`
 and trusts Cloudflare's published edge ranges, which are bundled with
 a date. `proxy.cloudflare_refresh = true` adds a daily refresh from
-Cloudflare's published lists; a list that does not parse leaves the
-previous set in force.
+Cloudflare's published lists. A refreshed list is held to the bounds
+of `proxy.trusted` below, and to public addresses: a list that does
+not parse, holds more than 500 ranges, or holds a range broader than
+`/8` (IPv4) or `/24` (IPv6) or a private, loopback or link-local one
+is refused whole and leaves the previous set in force. A fetched list
+that read `0.0.0.0/0` would otherwise make every peer a trusted
+proxy.
 
 ### Validation of `proxy.trusted`
 
@@ -426,7 +448,7 @@ header changes their body.
 | `/` as the redirect to the admin UI | `no-store, private` |
 | `/` as the text page of an API-only instance | `public, max-age=300` |
 | `/did/…`, `/list/…` | `public, max-age=30`; `no-store` while rows are held back for a handle check |
-| `/card/{did}` | `public, max-age=300` for a complete card (handle, DID and creation date all present); `no-store` otherwise. An admin card is always `no-store, private` |
+| `/card/{did}` | `public, max-age=300` for a complete card: one whose every fetch answered (the account's identity, its handle's check, its profile record), whether or not the account has a handle, an avatar or a creation date to show. `no-store` when a fetch failed, timed out or was not made for want of budget. An admin card is always `no-store, private` |
 | `/search`, public error pages | `no-store` |
 | `/robots.txt` | `public, max-age=300` |
 | Static assets under `/static/` | `public, max-age=3600`, with `X-Content-Type-Options: nosniff`; served in every configuration |
@@ -459,7 +481,11 @@ Read endpoints send `Access-Control-Allow-Origin: *` unless
 - `access.reads` is `public` (default), `api_key` or `disabled`.
   `disabled` turns read queries off for anonymous and API-key callers;
   the admin token and the admin UI still read.
-- Rotating the admin token signs out every admin session.
+- A change of the admin token's hash signs out every admin session,
+  whether it was rotated or written in the config editor.
+- A revoked API key stops working at once. The table of live keys is
+  read again every 30 seconds, and a read that began before the
+  revocation cannot put the key back.
 - The metrics listeners are separate ports and take an optional bearer
   token (`metrics.bearer_token_sha256`); empty means no authentication,
   so keep them off the public network.
@@ -467,7 +493,21 @@ Read endpoints send `Access-Control-Allow-Origin: *` unless
 ### Rate-limit classes
 
 Token buckets, in memory. An anonymous caller is keyed by resolved
-client address, IPv6 by its `/64`; an authenticated caller by token.
+client address; an authenticated caller by token.
+
+An IPv6 caller draws on three buckets at once: its `/64` at the
+class's limit, its `/48` at 4 times that, and its `/32` at 16 times.
+A request is admitted only if each has a token. A `/64` is one
+subscriber, but a routed `/48` holds 65,536 of them and is free to
+have: keyed by `/64` alone, it would be that many callers. The
+multiples leave room for the real subscribers of one site or one
+provider.
+
+At most 100,000 buckets are held. Beyond that, buckets that are full
+again are dropped first, since they hold no state, and then the
+quarter used longest ago. The periodic sweep drops only buckets that
+are full: a spent bucket of a class that does not refill is kept, so
+dropping it never hands its caller a new allowance.
 
 | Class | Sustained | Burst | Keyed by |
 |---|---|---|---|
@@ -500,12 +540,29 @@ left, so requests are never starved by it. The handle pass
 - At most `rate_limit.query_concurrency` (32) read queries run at
   once. A request that waits more than 2 s for a slot gets
   `503 Overloaded` with `Retry-After: 1`.
+- **No caller holds every slot.** A quarter of the slots (8 of 32; at
+  least one) is never given to anonymous callers, so callers with a
+  token always find them free of anonymous load. One anonymous
+  address (IPv6: one `/48`) has at most a quarter of the anonymous
+  slots in flight (6 of 24), one API key at most half of all slots
+  (16); the admin token has no such bound. A request over its
+  caller's bound waits for one of that caller's own places, up to the
+  same 2 s, so a burst of quick requests from one caller is served a
+  few at a time and a caller with slow ones holds only its share.
 - Every read runs with `statement_timeout` =
   `rate_limit.query_timeout` (`5s`); a timeout is `503 Overloaded`.
 - Public pages have their own render gate,
   `public_ui.query_concurrency` (8, never more than
   `rate_limit.query_concurrency`), with the same 2 s wait. Public
-  traffic cannot take every query slot from the API.
+  traffic cannot take every query slot from the API. One address
+  (IPv6: one `/48`) renders at most half of those slots at once.
+- A table's count is read at most once in 30 seconds for the same
+  table and filters. It is remembered by what was counted, not by the
+  address, so adding query parameters the page does not read does not
+  make Farsight count again. Such an address is still a page of its
+  own to a cache in front of Farsight, and is rendered for it; the
+  rate limit and the bound on renders per address are what limit
+  that.
 - Public tables are 50 rows a page with no `limit` parameter. A
   section's count is exact up to 5,000,000 and stated as "more than"
   beyond, so that a count cannot run to the timeout.
@@ -535,8 +592,22 @@ left, so requests are never starved by it. The handle pass
   `Referrer-Policy: same-origin`, and `X-Robots-Tag: noindex, nofollow`
   unless `public_ui.crawlable` is set.
 - Text that comes from the network (handles, list names and
-  descriptions) is rendered as plain text. A handle is shown only once
-  it has been verified in both directions.
+  descriptions) is rendered as plain text, without control
+  characters, bidirectional overrides or invisible characters
+  (zero-width space, word joiner, byte-order mark; a zero-width
+  joiner or non-joiner stays only inside a run of a script or an
+  emoji sequence that needs it). Two names that differ only by
+  characters nobody can see therefore look the same because they are
+  shown the same. A handle is shown only once it has been verified in
+  both directions, and is removed as soon as a check shows it is no
+  longer the account's.
+- **Images are named only on public hosts.** The address of an avatar
+  or of a list's image is built from the account's own server, which
+  the account names itself. It is used only if it is `https` with a
+  domain name of two or more labels that is not an IP address and not
+  under a private-network suffix; a card for any other server carries
+  no image and no host. A page therefore never makes a visitor's
+  browser request an address inside the visitor's own network.
 
 ### The admin UI
 
@@ -554,9 +625,30 @@ left, so requests are never starved by it. The handle pass
   metadata names another issuer than the one it was fetched from is
   refused. At most 256 sign-ins are held in progress; a newer one
   displaces the oldest.
+- **A fresh sign-in for what outlasts a session.** A session cookie
+  that is stolen is good for up to seven days, and four things would
+  let its holder keep control afterwards: a PLC directory or relay of
+  their own (`backfill.plc_url`, `backfill.relay_url`), a host the
+  outbound client may newly reach (`net.*`), an admin token they know
+  (`auth.*`, the rotate button) and an API key they made. Each of
+  these, and any change that opens `access.*` further, is carried out
+  only in a session that signed in at most 10 minutes ago; an older
+  one is sent through the sign-in again and nothing is changed until
+  it returns. See
+  [web-ui.md](web-ui.md#a-fresh-sign-in-for-sensitive-actions). Two
+  rules close what that leaves. The admin DID is resolved through the
+  PLC directory named when the process started, so a changed
+  `plc_url` cannot redirect the sign-in itself before a restart. And
+  a change of the admin token's hash ends every session, however it
+  was made.
 - **Cookies** are host-only, `HttpOnly`, and `Secure` whenever the
-  request arrived over HTTPS. The session cookie `farsight_admin` is
-  `SameSite=Strict`. The flow cookie is `SameSite=Lax` with
+  request arrived over HTTPS. Whether it did is what a trusted proxy
+  says (`X-Forwarded-Proto`): behind a proxy that is not in
+  `proxy.trusted`, cookies are set without `Secure`. The session
+  cookie is `SameSite=Strict`; it is named `__Host-farsight_admin`
+  over HTTPS, a name a browser accepts only with `Secure`, `Path=/`
+  and no `Domain`, and `farsight_admin` over plain HTTP (the loopback
+  sign-in). The flow cookie is `SameSite=Lax` with
   `Path=/enter`, because the return from the authorization server is a
   cross-site navigation. The stored session key is a SHA-256 over the
   cookie value and the admin DID, so a session does not survive a

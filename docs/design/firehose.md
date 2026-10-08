@@ -85,11 +85,17 @@ reader ─► bounded channel (10,000 events) ─► single writer ─► Postgr
   with it: a witness time before the epoch or more than 5 minutes
   ahead of the server's clock, or a `seq` that is negative or the
   largest value, is not an event. The frame is refused like one that
-  cannot be decoded and the session ends, so a position an instance
-  made up is never stored as the cursor or as `applied_through`. Resume
+  cannot be decoded and the session ends (see
+  [Reconnecting](#reconnecting) for a frame that stays unreadable),
+  so a position an instance made up is never stored as the cursor or
+  as `applied_through`. Resume
   cursors, failover gaps and the lag that coverage reports are all
   measured from `applied_through`, which is why the allowance is small.
-  A websocket message, compressed or not, may be at most 16 MiB.
+  A websocket message, compressed or not, may be at most 16 MiB. A
+  compressed frame may ask the decoder for a window of at most that
+  size too, so a frame cannot make the reader set aside more memory
+  than a frame can expand to. Each bundled dictionary is prepared for
+  decoding once per process, not once per message.
 - A frame is read one level at a time. Only its envelope and its
   position have to be readable for it to be an event. The `record`
   inside a commit is whatever its author wrote and is parsed on its
@@ -133,6 +139,9 @@ A commit is dropped before it is applied, and counted in
 | `foreign_listitem` | a listitem naming a list in another repository; only the list's owner can add members |
 
 Its position in the stream still counts, so the cursor moves past it.
+(The same counter has `poisoned`, below, and `unreadable`, for a
+frame stepped past after it could not be read on any attempt; that
+one has no position, and a gap covers it.)
 
 **A rejected record removes the version it replaced.** When a create
 or an update is rejected for its record alone, and its repository,
@@ -242,7 +251,7 @@ everything already read, then reads the persisted state and decides:
 | First start, nothing applied yet | none (live tail) | none |
 | Instance with its own cursor, v2 after v2 | `seq + 1`, exact | gap if the instance announces a clamp, answers with a lower `seq`, or its first event is more than `gap_threshold` after the stored cursor |
 | Instance with its own cursor, v1 (or v2 after v1) | `cursor_us − 120 s` | gap if a clamp is announced or the first event is later than the stored cursor |
-| Instance without a cursor, lag of the previous one known and at most `failover_max_lag` | `applied_through − max(failover_rewind_min, lag + 5 min)` | gap if a clamp is announced or the first event is more than `gap_threshold` after the cursor |
+| Instance without a cursor, lag of the previous one known and at most `failover_max_lag` | `applied_through − max(failover_rewind_min, lag + 5 min) − gap_threshold` | gap if a clamp is announced or the first event is more than `gap_threshold` after the cursor, that is, later than the rewind itself |
 | Instance without a cursor, lag unknown or too large | `applied_through − 30 min` | always a gap |
 
 An instance that refuses the cursor with `CursorTooOld` is read from
@@ -269,6 +278,20 @@ starting point from the first committed batch (see
   stalls without one event gives the next one twice as long, up to 16
   times the timeout; a session that delivers an event sets it back.
 - A closed socket, a read error or a v2 error frame ends the session.
+- **A frame that cannot be read** (its envelope or its position, or a
+  message that does not decompress) ends the session too: most such
+  frames are a fault in transit, and the reconnect reads the frame
+  again. One that is unreadable every time would come first on every
+  resume, on every instance, for good. So the reader remembers, per
+  instance, the position a session ended at for that reason. When 3
+  sessions in a row have ended at the same position, the next session
+  on that instance **steps past**: frames it cannot read at that
+  position are skipped, up to 64 of them, and the first event it can
+  read records a gap of cause `unreadable` from that position to the
+  event (unless the resume itself records a gap there). Each skipped
+  frame is counted in
+  `farsight_ingest_dropped_total{reason="unreadable"}`. A failover in
+  between does not forget the position; getting past it does.
 - **Backoff.** The reader waits before each reconnect: 0.5 s at
   first, doubled every time, up to 30 s. After a session that
   delivered events and lasted at least 60 s the wait starts again at
@@ -299,10 +322,15 @@ the commit time is the timestamp inside the commit's rev. That is the
 instance's lag. On failover B is resumed at
 
 ```text
-applied_through − max(firehose.tuning.failover_rewind_min, lag_A + 5 min)
+applied_through − max(firehose.tuning.failover_rewind_min, lag_A + 5 min) − gap_threshold
 ```
 
-with B's own lag taken as zero, which is always the safe side.
+with B's own lag taken as zero, which is always the safe side. The
+first two terms are the rewind the change of instance needs. The last
+is there because a clamp can only be told from a quiet stream when it
+is longer than `firehose.tuning.gap_threshold`: asking for that much
+more means that a clamp too short to detect costs only the extra, and
+a first event later than the rewind itself is always a gap.
 `failover_rewind_min` defaults to 10 minutes. If A's lag was never
 measured, or exceeds `firehose.tuning.failover_max_lag` (30 minutes),
 no rewind can be trusted: B is resumed 30 minutes back and a gap is
@@ -338,7 +366,12 @@ instances are not equally far behind the network.
   before it. A first event after it means that the instance no longer
   holds what it sent, however short the distance.
 - **A failover with a trusted rewind** whose first event is more than
-  `gap_threshold` after the requested cursor.
+  `gap_threshold` after the requested cursor: later than the start of
+  the rewind the failover needs, by however little.
+- **Frames stepped past.** After 3 sessions ended on a frame that
+  cannot be read at one position (see
+  [Reconnecting](#reconnecting)), from that position to the first
+  event read after it.
 - **A failover without a safe rewind.** Always.
 
 A conditional gap is recorded only when the first event lies **after**
@@ -367,8 +400,9 @@ CREATE TABLE firehose_gaps (
 | 3 | failover | a resume on an instance without a cursor was clamped, or had no safe rewind |
 | 4 | sync unavailable | an interval was spent on v1 (below) |
 | 5 | seam unrepaired | the re-read of a seam window could not be finished (below) |
+| 6 | unreadable | frames that could not be read on any attempt were stepped past |
 
-Gaps of causes 1 to 3 and 5 are recorded closed. Recording, closing or
+Gaps of causes 1 to 3, 5 and 6 are recorded closed. Recording, closing or
 healing a gap sends `NOTIFY farsight_coverage`.
 
 ### What a gap does

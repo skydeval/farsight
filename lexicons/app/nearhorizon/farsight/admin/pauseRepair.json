@@ -38,6 +38,9 @@
         },
         {
           "name": "SetupRequired"
+        },
+        {
+          "name": "InternalError"
         }
       ],
       "output": {

@@ -130,14 +130,23 @@ or shell can read.
   `SameSite=Strict`, host-only), stored server-side by its SHA-256.
   The token stays valid until setup completes, so a lost browser
   session can enter again. On completion the token file is deleted.
+- **Sessions.** A setup session is bound to the token it was opened
+  with: it holds that token's SHA-256, and every request compares it
+  with the token file as it is then. A session whose token has been
+  replaced is over, whoever replaced it: the minute check, or
+  `farsight setup-token --rotate` run in another process, which only
+  rewrites the file. So rotating the token is how an operator shuts
+  out whoever saw the old one, an open wizard included. A session
+  also ends 12 hours after it was opened, however active it is.
 - **Guessing.** The submitted token is always checked first, in
   constant time, and **a correct token is never refused by any
   limiter**. Limits apply to failures only: after 5 failures a minute
-  from one client address, that client's further failures are answered
-  after a 2-second delay and logged by sample; at most 64 delayed
-  responses are held at once, and beyond that a failure gets an
-  immediate `429`, so the delay cannot exhaust sockets. There is no
-  global lockout. With 128 bits, guessing is infeasible; the limits
+  from one client address (IPv6 by /64), that client's further
+  failures are answered after a 2-second delay and logged by sample;
+  at most 64 delayed responses are held at once, and beyond that a
+  failure gets an immediate `429`, so the delay cannot exhaust
+  sockets. Failures are counted for at most 10,000 clients at a time;
+  further clients share one count. There is no global lockout. With 128 bits, guessing is infeasible; the limits
   only keep the log quiet. Behind a proxy that is not configured yet,
   all clients share one address, which costs the operator nothing
   because a correct token bypasses the limiter.
@@ -156,17 +165,31 @@ revisited until the end. Every form carries the session's CSRF token.
 | Setup token | The token | Nothing else renders until it verifies |
 | Welcome | — | — |
 | Public identity | `server.hostname`, `server.contact` | A hostname without scheme or path; a non-empty contact of at most 300 characters |
-| Firehose source | `firehose.urls`, one per line | At least one `ws://` or `wss://` URL. "Test connection" subscribes for at most 10 seconds in total across the instances and reports events, lag and whether v2 is offered; with no v2 instance the step warns that coverage stays `partial` |
+| Firehose source | `firehose.urls`, one per line | At least one `ws://` or `wss://` URL. "Test connection" subscribes for at most 10 seconds in total across the instances, connecting included, and reports events, lag and whether v2 is offered; with no v2 instance the step warns that coverage stays `partial` |
 | Backfill | Sweep on or off and its source, `backfill.per_host_rps`, `backfill.concurrency`, the repos-per-hour cap, `backfill.plc_url` and whether to seed from its export, the disk available to Postgres in GB, an optional backlink source URL | Ranges and URL schemes. `storage.budget_bytes` is set to 70% of the disk entered. With the sweep on and less than 150 GB, a warning states the budget, where the sweep pauses and the projected runway |
 | Access | `access.reads`; two boxes, "Enable public UI" and "Enable admin UI", **both unticked**; the admin DID; the admin token | See below |
 | Reverse proxy | None, Cloudflare (bundled ranges), a tunnel or local proxy (its CIDR), or custom CIDRs | CIDR syntax. Trusting public address space outside the bundled Cloudflare ranges needs an explicit acknowledgement. A preview shows the current request's peer, its forwarding headers and the client address that would be resolved |
-| Storage | `storage.database_url`, prefilled from the environment | "Test" must pass: connect within 10 seconds, PostgreSQL 15 or newer, and the database either empty or holding a Farsight schema no newer than this build |
+| Storage | `storage.database_url`, prefilled from the environment | "Test" must pass: connect within 10 seconds, PostgreSQL 15 or newer, and the database either empty or holding a Farsight schema no newer than this build. A test that fails, or a test of another string than the step was saved with, takes the step's "done" mark away, so the wizard never finishes with a string that did not pass |
 | Review | — | Shows the whole config with secrets redacted |
 | Done | — | Writes the config |
 
 The default firehose source is Bluesky's two public v2 Jetstream
 instances, `wss://jetstream.us-east.bsky.network` then
 `wss://jetstream.us-west.bsky.network`, in failover order.
+
+The two connection tests connect to the address the operator typed,
+directly, and not through the safe outbound client: a Jetstream or a
+Postgres on a private network is what many deployments have. A test
+therefore tells whoever runs it whether a port inside the network
+answers. That is acceptable because only a setup session can run
+them, a setup session needs the setup token, and each attempt is
+bounded at 10 seconds; it is one reason to keep the wizard off the
+network until setup is done (`FARSIGHT_SETUP_BIND`).
+
+A connection string is shown with its secrets redacted wherever it
+appears (the storage step, the review, Settings), in each form a
+secret can take: the password of a URL, `password` given as a URL
+parameter, and `password = …` of the keyword form.
 
 **The Access step** carries three decisions.
 
@@ -252,6 +275,13 @@ authenticates the account and grants no access to its repository.
    redirect chain, and a `SameSite=Strict` cookie set on it would not
    be sent on a redirect that continued the chain.
 
+The admin DID's document is read from the PLC directory that
+`backfill.plc_url` named **when the process started**. That key
+otherwise applies as soon as it is saved, and whoever can save it
+could point it at a directory of their own, which would answer for
+the admin DID with a server of their choosing. A changed `plc_url`
+therefore decides where the admin signs in only after a restart.
+
 All outbound requests of the flow go through the safe client, which
 refuses private, loopback and link-local addresses; see
 [Security](security.md#the-safe-outbound-client).
@@ -300,15 +330,21 @@ flow.
 ### Sessions
 
 A successful sign-in creates a row in `admin_sessions` and sets the
-cookie `farsight_admin` (`Path=/`, `HttpOnly`, `SameSite=Strict`,
-host-only, 256 random bits). A session ends after **12 hours idle** or
-**7 days** in total, whichever comes first.
+session cookie (`Path=/`, `HttpOnly`, `SameSite=Strict`, host-only,
+256 random bits). Over HTTPS the cookie is named
+`__Host-farsight_admin` and is `Secure`: a browser accepts that name
+only with `Secure`, `Path=/` and no `Domain`, so no other host of the
+same site can set or replace it. Over plain HTTP, which is the
+loopback sign-in, it is `farsight_admin`. A session ends after **12
+hours idle** or **7 days** in total, whichever comes first.
 
 The stored key of a session is `SHA-256(cookie ‖ 0x00 ‖ admin DID)`.
 A session is therefore found only while the DID it was created for is
 the configured one: changing `access.admin_did` ends every session of
-the previous account without touching the table. Rotating the admin
-token deletes all sessions, as does a config reset.
+the previous account without touching the table. A stored change of
+the admin token's hash deletes all sessions, whichever way it was
+made (the rotate button, or `auth.admin_token_sha256` written in the
+config editor), as does a config reset.
 
 Sign-in has three states:
 
@@ -317,6 +353,42 @@ Sign-in has three states:
 | Admin UI off (`access.admin_ui = false`) | `404`; nothing under `/admin` or `/enter` exists and no session is looked up |
 | DID configured | The sign-in page; a signed-in admin is sent to `/admin` |
 | No DID | A page saying that no admin account is set; the process runs and the API serves |
+
+### A fresh sign-in for sensitive actions
+
+A session can be up to seven days old, and a session cookie can be
+stolen. Some actions would let whoever holds a session keep control
+after the session has ended, so they are carried out only in a session
+whose sign-in completed **at most 10 minutes ago**
+(`STEP_UP_WINDOW`):
+
+- a settings save that changes any `auth.*` or `net.*` key,
+  `backfill.plc_url` or `backfill.relay_url`, or that opens access
+  further: `access.reads` towards `public`, `access.cors` or
+  `access.public_ui` switched on. This holds for the config editor,
+  for the Public UI form and for the confirmation step of the public
+  UI;
+- rotating the admin token;
+- creating an API key.
+
+Everything else, and every change that narrows access, is done by any
+session.
+
+In an older session the action is **not performed**. The answer is
+`303` to `/enter?again=settings` or `/enter?again=ops`, the sign-in
+page with a banner that says why: "Sign in again to change this
+setting. Nothing was changed." The sign-in then runs exactly as the
+first one did, in either client mode, with the same checks. Its
+callback creates a new session, deletes the session that asked, and
+continues to the page the admin was on instead of `/admin`. The admin
+makes the change again there: the posted form is not carried through
+the sign-in, so nothing is done that the admin does not see being
+done. `again` names one of those two pages and nothing else; any other
+value is ignored, and without a session the address is the plain
+sign-in page.
+
+The form check comes first: a request without the session's token is
+`403` and learns nothing about the session's age.
 
 ### Access rule
 
@@ -392,10 +464,17 @@ control. These rules hold in every mode.
   (`Path=/enter`, `Max-Age=600`), which is `SameSite=Lax` because the
   OAuth callback is a cross-site top-level navigation and must carry
   it. It authorizes nothing by itself: it ties a callback to the
-  browser that started the flow.
+  browser that started the flow. The admin session cookie carries the
+  `__Host-` prefix over HTTPS. The flow cookie and the setup cookie
+  are scoped to `/enter` and `/setup`, and the prefix requires
+  `Path=/`, so they do not carry it.
 - **`Secure`** is set on a cookie when the request arrived with
   `X-Forwarded-Proto: https` from a trusted proxy. Farsight does not
   terminate TLS itself, so that header is its only evidence of HTTPS.
+  Behind a proxy that is not in `proxy.trusted` the header is
+  ignored: cookies are then set without `Secure` and the session
+  cookie without its prefix, although the browser's connection is
+  HTTPS. Trusting the proxy is what makes both apply.
   In setup mode, where no proxy is trusted yet, the header is
   honoured from any peer for this flag only (a forged value affects
   only the forger's own cookie) and never for the client address.
@@ -535,7 +614,9 @@ Forms that call the same code paths as the admin API
 ([API](api.md#admin-procedures)): enqueue a backfill for an account
 (priority, force); restart the firehose; pause or resume the sweep;
 create and revoke API keys (a new key is shown once); and the recent
-error log.
+error log. Creating a key asks for a
+[fresh sign-in](#a-fresh-sign-in-for-sensitive-actions). A revoked
+key stops working before the page answers.
 
 Gap repair has four controls, backed by `[backfill.repair]`
 (`auto_start`, default `true`; `paused`, default `false`):
@@ -564,12 +645,21 @@ mechanism itself is described in [Backfill](backfill.md#gap-repair).
   `admin_backfill_rps`, `key_backfill_rps`, `ui_lookup_rps` and
   `query_timeout`. Any other changed key is named on the page as
   needing a restart. (`access.admin_did` and `access.admin_ui` are
-  refused before that, as described above.)
+  refused before that, as described above.) The form carries the
+  SHA-256 of the file it shows, and a save is stored only while the
+  file is still that one: a whole file submitted from an older copy
+  (another tab saved in between, or an Operations control changed a
+  key) is refused with a message to reload, instead of undoing those
+  edits. The same holds for a file that waits on the public UI's
+  confirmation page.
 - **The Public UI form** exposes the public toggle and every
   `[public_ui]` key; all apply on save. Turning the toggle on answers
   with the confirmation page (below).
 - **Admin token rotation** shows the new token once and signs every
-  session out.
+  session out. A save in the config editor that changes
+  `auth.admin_token_sha256` signs every session out as well.
+- A save that touches a sensitive key, and the rotation, ask for a
+  [fresh sign-in](#a-fresh-sign-in-for-sensitive-actions).
 - The admin DID is shown read-only, and there is no control for
   `access.admin_ui`; the page says where each is changed.
 
@@ -609,6 +699,10 @@ Page views are limited per client address
 (`public_ui.rate_limit_rps` / `rate_limit_burst`) and renders are
 bounded process-wide (`public_ui.query_concurrency`; a render that
 cannot get a slot within 2 seconds is a `503` with `Retry-After`).
+One address (IPv6: one /48) has at most half of those slots under way
+at once, at least one; a request beyond that is the rate limit's
+`429`, so one visitor's slow pages do not turn everyone else's into
+`503`.
 
 An unknown root path is the bare `404` also while the public UI is on;
 the public not-found page is for public routes whose subject does not
@@ -699,15 +793,25 @@ unchanged by it.
   it reads "more than 5,000,000" and the controls end in a gap and a
   next arrow, which works for as long as rows follow, so every row
   stays reachable. If a count cannot be read in time, the heading
-  shows a dash and the controls show only what the rows prove.
+  shows a dash and the controls show only what the rows prove. A
+  count that was read answers every view of the same table with the
+  same filters for 30 seconds, which is as long as a cache may keep
+  the page: counting scans the table's index, and a large account's
+  page viewed often counts once in that time. The count is remembered
+  by what was counted (the table, its filters, the exclusion list),
+  not by the address, so a query parameter the page does not read
+  gets the remembered count like any other view.
 - **Order.** Rows are newest first by the shown time, once the
   table's sort index is built
   ([Storage](storage.md#the-sort-indexes)).
 - **Filter box.** Each table of an account page has a box
   (`?find=`, at most 100 characters) that filters it across all its
   pages by DID, or by part of a handle among the handles this
-  instance has verified. Submitting a whole handle resolves it, from
-  the handle budget, and finds the account either way.
+  instance has verified. Submitting a whole handle (`go=1`) resolves
+  it and finds the account either way. That lookup is charged to the
+  visitor's own lookup class (`rate_limit.ui_lookup_rps`, like a
+  search) before it draws on the instance's handle budget; without a
+  token there the box filters as it does for part of a handle.
 - **Layout.** Tables are frameless, with a hairline between rows; a
   row is one line.
 
@@ -800,6 +904,7 @@ on the caller.
 | Account or list page, complete | `public, max-age=30` |
 | Home page, complete | `public, max-age=60` |
 | A page that held rows back, or a top list still waiting for handles | `no-store` |
+| An account or list page whose own handle could not be checked this time (no budget, or no answer within 2 seconds) | `no-store` |
 | A complete profile card | `public, max-age=300` |
 | Every 4xx and 5xx, every redirect to a public page | `no-store` |
 | `robots.txt`, the API-only text at `/` | `public, max-age=300` |
@@ -825,7 +930,14 @@ directions**:
    `https://<handle>/.well-known/atproto-did`) and require the result
    to equal the DID.
 
-A handle that fails step 3 is not shown, on any page. Rendering a row
+A handle that fails step 3 is not shown, on any page. A check that
+finds a handle is no longer the account's removes it at once, from
+memory and from `handle_cache`: the document names no handle, the
+directory says the DID is gone, the document names another handle, or
+the handle resolves to **another account**. Handles change hands, and
+a name someone else may now hold is never left on this account's
+rows. Only a check that establishes nothing (a host that does not
+answer) keeps a stored handle. Rendering a row
 never waits for an outbound request. A page verifies at most one
 handle inline (its own subject, or a list's owner), waiting at most 2
 seconds.
@@ -855,7 +967,9 @@ miss the table, read once per page for all its accounts; on a miss in
 both, the account has no answer and is queued for warming. A stored
 verified handle older than 7 days is shown as it is and queued for
 one background verification; a stored "no handle" is re-checked after
-1 hour. A re-check on view that fails keeps a stored verified handle.
+1 hour. A re-check on view that establishes nothing keeps a stored
+verified handle; one that shows the handle is no longer the
+account's removes it (see [Verification](#verification)).
 
 ### Hold until verified
 
@@ -1032,6 +1146,19 @@ is used for a day, so that a card does not read the record on every
 view. Emptying the table is safe. A list's image follows the same
 rule with `lists.avatar_cid`: the address is named only with
 `show_avatars`, and the browser loads it.
+
+An image is named only on a host a visitor's browser may be pointed
+at. An account's server is whatever its identity says, which the
+account writes: an IP address, a single-label name, `nas.local`. A
+page that named such a host in an image address would make every
+visitor's browser knock on the visitor's own network. So the endpoint
+must be `https` with a domain name of two or more labels, not an IP
+address and not under a private-network suffix (`local`, `localhost`,
+`localdomain`, `internal`, `intranet`, `lan`, `home`, `corp`,
+`private`, `arpa`); otherwise the card has no image. The same rule
+decides whether a card carries the account's host at all (`data-pds`,
+which the list page's script builds the list image's address from and
+the account page's header shows as "Hosted on").
 
 `GET /admin/card/{did}` serves the same fragment to admin tables. It
 differs in three ways: without a valid session it is the bare `404`

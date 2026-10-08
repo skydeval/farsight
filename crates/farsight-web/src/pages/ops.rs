@@ -15,7 +15,9 @@ use farsight_storage::ids::CycleId;
 use farsight_storage::keys::Limits;
 
 use super::dashboard::repair_under_way;
-use super::{Admin, HandleError, Nav, WebState, check_form, gate, handle_to_did, nav};
+use super::{
+    Admin, HandleError, Nav, Return, WebState, check_form, gate, handle_to_did, nav, step_up,
+};
 use crate::common::render_private;
 
 /// The operations page.
@@ -280,6 +282,11 @@ pub(super) async fn ops_action(
             },
         },
         "keys-create" => {
+            // A key outlives the session that made it: a fresh sign-in
+            // first.
+            if let Err(r) = step_up(&s, Return::Ops) {
+                return r;
+            }
             let scopes: Vec<String> = form
                 .iter()
                 .filter(|(k, _)| k == "scope")
@@ -302,13 +309,10 @@ pub(super) async fn ops_action(
             }
         }
         "keys-revoke" => match get("id").parse::<i32>() {
-            Ok(id) => match farsight_storage::auth::revoke_token(&st.api.pool, id).await {
-                Ok(true) => {
-                    let _ = st.api.keys.refresh(&st.api.pool).await;
-                    Ok((format!("API key {id} revoked."), None))
-                }
+            Ok(id) => match api_admin::revoke_key(&st.api, id).await {
+                Ok(true) => Ok((format!("API key {id} revoked."), None)),
                 Ok(false) => Err(format!("No live key {id}.")),
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(e.message),
             },
             Err(_) => Err("bad key id".into()),
         },

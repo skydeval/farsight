@@ -137,6 +137,9 @@ pub async fn touch_tokens<'e>(ex: impl PgExecutor<'e>, ids: &[i32]) -> Result<()
 pub struct AdminSession {
     /// Per-session CSRF token.
     pub csrf: Vec<u8>,
+    /// Whole seconds since the sign-in that created the session, on the
+    /// database's clock.
+    pub age_secs: u64,
 }
 
 /// Stores a new session under the SHA-256 of its id, with its CSRF token
@@ -171,10 +174,11 @@ pub async fn touch_session(
     idle: std::time::Duration,
     absolute: std::time::Duration,
 ) -> Result<Option<AdminSession>> {
-    let row: Option<(Vec<u8>, bool)> = sqlx::query_as(
+    let row: Option<(Vec<u8>, bool, i64)> = sqlx::query_as(
         "SELECT csrf,
                 (last_seen < now() - make_interval(secs => $2)
-                 OR created_at < now() - make_interval(secs => $3))
+                 OR created_at < now() - make_interval(secs => $3)),
+                floor(extract(epoch FROM now() - created_at))::bigint
          FROM admin_sessions WHERE id_sha256 = $1",
     )
     .bind(id_sha256)
@@ -182,7 +186,7 @@ pub async fn touch_session(
     .bind(absolute.as_secs_f64())
     .fetch_optional(pool)
     .await?;
-    let Some((csrf, expired)) = row else {
+    let Some((csrf, expired, age)) = row else {
         return Ok(None);
     };
     if expired {
@@ -193,7 +197,12 @@ pub async fn touch_session(
         .bind(id_sha256)
         .execute(pool)
         .await?;
-    Ok(Some(AdminSession { csrf }))
+    Ok(Some(AdminSession {
+        csrf,
+        // A session created "in the future" (a clock that stepped back)
+        // counts as just made.
+        age_secs: u64::try_from(age).unwrap_or(0),
+    }))
 }
 
 /// Ends one session (logout).
@@ -205,7 +214,7 @@ pub async fn delete_session<'e>(ex: impl PgExecutor<'e>, id_sha256: &[u8]) -> Re
     Ok(())
 }
 
-/// Revokes every admin session (admin-token rotation, reset).
+/// Revokes every admin session (a changed admin token, reset).
 pub async fn delete_all_sessions<'e>(ex: impl PgExecutor<'e>) -> Result<u64> {
     Ok(sqlx::query("DELETE FROM admin_sessions")
         .execute(ex)

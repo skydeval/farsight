@@ -595,6 +595,9 @@ struct World {
     w19: String,
     w20: String,
     w21: String,
+    /// A subject whose one blocker has a stored handle that its document
+    /// no longer names.
+    w22: String,
     /// An author of 3,000 blocks; a list with 20,000 members and listblocks.
     dense_author_id: i64,
     filler_list_id: i64,
@@ -772,6 +775,20 @@ async fn seed_world(pool: &PgPool) -> Result<World, String> {
         ),
     )
     .await?;
+    // A stored handle, verified eight days ago, of an account whose
+    // document names no handle any more (the stand-in's answer for every
+    // account it was not told to fail).
+    let (w22, w22_id) = actor(did("wsx", 22)).await?;
+    seed_blockers(pool, "wxf", 1, w22_id, &recent, &recent).await?;
+    seed::exec(
+        pool,
+        &format!(
+            "INSERT INTO handle_cache (did, handle, resolved_at) VALUES
+             ('{}', 'stored-gone.example', now() - interval '8 days')",
+            did("wxf", 1)
+        ),
+    )
+    .await?;
     // The same account twice on one page.
     seed::exec(
         pool,
@@ -876,6 +893,7 @@ async fn seed_world(pool: &PgPool) -> Result<World, String> {
         w19,
         w20,
         w21,
+        w22,
         dense_author_id,
         filler_list_id,
         filler_path: format!("/list/{}/filler", did("flo", 1)),
@@ -2564,14 +2582,19 @@ async fn check_warming(
         ),
     )
     .await?;
-    let rows = n(pool, "SELECT count(*) FROM handle_cache WHERE handle <> ''").await?;
+    let gone = did("wxf", 1);
+    let rows = n(
+        pool,
+        &format!("SELECT count(*) FROM handle_cache WHERE handle <> '' AND did <> '{gone}'"),
+    )
+    .await?;
     let checked = n(
         pool,
         &format!("SELECT count(*) FROM handle_cache WHERE did = '{none}' AND handle = ''"),
     )
     .await?;
     c.check(
-        "only the handle older than seven days is verified again, in the background (its document is requested once, the fresh one's never); the verification fails here (the stand-in names no handle), so the old handle stays on the page and in the table; the account that was held back has been checked, is now a row showing its DID, and its check is stored as \"no handle\" without touching a stored handle",
+        "only the handle older than seven days is verified again, in the background (its document is requested once, the fresh one's never); the verification establishes nothing here (the stand-in answers 503 for that account's document), so the old handle stays on the page and in the table; the account that was held back has been checked, is now a row showing its DID, and its check is stored as \"no handle\" without touching a stored handle",
         plc.documents(&fresh) == 0
             && plc.documents(&stale) == 1
             && plc.documents(&none) == 1
@@ -2587,6 +2610,39 @@ async fn check_warming(
             plc.documents(&fresh),
             plc.documents(&stale),
             plc.documents(&none)
+        ),
+    );
+
+    // A stored handle that the account's document no longer names.
+    let first = a.get(&public_did(&w.w22)).await?;
+    let sec = section(&first.text, "blockers").unwrap_or("");
+    let shown_first = shown_as(sec, &gone).to_owned();
+    let started = Instant::now();
+    let dropped = format!("SELECT count(*) FROM handle_cache WHERE did = '{gone}' AND handle = ''");
+    while n(pool, &dropped).await? == 0 && started.elapsed() < Duration::from_secs(30) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let again = a.get(&public_did(&w.w22)).await?;
+    let sec = section(&again.text, "blockers").unwrap_or("");
+    let redated = n(
+        pool,
+        &format!(
+            "SELECT count(*) FROM handle_cache WHERE did = '{gone}' AND handle = ''
+               AND resolved_at > now() - interval '5 minutes'"
+        ),
+    )
+    .await?;
+    c.check(
+        "a stored handle that its account's document no longer names is shown until it is checked, then dropped at once: the check reads a document that names no handle, the row shows the DID, and the stored row says \"no handle\" as of now, so the name is not left on an account that may have given it up",
+        shown_first == "stored-gone.example"
+            && plc.documents(&gone) == 1
+            && shown_as(sec, &gone) == format!("<code>{gone}</code>")
+            && pending_of(sec) == 0
+            && redated == 1,
+        format!(
+            "first shown as {shown_first:?}, then {:?}; document asked {} time(s); {redated} row stored as none",
+            support::truncate(shown_as(sec, &gone), 60),
+            plc.documents(&gone)
         ),
     );
 
@@ -3235,6 +3291,9 @@ struct Args {
 async fn run(c: &mut Checks, pg: &Pg, args: &Args) -> Result<(), String> {
     let plc = Plc::start(STANDIN_ADDR).await?;
     println!("   stand-in PLC directory at {}", plc.base);
+    // The directory does not answer for this account: a check of its
+    // handle establishes nothing.
+    plc.fail(&did("wxe", 2));
     pg.create_db("s8").await?;
     let dsn = pg.url("s8");
     // A runs the migrations and builds the indexes on the empty tables;

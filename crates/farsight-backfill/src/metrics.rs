@@ -51,39 +51,71 @@ struct HostVolumes {
 
 static VOLUMES: Mutex<Option<HostVolumes>> = Mutex::new(None);
 
-/// The `host` label for a request to `host`, counting its volume.
-pub fn host_label(host: &str) -> String {
-    let mut g = VOLUMES.lock().unwrap_or_else(|e| e.into_inner());
-    let v = g.get_or_insert_with(|| HostVolumes {
-        counts: HashMap::new(),
-        top: HashSet::new(),
-        since: 0,
-    });
-    *v.counts.entry(host.to_owned()).or_insert(0) += 1;
-    v.since += 1;
-    if v.top.len() < TOP_HOSTS && !v.top.contains(host) {
-        v.top.insert(host.to_owned());
-    } else if v.since >= RECOMPUTE_EVERY {
-        v.since = 0;
-        let mut all: Vec<(&String, &u64)> = v.counts.iter().collect();
-        all.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-        v.top = all
-            .iter()
-            .take(TOP_HOSTS)
-            .map(|(h, _)| (*h).clone())
-            .collect();
-        // Bound the volume table too.
-        if v.counts.len() > 100_000 {
-            let keep: HashSet<String> =
-                all.iter().take(10_000).map(|(h, _)| (*h).clone()).collect();
-            v.counts.retain(|h, _| keep.contains(h));
+/// Most hosts whose request counts are kept. The counts exist to pick
+/// the [`TOP_HOSTS`] busiest; a host far down the list has no chance of
+/// being one of them. When the table is full, the less busy half goes.
+pub const MAX_TRACKED_HOSTS: usize = 4096;
+
+impl HostVolumes {
+    fn new() -> HostVolumes {
+        HostVolumes {
+            counts: HashMap::new(),
+            top: HashSet::new(),
+            since: 0,
         }
     }
-    if v.top.contains(host) {
-        host.to_owned()
-    } else {
-        "other".to_owned()
+
+    /// The hosts by request count, busiest first.
+    fn ranked(&self) -> Vec<(String, u64)> {
+        let mut all: Vec<(String, u64)> =
+            self.counts.iter().map(|(h, n)| (h.clone(), *n)).collect();
+        all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        all
     }
+
+    /// Counts one request to `host` and returns its label.
+    fn label(&mut self, host: &str) -> String {
+        // A host not seen before, with the table full: keep the busier
+        // half. A host dropped here starts again from zero if it comes
+        // back, which costs it nothing unless it was about to be one of
+        // the busiest, and those are in the half that stays.
+        if self.counts.len() >= MAX_TRACKED_HOSTS && !self.counts.contains_key(host) {
+            let keep: HashSet<String> = self
+                .ranked()
+                .into_iter()
+                .take(MAX_TRACKED_HOSTS / 2)
+                .map(|(h, _)| h)
+                .collect();
+            self.counts.retain(|h, _| keep.contains(h));
+        }
+        *self.counts.entry(host.to_owned()).or_insert(0) += 1;
+        self.since += 1;
+        if self.top.len() < TOP_HOSTS && !self.top.contains(host) {
+            self.top.insert(host.to_owned());
+        } else if self.since >= RECOMPUTE_EVERY {
+            self.since = 0;
+            self.top = self
+                .ranked()
+                .into_iter()
+                .take(TOP_HOSTS)
+                .map(|(h, _)| h)
+                .collect();
+        }
+        if self.top.contains(host) {
+            host.to_owned()
+        } else {
+            "other".to_owned()
+        }
+    }
+}
+
+/// The `host` label for a request to `host`, counting its volume.
+pub fn host_label(host: &str) -> String {
+    VOLUMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HostVolumes::new)
+        .label(host)
 }
 
 /// Registers series at zero so they are visible before first use.
@@ -123,5 +155,25 @@ mod tests {
         }
         assert!(labels.len() <= TOP_HOSTS + 1);
         assert!(labels.contains("other"));
+    }
+
+    #[test]
+    fn the_volume_table_is_bounded_and_keeps_the_busy_hosts() {
+        let mut v = HostVolumes::new();
+        // One busy host among a flood of hosts seen once each.
+        for _ in 0..500 {
+            v.label("busy.example");
+        }
+        for i in 0..(MAX_TRACKED_HOSTS * 5) {
+            v.label(&format!("h{i}.example"));
+            assert!(v.counts.len() <= MAX_TRACKED_HOSTS, "{}", v.counts.len());
+        }
+        assert_eq!(v.counts.get("busy.example"), Some(&500));
+        // It is still told apart once the top is worked out again.
+        for _ in 0..RECOMPUTE_EVERY {
+            v.label("busy.example");
+        }
+        assert_eq!(v.label("busy.example"), "busy.example");
+        assert!(v.top.len() <= TOP_HOSTS);
     }
 }

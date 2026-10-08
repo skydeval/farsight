@@ -23,3 +23,7 @@
    enough.
 5. In the wizard's reverse-proxy step, choose **Cloudflare**. Farsight
    then trusts `CF-Connecting-IP` only from Cloudflare addresses.
+   Trusting the proxy is also what tells Farsight that visitors arrive
+   over HTTPS: only then are its cookies `Secure`, and the admin
+   session cookie `__Host-farsight_admin`. Behind a proxy it does not
+   trust, they are set without `Secure`.

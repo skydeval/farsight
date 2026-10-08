@@ -118,6 +118,9 @@
         },
         {
           "name": "SetupRequired"
+        },
+        {
+          "name": "InternalError"
         }
       ]
     },

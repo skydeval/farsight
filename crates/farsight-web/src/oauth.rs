@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use farsight_core::Did;
-use farsight_core::config::Config;
 use farsight_core::did::is_valid_hostname;
 use farsight_core::net::{OutboundClient, OutboundResponse, SafeClient, SafeClientConfig};
 use ring::rand::SystemRandom;
@@ -390,8 +389,8 @@ pub fn check_server_metadata(
     Ok(server)
 }
 
-async fn did_document(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Value, OAuthError> {
-    let url = crate::public::handles::document_url(cfg, did)
+async fn did_document(safe: &SafeClient, plc_url: &str, did: &Did) -> Result<Value, OAuthError> {
+    let url = crate::public::handles::document_url_at(plc_url, did)
         .ok_or_else(|| OAuthError::Document(format!("{did} has no document URL")))?;
     let r = safe.get(&url).await?;
     match r.status {
@@ -405,7 +404,13 @@ async fn did_document(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Valu
     }
     let doc: Value = serde_json::from_slice(&r.body)
         .map_err(|_| OAuthError::Document("the DID document is not JSON".into()))?;
-    if doc["id"].as_str() != Some(did.as_str()) {
+    // Compared as DIDs: a did:web document may write its host in any case.
+    if doc["id"]
+        .as_str()
+        .and_then(|id| Did::parse(id).ok())
+        .as_ref()
+        != Some(did)
+    {
         return Err(OAuthError::Document(
             "the DID document is for another DID".into(),
         ));
@@ -415,9 +420,10 @@ async fn did_document(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Valu
 
 /// Finds and checks the authorization server of `did`: its DID document's
 /// PDS, that PDS's protected-resource metadata (exactly one authorization
-/// server), and that server's metadata.
-pub async fn discover(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Server, OAuthError> {
-    let doc = did_document(safe, cfg, did).await?;
+/// server), and that server's metadata. A did:plc document is read from
+/// the directory at `plc_url`.
+pub async fn discover(safe: &SafeClient, plc_url: &str, did: &Did) -> Result<Server, OAuthError> {
+    let doc = did_document(safe, plc_url, did).await?;
     let pds = pds_endpoint(&doc)
         .ok_or_else(|| OAuthError::Document("the DID document names no PDS".into()))?;
     let resource = pds.join("/.well-known/oauth-protected-resource")?;
@@ -448,9 +454,10 @@ pub struct Identity {
 }
 
 /// Resolves a DID for display. An error means the document could not be
-/// read; a document without a handle or a PDS is not an error.
-pub async fn identity(safe: &SafeClient, cfg: &Config, did: &Did) -> Result<Identity, OAuthError> {
-    let doc = did_document(safe, cfg, did).await?;
+/// read; a document without a handle or a PDS is not an error. A did:plc
+/// document is read from the directory at `plc_url`.
+pub async fn identity(safe: &SafeClient, plc_url: &str, did: &Did) -> Result<Identity, OAuthError> {
+    let doc = did_document(safe, plc_url, did).await?;
     let pds = pds_endpoint(&doc).and_then(|u| u.host_str().map(str::to_owned));
     let handle = match crate::public::handles::claimed_handle(&doc) {
         Some(h) => match crate::pages::handle_to_did(safe, &h).await {
@@ -543,6 +550,12 @@ pub struct Flow {
     pub cookie_sha256: [u8; 32],
     /// When the flow was started.
     pub created: Instant,
+    /// Where the browser continues after the sign-in: `/admin`, or the
+    /// admin page a repeated sign-in was asked from.
+    pub back: &'static str,
+    /// The stored key of the session that asked for a repeated sign-in;
+    /// the new session replaces it.
+    pub replaces: Option<[u8; 32]>,
 }
 
 /// Pushes the authorization request (PAR) and returns the flow record
@@ -602,6 +615,8 @@ pub async fn start(
             client,
             cookie_sha256,
             created: Instant::now(),
+            back: "/admin",
+            replaces: None,
         },
         to,
     ))
@@ -773,9 +788,15 @@ impl FlowStore {
 type Cached<T> = Mutex<Option<(String, Instant, T)>>;
 
 /// The sign-in's in-memory state: flows, the discovery cache, the admin
-/// handle for display, and the clock of the `sub`-mismatch warning.
-#[derive(Debug, Default)]
+/// handle for display, the clock of the `sub`-mismatch warning, and the
+/// PLC directory the admin DID is resolved through.
+#[derive(Debug)]
 pub struct OAuthState {
+    /// `backfill.plc_url` as it was when the process started. The admin
+    /// DID's document is read from this directory until the next start:
+    /// a `plc_url` changed while running (it is otherwise applied at
+    /// once) does not decide where the admin signs in.
+    plc_url: String,
     /// Flows in progress, keyed by `state`: put at `POST /enter`, taken
     /// once by the callback.
     pub flows: FlowStore,
@@ -785,16 +806,28 @@ pub struct OAuthState {
 }
 
 impl OAuthState {
+    /// The state of a process whose config named `plc_url` as the PLC
+    /// directory at start.
+    pub fn new(plc_url: &str) -> OAuthState {
+        OAuthState {
+            plc_url: plc_url.to_owned(),
+            flows: FlowStore::default(),
+            discovery: Mutex::new(None),
+            handle: Mutex::new(None),
+            last_mismatch_warning: Mutex::new(None),
+        }
+    }
+
+    /// The PLC directory pinned at start.
+    pub fn plc_url(&self) -> &str {
+        &self.plc_url
+    }
+
     /// The admin DID's authorization server, from the cache when it has
     /// an answer young enough (successes and failures both), otherwise
-    /// discovered now. None of the hosts contacted is chosen by the
-    /// caller.
-    pub async fn server(
-        &self,
-        safe: &SafeClient,
-        cfg: &Config,
-        did: &Did,
-    ) -> Result<Server, OAuthError> {
+    /// discovered now through the directory pinned at start. None of the
+    /// hosts contacted is chosen by the caller.
+    pub async fn server(&self, safe: &SafeClient, did: &Did) -> Result<Server, OAuthError> {
         {
             let c = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((d, at, r)) = c.as_ref() {
@@ -808,7 +841,7 @@ impl OAuthState {
                 }
             }
         }
-        let r = discover(safe, cfg, did).await;
+        let r = discover(safe, &self.plc_url, did).await;
         *self.discovery.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((did.as_str().to_owned(), Instant::now(), r.clone()));
         r
@@ -832,12 +865,12 @@ impl OAuthState {
     /// resolved now with a two-second budget. `None` when it has none,
     /// does not verify, or does not answer in time (a timeout is not
     /// cached).
-    pub async fn handle(&self, safe: &SafeClient, cfg: &Config, did: &str) -> Option<String> {
+    pub async fn handle(&self, safe: &SafeClient, did: &str) -> Option<String> {
         if let Some(h) = self.cached_handle(did) {
             return h;
         }
         let parsed = Did::parse(did).ok()?;
-        match tokio::time::timeout(HANDLE_WAIT, identity(safe, cfg, &parsed)).await {
+        match tokio::time::timeout(HANDLE_WAIT, identity(safe, &self.plc_url, &parsed)).await {
             Ok(r) => {
                 let h = r.ok().and_then(|i| i.handle);
                 self.remember_handle(did, h.clone());
@@ -865,6 +898,7 @@ impl OAuthState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use farsight_core::config::Config;
 
     fn flow(created: Instant, cookie: [u8; 32]) -> Flow {
         Flow {
@@ -877,6 +911,8 @@ mod tests {
             client: client_for("farsight.example", "farsight.example", false).unwrap(),
             cookie_sha256: cookie,
             created,
+            back: "/admin",
+            replaces: None,
         }
     }
 
@@ -1153,7 +1189,8 @@ mod tests {
 
     #[test]
     fn mismatch_warning_is_limited() {
-        let s = OAuthState::default();
+        let s = OAuthState::new("https://plc.example");
+        assert_eq!(s.plc_url(), "https://plc.example");
         assert!(s.may_warn_mismatch());
         assert!(!s.may_warn_mismatch());
     }

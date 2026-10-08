@@ -51,6 +51,56 @@ pub fn is_hot(key: &str) -> bool {
     })
 }
 
+/// The key of the admin token's hash. A stored edit that changes it ends
+/// every admin session.
+pub const ADMIN_TOKEN_KEY: &str = "auth.admin_token_sha256";
+
+fn reads_rank(m: config::ReadsMode) -> u8 {
+    match m {
+        config::ReadsMode::Disabled => 0,
+        config::ReadsMode::ApiKey => 1,
+        config::ReadsMode::Public => 2,
+    }
+}
+
+/// The dotted keys by which `new` differs from `old` in a way the admin
+/// UI treats as sensitive (it asks for a fresh sign-in before storing
+/// them): every `auth.*` and `net.*` key, `backfill.plc_url`,
+/// `backfill.relay_url`, and an `access.*` key that lets more callers in
+/// (`reads` towards `public`, `cors` or `public_ui` switched on). With
+/// these a session could outlive its own end: a token it knows, a
+/// directory or relay it runs, a host the outbound client may newly
+/// reach, or data served to people who could not read it before.
+pub fn sensitive_changes(old: &config::Config, new: &config::Config) -> Vec<String> {
+    let flat = |c: &config::Config| {
+        toml::Value::try_from(c)
+            .map(|v| flatten(&v))
+            .unwrap_or_default()
+    };
+    let (o, n) = (flat(old), flat(new));
+    let mut out: BTreeSet<String> = o
+        .keys()
+        .chain(n.keys())
+        .filter(|k| o.get(*k) != n.get(*k))
+        .filter(|k| {
+            k.starts_with("auth.")
+                || k.starts_with("net.")
+                || matches!(k.as_str(), "backfill.plc_url" | "backfill.relay_url")
+        })
+        .cloned()
+        .collect();
+    if reads_rank(new.access.reads) > reads_rank(old.access.reads) {
+        out.insert("access.reads".into());
+    }
+    if new.access.cors && !old.access.cors {
+        out.insert("access.cors".into());
+    }
+    if new.access.public_ui && !old.access.public_ui {
+        out.insert("access.public_ui".into());
+    }
+    out.into_iter().collect()
+}
+
 /// Refusal: a settings save tried to change `access.admin_did`.
 pub const ADMIN_DID_READ_ONLY: &str =
     "the admin DID cannot be changed here; use `farsight set-admin-did` and restart farsight";
@@ -84,6 +134,12 @@ pub enum EditError {
     /// The edit would switch the admin UI on or off.
     #[error("{0}")]
     AdminUi(&'static str),
+    /// The file is no longer the one the edit was made from.
+    #[error(
+        "the configuration was changed in the meantime (in another tab, or from the Operations \
+         page); nothing was saved. Reload the page and make the change again"
+    )]
+    Changed,
     /// Reading or writing the file failed.
     #[error("{0}")]
     Io(String),
@@ -206,11 +262,27 @@ impl ConfigStore {
     /// Replaces the whole file with `new_text` (settings page), refusing
     /// changes to environment-locked keys.
     pub async fn replace(&self, new_text: &str) -> Result<EditReport, EditError> {
+        self.replace_from(None, new_text).await
+    }
+
+    /// [`ConfigStore::replace`] for a text that was written from the
+    /// file as it was when its SHA-256 was `base`: if the file is another
+    /// one by now, nothing is stored ([`EditError::Changed`]). A whole
+    /// file submitted from an older copy would otherwise undo every edit
+    /// made since. The check and the write happen under the edit lock.
+    pub async fn replace_from(
+        &self,
+        base: Option<&[u8; 32]>,
+        new_text: &str,
+    ) -> Result<EditReport, EditError> {
         let _guard = self.edit_lock.lock().await;
         if self.current().from_env_only {
             return Err(EditError::ManagedExternally);
         }
         let text = self.file_text()?;
+        if base.is_some_and(|b| *b != crate::auth::sha256(&text)) {
+            return Err(EditError::Changed);
+        }
         self.store_locked(&text, new_text)
     }
 
@@ -292,6 +364,105 @@ mod tests {
         assert!(!is_hot("rate_limit.query_concurrency"));
         assert!(!is_hot("storage.database_url"));
         assert!(!is_hot("accessx"));
+    }
+
+    #[test]
+    fn sensitive_changes_are_named_and_nothing_else_is() {
+        use farsight_core::config::{Config, ReadsMode};
+        let base = Config::default();
+        let with = |f: &dyn Fn(&mut Config)| {
+            let mut c = base.clone();
+            f(&mut c);
+            sensitive_changes(&base, &c)
+        };
+        assert!(with(&|_| {}).is_empty());
+        assert_eq!(
+            with(&|c| c.auth.admin_token_sha256 = "ab".repeat(32)),
+            [ADMIN_TOKEN_KEY]
+        );
+        assert_eq!(
+            with(&|c| c.backfill.plc_url = "https://plc.evil.example".into()),
+            ["backfill.plc_url"]
+        );
+        assert_eq!(
+            with(&|c| c.backfill.relay_url = "https://relay.evil.example".into()),
+            ["backfill.relay_url"]
+        );
+        assert_eq!(
+            with(&|c| c.net.allow_http_hosts = vec!["198.51.100.1".into()]),
+            ["net.allow_http_hosts"]
+        );
+        // Everything else is an ordinary change.
+        assert!(with(&|c| c.server.contact = "mailto:x@example.com".into()).is_empty());
+        assert!(with(&|c| c.backfill.plc_rps += 1).is_empty());
+        assert!(with(&|c| c.public_ui.crawlable = !c.public_ui.crawlable).is_empty());
+        assert!(with(&|c| c.rate_limit.anon_rps += 1).is_empty());
+        // Access: only the direction that lets more callers in.
+        let mut closed = base.clone();
+        closed.access.reads = ReadsMode::Disabled;
+        closed.access.cors = false;
+        closed.access.public_ui = false;
+        let mut open = closed.clone();
+        open.access.reads = ReadsMode::Public;
+        open.access.cors = true;
+        open.access.public_ui = true;
+        assert_eq!(
+            sensitive_changes(&closed, &open),
+            ["access.cors", "access.public_ui", "access.reads"]
+        );
+        assert!(sensitive_changes(&open, &closed).is_empty());
+        let mut keyed = closed.clone();
+        keyed.access.reads = ReadsMode::ApiKey;
+        assert_eq!(sensitive_changes(&closed, &keyed), ["access.reads"]);
+        assert_eq!(sensitive_changes(&keyed, &open).len(), 3);
+        assert!(sensitive_changes(&open, &keyed).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_whole_file_from_an_older_copy_is_not_stored() {
+        let dir =
+            std::env::temp_dir().join(format!("farsight-config-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let file = |contact: &str, anon: u32| {
+            format!(
+                "[server]\nhostname = \"farsight.test\"\ncontact = \"{contact}\"\n\
+                 [storage]\ndatabase_url = \"postgres://u:p@db/f\"\n\
+                 [auth]\nadmin_token_sha256 = \"{}\"\n\
+                 [rate_limit]\nanon_rps = {anon}\n",
+                "ab".repeat(32)
+            )
+        };
+        let first = file("mailto:a@farsight.test", 10);
+        std::fs::write(&path, &first).unwrap();
+        let loaded = config::load_from_parts(Some(&first), &[]).unwrap();
+        let store = ConfigStore::new(path.clone(), Vec::new(), loaded);
+        let base = crate::auth::sha256(&first);
+        // Another tab saves in between.
+        store
+            .replace(&file("mailto:a@farsight.test", 20))
+            .await
+            .unwrap();
+        // The text made from the first copy would put `anon_rps` back.
+        let stale = file("mailto:b@farsight.test", 10);
+        assert!(matches!(
+            store.replace_from(Some(&base), &stale).await,
+            Err(EditError::Changed)
+        ));
+        assert_eq!(store.current().config.rate_limit.anon_rps, 20);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            file("mailto:a@farsight.test", 20)
+        );
+        // From the copy in force it is stored.
+        let base = crate::auth::sha256(&store.file_text().unwrap());
+        let report = store
+            .replace_from(Some(&base), &file("mailto:b@farsight.test", 20))
+            .await
+            .unwrap();
+        assert_eq!(report.changed, ["server.contact"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

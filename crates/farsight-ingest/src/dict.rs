@@ -2,6 +2,9 @@
 //! `docs/design/firehose.md`).
 
 use std::io::Read;
+use std::sync::LazyLock;
+
+use zstd::dict::DecoderDictionary;
 
 /// v1 `/subscribe?compress=true` dictionary.
 pub const LEGACY_DICT: &[u8] = include_bytes!("../dictionaries/legacy_subscribe.zdict");
@@ -32,9 +35,50 @@ pub enum DecompressError {
     TooLarge,
 }
 
+/// The largest window a frame may ask the decoder for, as a power of
+/// two: [`MAX_FRAME_BYTES`]. A frame cannot expand beyond that, so it
+/// needs no larger window, and one that asks for more is refused before
+/// any memory is set aside for it.
+pub const WINDOW_LOG_MAX: u32 = 24;
+
+/// One of the bundled dictionaries, as a session uses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dictionary {
+    /// [`LEGACY_DICT`].
+    Legacy,
+    /// [`V2_DICT`].
+    V2,
+}
+
+impl Dictionary {
+    /// The dictionary's bytes.
+    pub fn bytes(self) -> &'static [u8] {
+        match self {
+            Dictionary::Legacy => LEGACY_DICT,
+            Dictionary::V2 => V2_DICT,
+        }
+    }
+
+    /// The dictionary in the form the decoder works from. Building that
+    /// form (its tables) costs far more than expanding one small frame,
+    /// so it is built once per process and shared by every frame.
+    fn prepared(self) -> &'static DecoderDictionary<'static> {
+        static LEGACY: LazyLock<DecoderDictionary<'static>> =
+            LazyLock::new(|| DecoderDictionary::copy(LEGACY_DICT));
+        static V2: LazyLock<DecoderDictionary<'static>> =
+            LazyLock::new(|| DecoderDictionary::copy(V2_DICT));
+        match self {
+            Dictionary::Legacy => &LEGACY,
+            Dictionary::V2 => &V2,
+        }
+    }
+}
+
 /// Decompresses one zstd frame against `dict`.
-pub fn decompress(frame: &[u8], dict: &[u8]) -> Result<Vec<u8>, DecompressError> {
-    let decoder = zstd::stream::read::Decoder::with_dictionary(frame, dict)?;
+pub fn decompress(frame: &[u8], dict: Dictionary) -> Result<Vec<u8>, DecompressError> {
+    let mut decoder =
+        zstd::stream::read::Decoder::with_prepared_dictionary(frame, dict.prepared())?;
+    decoder.window_log_max(WINDOW_LOG_MAX)?;
     // A guess at the expanded size, never more than a frame may be: the
     // frame's length is the sender's.
     let guess = frame.len().saturating_mul(4).min(MAX_FRAME_BYTES as usize);
@@ -61,9 +105,38 @@ mod tests {
     #[test]
     fn round_trip_with_dictionary() {
         let text = br#"{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","time_us":1,"kind":"commit"}"#;
+        for dict in [Dictionary::Legacy, Dictionary::V2] {
+            let mut c = zstd::bulk::Compressor::with_dictionary(3, dict.bytes()).unwrap();
+            let frame = c.compress(text).unwrap();
+            // Frame after frame from the one prepared dictionary.
+            for _ in 0..3 {
+                assert_eq!(decompress(&frame, dict).unwrap(), text);
+            }
+            assert!(decompress(b"garbage", dict).is_err());
+        }
+        // A frame made with one dictionary does not expand with the other.
         let mut c = zstd::bulk::Compressor::with_dictionary(3, LEGACY_DICT).unwrap();
         let frame = c.compress(text).unwrap();
-        assert_eq!(decompress(&frame, LEGACY_DICT).unwrap(), text);
-        assert!(decompress(b"garbage", LEGACY_DICT).is_err());
+        assert!(decompress(&frame, Dictionary::V2).is_err());
+    }
+
+    #[test]
+    fn a_frame_that_asks_for_a_window_past_the_frame_bound_is_refused() {
+        use std::io::Write;
+        let text = vec![b'a'; 4096];
+        let frame_with_window = |log: u32| {
+            let mut e =
+                zstd::stream::write::Encoder::with_dictionary(Vec::new(), 3, LEGACY_DICT).unwrap();
+            e.window_log(log).unwrap();
+            // Streamed, so the frame states its window instead of its
+            // content size.
+            e.write_all(&text).unwrap();
+            e.finish().unwrap()
+        };
+        assert_eq!(
+            decompress(&frame_with_window(WINDOW_LOG_MAX), Dictionary::Legacy).unwrap(),
+            text
+        );
+        assert!(decompress(&frame_with_window(WINDOW_LOG_MAX + 2), Dictionary::Legacy).is_err());
     }
 }

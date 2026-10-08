@@ -3,6 +3,9 @@
 //! creation date, and counts what it was asked for. Handle warming against
 //! it ends as `failed` for every account without leaving the machine, and
 //! the counts show which accounts the server asked about, and how often.
+//! For the accounts it was told to fail ([`Plc::fail`]) it answers the
+//! document request with `503`: a directory that cannot be reached, as
+//! opposed to one that says the account names no handle.
 //!
 //! For the accounts a probe names it also stands in for their own server:
 //! their audit log names it as the PDS, and it answers `getRecord` for
@@ -32,6 +35,8 @@ struct Inner {
     profiles: HashMap<String, serde_json::Value>,
     /// Accounts whose audit log has a history: the handle they claim now.
     claims: HashMap<String, String>,
+    /// Accounts whose document request is answered `503`.
+    failing: Vec<String>,
     records: u32,
 }
 
@@ -69,6 +74,12 @@ impl Plc {
     pub fn documents(&self, did: &str) -> u32 {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.documents.get(did).copied().unwrap_or(0)
+    }
+
+    /// From now on the document of `did` cannot be read: `503`.
+    pub fn fail(&self, did: &str) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.failing.push(did.to_owned());
     }
 
     /// From now on the audit log of `did` names this stand-in as its PDS.
@@ -115,9 +126,13 @@ async fn document(State(p): State<Arc<Plc>>, Path(did): Path<String>) -> Respons
     if !did.starts_with("did:plc:") {
         return StatusCode::NOT_FOUND.into_response();
     }
-    {
+    let failing = {
         let mut g = p.inner.lock().unwrap_or_else(|e| e.into_inner());
         *g.documents.entry(did.clone()).or_default() += 1;
+        g.failing.contains(&did)
+    };
+    if failing {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     axum::Json(json!({"id": did, "alsoKnownAs": [], "service": []})).into_response()
 }

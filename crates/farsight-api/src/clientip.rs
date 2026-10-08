@@ -69,6 +69,23 @@ fn header_ip(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
         .map(canonical)
 }
 
+/// One `X-Forwarded-For` entry as an address: a bare address, or one
+/// with a port (`203.0.113.7:4711`, `[2001:db8::1]:4711`), which some
+/// proxies append. `None` for anything else.
+fn parse_hop(entry: &str) -> Option<IpAddr> {
+    let e = entry.trim();
+    if let Ok(ip) = e.parse::<IpAddr>() {
+        return Some(canonical(ip));
+    }
+    if let Ok(sa) = e.parse::<SocketAddr>() {
+        return Some(canonical(sa.ip()));
+    }
+    e.strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .and_then(|r| r.parse::<IpAddr>().ok())
+        .map(canonical)
+}
+
 /// The algorithm:
 ///
 /// ```text
@@ -76,9 +93,17 @@ fn header_ip(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
 /// elif mode == cloudflare and CF-Connecting-IP parses:
 ///                               client := CF-Connecting-IP
 /// elif X-Forwarded-For present: walk right→left, skip entries ∈ trusted;
-///                               client := first ∉ trusted (else leftmost)
+///                               client := first ∉ trusted (else leftmost);
+///                               an entry that is not an address ends the
+///                               walk: client := the hop to its right
 /// else:                         client := peer
 /// ```
+///
+/// An entry that cannot be read is never skipped. Everything to its right
+/// was written by trusted proxies, everything to its left may have been
+/// written by the client, so stepping over it would let the client name
+/// its own address. The walk stops there and the nearest proxy that was
+/// read (or the peer) stands in: the clients behind it share one key.
 pub fn resolve(peer: IpAddr, headers: &HeaderMap, mode: ProxyMode, trusted: &[IpNet]) -> IpAddr {
     let peer = canonical(peer);
     if !in_any(peer, trusted) {
@@ -89,21 +114,21 @@ pub fn resolve(peer: IpAddr, headers: &HeaderMap, mode: ProxyMode, trusted: &[Ip
     {
         return ip;
     }
-    let xff: Vec<IpAddr> = headers
+    let entries: Vec<&str> = headers
         .get_all("x-forwarded-for")
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|s| s.split(','))
-        .filter_map(|p| p.trim().parse::<IpAddr>().ok().map(canonical))
         .collect();
-    if xff.is_empty() {
-        return peer;
+    let mut nearest = peer;
+    for entry in entries.iter().rev() {
+        match parse_hop(entry) {
+            None => return nearest,
+            Some(ip) if !in_any(ip, trusted) => return ip,
+            Some(ip) => nearest = ip,
+        }
     }
-    xff.iter()
-        .rev()
-        .copied()
-        .find(|ip| !in_any(*ip, trusted))
-        .unwrap_or(xff[0])
+    nearest
 }
 
 /// Proxy trust in force: the configured CIDRs plus, in Cloudflare mode
@@ -325,6 +350,40 @@ mod tests {
             &t,
         );
         assert_eq!(ip, "7.7.7.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn an_unreadable_hop_ends_the_walk() {
+        let t = nets(&["10.0.0.0/8"]);
+        let peer: IpAddr = "10.0.0.2".parse().unwrap();
+        let walk = |xff: &str| {
+            resolve(
+                peer,
+                &h(&[("x-forwarded-for", xff)]),
+                ProxyMode::Forwarded,
+                &t,
+            )
+        };
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // A proxy that appends the port is read like any other.
+        assert_eq!(
+            walk("6.6.6.6, 198.51.100.1:4711, 10.0.0.5"),
+            ip("198.51.100.1")
+        );
+        assert_eq!(
+            walk("6.6.6.6, [2001:db8::7]:4711, 10.0.0.5"),
+            ip("2001:db8::7")
+        );
+        assert_eq!(walk("[2001:db8::7]"), ip("2001:db8::7"));
+        // An entry that is no address is not stepped over: the client
+        // wrote everything to its left, so `6.6.6.6` is not believed.
+        // The nearest proxy that was read stands in.
+        assert_eq!(walk("6.6.6.6, unknown, 10.0.0.5"), ip("10.0.0.5"));
+        assert_eq!(walk("6.6.6.6, _hidden, 10.0.0.5, 10.0.0.6"), ip("10.0.0.5"));
+        assert_eq!(walk("6.6.6.6, , 10.0.0.5"), ip("10.0.0.5"));
+        // Nothing readable at the right end: the peer itself.
+        assert_eq!(walk("6.6.6.6, garbage"), peer);
+        assert_eq!(walk("garbage"), peer);
     }
 
     #[test]

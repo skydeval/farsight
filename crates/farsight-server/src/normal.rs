@@ -228,6 +228,10 @@ pub async fn run(
         query_permits: Arc::new(Semaphore::new(
             cfg.rate_limit.query_concurrency.max(1) as usize
         )),
+        anon_permits: Arc::new(Semaphore::new(farsight_api::anon_slots(
+            cfg.rate_limit.query_concurrency,
+        ))),
+        in_flight: Default::default(),
         trust: trust.clone(),
         cf: cf.clone(),
         ingest: Some(IngestLink {
@@ -245,7 +249,9 @@ pub async fn run(
         api: api.clone(),
         safe: SafeClient::new(SafeClientConfig::from_config(&cfg, VERSION)),
         recent_logins: Mutex::new(Default::default()),
-        oauth: Default::default(),
+        // The directory the admin DID is resolved through is the one
+        // named at start, whatever a later settings save says.
+        oauth: farsight_web::oauth::OAuthState::new(&cfg.backfill.plc_url),
         reset: reset_tx,
         token_path: farsight_web::setup_token::token_path(&config_path),
         status: status.clone(),
