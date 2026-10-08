@@ -72,7 +72,8 @@ not under `app.nearhorizon.farsight.*`.
 
 ```sh
 echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
-docker compose up -d          # builds the image on first run
+docker compose pull           # fetches the published image; skip it to build from source
+docker compose up -d
 docker compose logs farsight  # copy the setup token printed at startup
 # open http://<host>:8080 and walk the setup wizard
 ```

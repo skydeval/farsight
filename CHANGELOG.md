@@ -7,16 +7,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Before 1.0, a minor version may change addresses, settings or the
 database schema; each entry says so where it does.
 
-## [Unreleased]
+## [0.6.2] - 2026-10-08
 
 ### Added
 
-- For contributors: a workflow builds the container image and, when a
-  tag `v<version>` is pushed, publishes it to `ghcr.io` under that
-  version (`.github/workflows/image.yml`). Run by hand it builds the
-  image and pushes nothing unless asked to.
-
-## [0.6.2] - 2026-10-08
+- The container image is published to `ghcr.io/skydeval/farsight`
+  under its version, and `compose.yml` names it. For contributors: the
+  workflow that builds it runs when a tag `v<version>` is pushed
+  (`.github/workflows/image.yml`); run by hand it builds the image and
+  pushes nothing unless asked to.
+- The Cloudflare guide says what Farsight leaves to the operator: it
+  serves plain HTTP on one port and does not terminate TLS, so a
+  reverse proxy with a certificate, or Cloudflare Tunnel, goes in
+  front.
 
 ### Fixed
 
@@ -1136,8 +1139,7 @@ Database schema version 9.
 - A Docker image and a compose file that runs the server, the backfill
   service and PostgreSQL.
 
-[Unreleased]: https://github.com/skydeval/farsight/compare/4293540...HEAD
-[0.6.2]: https://github.com/skydeval/farsight/compare/6871286...4293540
+[0.6.2]: https://github.com/skydeval/farsight/compare/6871286...3d7019d
 [0.6.1]: https://github.com/skydeval/farsight/compare/08be68d...6871286
 [0.6.0]: https://github.com/skydeval/farsight/compare/dd11be4...08be68d
 [0.5.0]: https://github.com/skydeval/farsight/compare/380a503...dd11be4

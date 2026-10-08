@@ -81,10 +81,13 @@ in `.env` and restart.
 ## The image
 
 The compose file names the image by version
-(`ghcr.io/skydeval/farsight:0.6.2`), not `latest`, and builds it from
-the checkout when it is not there. A checkout and its compose file
-therefore always run the version they describe; to move to another
-version, check it out and run `docker compose up -d --build`. The
+(`ghcr.io/skydeval/farsight:0.6.2`), not `latest`. `docker compose
+pull` fetches the published image; when the image is not on the
+machine, `docker compose up -d` builds it from the checkout. A checkout
+and its compose file therefore always run the version they describe;
+to move to another version, check it out and run `docker compose pull`
+and `docker compose up -d`, or `docker compose up -d --build` to build
+it from source. The
 Dockerfile names its two base images by digest, so a rebuild starts
 from the same images until the Dockerfile changes.
 
