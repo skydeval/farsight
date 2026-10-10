@@ -7,7 +7,7 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Before 1.0, a minor version may change addresses, settings or the
 database schema; each entry says so where it does.
 
-## [Unreleased]
+## [0.6.3] - 2026-10-10
 
 ### Added
 
@@ -1279,6 +1279,7 @@ Database schema version 9.
 - A Docker image and a compose file that runs the server, the backfill
   service and PostgreSQL.
 
+[0.6.3]: https://github.com/skydeval/farsight/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/skydeval/farsight/compare/6871286...3d7019d
 [0.6.1]: https://github.com/skydeval/farsight/compare/08be68d...6871286
 [0.6.0]: https://github.com/skydeval/farsight/compare/dd11be4...08be68d

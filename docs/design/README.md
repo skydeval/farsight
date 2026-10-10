@@ -7,7 +7,7 @@ describe how it is built: what it indexes, the processes and the
 database behind it, and the rules each part follows. This page is the
 overview and the index of the others.
 
-Version 0.6.2; database schema version 1; NSID prefix
+Version 0.6.3; database schema version 1; NSID prefix
 `app.nearhorizon.farsight`.
 
 ## What Farsight is
