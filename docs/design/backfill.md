@@ -251,8 +251,25 @@ Bounds on a job, so that no host can keep a worker:
 Three more rules keep slow hosts from holding the workers. A queue
 entry, a sweep member and a list item are not started while their
 account's host takes no request: it is cooling down, at its request
-limit, or under a domain at its limit. They wait where they are and
-the worker goes to other work. A host that answers validly but takes
+limit, has as many requests waiting for a slot as it takes at once
+(`backfill.per_host_concurrency`), or is under a domain at its limit.
+They wait where they are and the worker goes to other work. The
+count of waiting requests is what keeps a fast host that is asked at
+its rate from taking every worker: such a host has a request or two
+in flight, far under its request limit, and every job that is on it
+waiting for the next token. Counted by the requests in flight alone
+it looks free, and jobs for it are started until no worker is left
+for the other hosts. The scheduler can do this only for work whose
+host it knows, and a sweep member met for the first time is resolved
+by its job. So a repo job that resolves its account to a host with
+such a queue ends at once with the outcome `busy`, having recorded
+the host on the account's row: the worker goes to other work, and
+the account, whose host is now known, is left where it waits until
+the host has room. Only a queue does this. A job for a host that is
+cooling down runs, has its first request refused and fails, to be
+retried on `backfill.retry_schedule`: that is how an account on a
+host that stays down comes to be terminal. A host
+that answers validly but takes
 longer than 10 seconds a page ends the attempt as failed, with what
 it listed stored and its cursor kept; the job is retried on
 `backfill.retry_schedule` and goes on from there. Only the time spent
@@ -480,7 +497,7 @@ Every outbound request waits for a slot on its host:
 | Concurrent requests per host | `backfill.per_host_concurrency` | 4 |
 | Token bucket, requests per second over all hosts of one registrable domain | `backfill.per_domain_rps` | 20 |
 | Concurrent requests over all hosts of one registrable domain | `backfill.per_domain_concurrency` | 8 |
-| PLC directory, requests per second in total | `backfill.plc_rps` | 10 |
+| PLC directory, requests per second in total | `backfill.plc_rps` | 20 |
 
 - A host is its name and port. The registrable domain is the one the
   cap buckets use (eTLD+1 by the public suffix list), so an operator
@@ -588,10 +605,21 @@ CREATE TABLE cycle_outstanding (
 Outstanding membership is persisted, keyed by DID text so that a
 member needs no `actors` row.
 
-- Every 5 seconds, each open cycle enumerates one page (at most 2,000
-  entries) while its outstanding rows are fewer than
-  `backfill.sweep.max_outstanding` (10,000). A page asks for no more
-  than the room left, so the bound holds.
+- Every 5 seconds, each open cycle enumerates up to 25 pages (at most
+  2,000 entries each) while its outstanding rows are fewer than
+  `backfill.sweep.max_outstanding` (10,000,000). A page asks for no
+  more than the room left, so the bound holds.
+- **The bound is meant to hold the whole source.** The relay lists the
+  accounts of one host after another, in long runs. Members are
+  dispatched in DID order, which is as good as random with respect to
+  the host, so the work lands on every host in proportion to its
+  accounts, but only among the members that are outstanding. With a
+  bound smaller than a run, nearly every member outstanding is on one
+  host: its request limit paces the whole sweep, every worker waits
+  for a slot there, and the other hosts are asked almost nothing. A
+  member costs a row of about 160 bytes while it is outstanding. Lower
+  the bound only to save that space, and expect the sweep to slow down
+  by much more than the bound was lowered.
 - A member whose job failed stays outstanding while it is retried, up
   to `backfill.terminal_after`. Such members must not fill the bound
   and stop enumeration for that long. When the bound is full and at
@@ -640,11 +668,30 @@ outstanding; terminal rows do not hold it up, they stay counted in
 notifies the coverage snapshot. A completed full cycle also heals
 every firehose gap that closed before its effective start.
 
+**The members of a `relay_collections` cycle are counted ahead.**
+Enumeration takes a page only when the cycle has room for its members
+(`backfill.sweep.max_outstanding`), so for most of a cycle it has seen
+a small part of the source, and the relay gives no total. A cycle
+measured over the pages it has taken shows the same high figure from
+its first hour to its last. So beside the enumeration the process
+reads every page of the three listings once and keeps the number of
+entries, a few thousand requests for some millions of accounts, and
+stores it as the cycle's total (`sweep_cycles.total_est`). Each
+process counts an open cycle once, at its start. The count is
+somewhat high: an account in two listings is counted twice, and one
+whose job ran after the cycle started and before enumeration reached
+it never becomes a member. The last page of the enumeration replaces
+it with the members settled and outstanding at that moment. Until
+the count is in, the cycle has no total, and `getStats` gives neither
+`progress` nor `etaSeconds` for it.
+
 Progress is published as
-`farsight_backfill_sweep_progress_ratio{cycle_kind}`, measured over
-what has been enumerated so far, and, once enumeration has finished,
-`farsight_backfill_sweep_eta_seconds`: outstanding members divided by
-the rate of the trailing hour.
+`farsight_backfill_sweep_progress_ratio{cycle_kind}`: the members
+settled over the cycle's total, which is the count for a
+`relay_collections` cycle (0 until the count is in) and, for the
+other sources, what has been enumerated so far.
+`farsight_backfill_sweep_eta_seconds` is what is left, divided by the
+rate of the trailing hour; it is published once a total is known.
 
 ## Gap repair
 

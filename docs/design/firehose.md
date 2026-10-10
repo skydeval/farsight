@@ -249,9 +249,28 @@ flag is cleared when ingest starts, before any session connects: a
 process that was killed never cleared it.
 
 Failing over to another instance starts a new cursor space. The
-previous instance's row stays, so a later return to it resumes from
-that instance's own cursor, exact by `seq` on v2, rather than by
+previous instance's row stays, so a return to it soon after resumes
+from that instance's own cursor, exact by `seq` on v2, rather than by
 timestamp. An instance with no row is resumed as a failover.
+
+**A cursor left long ago is not resumed.** An instance's own cursor
+stands where the instance was left. Once another instance has been
+applied from, and that cursor is more than 30 minutes behind what was
+applied, resuming it would replay everything since, hours or days of
+it, and nothing new would be applied until the replay reached the
+present. Such an instance is planned as one without a cursor: a
+rewind by what a change of instance needs, with that plan's gap
+rules.
+
+**A starting process connects first to the configured instance whose
+own cursor is furthest along**, and to the first of `firehose.urls`
+if none has a cursor. That is the instance the process was reading
+when it stopped, so a process that had failed over resumes there by
+`seq`, with nothing to replay and no gap. It is the furthest cursor
+and not the instance of the last batch: while an instance replays a
+stretch it was behind on, its batches are the last applied, and it is
+the one furthest back. From there on the order of `firehose.urls` is
+the failover order as before.
 
 The one case in which a cursor is lowered: an instance that answers a
 `seq` resume with a lower `seq` has started its sequence again, and

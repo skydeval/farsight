@@ -940,6 +940,36 @@ pub async fn run(ctx: &Ctx, req: &JobReq) -> JobResult {
         },
         cost,
     };
+    // An account whose host has a queue of its own is not listed now.
+    // The scheduler leaves such an account where it waits, but only when
+    // it knows the host, and a sweep member met for the first time is
+    // resolved here. Listed all the same, it would stand in the host's
+    // queue and hold its worker for as long: enough of them hold every
+    // worker, and the other hosts get none. So the job ends as busy,
+    // with the host on the account's row, and the account is taken up
+    // again when the host takes work.
+    //
+    // Only a queue does this. A host that is cooling down refuses the
+    // job's first request, the job fails and is retried on its schedule:
+    // that is how an account on a host that stays down becomes terminal.
+    // The resolution is handed to the attempt, which resolves once.
+    let first = ctx.resolver.resolve_noting(&req.did, false).await;
+    if let Ok((pds, _)) = &first
+        && ctx.net.has_queue(&pds.host)
+    {
+        cost += 1;
+        let noted = async {
+            jobs::intern(ctx, &req.did).await?;
+            ctx.resolver.note_host(&req.did, pds).await
+        };
+        if let Err(e) = noted.await {
+            tracing::warn!(did = %req.did, error = %e, "recording the host of an account left for later failed");
+        }
+        return JobResult {
+            outcome: Outcome::Busy,
+            cost,
+        };
+    }
     let job_start = match jobs::db_now(&ctx.pool).await {
         Ok(t) => t,
         Err(e) => return failed(e.to_string(), cost),
@@ -953,7 +983,8 @@ pub async fn run(ctx: &Ctx, req: &JobReq) -> JobResult {
         Err(e) => return failed(e.to_string(), cost),
     };
     let max = ctx.cfg().backfill.repo_job_max_duration.get();
-    let attempted = match tokio::time::timeout(max, attempt(ctx, req, &run, &mut cost)).await {
+    let attempted = match tokio::time::timeout(max, attempt(ctx, req, &run, &mut cost, first)).await
+    {
         Ok(r) => r,
         // Out of time: what was listed is stored and its cursor with it.
         Err(_) => Err((Stop::Yield, None)),
@@ -1071,6 +1102,7 @@ async fn attempt(
     req: &JobReq,
     run: &Run,
     cost: &mut u64,
+    first: Result<(Pds, bool), ResolveError>,
 ) -> Result<(Outcome, Option<Stamp>), AttemptErr> {
     let pool = &ctx.pool;
     let did = &req.did;
@@ -1114,8 +1146,15 @@ async fn attempt(
     // 1. Resolve (re-resolve bypassing the cache on a repo-level error,
     // and before a divergence is acted on).
     let mut bypass = false;
+    // The job resolved the account before this attempt: the first turn
+    // uses that answer, cached or not as it was.
+    let mut first = Some(first);
     loop {
-        let (pds, cached) = match ctx.resolver.resolve_noting(did, bypass).await {
+        let resolved = match first.take() {
+            Some(r) if !bypass => r,
+            _ => ctx.resolver.resolve_noting(did, bypass).await,
+        };
+        let (pds, cached) = match resolved {
             Ok(p) => p,
             Err(ResolveError::NotFound) => {
                 return Err(e(Stop::Failed("DID does not resolve".into())));
@@ -1250,6 +1289,14 @@ async fn list_repo(
         // Nothing present and nothing held: an empty repo (one describeRepo).
         return Ok(Outcome::Clean);
     };
+    // A sweep member holds no row, and its resolution is in memory alone.
+    // The row its first stored record makes would know no host, and what
+    // is listed here would be charged to `unresolved` and stay there. So
+    // the row is made before anything is stored, with the host on it.
+    if !present.is_empty() {
+        jobs::intern(ctx, did).await?;
+    }
+    ctx.resolver.note_host(did, pds).await?;
     // 5. Whole-range reconcile of absent collections (early stamp only).
     if !stamp.late && !absent.is_empty() {
         let limits = ctx.limits();

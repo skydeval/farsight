@@ -280,6 +280,19 @@ impl H {
             .map_err(|x| format!("{x}: {sql}"))
     }
 
+    /// Blocks charged to the `unresolved` bucket, pending deltas flushed.
+    async fn unresolved_blocks(&self) -> Res<i64> {
+        self.ctx
+            .counters
+            .flush(self.pool(), &self.ctx.limits())
+            .await
+            .map_err(e)?;
+        self.i64(
+            "SELECT COALESCE((SELECT stored_blocks FROM host_usage WHERE bucket = 'unresolved'), 0)",
+        )
+        .await
+    }
+
     async fn id(&self, d: &str) -> Res<i64> {
         self.i64(&format!("SELECT id FROM actors WHERE did = '{d}'"))
             .await
@@ -486,6 +499,7 @@ async fn check_outcomes(h: &H, c: &mut Checks) -> Res<()> {
         .collect();
     recs.push((Collection::List, tid_now(), list_v("a list")));
     h.put_repo(&a, recs);
+    let unresolved_before = h.unresolved_blocks().await?;
     let r = h.job(&a, 1, "token:1").await?;
     let row: (i16, Option<DateTime<Utc>>, Option<i16>) = sqlx::query_as(
         "SELECT b.state, b.clean_witness, b.last_outcome FROM backfill_state b JOIN actors x ON x.id = b.actor_id WHERE x.did = $1",
@@ -508,6 +522,49 @@ async fn check_outcomes(h: &H, c: &mut Checks) -> Res<()> {
         "clean: state done, last_outcome clean, clean_witness set, 3 blocks stored, membership settled",
         r.outcome == Outcome::Clean && row.0 == 3 && row.2 == Some(1) && row.1.is_some() && blocks == 3 && member == 0,
         format!("outcome {:?}, row {row:?}, blocks {blocks}, outstanding {member}", r.outcome),
+    );
+    // A held no row before its job, so its resolution was in memory
+    // alone: the row the job made must hold the host all the same.
+    let hosted = h
+        .bool(&format!(
+            "SELECT pds_host_id IS NOT NULL FROM actors WHERE did = '{a}'"
+        ))
+        .await?;
+    let unresolved_after = h.unresolved_blocks().await?;
+    c.check(
+        "an account without a row before its job: its row holds the host, nothing it stored is charged to unresolved",
+        hosted && unresolved_after == unresolved_before,
+        format!("host recorded {hosted}, unresolved blocks {unresolved_before} -> {unresolved_after}"),
+    );
+    // An account listed before that held: a row with a finished listing,
+    // no host, and its block in `unresolved`. The pass at start records
+    // the host and moves the block out.
+    let stuck = did("rpz", 1);
+    h.put_repo(&stuck, vec![]);
+    h.fh(
+        &stuck,
+        Collection::Block,
+        &tid_now(),
+        block_v(&did("sub", 90)),
+    )
+    .await?;
+    h.exec(&format!(
+        "INSERT INTO backfill_state (actor_id, state, last_outcome)
+         SELECT id, 3, 1 FROM actors WHERE did = '{stuck}'"
+    ))
+    .await?;
+    let before = h.unresolved_blocks().await?;
+    let recorded = farsight_backfill::record_missing_hosts(&h.ctx).await;
+    let hosted = h
+        .bool(&format!(
+            "SELECT pds_host_id IS NOT NULL FROM actors WHERE did = '{stuck}'"
+        ))
+        .await?;
+    let after = h.unresolved_blocks().await?;
+    c.check(
+        "an account listed without a host: the pass at start records it and its usage leaves unresolved",
+        recorded >= 1 && hosted && after == before - 1,
+        format!("recorded {recorded}, host recorded {hosted}, unresolved blocks {before} -> {after}"),
     );
     // B: complete-with-debts — 8 blocks against a per-author cap of 5.
     h.set_cfg(|c| c.limits.blocks_per_author = 5);
@@ -1463,6 +1520,17 @@ async fn check_sweep(h: &H, c: &mut Checks) -> Res<()> {
     let first_fill = h
         .i64("SELECT count(*) FROM cycle_outstanding o JOIN sweep_cycles c ON c.id = o.cycle_id WHERE c.kind = 1 AND c.completed_at IS NULL AND o.state = 1")
         .await?;
+    // The count taken ahead of the enumeration: every entry of the three
+    // listings, the junk and the DIDs listed twice included. Before it the
+    // cycle has no total, however many pages it has taken.
+    let counting = h
+        .opt_i64("SELECT max(id) FROM sweep_cycles WHERE kind = 1")
+        .await?
+        .ok_or("no sweep cycle started")?;
+    let total_sql = format!("SELECT total_est FROM sweep_cycles WHERE id = {counting}");
+    let uncounted = h.opt_i64(&total_sql).await?;
+    sweep::count_members(h.ctx.clone(), farsight_storage::ids::CycleId::new(counting)).await;
+    let counted = h.opt_i64(&total_sql).await?;
     let sched = Scheduler::new(h.ctx.clone());
     let (stop_tx, stop) = watch::channel(false);
     let task = tokio::spawn(sched.clone().run(stop));
@@ -1536,6 +1604,17 @@ async fn check_sweep(h: &H, c: &mut Checks) -> Res<()> {
         "effective_start ≥ first_applied_at; source relay_collections",
         row.3 && row.0 == "relay_collections",
         format!("{row:?}"),
+    );
+    let total_end = h.opt_i64(&total_sql).await?;
+    c.check(
+        "the cycle has no total until its members are counted ahead (1073 entries in the three listings); the last page replaces the count with the members settled and outstanding then, which is never under what the cycle settles",
+        uncounted.is_none()
+            && counted == Some(1073)
+            && total_end.is_some_and(|t| t >= row.4 + row.5 && t != 1073),
+        format!(
+            "before the count {uncounted:?}, counted {counted:?}, at the end {total_end:?} (done {} + terminal {})",
+            row.4, row.5
+        ),
     );
     c.check(
         format!("cycle_outstanding fills to the cap ({cap}) and never exceeds it"),
@@ -3575,7 +3654,11 @@ async fn check_fallback(h: &H, c: &mut Checks) -> Res<()> {
     // the same process state, and uses it.
     retire_cycles(h).await?;
     w(&h.world).collections_supported = true;
+    // Room for one member: the cycle takes one page and stays in the
+    // middle of its enumeration, where the next step needs it.
+    h.set_cfg(|c| c.backfill.sweep.max_outstanding = 1);
     sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
+    h.set_cfg(|c| c.backfill.sweep.max_outstanding = 5000);
     let second = open_full_cycle(h).await?;
     c.check(
         "the relay is probed before every full cycle: once it has the method, the next cycle is relay_collections again",

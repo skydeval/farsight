@@ -88,8 +88,9 @@ preferences, who may read the API and which web interfaces to serve,
 then writes the config and starts ingesting. The default Jetstream
 source is Bluesky's two public v2 instances.
 
-Hardware: 4 vCPU, 8 GB RAM and a 500 GB SSD are recommended; a 100 GB
-disk is supported with limits.
+Hardware: 4 vCPU, 8 GB RAM and a 500 GB SSD are recommended. A first
+full sweep stores about 180 GB; a smaller disk runs without the sweep,
+or with one that pauses at the space you allow.
 
 ## Guide
 
@@ -121,9 +122,6 @@ machine, backfill, the firehose, limits) is in the
 
 ## Prior art and compatible services
 
-- **Clearsky**, the comparable public backlink index for blocks and
-  block lists. Farsight is a self-hosted equivalent of what it
-  provided, and its data model matches Clearsky's.
 - **Jetstream**, Bluesky's JSON firehose. It is Farsight's live
   source. Bluesky's public instances at
   `jetstream.us-{east,west}.bsky.network` serve the v2 protocol, which

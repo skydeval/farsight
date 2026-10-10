@@ -7,6 +7,7 @@
 //! | first start (nothing applied) | live tail | none |
 //! | instance with its own cursor, v2 → v2 | `seq + 1` (exact) | gap `[from, first event]` if the instance announces a clamp (`#info OutdatedCursor`), answers with a `seq` below the one asked for (its sequence started again; the stored cursor is dropped), or its first event is more than `gap_threshold` after the stored cursor |
 //! | instance with its own cursor, v1 (or v1 → v2) | `cursor_us − 120 s` | gap `[from, first event]` if a clamp is announced or the first event is later than the stored cursor: the instance no longer holds what it sent before |
+//! | instance whose own cursor is further back than `applied − 30 min` and that was not the last applied from | as an instance without a cursor (the two rows below) | as there |
 //! | instance without a cursor (failover), lag known and ≤ `failover_max_lag` | `applied − max(failover_rewind_min, lag + 5 min) − gap_threshold` | gap `[applied − 30 min, first event]` if a clamp is announced or the first event is more than `gap_threshold` after the cursor, that is, later than `applied − max(failover_rewind_min, lag + 5 min)` |
 //! | instance without a cursor, lag unknown or too large | `applied − 30 min` | always gap `[applied − 30 min, first event]` |
 //!
@@ -181,8 +182,15 @@ pub fn plan(
     let base = applied.min(now_us);
     let failover_from = base.saturating_sub(us(FAILOVER_GAP));
     let same_instance = p.source_url.as_deref() == Some(url);
-    if same_instance {
-        let applied_here = p.applied_from.as_deref().is_none_or(|u| u == url);
+    let applied_here = p.applied_from.as_deref().is_none_or(|u| u == url);
+    // A cursor of this instance's own that lies further back than a
+    // failover would reach is from an earlier stay: everything since was
+    // read from another instance. Resumed there, the instance replays all
+    // of it, hours or days, and nothing new is applied until the replay
+    // reaches the present. Such an instance is planned as one without a
+    // cursor, which rewinds by what a change of instance needs.
+    let left_behind = !applied_here && p.cursor_us.is_some_and(|c| c < failover_from);
+    if same_instance && !left_behind {
         let stored_us = p.cursor_us.unwrap_or(applied);
         // A gap starts at the instance's own position when that is
         // behind what was applied. It is right after a failover: the
@@ -397,6 +405,69 @@ mod tests {
     }
 
     #[test]
+    fn an_instance_returned_to_long_after_it_was_left_is_planned_as_a_failover() {
+        // A was left at 1,000 s. B has been read since and what was
+        // applied reaches 10,000 s: A's own cursor is 9,000 s back.
+        for proto in [Protocol::V1, Protocol::V2] {
+            let p = Persisted {
+                source_url: Some(A.into()),
+                protocol: Some(proto),
+                cursor_seq: Some(70),
+                cursor_us: Some(1_000 * S),
+                applied_through_us: Some(10_000 * S),
+                applied_from: Some(B.into()),
+            };
+            // The plan is the one of an instance that has no cursor.
+            let none = Persisted {
+                source_url: None,
+                cursor_seq: None,
+                cursor_us: None,
+                ..p.clone()
+            };
+            for lag in [None, Some(Duration::from_secs(20))] {
+                let got = plan(&p, A, proto, lag, &T, NOW);
+                assert_eq!(
+                    got,
+                    plan(&none, A, proto, lag, &T, NOW),
+                    "{proto:?} {lag:?}"
+                );
+                // It asks for a time near what was applied, never for
+                // the place it was left at.
+                let Cursor::TimeUs(asked) = got.cursor else {
+                    panic!("a time cursor, got {:?}", got.cursor);
+                };
+                assert!(asked >= 10_000 * S - us(FAILOVER_GAP), "{proto:?} {lag:?}");
+            }
+        }
+        // A cursor of its own within a failover's reach is kept: the
+        // instance took over a moment ago and has not been applied from
+        // yet.
+        let near = Persisted {
+            source_url: Some(A.into()),
+            protocol: Some(Protocol::V2),
+            cursor_seq: Some(70),
+            cursor_us: Some(9_500 * S),
+            applied_through_us: Some(10_000 * S),
+            applied_from: Some(B.into()),
+        };
+        assert_eq!(
+            plan(&near, A, Protocol::V2, None, &T, NOW).cursor,
+            Cursor::Seq(71)
+        );
+        // And so is the cursor of the instance that was applied from
+        // last, however far back it is.
+        let here = Persisted {
+            cursor_us: Some(1_000 * S),
+            applied_from: Some(A.into()),
+            ..near
+        };
+        assert_eq!(
+            plan(&here, A, Protocol::V2, None, &T, NOW).cursor,
+            Cursor::Seq(71)
+        );
+    }
+
+    #[test]
     fn first_start_is_live_without_gap() {
         let p = plan(&Persisted::default(), A, Protocol::V1, None, &T, NOW);
         assert_eq!(
@@ -591,11 +662,12 @@ mod tests {
                 cause: GapCause::CursorTooOld
             }
         );
-        // An instance never read from, and one returned to while the
-        // position came from another: 30 minutes earlier.
+        // An instance never read from, and one returned to soon after
+        // it was left, while the position came from another: 30 minutes
+        // earlier.
         let fresh = plan(&elsewhere(Protocol::V2), B, Protocol::V2, None, &T, NOW);
         let back = Persisted {
-            cursor_us: Some(4_000 * S),
+            cursor_us: Some(9_000 * S),
             applied_from: Some(B.into()),
             ..persisted(Protocol::V2)
         };
@@ -745,7 +817,8 @@ mod tests {
             /// For any persisted state, instance, protocol, lag, tuning
             /// and clock: nothing applied means the live tail without a
             /// gap; a `seq` cursor is sent only to the instance it came
-            /// from, on v2; a timestamp cursor is never after the
+            /// from, on v2, and not to one left more than 30 minutes
+            /// behind the position; a timestamp cursor is never after the
             /// position nor after the clock; a gap starts at
             /// `applied_through`, or at the instance's own cursor if
             /// that is behind it, only on the instance the position came
@@ -771,6 +844,11 @@ mod tests {
                     return Ok(());
                 };
                 let here = same && p.applied_from.as_deref().is_none_or(|u| u == url);
+                // An instance left long ago is planned as one without a
+                // cursor.
+                let left = p.applied_from.as_deref().is_some_and(|u| u != url)
+                    && p.cursor_us.is_some_and(|c| c < sub(applied.min(now), FAILOVER_GAP));
+                let same = same && !left;
                 let from = if here {
                     applied.min(p.cursor_us.unwrap_or(applied))
                 } else {

@@ -170,7 +170,7 @@ revisited until the end. Every form carries the session's CSRF token.
 | Welcome | — | — |
 | Public identity | `server.hostname`, `server.contact` | A hostname without scheme or path; a non-empty contact of at most 300 characters |
 | Firehose source | `firehose.urls`, one per line | At least one `ws://` or `wss://` URL. "Test connection" subscribes for at most 10 seconds in total across the instances, connecting included, and reports events, lag and whether v2 is offered; with no v2 instance the step warns that coverage stays `partial` |
-| Backfill | Sweep on or off and its source, `backfill.per_host_rps`, `backfill.concurrency`, the repos-per-hour cap, `backfill.plc_url` and whether to seed from its export, the disk available to Postgres in GB, an optional backlink source URL | Ranges and URL schemes. `storage.budget_bytes` is set to 70% of the disk entered. With the sweep on and less than 150 GB, a warning states the budget, where the sweep pauses and the projected runway |
+| Backfill | Sweep on or off and its source, `backfill.per_host_rps`, `backfill.concurrency`, the repos-per-hour cap, `backfill.plc_url` and whether to seed from its export, the disk space the database may use in GB, an optional backlink source URL | Ranges and URL schemes. The size entered is written as `storage.hard_ceiling_bytes`, the size at which Farsight stores nothing new, and `storage.budget_bytes` is set as close under it as the two may be (the ceiling is 105% of the budget). With the sweep on and less than 250 GB, a warning states the budget, where the sweep pauses and what a completed sweep was measured at |
 | Access | `access.reads`; two boxes, "Enable public UI" and "Enable admin UI", **both unticked**; the admin DID; the admin token | See below |
 | Reverse proxy | None, Cloudflare (bundled ranges), a tunnel or local proxy (its CIDR), or custom CIDRs | CIDR syntax. Trusting public address space outside the bundled Cloudflare ranges needs an explicit acknowledgement. A preview shows the current request's peer, its forwarding headers and the client address that would be resolved |
 | Storage | `storage.database_url`, prefilled from the environment | "Test" must pass: connect within 10 seconds, PostgreSQL 15 or newer, and the database either empty or holding a Farsight schema no newer than this build. A test that fails, or a test of another string than the step was saved with, takes the step's "done" mark away, so the wizard never finishes with a string that did not pass |
@@ -880,10 +880,17 @@ collapsed under its heading; the other public pages have the same
 guide behind a button in the bar, which otherwise holds the icon, the
 search form and the theme toggle.
 
-A home page left open keeps itself current. Once a minute, while the
-tab is visible, the script reads the page again and replaces the
-totals and the "Last updated" line together, so the two never
-disagree. Without JavaScript the page changes on a reload.
+A page left open keeps itself current. Once a minute, while the tab
+is visible, the script reads the page again and replaces what counts
+things together with the "Last updated" line, so the two never
+disagree: the totals on the home page, and on an account's or a
+list's page the heading of every table, which holds its count. The
+rows of a table are left as they were read, so a reader in the middle
+of a page keeps the place; the count above them may then be ahead of
+them until the page is loaded again. A table filtered with the Find
+box is not read again: its count is of the matches, and counting them
+draws on the lookup budget (`rate_limit.ui_lookup_rps`). Without
+JavaScript a page changes on a reload.
 
 **Top lists** are optional. Two switches, each off by default, add
 them:

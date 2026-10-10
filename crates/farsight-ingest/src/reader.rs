@@ -444,6 +444,22 @@ struct Attempts {
     prev_instance_lag: Option<Duration>,
 }
 
+/// The index of the furthest of `positions`, the instances' own cursors
+/// in the order of `firehose.urls` (witness µs; `None` for an instance
+/// never read): the first of them when two are equally far, and 0 when
+/// none has a cursor.
+fn start_index(positions: &[Option<i64>]) -> usize {
+    let mut best: Option<(usize, i64)> = None;
+    for (i, p) in positions.iter().enumerate() {
+        if let Some(p) = *p
+            && best.is_none_or(|(_, b)| p > b)
+        {
+            best = Some((i, p));
+        }
+    }
+    best.map_or(0, |(i, _)| i)
+}
+
 fn set_connected_gauge(protocol: Option<Protocol>) {
     for p in [Protocol::V1, Protocol::V2] {
         let v = if Some(p) == protocol { 1.0 } else { 0.0 };
@@ -568,10 +584,34 @@ impl Reader {
         Err(ConnectError::NotOffered(404))
     }
 
+    /// Where a starting process connects first: the configured instance
+    /// whose own cursor is furthest along, and the first one if none has
+    /// a cursor. That is the instance the process was reading when it
+    /// stopped: it resumes there by `seq`, with nothing to replay and no
+    /// gap. Starting on the first instance again after a failover would
+    /// resume a cursor as old as the failover.
+    ///
+    /// The furthest cursor, not the instance of the last batch: while an
+    /// instance replays a stretch it was behind on, its batches are the
+    /// last ones applied, and it is the one furthest back.
+    async fn start_index(&self) -> usize {
+        let mut positions = Vec::with_capacity(self.cfg.urls.len());
+        for url in &self.cfg.urls {
+            match firehose::instance_cursor(&self.pool, url).await {
+                Ok(c) => positions.push(c.and_then(|c| c.cursor_us)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "reading firehose_cursors failed; starting on the first instance");
+                    return 0;
+                }
+            }
+        }
+        start_index(&positions)
+    }
+
     /// Runs until shutdown or the writer goes away.
     pub async fn run(mut self) {
         let mut at = Attempts {
-            idx: 0,
+            idx: self.start_index().await,
             reconnects: Reconnects::default(),
             lag: LagTracker::new(),
             prev_instance_lag: None,
@@ -1031,6 +1071,20 @@ fn at_position(mut ev: InEvent, position_us: Option<i64>) -> InEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_starting_process_connects_to_the_instance_whose_cursor_is_furthest_along() {
+        // It had failed over to the second, which is where it was
+        // reading: it starts there.
+        assert_eq!(start_index(&[Some(1_000), Some(9_000)]), 1);
+        assert_eq!(start_index(&[Some(9_000), Some(1_000)]), 0);
+        // An instance never read has no say.
+        assert_eq!(start_index(&[None, Some(1)]), 1);
+        // Equally far, or nothing applied yet: the first.
+        assert_eq!(start_index(&[Some(5), Some(5)]), 0);
+        assert_eq!(start_index(&[None, None]), 0);
+        assert_eq!(start_index(&[]), 0);
+    }
 
     const LONG: Duration = Duration::from_secs(3600);
     const SHORT: Duration = Duration::from_secs(2);

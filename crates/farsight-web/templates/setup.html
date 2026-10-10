@@ -44,11 +44,11 @@ listblocks). It reads them live from a Jetstream firehose and, in the background
 account's repo.</p>
 <h2>Disk</h2>
 <table>
-<tr><th>Stage</th><th>Data + indexes</th><th>With ~25% overhead</th></tr>
+<tr><th>Stage</th><th>Database size</th><th>Source</th></tr>
 {% for r in self.projection() %}<tr><td>{{ r.0 }}</td><td>{{ r.1 }}</td><td>{{ r.2 }}</td></tr>{% endfor %}
 </table>
-<p class="muted">Recommended: 4 vCPU, 8 GB RAM, 500 GB SSD. About 100 GB works with caveats
-(the next steps explain them).</p>
+<p class="muted">Recommended: 4 vCPU, 8 GB RAM, 500 GB SSD. A smaller disk runs without the sweep,
+or with a sweep that pauses when the space you allow is used (the next steps explain it).</p>
 <form method="post" action="/setup/welcome"><input type="hidden" name="csrf" value="{{ csrf }}">
 <div class="row"><button type="submit">Next</button></div></form>
 </div>
@@ -117,16 +117,18 @@ incoming answers become complete. Without it, coverage stays <code>partial</code
 <label for="plc_url">PLC directory URL</label>
 <input type="url" id="plc_url" name="plc_url" value="{{ w.plc_url }}">
 <label><input type="checkbox" name="plc_seed" {% if w.plc_seed %}checked{% endif %}> Seed PDS resolution from the PLC export</label>
-<div class="hint">Resolution is the sweep's bottleneck (~4–6 days at 10 requests/s); seeding
-from the export or a PLC mirror shortens it.</div>
-<label for="disk_gb">Disk available to Postgres (GB)</label>
+<div class="hint">Every account the sweep has not met before costs one request to the directory,
+so its request rate paces a first sweep; seeding from the export or a PLC mirror shortens it.</div>
+<label for="disk_gb">Disk space the database may use (GB)</label>
 <input type="number" id="disk_gb" name="disk_gb" min="1" value="{{ w.disk_gb }}">
-<div class="hint">The storage budget is 70% of it ({{ budget_text }} now). At 90% of the budget
-the sweep pauses; at 100% new list admissions are deferred and writes from non-large hosts are
-refused (and counted).</div>
+<div class="hint">This is the hard ceiling: Farsight stores nothing new once the database is this
+size. The storage budget is set just under it ({{ budget_text }} now). At 90% of the budget the
+sweep pauses; at 100% new list admissions are deferred and writes from non-large hosts are
+refused (and counted). Postgres needs room on the disk beyond this figure, for its write-ahead
+log and for maintenance: enter what the database may use, not the size of the disk.</div>
 {% if let Some(d) = disk_warning %}<div class="banner">{{ d }}</div>{% endif %}
 <table>
-<tr><th>Stage</th><th>Data + indexes</th><th>With ~25% overhead</th></tr>
+<tr><th>Stage</th><th>Database size</th><th>Source</th></tr>
 {% for r in self.projection() %}<tr><td>{{ r.0 }}</td><td>{{ r.1 }}</td><td>{{ r.2 }}</td></tr>{% endfor %}
 </table>
 <label for="backlinks_url">Backlink source (optional)</label>

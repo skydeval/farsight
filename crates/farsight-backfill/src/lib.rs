@@ -485,6 +485,19 @@ async fn run_normal(
             }
         },
     ));
+    tasks.spawn({
+        let (ctx, mut stop) = (ctx.clone(), stop.clone());
+        async move {
+            tokio::select! {
+                n = record_missing_hosts(&ctx) => {
+                    if n > 0 {
+                        tracing::info!(accounts = n, "hosts recorded for accounts listed without one");
+                    }
+                }
+                _ = stop.changed() => {}
+            }
+        }
+    });
     tracing::info!(concurrency = cfg.backfill.concurrency, "backfill running");
     let end = watch_config(&ctx, path, &mut shutdown).await;
     let _ = stop_tx.send(true);
@@ -633,6 +646,58 @@ pub async fn budget_monitor(ctx: &Ctx) {
             }
         }
         Err(e) => tracing::warn!(error = %e, "measuring the database failed"),
+    }
+}
+
+/// Accounts listed per read of [`record_missing_hosts`].
+const HOSTLESS_BATCH: i64 = 500;
+
+/// Records the host of every account whose listing finished while its
+/// row held none, and returns how many it recorded. Before 0.6.3 the row
+/// a repo job made for a sweep member never got its host, so the
+/// account's usage stayed in the `unresolved` bucket and filled it for
+/// every other unresolved author. Resolving such an account again puts
+/// the host on its row and moves its usage to the buckets of that host.
+/// Only an account that holds rows is looked at: one found inactive has
+/// a finished listing and no host too, holds nothing, and there are many
+/// of them. Runs once at start: with no such account it reads
+/// `backfill_state` once and ends.
+pub async fn record_missing_hosts(ctx: &Ctx) -> u64 {
+    use farsight_storage::codes::sql::RUN_LISTED;
+    let (mut after, mut recorded) = (0i64, 0u64);
+    loop {
+        let rows: Vec<(i64, String)> = match sqlx::query_as(&format!(
+            "SELECT s.actor_id, a.did FROM backfill_state s JOIN actors a ON a.id = s.actor_id
+             WHERE s.actor_id > $1 AND s.last_outcome IN {RUN_LISTED} AND a.pds_host_id IS NULL
+               AND (a.authored_blocks > 0 OR a.authored_listblocks > 0
+                    OR a.authored_lists > 0 OR a.owned_items > 0)
+             ORDER BY s.actor_id LIMIT $2"
+        ))
+        .bind(after)
+        .bind(HOSTLESS_BATCH)
+        .fetch_all(&ctx.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "reading the accounts without a host failed");
+                return recorded;
+            }
+        };
+        let Some(last) = rows.last().map(|r| r.0) else {
+            return recorded;
+        };
+        after = last;
+        for (_, did) in rows {
+            let Ok(did) = farsight_core::Did::parse(&did) else {
+                continue;
+            };
+            // Past every cache: the answer in memory is the one that was
+            // never recorded. A DID that no longer resolves stays as it is.
+            if ctx.resolver.resolve(&did, true).await.is_ok() {
+                recorded += 1;
+            }
+        }
     }
 }
 

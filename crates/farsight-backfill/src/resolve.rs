@@ -4,7 +4,9 @@
 //! `https://<host>/.well-known/did.json`, both via the safe client.
 //! Results are cached on `actors.pds_host_id` (TTL 7 days; `identity`
 //! events invalidate) for interned DIDs and in memory for the rest (sweep
-//! members hold no row); nonexistent DIDs are negatively cached for 24 h.
+//! members hold no row, and a repo job records the host once it has made
+//! one: [`Resolver::note_host`]); nonexistent DIDs are negatively cached
+//! for 24 h.
 //! Both in-memory caches are bounded: at their cap the entries past their
 //! TTL go, and all of them if none is.
 //! Resolving records the host in `pds_hosts` with its cap buckets
@@ -216,6 +218,28 @@ impl Resolver {
                 ),
             );
         }
+    }
+
+    /// Records `pds` on the row of `did` when the row holds no host, and
+    /// says whether there is a row. A DID without a row has its
+    /// resolution in memory alone, and the row made later (by its first
+    /// stored record, or by a job that interns it) knows no host: until
+    /// one is recorded the account counts as unresolved and its usage
+    /// stays in the `unresolved` bucket.
+    pub async fn note_host(
+        &self,
+        did: &Did,
+        pds: &Pds,
+    ) -> Result<bool, farsight_storage::StorageError> {
+        let hostless: Option<bool> =
+            sqlx::query_scalar("SELECT pds_host_id IS NULL FROM actors WHERE did = $1")
+                .bind(did.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        if hostless == Some(true) {
+            self.record(did, pds).await?;
+        }
+        Ok(hostless.is_some())
     }
 
     /// Resolves `did`; `bypass` skips every cache (repo-level errors).

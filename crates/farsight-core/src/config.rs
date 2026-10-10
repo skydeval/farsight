@@ -337,7 +337,7 @@ impl Default for BackfillConfig {
             concurrency: 32,
             per_host_rps: 10,
             plc_url: "https://plc.directory".to_owned(),
-            plc_rps: 10,
+            plc_rps: 20,
             plc_seed_from_export: false,
             relay_url: "https://bsky.network".to_owned(),
             request_fresh_window: ConfigDuration::hours(1),
@@ -424,7 +424,10 @@ pub struct SweepConfig {
     pub max_repos_per_hour: u64,
     /// Periodic full cycle interval; 0 = never.
     pub full_every_days: u32,
-    /// Bound on outstanding cycle members.
+    /// Bound on outstanding cycle members. The default holds the whole
+    /// of a `relay_collections` listing: members are dispatched in DID
+    /// order, which spreads the work over every host only when the
+    /// members of every host are there to pick from.
     pub max_outstanding: u64,
 }
 
@@ -435,7 +438,7 @@ impl Default for SweepConfig {
             source: SweepSource::RelayCollections,
             max_repos_per_hour: 0,
             full_every_days: 0,
-            max_outstanding: 10_000,
+            max_outstanding: 10_000_000,
         }
     }
 }

@@ -212,9 +212,18 @@ impl Wizard {
         }
     }
 
-    /// `storage.budget_bytes`: 70% of the disk entered.
+    /// `storage.hard_ceiling_bytes`: the figure entered. It is what the
+    /// operator allows the database, so it is the size at which Farsight
+    /// stops storing, not a size it stays well under.
+    pub fn ceiling_bytes(&self) -> u64 {
+        self.disk_gb.saturating_mul(1_000_000_000)
+    }
+
+    /// `storage.budget_bytes`: as close under the ceiling as a ceiling
+    /// may be to its budget, which is 105% of it
+    /// (`StorageConfig::ceiling_clears_release_mark`).
     pub fn budget_bytes(&self) -> u64 {
-        self.disk_gb.saturating_mul(1_000_000_000) / 10 * 7
+        self.ceiling_bytes() / 105 * 100
     }
 
     /// The config this wizard would write.
@@ -224,6 +233,7 @@ impl Wizard {
         c.server.contact = self.contact.clone();
         c.storage.database_url = self.dsn.clone();
         c.storage.budget_bytes = self.budget_bytes();
+        c.storage.hard_ceiling_bytes = self.ceiling_bytes();
         c.firehose.urls = self.urls.clone();
         c.backfill.sweep.enabled = self.sweep;
         c.backfill.sweep.source = match self.source.as_str() {
@@ -447,14 +457,26 @@ pub struct StepNav {
     pub class: &'static str,
 }
 
-/// The rows of the size projection table: (stage, data + indexes, with
-/// overhead).
-pub const PROJECTION: [(&str, &str, &str); 4] = [
-    ("Day one", "< 100 MB", "< 150 MB"),
-    ("30 days, firehose only", "~2–8 GB", "~2.5–10 GB"),
-    ("First sweep cycle complete", "~22–42 GB", "~28–52 GB"),
-    ("Growth per year after", "~14–15 GB", "~17–19 GB"),
+/// The rows of the size table: (stage, database size, where the figure
+/// comes from). The sweep's figure is a measurement: the sizes this page
+/// showed before it came from a guess at how many blocks the network
+/// holds, and were about a third of it.
+pub const PROJECTION: [(&str, &str, &str); 3] = [
+    ("Day one", "< 150 MB", "an empty index"),
+    (
+        "First sweep cycle complete",
+        "about 180 GB",
+        "measured in October 2026 on a sweep 37% done, scaled to the whole",
+    ),
+    ("Growth per year after", "not known", "not measured yet"),
 ];
+
+/// The size, in GB, a completed first sweep was measured at
+/// ([`PROJECTION`]).
+const SWEEP_GB: f64 = 180.0;
+/// Below this size entered, with the sweep on, the wizard warns
+/// ([`disk_warning`]): a completed sweep and some room after it.
+const SWEEP_DISK_GB: u64 = 250;
 
 /// The setup page (one template for every step).
 #[derive(Template)]
@@ -480,11 +502,11 @@ pub struct SetupPage {
     pub w: Wizard,
     /// Show the admin token (until saved).
     pub show_token: bool,
-    /// Set when the sweep is on and the disk entered is under 150 GB:
+    /// Set when the sweep is on and the size entered is under 250 GB:
     /// what the resulting budget allows.
     pub disk_warning: Option<String>,
-    /// The storage budget the wizard would write (70% of the disk
-    /// entered), in decimal units.
+    /// The storage budget the wizard would write (just under the size
+    /// entered, which is the hard ceiling), in decimal units.
     pub budget_text: String,
     /// Proxy preview lines.
     pub preview: Vec<String>,
@@ -732,26 +754,21 @@ fn expiry_warning(state: &SetupState) -> Option<String> {
 }
 
 fn disk_warning(w: &Wizard) -> Option<String> {
-    if !w.sweep || w.disk_gb >= 150 {
+    if !w.sweep || w.disk_gb >= SWEEP_DISK_GB {
         return None;
     }
     let budget = w.budget_bytes() as f64 / 1e9;
     let pause = budget * 0.9;
-    let (lo, hi) = (budget - 52.0, budget - 28.0);
-    let runway = if hi <= 0.0 {
-        "the first sweep may not complete within this budget".to_owned()
+    let fits = if pause < SWEEP_GB {
+        "the first sweep will pause before it is complete, and goes on when the budget is raised"
     } else {
-        format!(
-            "after a completed first sweep (~28–52 GB) about {:.1}–{:.1} years of growth \
-             (~17–19 GB/year) remain before the budget gate engages",
-            (lo.max(0.0)) / 19.0,
-            hi / 17.0
-        )
+        "a completed first sweep leaves little room for growth"
     };
     Some(format!(
-        "{} GB is below the recommended 150 GB with the sweep on. The storage budget will be \
-         {budget:.0} GB: the sweep pauses at 90% ({pause:.0} GB) and new list admissions are \
-         deferred at 100%; {runway}.",
+        "{} GB is below the recommended {SWEEP_DISK_GB} GB with the sweep on: a completed first \
+         sweep was measured at about {SWEEP_GB:.0} GB. Farsight stores nothing past the size \
+         entered; the storage budget will be {budget:.0} GB: the sweep pauses at 90% \
+         ({pause:.0} GB) and new list admissions are deferred at 100%; {fits}.",
         w.disk_gb
     ))
 }
@@ -2018,10 +2035,24 @@ mod tests {
     }
 
     #[test]
-    fn budget_is_70_percent() {
+    fn the_size_entered_is_the_hard_ceiling_and_the_budget_sits_just_under_it() {
         let mut w = Wizard::new(&[]);
         w.disk_gb = 100;
-        assert_eq!(w.budget_bytes(), 70_000_000_000);
+        assert_eq!(w.ceiling_bytes(), 100_000_000_000);
+        // The largest budget a ceiling of that size may have.
+        assert_eq!(w.budget_bytes(), 95_238_095_200);
+        let c = w.build_config();
+        assert_eq!(c.storage.effective_hard_ceiling(), 100_000_000_000);
+        assert!(c.storage.ceiling_clears_release_mark());
+        w.disk_gb = 285;
+        assert_eq!(
+            w.build_config().storage.effective_hard_ceiling(),
+            285_000_000_000
+        );
+        assert!(w.build_config().storage.ceiling_clears_release_mark());
+        w.disk_gb = 1;
+        assert!(w.build_config().storage.ceiling_clears_release_mark());
+        w.disk_gb = 100;
         w.sweep = true;
         assert!(disk_warning(&w).is_some());
         w.disk_gb = 500;
@@ -2055,7 +2086,8 @@ mod tests {
         assert!(!w.build_config().access.public_ui);
         w.public_confirmed = true;
         assert!(w.build_config().access.public_ui);
-        assert_eq!(l.config.storage.budget_bytes, 350_000_000_000);
+        assert_eq!(l.config.storage.hard_ceiling_bytes, 500_000_000_000);
+        assert_eq!(l.config.storage.budget_bytes, 476_190_476_100);
         assert!(redacted_toml(&l.config).contains("<redacted>"));
         assert!(!redacted_toml(&l.config).contains("u:p@"));
     }

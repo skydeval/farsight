@@ -19,7 +19,7 @@ use farsight_storage::codes::sql::{
     ACTOR_ACTIVE, CYCLE_FULL, CYCLE_REPAIR, MEMBER_OUTSTANDING, REPO_FAILED, RUN_LISTED, TRACKED,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -36,6 +36,10 @@ use crate::metrics as m;
 use crate::xrpc;
 
 const TICK: Duration = Duration::from_secs(5);
+/// Pages a cycle enumerates in one tick while it has room for them. A
+/// source of some millions of entries is read in minutes, and the relay
+/// is asked a few times a second.
+const PAGES_PER_TICK: u32 = 25;
 /// Largest enumeration page asked for (`listReposByCollection` limit).
 const PAGE: i64 = 2000;
 /// Collections a sweep enumerates with `relay_collections`.
@@ -87,6 +91,9 @@ pub struct Sweep {
     /// The relay was last found without `listReposByCollection`: full
     /// cycles use `relay_repos`.
     pub fell_back: AtomicBool,
+    /// The cycle whose members this process has counted or is counting
+    /// (`sweep_cycles.id`; 0 before the first).
+    counted: AtomicI64,
 }
 
 impl Sweep {
@@ -126,11 +133,117 @@ impl Sweep {
     }
 }
 
+/// Largest page of the count (`listReposByCollection` limit).
+const COUNT_PAGE: u32 = 2000;
+/// Failed pages in a row after which a count is given up.
+const COUNT_RETRIES: u32 = 20;
+/// Wait before a failed page of the count is asked for again.
+const COUNT_RETRY_WAIT: Duration = Duration::from_secs(30);
+
+/// The open full `relay_collections` cycle whose members are not counted
+/// yet, if the sweep is on. Each process counts a cycle once: a cycle
+/// left open by an earlier process is counted again, since what that
+/// process stored may be the pages it had taken and not a count.
+async fn cycle_to_count(ctx: &Ctx, sweep: &Sweep) -> Option<CycleId> {
+    if !ctx.cfg().backfill.sweep.enabled {
+        return None;
+    }
+    let id: CycleId = sqlx::query_scalar(
+        "SELECT id FROM sweep_cycles
+         WHERE completed_at IS NULL AND enumerated_at IS NULL AND kind = $1 AND source = $2
+         ORDER BY id LIMIT 1",
+    )
+    .bind(CycleKind::Full)
+    .bind(CycleSource::RelayCollections)
+    .fetch_optional(&ctx.pool)
+    .await
+    .ok()
+    .flatten()?;
+    (sweep.counted.swap(id.get(), Ordering::Relaxed) != id.get()).then_some(id)
+}
+
+/// Counts the members of a `relay_collections` cycle and stores the count
+/// as the cycle's total.
+///
+/// Enumeration takes a page only when the cycle has room for its members
+/// (`backfill.sweep.max_outstanding`), so for most of a cycle it has seen
+/// a small part of the source and cannot say how much is left. The relay
+/// gives no total either. This reads every page of the three listings
+/// once, keeping nothing but the number of entries: a few thousand
+/// requests for some millions of accounts. An account that is in more
+/// than one listing is counted in each, and one that is listed before the
+/// count reaches it and satisfied before enumeration does is counted and
+/// never becomes a member, so the total is somewhat high. The last page
+/// of the enumeration replaces it with the members settled and
+/// outstanding at that moment.
+pub async fn count_members(ctx: Arc<Ctx>, cycle: CycleId) {
+    let relay = ctx.cfg().backfill.relay_url.clone();
+    let mut total = 0i64;
+    for k in SWEPT {
+        let mut cursor: Option<String> = None;
+        let mut failures = 0u32;
+        loop {
+            let page = xrpc::list_repos_by_collection(
+                &ctx.net,
+                &relay,
+                k.nsid(),
+                cursor.as_deref(),
+                COUNT_PAGE,
+            )
+            .await;
+            match page {
+                Ok((dids, next)) => {
+                    failures = 0;
+                    total += dids.len() as i64;
+                    match next.filter(|n| Some(n) != cursor.as_ref()) {
+                        Some(n) => cursor = Some(n),
+                        None => break,
+                    }
+                }
+                Err(e) => {
+                    failures += 1;
+                    if failures > COUNT_RETRIES {
+                        tracing::warn!(cycle = cycle.get(), error = %e, "counting the cycle's members failed; its progress stays unknown");
+                        return;
+                    }
+                    tokio::time::sleep(COUNT_RETRY_WAIT).await;
+                }
+            }
+        }
+    }
+    let stored = sqlx::query(
+        "UPDATE sweep_cycles SET total_est = $2 WHERE id = $1 AND enumerated_at IS NULL",
+    )
+    .bind(cycle)
+    .bind(total)
+    .execute(&ctx.pool)
+    .await;
+    match stored {
+        Ok(_) => tracing::info!(
+            cycle = cycle.get(),
+            members = total,
+            "cycle members counted"
+        ),
+        Err(e) => {
+            tracing::warn!(cycle = cycle.get(), error = %e, "storing the cycle's count failed")
+        }
+    }
+}
+
 /// Runs cycles until `stop` flips.
 pub async fn run(ctx: Arc<Ctx>, sweep: Arc<Sweep>, mut stop: watch::Receiver<bool>) {
+    // The count of a cycle's members runs beside the ticks, and ends
+    // with this future.
+    let mut counts: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
         if let Err(e) = tick(&ctx, &sweep).await {
             tracing::warn!(error = %e, "sweep tick failed");
+        }
+        while counts.try_join_next().is_some() {}
+        if counts.is_empty()
+            && let Some(cycle) = cycle_to_count(&ctx, &sweep).await
+        {
+            counts.spawn(count_members(ctx.clone(), cycle));
         }
         tokio::select! {
             _ = tokio::time::sleep(TICK) => {}
@@ -159,7 +272,7 @@ pub enum SweepError {
 
 type Res<T> = Result<T, SweepError>;
 
-/// One step: start cycles that are due, enumerate a page per open cycle
+/// One step: start cycles that are due, enumerate pages of each open cycle
 /// while under the outstanding bound, complete finished cycles.
 pub async fn tick(ctx: &Ctx, sweep: &Sweep) -> Res<()> {
     let pool = &ctx.pool;
@@ -207,10 +320,37 @@ pub async fn tick(ctx: &Ctx, sweep: &Sweep) -> Res<()> {
                 outstanding -= release_waiting(ctx, c.id, max_out).await?;
             }
             // Each page asks for at most the room left, so outstanding
-            // rows never exceed the bound.
-            if outstanding < max_out {
+            // rows never exceed the bound. The pages of one tick are
+            // counted as full: the rows are counted once a tick.
+            let mut cycle = c.clone();
+            for _ in 0..PAGES_PER_TICK {
+                if outstanding >= max_out {
+                    break;
+                }
                 let room = u32::try_from((max_out - outstanding).min(PAGE)).unwrap_or(1);
-                enumerate_page(ctx, sweep, c, room).await?;
+                enumerate_page(ctx, sweep, &cycle, room).await?;
+                outstanding += i64::from(room);
+                let next: Option<Cycle> = sqlx::query_as(
+                    "SELECT id, kind, source, started_at, effective_start_witness, enumerated_at,
+                            checkpoint, repair_from
+                     FROM sweep_cycles WHERE id = $1 AND completed_at IS NULL",
+                )
+                .bind(c.id)
+                .fetch_optional(pool)
+                .await?;
+                // The next page follows at once only when this one moved
+                // the cycle on: a page that failed, the last one, and a
+                // change of source all wait for the next tick.
+                match next {
+                    Some(n)
+                        if n.enumerated_at.is_none()
+                            && n.source == cycle.source
+                            && n.checkpoint != cycle.checkpoint =>
+                    {
+                        cycle = n;
+                    }
+                    _ => break,
+                }
             }
         }
         maybe_complete(ctx, c).await?;
@@ -747,16 +887,27 @@ async fn enumerate_page(ctx: &Ctx, sweep: &Sweep, c: &Cycle, room: u32) -> Res<(
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    sqlx::query(
+    // The total of a `relay_collections` cycle is counted ahead of its
+    // enumeration ([`count_members`]), which only ever knows the pages it
+    // has taken: there the count stands until the last page, and is then
+    // replaced by the members settled and outstanding. The other sources have no
+    // count, and their total grows page by page.
+    sqlx::query(&format!(
         "UPDATE sweep_cycles SET checkpoint = $2,
-           total_est = COALESCE(total_est, 0) + $3,
+           total_est = CASE
+             WHEN source <> $5 THEN COALESCE(total_est, 0) + $3
+             WHEN $4 THEN done + failed_terminal
+               + (SELECT count(*) FROM cycle_outstanding o
+                  WHERE o.cycle_id = sweep_cycles.id AND o.state = {MEMBER_OUTSTANDING})
+             ELSE total_est END,
            enumerated_at = CASE WHEN $4 THEN now() END
          WHERE id = $1",
-    )
+    ))
     .bind(c.id)
     .bind(&next)
     .bind(n as i64)
     .bind(done)
+    .bind(CycleSource::RelayCollections)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -884,10 +1035,10 @@ async fn maybe_complete(ctx: &Ctx, c: &Cycle) -> Res<()> {
 /// (remaining ÷ trailing-1h rate).
 async fn publish_progress(ctx: &Ctx) {
     for (kind, label) in [(CycleKind::Full, "full"), (CycleKind::Repair, "repair")] {
-        let row: Option<(i64, i64, i64, bool)> = sqlx::query_as(
+        let row: Option<(i64, i64, i64, bool, CycleSource, Option<i64>)> = sqlx::query_as(
             &format!("SELECT c.done, c.failed_terminal,
                     (SELECT count(*) FROM cycle_outstanding o WHERE o.cycle_id = c.id AND o.state = {MEMBER_OUTSTANDING}),
-                    c.enumerated_at IS NOT NULL
+                    c.enumerated_at IS NOT NULL, c.source, c.total_est
              FROM sweep_cycles c WHERE c.completed_at IS NULL AND c.kind = $1 ORDER BY c.id LIMIT 1"),
         )
         .bind(kind)
@@ -895,15 +1046,31 @@ async fn publish_progress(ctx: &Ctx) {
         .await
         .ok()
         .flatten();
-        let Some((done, failed, outstanding, enumerated)) = row else {
+        let Some((done, failed, outstanding, enumerated, source, counted)) = row else {
             metrics::gauge!(m::SWEEP_PROGRESS, "cycle_kind" => label).set(1.0);
             continue;
         };
-        // Until enumeration ends the total is unknown: progress over what
-        // has been enumerated so far.
-        let total = (done + failed + outstanding).max(1) as f64;
-        metrics::gauge!(m::SWEEP_PROGRESS, "cycle_kind" => label)
-            .set((done + failed) as f64 / total);
+        let settled = done + failed;
+        // What is left to do. Once enumeration has ended that is the
+        // members still outstanding. Before, only a `relay_collections`
+        // cycle knows: its members were counted ahead. Any other cycle
+        // knows the pages it has taken and no more, and its progress is
+        // over those.
+        let left = if enumerated {
+            Some(outstanding)
+        } else if source == CycleSource::RelayCollections {
+            counted.map(|t| (t - settled).max(outstanding))
+        } else {
+            None
+        };
+        let total = (settled + left.unwrap_or(outstanding)).max(1) as f64;
+        // A cycle whose count is not in yet has no progress to give.
+        let ratio = if !enumerated && source == CycleSource::RelayCollections && counted.is_none() {
+            0.0
+        } else {
+            settled as f64 / total
+        };
+        metrics::gauge!(m::SWEEP_PROGRESS, "cycle_kind" => label).set(ratio);
         if kind == CycleKind::Full {
             let rate: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM backfill_state WHERE backfilled_at > now() - interval '1 hour'",
@@ -911,8 +1078,8 @@ async fn publish_progress(ctx: &Ctx) {
             .fetch_one(&ctx.pool)
             .await
             .unwrap_or(0);
-            if rate > 0 && enumerated {
-                metrics::gauge!(m::SWEEP_ETA).set(outstanding as f64 / rate as f64 * 3600.0);
+            if let (true, Some(left)) = (rate > 0, left) {
+                metrics::gauge!(m::SWEEP_ETA).set(left as f64 / rate as f64 * 3600.0);
             }
         }
     }

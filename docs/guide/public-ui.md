@@ -3,7 +3,7 @@
 Farsight can serve a public lookup site from the same binary: search by
 handle, DID, `at://` URI or bsky.app link, then a page per account (who
 blocks it, which listblocked lists name it) and per list (members, who
-blocks it). It is an independent equivalent of Clearsky's lookup pages.
+blocks it).
 
 It is **off by default**, and served at the root of the hostname: `/`,
 `/did/<did>`, `/list/<did>/<rkey>`, `/search`. Turn it on in the wizard
@@ -195,6 +195,12 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
   `lists`, `out`, `outlists`, `subscribers` for a page's other tables).
   The count in a table's heading is the real number, counted with the
   page's filters on every view.
+- **Kept current.** A page left open in a visible tab reads itself
+  again once a minute and updates its counts and its "Last updated"
+  line: the totals on the home page, the count in each table's heading
+  on an account's or a list's page. The rows shown do not move under
+  the reader; a reload brings the new ones. A table filtered with the
+  Find box is not read again.
 - **Newest first.** Tables are sorted by creation time. That time is
   the author's own claim, so the order uses the earlier of it and the
   moment Farsight first stored the record: a record dated in the future

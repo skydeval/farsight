@@ -7,6 +7,146 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Before 1.0, a minor version may change addresses, settings or the
 database schema; each entry says so where it does.
 
+## [Unreleased]
+
+### Added
+
+- An account's page and a list's page left open keep their counts
+  current, as the home page does its totals. Once a minute, while the
+  tab is visible, the page reads itself again and takes the heading of
+  every table, with its count, and the "Last updated" line. The rows
+  stay as they were read, and a table filtered with the Find box is
+  not read again.
+
+### Fixed
+
+- Backfill: an account the sweep found before anything else had named
+  it was left without its host. Such an account has no row when its
+  job resolves it, the row was made by the first record stored, and
+  nothing put the host on that row afterwards. The account went on
+  counting as unresolved, and everything it had stored stayed in the
+  shared `unresolved` bucket. A few thousand such accounts fill that
+  bucket (`limits.unresolved_blocks`, 1,000,000 blocks), and from then
+  on the blocks of every author not yet resolved were refused, those
+  arriving on the firehose included, each with a `refused` debt. A repo
+  job now makes the row and records the host before it stores
+  anything. At start the backfill process also looks for accounts
+  listed without a host, resolves each again and moves its usage to the
+  buckets of its host, which reopens `unresolved` on an instance where
+  it had filled; the debts are then re-listed as usual.
+- Backfill: starting a job read the whole queue. Picking the next
+  sweep member joined every queue entry to its account and sorted the
+  members outstanding, and claiming a requester's next entry sorted
+  all of that requester's waiting entries. With some tens of thousands
+  of entries waiting, each took about 0.2 s. Jobs are started one at a
+  time, so this held the backfill to a few jobs a second whatever
+  `backfill.concurrency` was. Both now follow an index to the first
+  entry they can take, in about a millisecond, with ten thousand
+  members outstanding or with millions.
+- Firehose: a restart after a failover replayed everything since the
+  failover, and applied nothing new until the replay was through. A
+  starting process connected to the first instance of `firehose.urls`
+  and resumed that instance's own cursor, which stood where the
+  instance had been left; an instance returned to by a later failover
+  did the same. After a day on the second instance, a restart meant
+  some hours in which new blocks did not appear, with the page saying
+  the stream was behind. Nothing was lost: the replayed events were
+  recognised as stored. A starting process now connects first to the
+  instance whose own cursor is furthest along, which is the one it was
+  reading, and resumes there exactly, and an
+  instance whose own cursor is more than 30 minutes behind what has
+  been applied is resumed as a failover, by a short rewind.
+- The compose file's Postgres ran out of shared memory. Docker gives a
+  container 64 MB of `/dev/shm`. Postgres keeps there what a parallel
+  query shares between its workers, and a pooled session that has run
+  one holds about 1 MB for as long as it lives, so the sessions of the
+  two processes fill it. From then on queries failed with "could not
+  resize shared memory segment … No space left on device": mostly the
+  scheduler's read of the waiting list jobs, logged as "scheduler pick
+  failed", and the sweep's own counts. The Postgres service now has
+  `shm_size: 1gb`. `docker compose up -d postgres` applies it to an
+  existing installation.
+- The sweep's progress and time left said nothing while a cycle was
+  being enumerated, which is most of it. They were measured over the
+  accounts enumerated so far, and enumeration keeps only
+  `backfill.sweep.max_outstanding` ahead of the work, so a cycle read
+  about 94% from its first hour on. The members of a
+  `relay_collections` cycle are now counted at its start: every page
+  of the relay's three listings is read once and only the number of
+  entries kept. `getStats`, the dashboard and
+  `farsight_backfill_sweep_progress_ratio` use that count, and give no
+  progress for the few minutes until it is in. The count is somewhat
+  high, since an account in two listings is counted twice.
+
+### Changed
+
+- **A first sweep is several times faster.** The relay lists the
+  accounts of one host after another, in long runs, and a cycle kept
+  only 10,000 members outstanding, so nearly all of them were on one
+  host at a time. That host's request limit paced the whole sweep:
+  every worker waited for a slot there while the other hosts were
+  asked almost nothing. `backfill.sweep.max_outstanding` now defaults
+  to 10,000,000, which holds the whole listing. Members are dispatched
+  in DID order, so with all of them outstanding the work lands on
+  every host at once. A cycle reads up to 25 pages of its source every
+  5 seconds, not one, so the listing is in within minutes. With the
+  hosts worked together, resolving accounts at the PLC directory sets
+  the pace, and `backfill.plc_rps` now defaults to 20. On the instance
+  this was measured on, a sweep of about four million accounts went
+  from under 30,000 accounts an hour to about 70,000 with these
+  defaults.
+  **An instance set up before this version has the old values in its
+  configuration file**, where the wizard wrote them: set
+  `max_outstanding` under `[backfill.sweep]` and `plc_rps` under
+  `[backfill]` on the Settings page. Both apply at once. A member
+  outstanding costs about 160 bytes of storage.
+- **The size given to the setup wizard is the size Farsight uses.** The
+  wizard asked for the disk available to Postgres and set the storage
+  budget to 70% of it, with the hard ceiling at 115% of that: of 285 GB
+  entered, Farsight stopped at 229. The figure is now asked for as the
+  space the database may use and is written as
+  `storage.hard_ceiling_bytes`, with `storage.budget_bytes` just under
+  it (the ceiling is 105% of the budget). Room for Postgres'
+  write-ahead log and for maintenance is the operator's to leave
+  beyond it, and the step says so. An instance already set up keeps
+  the values in its file; both keys are on the Settings page.
+- **The disk a first sweep needs is about 180 GB, not 30–56 GB.** The
+  earlier figure came from a model whose count of the network's blocks
+  was a guess, about a third of what a sweep finds. The new one is a
+  measurement, taken in October 2026 on a sweep 37% done and scaled to
+  the whole: roughly 430 million blocks at about 360 bytes each with
+  their indexes. The storage guide, the compose file, the README and
+  the wizard say so and say where the figure comes from; the wizard
+  now warns under 250 GB, not 150. Growth per year was derived from
+  the same guess and is given as not yet measured.
+- Backfill: a host being asked at its rate no longer takes every
+  worker. Work for a host is held back while the host takes no
+  request, and that was judged by the requests in flight. A host that
+  answers quickly has one or two in flight and all its jobs waiting
+  for the next token, so it looked free: jobs for it were started
+  until they held nearly every worker, and the other hosts were left
+  with a handful. The requests waiting for a slot are now counted,
+  and a host with as many waiting as it takes at once
+  (`backfill.per_host_concurrency`) gets no new work until they are
+  through. The scheduler can hold work back only for a host it knows,
+  and a sweep member met for the first time is resolved by its job. So
+  a job that resolves its account to a host with such a queue ends at
+  once as `busy`, with the host recorded on the account: the worker
+  goes to other work and the account is taken up again when the host
+  has room. A host that is cooling down is not such a queue: a job for
+  it fails and is retried on its schedule, as before.
+- The line the backfill process logs for each finished job says where
+  the job's time went that was not its own work: `answer_ms` waiting
+  for hosts to answer, `slot_ms` waiting for a request slot of a host,
+  and `plc_ms` waiting for the PLC directory's limiter. A sweep whose
+  jobs spend their time in `slot_ms` is held up by one host; in
+  `plc_ms`, by `backfill.plc_rps`.
+- The compose file keeps three log files of 50 MB for each container.
+  Docker's default keeps every line, and the backfill process writes
+  one for each job it finishes.
+- The storage guide says what the memory of a larger host is used
+  for, and gives the Postgres settings for one.
+
 ## [0.6.2] - 2026-10-08
 
 ### Added

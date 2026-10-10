@@ -9,9 +9,10 @@
 # command stops with an error that names it. Letters and digits only: it
 # is part of a URL.
 #
-# Disk: the farsight-pgdata volume holds the index. Plan for roughly
-# 30-56 GB after the first full sweep plus 18-20 GB/year of growth;
-# 500 GB is recommended. See docs/guide/storage.md.
+# Disk: the farsight-pgdata volume holds the index. A first full sweep
+# was measured at about 180 GB (October 2026, a sweep 37% done scaled to
+# the whole); growth after it is not measured yet. 500 GB is
+# recommended. See docs/guide/storage.md.
 
 name: farsight
 
@@ -24,6 +25,12 @@ x-farsight-common: &farsight-common
   build: .
   restart: unless-stopped
   user: "10001:10001"
+  logging: &farsight-logging
+    # Docker keeps every line by default. Three files of 50 MB each.
+    driver: json-file
+    options:
+      max-size: 50m
+      max-file: "3"
   env_file:
     - path: farsight.env
       required: false
@@ -73,6 +80,13 @@ services:
     image: postgres:16
     container_name: farsight-postgres
     restart: unless-stopped
+    logging: *farsight-logging
+    # Postgres keeps what a parallel query shares between its workers in
+    # /dev/shm, and a pooled session that has run one keeps about 1 MB
+    # there for as long as it lives. Docker gives a container 64 MB, which
+    # the two processes' sessions fill: queries then fail with "could not
+    # resize shared memory segment".
+    shm_size: 1gb
     environment:
       POSTGRES_USER: farsight
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env beside compose.yml}

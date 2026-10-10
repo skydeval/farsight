@@ -452,7 +452,7 @@
     zoneNote();
     tabs();
     pending();
-    homeLive();
+    live();
     swaps();
     pagers();
     finds();
@@ -1094,21 +1094,34 @@
   }
   var pendingRun = 0;
 
-  // The home page left open keeps itself current: once a minute, while
-  // it is visible, it reads itself again and takes the totals and the
-  // "Last updated" line from the answer, both or neither.
-  function homeLive() {
-    var totals = document.querySelector("dl.home-totals");
-    if (!totals || !window.fetch) {
+  // A page left open keeps itself current: once a minute, while it is
+  // visible, it reads itself again and takes from the answer what counts
+  // things, with the "Last updated" line. On the home page that is the
+  // totals; on an account's or a list's page, the heading of every
+  // table, which holds its count. All of them change together or none
+  // does. The rows of a table stay as they were read: a reader in the
+  // middle of a page keeps the place.
+  //
+  // A table filtered with the Find box is not read again. Its count is
+  // of the matches, and counting them draws on the lookup budget.
+  var LIVE_HEADS = "section.data-section[id] > .section-header > h2";
+
+  function live() {
+    if (!window.fetch || !window.DOMParser) {
+      return;
+    }
+    var home = !!document.querySelector("dl.home-totals");
+    if (!home && !document.querySelector(LIVE_HEADS)) {
       return;
     }
     var busy = false;
     function read() {
-      if (document.hidden || busy) {
+      if (document.hidden || busy || /[?&]find=[^&]/.test(location.search)) {
         return;
       }
       busy = true;
-      fetch(location.pathname, { credentials: "same-origin", cache: "no-store" })
+      var asked = home ? location.pathname : location.pathname + location.search;
+      fetch(asked, { credentials: "same-origin", cache: "no-store" })
         .then(function (r) {
           if (r.status !== 200 || r.redirected) {
             throw new Error("not the page");
@@ -1116,16 +1129,40 @@
           return r.text();
         })
         .then(function (html) {
-          var doc = new DOMParser().parseFromString(html, "text/html");
-          var freshTotals = doc.querySelector("dl.home-totals");
-          var freshLine = doc.querySelector(".footer-updated");
-          var line = document.querySelector(".footer-updated");
-          if (!freshTotals || !freshLine || !line) {
+          // The reader went to another page of the table meanwhile.
+          if (!home && asked !== location.pathname + location.search) {
             return;
           }
-          totals.innerHTML = freshTotals.innerHTML;
-          line.innerHTML = freshLine.innerHTML;
-          times(line);
+          var doc = new DOMParser().parseFromString(html, "text/html");
+          var pairs = [];
+          var totals = document.querySelector("dl.home-totals");
+          if (totals) {
+            pairs.push([totals, doc.querySelector("dl.home-totals")]);
+          }
+          var heads = document.querySelectorAll(LIVE_HEADS);
+          for (var i = 0; i < heads.length; i++) {
+            var section = doc.getElementById(heads[i].parentNode.parentNode.id);
+            pairs.push([heads[i], section ? section.querySelector(".section-header > h2") : null]);
+          }
+          var line = document.querySelector(".footer-updated");
+          var freshLine = doc.querySelector(".footer-updated");
+          if (!pairs.length || !line !== !freshLine) {
+            return;
+          }
+          for (var k = 0; k < pairs.length; k++) {
+            if (!pairs[k][1]) {
+              return;
+            }
+          }
+          for (var n = 0; n < pairs.length; n++) {
+            if (pairs[n][0].innerHTML !== pairs[n][1].innerHTML) {
+              pairs[n][0].innerHTML = pairs[n][1].innerHTML;
+            }
+          }
+          if (line) {
+            line.innerHTML = freshLine.innerHTML;
+            times(line);
+          }
         })
         .catch(function () {
           // The page stays as it is until the next reading.

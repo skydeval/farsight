@@ -1318,6 +1318,20 @@ described in [security](security.md#aggregate-bounds).
 
 ## Sizing
 
+**Measured, October 2026.** On an instance whose first sweep was 37%
+done the database held 67 GB: 158 million blocks of about 1.35
+million accounts, out of 3.7 million accounts that hold a block or a
+list. Scaled to the whole that is roughly 430 million blocks and about
+180 GB, the sort indexes included. A block took about 360 bytes: 89 in
+the heap, 62 to 77 in each of its four indexes. The distribution is
+what the model below did not have: the median account that blocks
+anyone has 7 blocks, the 99th percentile 1,744, the largest 770,000,
+and the thousand largest held a quarter of all that was stored. The
+model's sizes per row hold up to about a fifth; its count of blocks
+was about a third of what is there, and with it every total below.
+The totals and the growth figures that follow are kept as the model
+gave them and are not to be planned by.
+
 The per-row sizes below are estimates from a model, not measurements:
 a 24-byte tuple header plus aligned columns per heap row; about 16
 bytes of overhead plus the keys per B-tree entry; about 90% fill. The
@@ -1348,8 +1362,8 @@ four indexes instead of two.
 |---|---|---|
 | Day one | < 100 MB | < 150 MB |
 | 30 days, firehose only | ~2–8 GB | ~2.5–10 GB |
-| First full sweep complete | ~24–45 GB | ~30–56 GB |
-| Growth per year afterwards | ~15–16 GB | ~18–20 GB |
+| First full sweep complete (model; measured: about 180 GB) | ~24–45 GB | ~30–56 GB |
+| Growth per year afterwards (model; not measured) | ~15–16 GB | ~18–20 GB |
 
 "With overhead" allows about a quarter for bloat and free space inside
 the database; it is the figure to plan a disk by, and the one the
@@ -1378,15 +1392,13 @@ lookup by subject costs one to three random leaf reads.
 - **Recommended:** 4 vCPU, 8 GB RAM, 500 GB SSD or NVMe. The disk
   leaves room for vacuum, reindexing, `pg_dump` and growth in the
   number of blocks.
-- **About 100 GB of disk** works with limits. Firehose-only, after the
-  early arrival of list items, the database grows by under 20 GB a
-  year (~18–20 GB with overhead), which is several years of room. With the sweep on, a budget of
-  70 GB (ceiling ~80 GB) is the practical maximum: the ceiling must
-  stay under the disk with about 20 GB left for WAL and for rewriting
-  the largest table. A completed sweep (~30–56 GB with overhead) then
-  leaves about 14–40 GB of budget, from under one to about two years
-  of growth, before the budget gate engages. The setup wizard
-  warns when the sweep is on and the disk is under 150 GB.
+- **A smaller disk** works with limits. Firehose-only, the database
+  grows with what is blocked from then on. With the sweep on, the
+  sweep pauses at 90% of the storage budget and goes on when the
+  budget is raised; a completed sweep needs about 180 GB, and the
+  ceiling must stay under the disk with room left for WAL and for
+  maintenance. The setup wizard warns when the sweep is on and the
+  size entered is under 250 GB.
 
 The Compose file keeps the database in the named volume
 `farsight-pgdata` and tunes Postgres for an 8 GB host:

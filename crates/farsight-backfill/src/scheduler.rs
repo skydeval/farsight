@@ -40,7 +40,7 @@ use std::hash::Hash;
 use farsight_core::Did;
 use farsight_core::bucket::{Bucket, Rate};
 use farsight_storage::codes::{CycleKind, JobKind, Priority, RequesterKey, Tier};
-use farsight_storage::ids::{ActorId, QueueId};
+use farsight_storage::ids::{ActorId, CycleId, QueueId};
 use farsight_storage::queue;
 use sqlx::PgPool;
 use tokio::sync::{Notify, watch};
@@ -50,7 +50,7 @@ use crate::ctx::{Ctx, JOB};
 use crate::jobs::{self, Finish, JobReq, JobResult, Outcome};
 use crate::lanes::{self, Item, Lanes};
 use crate::metrics as m;
-use crate::net::{METER, WAITED_MS};
+use crate::net::{METER, TURN_MS, WAITED_MS};
 
 /// High-priority picks per normal pick within a requester.
 pub const HIGH_PER_NORMAL: u32 = 4;
@@ -440,44 +440,57 @@ impl Scheduler {
         // would hold a worker while it waits for the host. This is what
         // keeps a few slow hosts from holding every worker.
         let blocked = self.ctx.net.blocked_hosts();
-        let sql = format!(
-            "UPDATE backfill_queue SET claimed_by = $5,
-               claimed_until = now() + make_interval(secs => $6)
-             WHERE id = (
-               SELECT q.id FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
-               WHERE q.tier = $1 AND q.claimed_by IS NULL
-                 AND (q.not_before IS NULL OR q.not_before <= now())
-                 AND a.did <> ALL($2) {sql_filter}
-                 AND NOT EXISTS (SELECT 1 FROM pds_hosts h
-                                 WHERE h.id = a.pds_host_id AND h.host = ANY($7))
-                 AND NOT EXISTS (SELECT 1 FROM job_leases j
-                                 WHERE j.did = a.did AND j.lease_until > now())
-               ORDER BY {} q.enqueued_at, q.id LIMIT 1 FOR UPDATE OF q SKIP LOCKED)
-             RETURNING id, actor_id,
-               (SELECT did FROM actors WHERE id = backfill_queue.actor_id), kind, tier, priority, requester",
-            if args.2.is_some() { "(q.priority = $4) DESC," } else { "" }
-        );
-        let row: Option<QueueRow> = sqlx::query_as(&sql)
-            .bind(args.0)
-            .bind(&inflight)
-            .bind(args.1)
-            .bind(args.2)
-            .bind(&self.ctx.process)
-            .bind(queue::CLAIM.as_secs_f64())
-            .bind(&blocked)
-            .fetch_optional(&self.ctx.pool)
-            .await?;
-        Ok(row.map(
-            |(id, actor_id, did, kind, tier, priority, requester)| Work::Queue {
-                id,
-                actor_id,
-                did,
-                kind,
-                tier,
-                priority,
-                requester,
-            },
-        ))
+        // With a preferred priority, the entries of that priority are read
+        // first and the others after: each read follows
+        // `backfill_queue_pick` in its order and ends at the first entry
+        // it can take. One read ordered "preferred first" sorts every
+        // waiting entry of the requester for each job started.
+        let priorities: Vec<Option<Priority>> = match args.2 {
+            Some(Priority::High) => vec![Some(Priority::High), Some(Priority::Normal)],
+            Some(Priority::Normal) => vec![Some(Priority::Normal), Some(Priority::High)],
+            None => vec![None],
+        };
+        for priority in priorities {
+            let sql = format!(
+                "UPDATE backfill_queue SET claimed_by = $5,
+                   claimed_until = now() + make_interval(secs => $6)
+                 WHERE id = (
+                   SELECT q.id FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
+                   WHERE q.tier = $1 AND q.claimed_by IS NULL
+                     AND (q.not_before IS NULL OR q.not_before <= now())
+                     AND a.did <> ALL($2) {sql_filter} {}
+                     AND NOT EXISTS (SELECT 1 FROM pds_hosts h
+                                     WHERE h.id = a.pds_host_id AND h.host = ANY($7))
+                     AND NOT EXISTS (SELECT 1 FROM job_leases j
+                                     WHERE j.did = a.did AND j.lease_until > now())
+                   ORDER BY q.enqueued_at, q.id LIMIT 1 FOR UPDATE OF q SKIP LOCKED)
+                 RETURNING id, actor_id,
+                   (SELECT did FROM actors WHERE id = backfill_queue.actor_id), kind, tier, priority, requester",
+                if priority.is_some() { "AND q.priority = $4" } else { "" }
+            );
+            let row: Option<QueueRow> = sqlx::query_as(&sql)
+                .bind(args.0)
+                .bind(&inflight)
+                .bind(args.1)
+                .bind(priority)
+                .bind(&self.ctx.process)
+                .bind(queue::CLAIM.as_secs_f64())
+                .bind(&blocked)
+                .fetch_optional(&self.ctx.pool)
+                .await?;
+            if let Some((id, actor_id, did, kind, tier, priority, requester)) = row {
+                return Ok(Some(Work::Queue {
+                    id,
+                    actor_id,
+                    did,
+                    kind,
+                    tier,
+                    priority,
+                    requester,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     async fn pick_tier1(&self) -> Result<Option<Work>, sqlx::Error> {
@@ -576,24 +589,62 @@ impl Scheduler {
         };
         // Members are dispatched straight from cycle_outstanding (no
         // actors row needed); failed members retry via the queue.
-        let row: Option<(String, CycleKind)> = sqlx::query_as(
-            &format!("SELECT o.did, c.kind FROM cycle_outstanding o JOIN sweep_cycles c ON c.id = o.cycle_id
-             WHERE o.state = {MEMBER_OUTSTANDING} AND c.completed_at IS NULL AND o.did > $1 AND o.did <> ALL($2)
-               AND ($3 OR c.kind = {CYCLE_REPAIR}) AND ($4 OR c.kind <> {CYCLE_REPAIR})
-               AND NOT EXISTS (SELECT 1 FROM job_leases j WHERE j.did = o.did AND j.lease_until > now())
-               AND NOT EXISTS (SELECT 1 FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
-                               WHERE a.did = o.did AND q.kind = {JOB_REPO})
-               AND NOT EXISTS (SELECT 1 FROM actors a JOIN pds_hosts h ON h.id = a.pds_host_id
-                               WHERE a.did = o.did AND h.host = ANY($5))
-             ORDER BY o.did LIMIT 1"),
-        )
-        .bind(&cursor)
-        .bind(&inflight)
+        //
+        // Each open cycle is asked for its next member through its own
+        // index, in DID order from the cursor, and the earliest of them is
+        // taken. The read ends at the first member it can take, so it
+        // costs the same with ten thousand members outstanding or with
+        // millions. Asked of all cycles at once, the members after the
+        // cursor are read and sorted for every pick.
+        //
+        // What rules a member out is asked about that member alone, as
+        // one scalar subquery: whether its host takes no request now, and
+        // whether it has an entry in the queue (waiting entries and
+        // claimed ones each through their own index). Written as joins,
+        // these are the planner's to reorder, and it has chosen to read
+        // every row of `actors` for one pick. The leases are read once.
+        let cycles: Vec<(CycleId, CycleKind)> = sqlx::query_as(&format!(
+            "SELECT id, kind FROM sweep_cycles
+             WHERE completed_at IS NULL
+               AND ($1 OR kind = {CYCLE_REPAIR}) AND ($2 OR kind <> {CYCLE_REPAIR})
+             ORDER BY id"
+        ))
         .bind(full_enabled)
         .bind(!self.ctx.cfg().backfill.repair.paused)
-        .bind(self.ctx.net.blocked_hosts())
-        .fetch_optional(&self.ctx.pool)
+        .fetch_all(&self.ctx.pool)
         .await?;
+        let blocked = self.ctx.net.blocked_hosts();
+        let mut row: Option<(String, CycleKind)> = None;
+        for (cycle, kind) in cycles {
+            let did: Option<String> = sqlx::query_scalar(&format!(
+                "SELECT o.did FROM cycle_outstanding o
+                 WHERE o.cycle_id = $1 AND o.state = {MEMBER_OUTSTANDING}
+                   AND o.did > $2 AND o.did <> ALL($3)
+                   AND o.did NOT IN (SELECT j.did FROM job_leases j WHERE j.lease_until > now())
+                   AND NOT COALESCE((
+                     SELECT h.host = ANY($4)
+                       OR EXISTS (SELECT 1 FROM backfill_queue q
+                                  WHERE q.actor_id = a.id AND q.kind = {JOB_REPO}
+                                    AND q.claimed_by IS NULL)
+                       OR EXISTS (SELECT 1 FROM backfill_queue q
+                                  WHERE q.actor_id = a.id AND q.kind = {JOB_REPO}
+                                    AND q.claimed_by IS NOT NULL)
+                     FROM actors a LEFT JOIN pds_hosts h ON h.id = a.pds_host_id
+                     WHERE a.did = o.did), false)
+                 ORDER BY o.did LIMIT 1"
+            ))
+            .bind(cycle)
+            .bind(&cursor)
+            .bind(&inflight)
+            .bind(&blocked)
+            .fetch_optional(&self.ctx.pool)
+            .await?;
+            if let Some(did) = did
+                && row.as_ref().is_none_or(|(earliest, _)| did < *earliest)
+            {
+                row = Some((did, kind));
+            }
+        }
         match row {
             Some((did, kind)) => {
                 self.st().member_cursor = Some(did.clone());
@@ -824,27 +875,33 @@ impl Scheduler {
             job,
             METER.scope(
                 meter,
-                WAITED_MS.scope(waited, async move {
-                    // `running` is owned by this task: it is dropped when the
-                    // task ends, whether the job returned, panicked or was
-                    // stopped.
-                    let sched = running.sched.clone();
-                    let ended =
-                        farsight_core::task::catch(sched.run_job(running.tier, &running.work, job))
-                            .await;
-                    if let Err(message) = ended {
-                        farsight_core::task::report_panic(JOB_TASK, &message);
-                        let handled = farsight_core::task::catch(sched.panicked(
+                WAITED_MS.scope(
+                    waited,
+                    TURN_MS.scope(Arc::default(), async move {
+                        // `running` is owned by this task: it is dropped when the
+                        // task ends, whether the job returned, panicked or was
+                        // stopped.
+                        let sched = running.sched.clone();
+                        let ended = farsight_core::task::catch(sched.run_job(
+                            running.tier,
                             &running.work,
                             job,
-                            &message,
                         ))
                         .await;
-                        if let Err(again) = handled {
-                            farsight_core::task::report_panic(JOB_TASK, &again);
+                        if let Err(message) = ended {
+                            farsight_core::task::report_panic(JOB_TASK, &message);
+                            let handled = farsight_core::task::catch(sched.panicked(
+                                &running.work,
+                                job,
+                                &message,
+                            ))
+                            .await;
+                            if let Err(again) = handled {
+                                farsight_core::task::report_panic(JOB_TASK, &again);
+                            }
                         }
-                    }
-                }),
+                    }),
+                ),
             ),
         ));
     }
@@ -854,6 +911,11 @@ impl Scheduler {
     async fn run_job(&self, tier: Tier, work: &Work, job: u64) {
         let started = Instant::now();
         let (result, requester, _) = self.execute(work).await;
+        // Where the job's time went that was not its own work: waiting
+        // for hosts to answer, for a request slot of a host, and for the
+        // PLC directory's limiter.
+        let answer_ms = crate::net::waited_ms().unwrap_or(0);
+        let (slot_ms, plc_ms) = crate::net::turn_ms().unwrap_or((0, 0));
         // One line per job at the default level.
         let (kind, subject) = match work {
             Work::Queue { kind, did, .. } => (
@@ -881,6 +943,9 @@ impl Scheduler {
                 error,
                 cost = result.cost,
                 ms = started.elapsed().as_millis() as u64,
+                answer_ms,
+                slot_ms,
+                plc_ms,
                 "job finished"
             ),
             o => tracing::info!(
@@ -891,6 +956,9 @@ impl Scheduler {
                 outcome = o.label(),
                 cost = result.cost,
                 ms = started.elapsed().as_millis() as u64,
+                answer_ms,
+                slot_ms,
+                plc_ms,
                 "job finished"
             ),
         }

@@ -360,11 +360,14 @@ await probe("after 65 seconds on an open page the relative part of a <time> has 
   const a = row.exec(before.text);
   const b = row.exec(after.text);
   const moved = a && b ? Number(b[2]) - Number(a[2]) : null;
-  // The footer reads in minutes up to 90 minutes, and must have moved too.
+  // The footer reads in minutes up to 90 minutes, and must have moved
+  // too: its reading is older, or the page has read itself again within
+  // the minute and the line carries a later instant.
   const footerAge = Date.now() - Date.parse(after.footerIso);
+  const reread = Date.parse(after.footerIso) > Date.parse(before.footerIso);
   const footerOk =
     /^\d+ (second|minute|hour|day)s? ago$/.test(after.footer) &&
-    (footerAge > 5400000 || after.footer !== before.footer);
+    (footerAge > 5400000 || after.footer !== before.footer || reread);
   return {
     ok: !!a && !!b && a[1] === b[1] && moved >= 60 && moved <= 70 && before.title === "probe UTC" && after.title === "probe UTC" && footerOk,
     detail: JSON.stringify({ before, after }),

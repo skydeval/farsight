@@ -154,6 +154,9 @@ impl Client {
 struct HostState {
     bucket: Bucket,
     inflight: u32,
+    /// Requests that wait for a slot here: the host's rate or its
+    /// request limit is in their way.
+    waiting: u32,
     cooldown_until: Option<Instant>,
     consecutive_failures: u32,
     trips: u32,
@@ -230,6 +233,25 @@ impl Drop for Slot<'_> {
     }
 }
 
+/// A request that waits for a slot on a host ([`HostLimiter::acquire`]),
+/// counted in the host's `waiting` until it is dropped.
+struct Waiting<'a> {
+    limiter: &'a HostLimiter,
+    host: &'a str,
+    counted: bool,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            let mut s = self.limiter.lock();
+            if let Some(h) = s.hosts.get_mut(self.host) {
+                h.waiting = h.waiting.saturating_sub(1);
+            }
+        }
+    }
+}
+
 /// `now + d`, or `now` where the sum cannot be represented.
 fn after(now: Instant, d: Duration) -> Instant {
     now.checked_add(d).unwrap_or(now)
@@ -299,6 +321,7 @@ impl Limited {
         if !self.hosts.contains_key(host) && self.hosts.len() >= REMEMBERED {
             self.hosts.retain(|_, s| {
                 s.inflight > 0
+                    || s.waiting > 0
                     || s.cooldown_until.is_some_and(|u| u > now)
                     || s.last_trip
                         .is_some_and(|t| now.saturating_duration_since(t) < BREAKER_REPEAT)
@@ -312,6 +335,7 @@ impl Limited {
             .or_insert_with(|| HostState {
                 bucket: Bucket::full(rate, now),
                 inflight: 0,
+                waiting: 0,
                 cooldown_until: None,
                 consecutive_failures: 0,
                 trips: 0,
@@ -396,17 +420,42 @@ impl HostLimiter {
         let now = Instant::now();
         let limits = s.limits;
         let h = s.host(host, now);
-        if h.cooldown_until.is_some_and(|u| u > now) || h.inflight >= limits.host_concurrency {
+        if h.cooldown_until.is_some_and(|u| u > now)
+            || h.inflight >= limits.host_concurrency
+            || h.waiting >= limits.host_concurrency
+        {
             return false;
         }
         domain.is_none_or(|d| s.domain(d, now).inflight < limits.domain_concurrency)
     }
 
+    /// Whether `host` has a queue: as many requests in flight, or
+    /// waiting for a slot, as it takes at once. More work for it would
+    /// only wait. A host that is cooling down has no queue by that: its
+    /// requests are refused at once, and a job for it fails and is
+    /// retried on its schedule, which is how a host that stays down
+    /// comes to be given up.
+    pub fn has_queue(&self, host: &str) -> bool {
+        let s = self.lock();
+        let limits = s.limits;
+        s.hosts.get(host).is_some_and(|h| {
+            h.inflight >= limits.host_concurrency || h.waiting >= limits.host_concurrency
+        })
+    }
+
     /// The hosts known not to take a request now: cooling down, at
-    /// their request limit, or under a domain (`domain_of`) at its limit.
-    /// Work for them is left where it waits, so it neither takes a
-    /// worker nor a place among the candidates loaded. Read-only: it
+    /// their request limit, with as many requests waiting for a slot as
+    /// the host takes at once, or under a domain (`domain_of`) at its
+    /// limit. Work for them is left where it waits, so it neither takes
+    /// a worker nor a place among the candidates loaded. Read-only: it
     /// does not count as a use of the host.
+    ///
+    /// The requests in flight alone do not say that a host is full. One
+    /// that answers in a few hundredths of a second and is asked at its
+    /// rate has a request or two in flight and every job that is on it
+    /// waiting for the next token. Without the count of those, jobs for
+    /// it are started until they hold every worker, and the other hosts
+    /// are left with none.
     pub fn blocked(&self, domain_of: impl Fn(&str) -> Option<String>) -> Vec<String> {
         let s = self.lock();
         let now = Instant::now();
@@ -416,6 +465,7 @@ impl HostLimiter {
             .filter(|(host, h)| {
                 h.cooldown_until.is_some_and(|u| u > now)
                     || h.inflight >= limits.host_concurrency
+                    || h.waiting >= limits.host_concurrency
                     || domain_of(host)
                         .and_then(|d| s.domains.get(&d))
                         .is_some_and(|d| d.inflight >= limits.domain_concurrency)
@@ -439,6 +489,13 @@ impl HostLimiter {
     /// host and, with a `domain`, of the domain too.
     pub async fn acquire(&self, host: &str, domain: Option<&str>) -> Result<Slot<'_>, NetError> {
         let start = Instant::now();
+        // Counted on the host from its first wait until this call ends,
+        // with a slot, with an error or dropped.
+        let mut waiting = Waiting {
+            limiter: self,
+            host,
+            counted: false,
+        };
         loop {
             let wait = {
                 let mut s = self.lock();
@@ -471,6 +528,10 @@ impl HostLimiter {
                     h.inflight += 1;
                 }
                 let host_wait = slot_wait(&h.bucket, limits.host);
+                if !took && !waiting.counted {
+                    h.waiting += 1;
+                    waiting.counted = true;
+                }
                 if took {
                     if let Some(d) = domain {
                         let ds = s.domain(d, now);
@@ -609,6 +670,12 @@ impl PlcLimiter {
     /// Waits for a PLC token. The resolver tries the reserved half, then
     /// the shared half; the export waits on the shared half alone.
     pub async fn acquire(&self, use_: PlcUse) {
+        let asked = Instant::now();
+        self.take_turn(use_).await;
+        waited_turn(TURN_PLC, asked);
+    }
+
+    async fn take_turn(&self, use_: PlcUse) {
         loop {
             let half = self.half();
             if use_ == PlcUse::Resolver {
@@ -639,6 +706,35 @@ tokio::task_local! {
     /// requester is charged for it as for its requests, and a listing
     /// judges a host's pace by it.
     pub static WAITED_MS: Arc<AtomicU64>;
+    /// The time, in milliseconds, the job running in this task has spent
+    /// waiting for its turn and not for an answer: [`TURN_SLOT`] for a
+    /// request slot of a host, [`TURN_PLC`] for a token of the PLC
+    /// directory's limiter. The line a finished job logs carries both.
+    pub static TURN_MS: Arc<[AtomicU64; 2]>;
+}
+
+/// Index in [`TURN_MS`] of the wait for a host's request slot.
+pub const TURN_SLOT: usize = 0;
+/// Index in [`TURN_MS`] of the wait for the PLC directory's limiter.
+pub const TURN_PLC: usize = 1;
+
+/// Adds the time since `asked` to the running job's wait of `kind`.
+fn waited_turn(kind: usize, asked: Instant) {
+    let ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let _ = TURN_MS.try_with(|t| t[kind].fetch_add(ms, Ordering::Relaxed));
+}
+
+/// The milliseconds the job running in this task has waited for its turn
+/// so far, at hosts and at the PLC directory; `None` outside a job.
+pub fn turn_ms() -> Option<(u64, u64)> {
+    TURN_MS
+        .try_with(|t| {
+            (
+                t[TURN_SLOT].load(Ordering::Relaxed),
+                t[TURN_PLC].load(Ordering::Relaxed),
+            )
+        })
+        .ok()
 }
 
 /// The milliseconds the job running in this task has waited for answers
@@ -774,6 +870,11 @@ impl Net {
         Some(farsight_core::registrable_domain(bare))
     }
 
+    /// Whether `host` has a queue of requests ([`HostLimiter::has_queue`]).
+    pub fn has_queue(&self, host: &str) -> bool {
+        self.hosts.has_queue(host)
+    }
+
     /// Whether a request to `host` could start now.
     pub fn has_capacity(&self, host: &str) -> bool {
         self.hosts
@@ -833,7 +934,10 @@ impl Net {
             None
         } else {
             let domain = self.domain_of(&host);
-            Some(self.hosts.acquire(&host, domain.as_deref()).await?)
+            let asked = Instant::now();
+            let slot = self.hosts.acquire(&host, domain.as_deref()).await;
+            waited_turn(TURN_SLOT, asked);
+            Some(slot?)
         };
         let _ = METER.try_with(|m| m.fetch_add(1, Ordering::Relaxed));
         let started = Instant::now();
@@ -931,6 +1035,58 @@ mod tests {
             l.acquire("h", None).await,
             Err(NetError::Cooling { .. })
         ));
+    }
+
+    /// Polls `f` once and says whether it is still waiting.
+    fn pending<F: std::future::Future>(f: &mut std::pin::Pin<Box<F>>) -> bool {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        f.as_mut().poll(&mut cx).is_pending()
+    }
+
+    #[tokio::test]
+    async fn a_host_with_a_queue_of_waiting_requests_takes_no_new_work() {
+        // One request a second and room for two at once: the first takes
+        // the token there is, and the host is free again once it is back.
+        let l = HostLimiter::new(1, 2);
+        l.acquire("h", None)
+            .await
+            .unwrap()
+            .release(SlotOutcome::Healthy);
+        assert!(l.blocked(|_| None).is_empty());
+        assert!(l.has_capacity("h", None));
+        // Two more ask before there is another token: nothing is in
+        // flight, and both wait.
+        let mut a = Box::pin(l.acquire("h", None));
+        let mut b = Box::pin(l.acquire("h", None));
+        assert!(pending(&mut a));
+        // One waiting is under what the host takes at once.
+        assert!(l.blocked(|_| None).is_empty());
+        assert!(pending(&mut b));
+        // As many waiting as it takes at once: no more work for it.
+        assert_eq!(l.blocked(|_| None), ["h".to_owned()]);
+        assert!(!l.has_capacity("h", None));
+        assert!(l.has_queue("h"));
+        // Polled again, a waiter is counted once.
+        assert!(pending(&mut a));
+        assert_eq!(l.blocked(|_| None), ["h".to_owned()]);
+        // A waiter that gives up is no longer counted, and the host is
+        // kept while one waits.
+        drop(a);
+        assert!(l.blocked(|_| None).is_empty());
+        assert_eq!(l.remembered().0, 1);
+        drop(b);
+        assert!(l.has_capacity("h", None));
+        assert!(!l.has_queue("h"));
+        // Another host was never affected.
+        assert!(l.has_capacity("other", None));
+        // A host that is cooling down takes no request and has no queue:
+        // a job for it is to fail, not to wait.
+        l.acquire("down", None)
+            .await
+            .unwrap()
+            .release(SlotOutcome::RateLimited(Duration::from_secs(60)));
+        assert!(!l.has_capacity("down", None));
+        assert!(!l.has_queue("down"));
     }
 
     #[tokio::test]

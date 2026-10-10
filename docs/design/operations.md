@@ -306,7 +306,7 @@ The resume plan, failover and seam repair are explained in
 | `per_domain_rps` | `20` | Request rate towards all hosts of one registrable domain together. Never applied below `per_host_rps`. Large hosts are exempt. Positive. |
 | `per_domain_concurrency` | `8` | Concurrent requests towards all hosts of one registrable domain together. Never applied below `per_host_concurrency`. Large hosts are exempt. Positive. |
 | `plc_url` | `"https://plc.directory"` | PLC directory. An `http` or `https` URL. |
-| `plc_rps` | `10` | Request rate towards the PLC directory. Positive. |
+| `plc_rps` | `20` | Request rate towards the PLC directory. Positive. Every account the sweep has not met before costs one request, so with every host being worked at once this rate is what paces a first sweep. |
 | `plc_seed_from_export` | `false` | Seed PDS resolution from the PLC export ([backfill.md](backfill.md#sources) says what that risks). |
 | `relay_url` | `"https://bsky.network"` | Relay used to enumerate repositories. An `http` or `https` URL. |
 | `request_fresh_window` | `"1h"` | A `requestBackfill` for an account done more recently than this adds no work unless forced ([api.md](api.md)). |
@@ -331,7 +331,7 @@ The resume plan, failover and seam repair are explained in
 | `source` | `"relay_collections"` | Enumeration source: `relay_collections` (the relay's per-collection repository listing), `relay_repos` (the relay's `listRepos`) or `plc` (the PLC export, exhaustive and slow). |
 | `max_repos_per_hour` | `0` | Pacing cap; `0` means bounded only by the per-host limits. |
 | `full_every_days` | `0` | Interval of a periodic full cycle; `0` means never. |
-| `max_outstanding` | `10_000` | Bound on cycle members handed out and not yet finished. At least 1. |
+| `max_outstanding` | `10_000_000` | Bound on cycle members handed out and not yet finished. At least 1. The default holds a whole `relay_collections` listing, which is what spreads the work over every host ([backfill.md](backfill.md)); a member outstanding costs about 160 bytes. |
 
 ### `[backfill.repair]`
 
