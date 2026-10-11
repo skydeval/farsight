@@ -387,12 +387,32 @@ async fn release_waiting(ctx: &Ctx, cycle: CycleId, max_out: i64) -> Res<i64> {
     if (waiting.len() as i64) < (max_out + 1) / 2 {
         return Ok(0);
     }
+    let settled = settle_unreachable(ctx, waiting).await?;
+    if settled > 0 {
+        tracing::warn!(
+            cycle = cycle.get(),
+            settled,
+            "the sweep's outstanding bound was full of members waiting for a retry; \
+             the longest-failing are counted as unreachable so that enumeration goes on"
+        );
+    }
+    Ok(settled)
+}
+
+/// Settles up to one page of `members` (DID, actor, the point of the run
+/// that failed) as what a member that goes on failing becomes: `terminal`
+/// in its cycle, with an `unreachable` debt. Returns how many.
+async fn settle_unreachable(
+    ctx: &Ctx,
+    members: Vec<(String, ActorId, Option<DateTime<Utc>>)>,
+) -> Res<i64> {
+    let pool = &ctx.pool;
     let now = crate::jobs::db_now(pool).await?;
     let witness = farsight_storage::firehose::clock(pool, now)
         .await?
         .unwrap_or(now);
     let mut settled = 0;
-    for (did, id, point) in waiting.into_iter().take(PAGE as usize) {
+    for (did, id, point) in members.into_iter().take(PAGE as usize) {
         let Ok(did) = Did::parse(&did) else { continue };
         farsight_storage::debts::add_debt(
             pool,
@@ -405,12 +425,60 @@ async fn release_waiting(ctx: &Ctx, cycle: CycleId, max_out: i64) -> Res<i64> {
         crate::jobs::settle_membership(pool, &did, now, true).await?;
         settled += 1;
     }
+    Ok(settled)
+}
+
+/// Ends the wait of a cycle that has nothing left but failing members.
+///
+/// A member whose job failed stays outstanding while it is retried, for
+/// up to `backfill.terminal_after`, a week by default, and a cycle is
+/// complete only when no member is outstanding. With the whole source
+/// outstanding the bound is never full, so [`release_waiting`] never
+/// runs, and a cycle that has listed every account it could reach would
+/// stand at its last percent for that week: the accounts the relay still
+/// lists and their hosts no longer have, the ones taken down or
+/// deactivated. So once enumeration has finished and every member still
+/// outstanding has failed and not succeeded since, one page of them, the
+/// longest-failing first, is settled as what they would become:
+/// `terminal` in the cycle, with an `unreachable` debt. Coverage counts
+/// them as unreachable from then on, the cycle completes, their retries
+/// stay queued, and one that succeeds clears its debt. A member that has
+/// not been tried, or that stepped aside for a busy host, holds this
+/// back: it is not unreachable. Returns how many were settled.
+async fn release_failing(ctx: &Ctx, cycle: CycleId) -> Res<i64> {
+    let pool = &ctx.pool;
+    let untried: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (
+           SELECT 1 FROM cycle_outstanding o
+           LEFT JOIN actors a ON a.did = o.did
+           LEFT JOIN backfill_state b ON b.actor_id = a.id
+           WHERE o.cycle_id = $1 AND o.state = {MEMBER_OUTSTANDING}
+             AND b.first_failed_at IS NULL)"
+    ))
+    .bind(cycle)
+    .fetch_one(pool)
+    .await?;
+    if untried {
+        return Ok(0);
+    }
+    let failing: Vec<(String, ActorId, Option<DateTime<Utc>>)> = sqlx::query_as(&format!(
+        "SELECT o.did, a.id, b.current_run_point FROM cycle_outstanding o
+         JOIN actors a ON a.did = o.did JOIN backfill_state b ON b.actor_id = a.id
+         WHERE o.cycle_id = $1 AND o.state = {MEMBER_OUTSTANDING}
+           AND b.first_failed_at IS NOT NULL
+         ORDER BY b.first_failed_at, a.id LIMIT $2"
+    ))
+    .bind(cycle)
+    .bind(PAGE)
+    .fetch_all(pool)
+    .await?;
+    let settled = settle_unreachable(ctx, failing).await?;
     if settled > 0 {
-        tracing::warn!(
+        tracing::info!(
             cycle = cycle.get(),
             settled,
-            "the sweep's outstanding bound was full of members waiting for a retry; \
-             the longest-failing are counted as unreachable so that enumeration goes on"
+            "every member the cycle has left is failing; they are counted as unreachable \
+             and their retries go on"
         );
     }
     Ok(settled)
@@ -958,6 +1026,9 @@ async fn maybe_complete(ctx: &Ctx, c: &Cycle) -> Res<()> {
     if enumerated.is_none() {
         return Ok(());
     }
+    // Nothing left but members that keep failing: they are settled as
+    // unreachable, a page a tick, and the cycle completes without them.
+    release_failing(ctx, c.id).await?;
     let outstanding: bool = sqlx::query_scalar(
         &format!("SELECT EXISTS (SELECT 1 FROM cycle_outstanding WHERE cycle_id = $1 AND state = {MEMBER_OUTSTANDING})"),
     )

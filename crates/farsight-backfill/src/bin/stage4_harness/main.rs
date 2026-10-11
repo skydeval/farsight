@@ -443,6 +443,7 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
         ("extra: a relay without listReposByCollection", 14),
         ("extra: work survives a stop", 15),
         ("extra: hosts that never finish, and bounded work", 16),
+        ("extra: a cycle left with failing members only", 17),
     ];
     for (name, n) in checks {
         c.section(name);
@@ -461,6 +462,7 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
             14 => check_fallback(&h, c).await,
             15 => check_survives(&h, c).await,
             16 => check_bounds(&h, c).await,
+            17 => check_completes_past_failing(&h, c).await,
             _ => check_discovery(&h, c).await,
         };
         if let Err(x) = r {
@@ -3694,6 +3696,116 @@ async fn check_fallback(h: &H, c: &mut Checks) -> Res<()> {
         c.backfill.sweep.full_every_days = 0;
         c.backfill.sweep.max_outstanding = 200;
         c.backfill.repair.auto_start = true;
+    });
+    Ok(())
+}
+
+/// A cycle that has listed every account it could reach, and is left
+/// with members whose jobs keep failing, completes at once: they would
+/// otherwise hold it for `backfill.terminal_after`.
+async fn check_completes_past_failing(h: &H, c: &mut Checks) -> Res<()> {
+    retire_cycles(h).await?;
+    // Two accounts that list, and two whose host cannot be reached.
+    let reachable: Vec<String> = (0..2).map(|i| did("cmp", i)).collect();
+    let down: Vec<String> = (2..4).map(|i| did("cmp", i)).collect();
+    {
+        let mut wd = w(&h.world);
+        wd.collections_supported = true;
+        wd.by_collection.clear();
+        let listing = wd
+            .by_collection
+            .entry(Collection::Block.nsid().to_owned())
+            .or_default();
+        for d in reachable.iter().chain(&down) {
+            listing.insert(d.clone());
+        }
+        for d in &reachable {
+            wd.repos.insert(
+                d.clone(),
+                Repo {
+                    rev: tid_now(),
+                    ..Repo::default()
+                },
+            );
+            wd.plc.insert(d.clone(), h.pds.clone());
+        }
+        for d in &down {
+            wd.plc.insert(d.clone(), "http://127.0.0.1:1".into());
+        }
+    }
+    h.set_cfg(|c| {
+        c.backfill.sweep.enabled = true;
+        c.backfill.sweep.full_every_days = 1;
+        c.backfill.sweep.max_outstanding = 5000;
+        c.backfill.repair.auto_start = false;
+        // A week, and an hour between attempts: nothing here becomes
+        // terminal by its age, and no retry comes due.
+        c.backfill.terminal_after = ConfigDuration::secs(7 * 24 * 3600);
+        c.backfill.retry_schedule = vec![ConfigDuration::secs(3600)];
+    });
+    let sw = sweep::Sweep::default();
+    let sched = Scheduler::new(h.ctx.clone());
+    let (stop_tx, stop) = watch::channel(false);
+    let task = tokio::spawn(sched.clone().run(stop));
+    let start = Instant::now();
+    let state = "SELECT completed_at IS NOT NULL, failed_terminal FROM sweep_cycles
+                 WHERE kind = 1 ORDER BY id DESC LIMIT 1";
+    let mut cycle: Option<(bool, i64)> = None;
+    while start.elapsed() < Duration::from_secs(90) {
+        sweep::tick(&h.ctx, &sw).await.map_err(|e| e.to_string())?;
+        cycle = sqlx::query_as(state)
+            .fetch_optional(h.pool())
+            .await
+            .map_err(e)?;
+        if cycle.is_some_and(|(completed, _)| completed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let _ = stop_tx.send(true);
+    let _ = task.await;
+    let listed = reachable.iter().all(|d| h.hits("describeRepo", d, "") > 0);
+    let count = |sql: &'static str| {
+        let down = down.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(down)
+                .fetch_one(h.pool())
+                .await
+                .map_err(e)
+        }
+    };
+    let debts = count(
+        "SELECT count(*) FROM relist_debt d JOIN actors a ON a.id = d.actor_id
+         WHERE a.did = ANY($1) AND d.reason = 1",
+    )
+    .await?;
+    let retries = count(
+        "SELECT count(*) FROM backfill_queue q JOIN actors a ON a.id = q.actor_id
+         WHERE a.did = ANY($1) AND q.kind = 1",
+    )
+    .await?;
+    let still_failing = count(
+        "SELECT count(*) FROM backfill_state b JOIN actors a ON a.id = b.actor_id
+         WHERE a.did = ANY($1) AND b.state = 4 AND b.next_attempt_at > now()",
+    )
+    .await?;
+    c.check(
+        "a cycle left with nothing but failing members completes without waiting a week for them: the two are terminal in it with unreachable debts, still failing, and their retries stay queued",
+        cycle == Some((true, 2)) && listed && debts == 2 && retries == 2 && still_failing == 2,
+        format!(
+            "cycle (completed, terminal) {cycle:?} after {:.1} s, reachable listed {listed}, unreachable debts {debts}, retries queued {retries}, still failing {still_failing}",
+            start.elapsed().as_secs_f64()
+        ),
+    );
+    retire_cycles(h).await?;
+    h.set_cfg(|c| {
+        c.backfill.sweep.enabled = false;
+        c.backfill.sweep.full_every_days = 0;
+        c.backfill.sweep.max_outstanding = 200;
+        c.backfill.repair.auto_start = true;
+        c.backfill.terminal_after = ConfigDuration::secs(5);
+        c.backfill.retry_schedule = vec![ConfigDuration::secs(1)];
     });
     Ok(())
 }

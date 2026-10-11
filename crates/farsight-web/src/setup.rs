@@ -458,25 +458,26 @@ pub struct StepNav {
 }
 
 /// The rows of the size table: (stage, database size, where the figure
-/// comes from). The sweep's figure is a measurement: the sizes this page
-/// showed before it came from a guess at how many blocks the network
-/// holds, and were about a third of it.
+/// comes from). The sweep's figure is a measurement, of a sweep that
+/// ran to completion: this page showed a guess before 0.6.3, and in
+/// 0.6.3 a figure scaled from the first third of that sweep, which was
+/// twice the truth.
 pub const PROJECTION: [(&str, &str, &str); 3] = [
     ("Day one", "< 150 MB", "an empty index"),
     (
         "First sweep cycle complete",
-        "about 180 GB",
-        "measured in October 2026 on a sweep 37% done, scaled to the whole",
+        "about 95 GB",
+        "measured in October 2026 on a sweep that ran to completion",
     ),
     ("Growth per year after", "not known", "not measured yet"),
 ];
 
 /// The size, in GB, a completed first sweep was measured at
 /// ([`PROJECTION`]).
-const SWEEP_GB: f64 = 180.0;
+const SWEEP_GB: f64 = 95.0;
 /// Below this size entered, with the sweep on, the wizard warns
 /// ([`disk_warning`]): a completed sweep and some room after it.
-const SWEEP_DISK_GB: u64 = 250;
+const SWEEP_DISK_GB: u64 = 150;
 
 /// The setup page (one template for every step).
 #[derive(Template)]
@@ -502,7 +503,7 @@ pub struct SetupPage {
     pub w: Wizard,
     /// Show the admin token (until saved).
     pub show_token: bool,
-    /// Set when the sweep is on and the size entered is under 250 GB:
+    /// Set when the sweep is on and the size entered is under 150 GB:
     /// what the resulting budget allows.
     pub disk_warning: Option<String>,
     /// The storage budget the wizard would write (just under the size

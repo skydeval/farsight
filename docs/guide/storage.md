@@ -6,23 +6,24 @@ most of the storage.
 | Stage | Database size |
 |---|---|
 | Day one | < 150 MB |
-| First full backfill sweep complete | about 180 GB |
+| First full backfill sweep complete | about 95 GB |
 | Growth afterwards | not measured yet |
 
-**The sweep's figure is a measurement, taken in October 2026** on a
-sweep 37% done and scaled to the whole: 67 GB for 158 million blocks
-of about 1.35 million accounts, out of 3.7 million accounts that hold
-a block or a list. That is roughly 430 million blocks at about 360
-bytes each, the four indexes on them included. A few accounts hold
-most of them: the median account that blocks anyone has 7 blocks, and
-the thousand largest held a quarter of all that was stored. Earlier
-versions of this guide gave 30–56 GB, from a guess at the number of
-blocks that was about a third of what is there. Growth per year was
-derived from the same guess and is left out until it has been
-measured.
+**The sweep's figure is a measurement**, taken when a first sweep
+completed in October 2026: 94.5 GB (decimal, as the dashboard and the
+storage budget count) for 212 million blocks made by 3.1 million
+accounts, 16.5 million list members and 12.8 million accounts in all.
+A block takes about 380 bytes, the four indexes on it included. A few
+accounts hold a large share: half of the accounts that block anyone
+have 5 blocks or fewer, one in a hundred has over 900, and the
+thousand largest hold a fifth of all blocks. 0.6.3 gave about 180 GB
+here, scaled up from the first third of that sweep; those were the
+network's oldest accounts, which block far more than the rest, and
+the figure was twice the truth. Versions before it gave 30–56 GB,
+from a guess. Growth per year has not been measured yet.
 
-The figure includes the four indexes that sort the UI's tables by
-creation time, about a third of it. They are built in the
+The figure includes the two indexes that sort the UI's tables of
+blocks by creation time, about a third of it. They are built in the
 background, and only while the storage budget has room for them.
 `limits.blocks_per_author` (1,000,000) is the most one account's
 blocks may take; lowering it is the one setting that makes the index

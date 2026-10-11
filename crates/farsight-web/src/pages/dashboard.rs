@@ -399,6 +399,9 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, DashboardError> 
         if let Some(e) = s["etaSeconds"].as_i64() {
             d.backfill.push(stat("ETA", common::human_secs(e)));
         }
+        if let Some(n) = s["unreachable"].as_i64().filter(|n| *n > 0) {
+            d.backfill.push(count("Unreachable", n));
+        }
         // The latest cycle is a repair while one runs; its own line is
         // added below, from the cycle itself.
         if s["state"] != SweepState::Completed.api_name()

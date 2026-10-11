@@ -507,12 +507,37 @@ Every outbound request waits for a slot on its host:
   allowed. The hosts in `limits.large_hosts` are exempt from the
   per-domain limits: each is limited by itself.
 
+- **A host that states its own request limit is paced by it.** An
+  answer that carries `RateLimit-Remaining` and `RateLimit-Reset` says
+  how many requests the host still takes and until when. From then to
+  that reset the host is asked at the rate that uses what is left
+  evenly, never faster than `backfill.per_host_rps`. 5% of the limit
+  it states (`RateLimit-Limit`) is left unused: the server process
+  asks the same hosts from the same address for handles and profiles,
+  and the two share no limiter state. When that reserve is all that
+  is left, the host is not asked again until its reset. The reset is
+  read as a Unix time or, when the number is too small to be one, as
+  seconds from now, against the answer's own `Date` when it has one;
+  a reset more than an hour away is believed for an hour. A host that
+  states nothing is asked at the configured rate. The fixed rate
+  alone runs a host to the end of its allowance and into a refusal,
+  with every job on it failed; paced by the host's own count it is
+  not refused.
 - A `429`, or a response with `RateLimit-Remaining: 0`, cools the host
-  for the seconds its `Retry-After` names, at most 1 hour (60 seconds
-  when it names none, or a date). Requests to a cooling host fail at
-  once and the job is retried later.
+  for the seconds its `Retry-After` names, at most 1 hour; without
+  one, until the reset it names; without either (or with a date), for
+  60 seconds. Such a cooldown, and the wait for a reset above, is the
+  host's request limit: the host answers, and takes requests again
+  when it ends. A request waits it out when it ends within the 2
+  minutes a request waits for a slot, and fails at once otherwise. A
+  job that resolves its account to a host in such a cooldown ends as
+  `busy`, like one that finds a queue there, and the account is taken
+  up when the host takes requests again.
 - **Circuit breaker.** Five consecutive failures on a host trip it for
   1 minute; a second trip within an hour of the last lasts 1 hour.
+  This cooldown is never waited out: a request to the host fails at
+  once and its job is retried on `backfill.retry_schedule`, which is
+  how an account on a host that stays down comes to be given up.
 - A request waits at most 2 minutes for a slot. A slot is given back
   when its request ends, also when the request is abandoned midway.
 - The limiter remembers a host while it has a request in flight, a
@@ -663,7 +688,22 @@ storage is at 90% of the budget.
 
 A cycle completes when enumeration has finished and no row is still
 outstanding; terminal rows do not hold it up, they stay counted in
-`unreachableRepos`. Completion writes `completed_at` and
+`unreachableRepos`.
+
+**A cycle does not wait for members that keep failing.** A member
+whose job failed stays outstanding while it is retried, for up to
+`backfill.terminal_after`, a week by default. Left at that, a cycle
+that has listed every account it could reach stands at its last
+percent for that week: the relay still lists accounts that their
+hosts no longer have, and ones taken down or deactivated. So once
+enumeration has finished and every member still outstanding has
+failed and not succeeded since, they are settled, a page a tick and
+the longest-failing first, as what they would become: `terminal` in
+the cycle, each with an `unreachable` debt. The cycle completes,
+coverage counts them in `unreachableRepos`, their retries stay
+queued, and one that succeeds clears its debt. A member that has not
+been tried yet, or that stepped aside for a busy host, is not
+unreachable and holds this back. Completion writes `completed_at` and
 `completed_witness`, deletes the cycle's `cycle_outstanding` rows and
 notifies the coverage snapshot. A completed full cycle also heals
 every firehose gap that closed before its effective start.

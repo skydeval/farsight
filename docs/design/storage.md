@@ -1318,19 +1318,25 @@ described in [security](security.md#aggregate-bounds).
 
 ## Sizing
 
-**Measured, October 2026.** On an instance whose first sweep was 37%
-done the database held 67 GB: 158 million blocks of about 1.35
-million accounts, out of 3.7 million accounts that hold a block or a
-list. Scaled to the whole that is roughly 430 million blocks and about
-180 GB, the sort indexes included. A block took about 360 bytes: 89 in
-the heap, 62 to 77 in each of its four indexes. The distribution is
-what the model below did not have: the median account that blocks
-anyone has 7 blocks, the 99th percentile 1,744, the largest 770,000,
-and the thousand largest held a quarter of all that was stored. The
-model's sizes per row hold up to about a fifth; its count of blocks
-was about a third of what is there, and with it every total below.
-The totals and the growth figures that follow are kept as the model
-gave them and are not to be planned by.
+**Measured, October 2026.** A first sweep that ran to completion left
+a database of 94.5 GB (decimal): 212 million blocks made by 3.1
+million accounts, 16.5 million list items, 3.4 million listblocks and
+12.8 million actors; 3.69 million accounts held a block or a list,
+and 27,500 of them could not be read. The `blocks` table took 81.4
+GB, about 383 bytes a block: 93 in the heap, and 65, 67, 76 and 82 in
+its four indexes. The distribution is what the model below did not
+have: half of the accounts that block anyone have 5 blocks or fewer,
+a tenth have 88 or more, one in a hundred over 900, the largest
+771,000; the thousand largest hold a fifth of all blocks and the ten
+thousand largest nearly two fifths. The model's size per block was a
+fifth too small with all four indexes; its count of blocks, 50 to 150
+million, was under what is there, and its total with it. (0.6.3
+stated about 180 GB, scaled from the first third of that sweep. The
+sweep then followed the relay's listing, which begins with the oldest
+accounts; those block several times as much as the rest, and the
+scaled figure was twice the truth.) The totals and the growth figures
+that follow are kept as the model gave them and are not to be planned
+by.
 
 The per-row sizes below are estimates from a model, not measurements:
 a 24-byte tuple header plus aligned columns per heap row; about 16
@@ -1362,7 +1368,7 @@ four indexes instead of two.
 |---|---|---|
 | Day one | < 100 MB | < 150 MB |
 | 30 days, firehose only | ~2–8 GB | ~2.5–10 GB |
-| First full sweep complete (model; measured: about 180 GB) | ~24–45 GB | ~30–56 GB |
+| First full sweep complete (model; measured: 94.5 GB) | ~24–45 GB | ~30–56 GB |
 | Growth per year afterwards (model; not measured) | ~15–16 GB | ~18–20 GB |
 
 "With overhead" allows about a quarter for bloat and free space inside
@@ -1395,10 +1401,10 @@ lookup by subject costs one to three random leaf reads.
 - **A smaller disk** works with limits. Firehose-only, the database
   grows with what is blocked from then on. With the sweep on, the
   sweep pauses at 90% of the storage budget and goes on when the
-  budget is raised; a completed sweep needs about 180 GB, and the
+  budget is raised; a completed sweep needs about 95 GB, and the
   ceiling must stay under the disk with room left for WAL and for
   maintenance. The setup wizard warns when the sweep is on and the
-  size entered is under 250 GB.
+  size entered is under 150 GB.
 
 The Compose file keeps the database in the named volume
 `farsight-pgdata` and tunes Postgres for an 8 GB host:

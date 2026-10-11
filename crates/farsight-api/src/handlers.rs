@@ -873,13 +873,20 @@ pub async fn get_stats(st: &Arc<ApiState>, p: &Params) -> Result<Reply, XrpcErro
             SweepState::Running
         };
         s.insert("state".into(), json!(state.api_name()));
+        // A member is settled when it was listed or given up as
+        // unreachable: both are the cycle's work done. A completed cycle
+        // has settled every member, whatever its total was estimated at.
+        let settled = c.done + c.failed_terminal;
+        s.insert("unreachable".into(), json!(c.failed_terminal));
         if let Some(total) = c.total_est.filter(|t| *t > 0) {
-            s.insert(
-                "progress".into(),
-                json!(((c.done as f64 / total as f64).min(1.0) * 1000.0).round() / 1000.0),
-            );
+            let progress = if c.completed_at.is_some() {
+                1.0
+            } else {
+                ((settled as f64 / total as f64).min(1.0) * 1000.0).round() / 1000.0
+            };
+            s.insert("progress".into(), json!(progress));
             if c.completed_at.is_none() && bf.repos_last_hour > 0 {
-                let remaining = (total - c.done).max(0);
+                let remaining = (total - settled).max(0);
                 s.insert(
                     "etaSeconds".into(),
                     json!(remaining * 3600 / bf.repos_last_hour),

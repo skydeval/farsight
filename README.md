@@ -89,7 +89,7 @@ then writes the config and starts ingesting. The default Jetstream
 source is Bluesky's two public v2 instances.
 
 Hardware: 4 vCPU, 8 GB RAM and a 500 GB SSD are recommended. A first
-full sweep stores about 180 GB; a smaller disk runs without the sweep,
+full sweep stores about 95 GB; a smaller disk runs without the sweep,
 or with one that pauses at the space you allow.
 
 ## Guide

@@ -954,8 +954,12 @@ pub async fn run(ctx: &Ctx, req: &JobReq) -> JobResult {
     // that is how an account on a host that stays down becomes terminal.
     // The resolution is handed to the attempt, which resolves once.
     let first = ctx.resolver.resolve_noting(&req.did, false).await;
+    //
+    // A host that cools down because of its request limit is the same
+    // case: it answers, and takes requests again when its allowance
+    // starts anew.
     if let Ok((pds, _)) = &first
-        && ctx.net.has_queue(&pds.host)
+        && (ctx.net.has_queue(&pds.host) || ctx.net.rate_limited(&pds.host))
     {
         cost += 1;
         let noted = async {

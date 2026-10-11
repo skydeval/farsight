@@ -7,6 +7,60 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Before 1.0, a minor version may change addresses, settings or the
 database schema; each entry says so where it does.
 
+## [Unreleased]
+
+### Changed
+
+- Backfill: a host that states its own request limit is paced by it.
+  A host was asked at `backfill.per_host_rps` until it refused, then
+  left alone for a fixed time, and every job that was on it failed, to
+  be retried an hour later. An answer that carries
+  `RateLimit-Remaining` and `RateLimit-Reset` now sets the host's pace
+  until that reset: what is left, used evenly, less 5% of the limit
+  for whatever else asks the host from the same address, and never
+  faster than `per_host_rps`. A host that states nothing is asked as
+  before. Where a host does refuse, or its allowance is used up, the
+  cooldown lasts until the reset it names and not a fixed minute; a
+  request that can wait for that does, and a job that resolves its
+  account to such a host ends as `busy` and is taken up again when the
+  host takes requests, where it used to fail.
+- Backfill: a sweep completes when all it has left are accounts that
+  keep failing. A member whose job fails is retried for
+  `backfill.terminal_after`, a week by default, and held its cycle
+  open for as long, so a cycle that had listed everything it could
+  reach stood at 99% for a week over the accounts the relay still
+  lists and their hosts no longer have, and the ones taken down or
+  deactivated. Since 0.6.3 keeps the whole source outstanding, the
+  rule that used to set such members aside when they filled the bound
+  no longer ran. Once enumeration has finished and every member still
+  outstanding has failed and not succeeded since, they are now
+  counted as unreachable (`unreachableRepos` in the coverage
+  exceptions, on the dashboard and in `getStats`) and the cycle
+  completes; their retries go on, and one that succeeds is no longer
+  counted.
+
+### Fixed
+
+- A completed sweep reads 100%, and says how many accounts it could
+  not read. `getStats` gave `sweep.progress` as the members read over
+  the cycle's total, so a cycle that completed with unreachable
+  members stood at 99.3% beside the word "completed". Progress now
+  counts a member as settled when it was read or given up as
+  unreachable, and is 1 for a completed cycle. The unreachable ones
+  are a new field, `sweep.unreachable`, and a line on the dashboard's
+  Backfill card.
+- **The disk a first sweep needs is about 95 GB, not 180.** 0.6.3
+  stated about 180 GB, scaled up from a sweep a third done. That
+  third was not a sample: the sweep then followed the relay's
+  listing, which begins with the network's oldest accounts, and those
+  block several times as much as the rest. The sweep has since run to
+  completion, and the figure is what it left: 94.5 GB (decimal, as
+  the dashboard and the storage budget count) for 212 million blocks
+  of 3.1 million accounts. The storage guide, the compose file, the
+  README, the design notes and the wizard carry it, and the wizard
+  warns under 150 GB again, not 250. Growth per year is still not
+  measured.
+
 ## [0.6.3] - 2026-10-10
 
 ### Added

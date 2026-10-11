@@ -214,6 +214,11 @@
           "type": "integer",
           "minimum": 0
         },
+        "unreachable": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Members of the cycle that could not be read and were settled as unreachable. They count as done in `progress`."
+        },
         "completedAt": {
           "type": "string",
           "format": "datetime"

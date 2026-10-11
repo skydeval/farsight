@@ -963,6 +963,10 @@ pub struct CycleRow {
     pub completed_at: Option<DateTime<Utc>>,
     /// `sweep_cycles.done`: members finished so far.
     pub done: i64,
+    /// `sweep_cycles.failed_terminal`: members settled as unreachable,
+    /// because their job failed for `backfill.terminal_after` or because
+    /// they were all the cycle had left.
+    pub failed_terminal: i64,
     /// `sweep_cycles.total_est`: an estimate of how many members the cycle
     /// has, when there is one.
     pub total_est: Option<i64>,
@@ -977,10 +981,11 @@ pub async fn backfill_overview(conn: &mut PgConnection) -> Result<BackfillOvervi
         DateTime<Utc>,
         Option<DateTime<Utc>>,
         i64,
+        i64,
         Option<i64>,
     );
     let cycle: Option<Row> = sqlx::query_as(
-        "SELECT id, kind, source, started_at, completed_at, done, total_est
+        "SELECT id, kind, source, started_at, completed_at, done, failed_terminal, total_est
          FROM sweep_cycles ORDER BY started_at DESC, id DESC LIMIT 1",
     )
     .fetch_optional(&mut *conn)
@@ -1007,7 +1012,8 @@ pub async fn backfill_overview(conn: &mut PgConnection) -> Result<BackfillOvervi
             started_at: r.3,
             completed_at: r.4,
             done: r.5,
-            total_est: r.6,
+            failed_terminal: r.6,
+            total_est: r.7,
         }),
         queue_by_tier,
         repos_last_hour,

@@ -6,6 +6,13 @@
 //! `Retry-After` handling and a circuit breaker; the PLC directory has
 //! its own limiter with half reserved for the resolver.
 //!
+//! A host that states its own request limit in its answers
+//! (`RateLimit-Remaining`, `RateLimit-Reset`) is asked at the pace that
+//! uses what it has left evenly until the reset ([`Allowance`]), never
+//! faster than `backfill.per_host_rps`. The fixed rate alone runs a host
+//! to the end of its allowance and into a refusal; paced by the host's
+//! own count, it is not refused.
+//!
 //! One [`Net`] serves the process for its lifetime: a rebuild after a
 //! config change gives it the new client and limits and keeps what it
 //! knows of every host (cooldowns, breaker trips, requests in flight).
@@ -158,6 +165,13 @@ struct HostState {
     /// request limit is in their way.
     waiting: u32,
     cooldown_until: Option<Instant>,
+    /// The cooldown is the host's request limit (a `429`, an allowance
+    /// used up) and not the breaker: the host answers, and takes
+    /// requests again when the cooldown ends.
+    limited: bool,
+    /// The pace the host's own allowance supports, in requests a second,
+    /// and until when it holds (the allowance's reset).
+    advised: Option<(f64, Instant)>,
     consecutive_failures: u32,
     trips: u32,
     last_trip: Option<Instant>,
@@ -192,6 +206,82 @@ pub const REMEMBERED: usize = 10_000;
 /// no cooldown or recent breaker trip, is idle.
 pub const IDLE_AFTER: Duration = Duration::from_secs(600);
 
+/// The share of a stated request limit that is left unused, for whatever
+/// else asks the host from this address (the server process verifies
+/// handles and reads profiles there).
+pub const ALLOWANCE_RESERVE: f64 = 0.05;
+/// The longest time to a reset that is believed. A host that names a
+/// later one is paced as if it reset then.
+pub const MAX_ALLOWANCE_WINDOW: Duration = Duration::from_secs(3600);
+
+/// What a host said of its own request limit in one answer
+/// (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Allowance {
+    /// Requests left until the reset.
+    pub remaining: u64,
+    /// The limit the count started from, if stated.
+    pub limit: Option<u64>,
+    /// Time until the count starts again, at most
+    /// [`MAX_ALLOWANCE_WINDOW`].
+    pub reset_in: Duration,
+}
+
+impl Allowance {
+    /// The pace, in requests a second, that uses what is left evenly
+    /// until the reset, less [`ALLOWANCE_RESERVE`] of the stated limit.
+    /// `None` when that leaves nothing to use: the host is not asked
+    /// until the reset.
+    pub fn pace(&self) -> Option<f64> {
+        let reserve = self
+            .limit
+            .map_or(0.0, |l| (l as f64 * ALLOWANCE_RESERVE).ceil());
+        let usable = self.remaining as f64 - reserve;
+        (usable >= 1.0).then(|| usable / self.reset_in.as_secs_f64().max(1.0))
+    }
+
+    /// Reads the allowance off an answer's headers, at `now` (Unix
+    /// seconds) by this machine's clock. `None` unless both the count
+    /// and the reset are stated as whole numbers. The reset is a Unix
+    /// time, as the reference PDS sends it, or a number of seconds from
+    /// now, as the draft standard has it: a value too small to be a time
+    /// of this century is the latter. The answer's own `Date` is the
+    /// clock the reset is read against when it has one, so that a host
+    /// whose clock differs from this machine's is paced by its own.
+    pub fn read(r: &OutboundResponse, now: u64) -> Option<Allowance> {
+        let h = |name: &str| {
+            r.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.trim())
+        };
+        let number = |name: &str| h(name).and_then(|v| v.parse::<u64>().ok());
+        let remaining = number("ratelimit-remaining")?;
+        let reset = number("ratelimit-reset")?;
+        let secs = if reset < 1_000_000_000 {
+            reset
+        } else {
+            let clock = h("date")
+                .and_then(|d| chrono::DateTime::parse_from_rfc2822(d).ok())
+                .and_then(|d| u64::try_from(d.timestamp()).ok())
+                .unwrap_or(now);
+            reset.saturating_sub(clock)
+        };
+        Some(Allowance {
+            remaining,
+            limit: number("ratelimit-limit"),
+            reset_in: Duration::from_secs(secs).min(MAX_ALLOWANCE_WINDOW),
+        })
+    }
+}
+
+/// Unix seconds by this machine's clock.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// How a request that held a slot ended, for the breaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotOutcome {
@@ -217,10 +307,16 @@ pub struct Slot<'a> {
 
 impl Slot<'_> {
     /// Frees the slot and records the result for the breaker.
-    pub fn release(mut self, outcome: SlotOutcome) {
+    pub fn release(self, outcome: SlotOutcome) {
+        self.release_with(outcome, None);
+    }
+
+    /// [`Slot::release`], with what the answer said of the host's own
+    /// request limit: the host is paced by it until its reset.
+    pub fn release_with(mut self, outcome: SlotOutcome, allowance: Option<Allowance>) {
         self.released = true;
         self.limiter
-            .release(&self.host, self.domain.as_deref(), Some(outcome));
+            .release(&self.host, self.domain.as_deref(), Some(outcome), allowance);
     }
 }
 
@@ -228,7 +324,7 @@ impl Drop for Slot<'_> {
     fn drop(&mut self) {
         if !self.released {
             self.limiter
-                .release(&self.host, self.domain.as_deref(), None);
+                .release(&self.host, self.domain.as_deref(), None, None);
         }
     }
 }
@@ -255,6 +351,19 @@ impl Drop for Waiting<'_> {
 /// `now + d`, or `now` where the sum cannot be represented.
 fn after(now: Instant, d: Duration) -> Instant {
     now.checked_add(d).unwrap_or(now)
+}
+
+/// The rate `h` is asked at: the configured one, or the pace its own
+/// allowance supports while that is lower and holds. A paced host keeps
+/// room for one request at least.
+fn host_rate(h: &HostState, configured: Rate, now: Instant) -> Rate {
+    match h.advised {
+        Some((pace, until)) if until > now && pace < configured.per_sec => Rate {
+            per_sec: pace,
+            burst: pace.clamp(1.0, configured.burst.max(1.0)),
+        },
+        _ => configured,
+    }
 }
 
 /// How long a request that got no slot sleeps before it looks again
@@ -337,6 +446,8 @@ impl Limited {
                 inflight: 0,
                 waiting: 0,
                 cooldown_until: None,
+                limited: false,
+                advised: None,
                 consecutive_failures: 0,
                 trips: 0,
                 last_trip: None,
@@ -429,6 +540,30 @@ impl HostLimiter {
         domain.is_none_or(|d| s.domain(d, now).inflight < limits.domain_concurrency)
     }
 
+    /// Whether `host` is cooling down because of its request limit: it
+    /// refused a request (`429`) or has used its allowance up. Such a host
+    /// answers and takes requests again when the cooldown ends, unlike
+    /// one the breaker cools down.
+    pub fn rate_limited(&self, host: &str) -> bool {
+        let s = self.lock();
+        let now = Instant::now();
+        s.hosts
+            .get(host)
+            .is_some_and(|h| h.limited && h.cooldown_until.is_some_and(|u| u > now))
+    }
+
+    /// The pace `host` is held to by its own allowance, in requests a
+    /// second, while that is under the configured rate.
+    pub fn paced(&self, host: &str) -> Option<f64> {
+        let s = self.lock();
+        let now = Instant::now();
+        let configured = s.limits.host;
+        s.hosts.get(host).and_then(|h| {
+            let rate = host_rate(h, configured, now);
+            (rate.per_sec < configured.per_sec).then_some(rate.per_sec)
+        })
+    }
+
     /// Whether `host` has a queue: as many requests in flight, or
     /// waiting for a slot, as it takes at once. More work for it would
     /// only wait. A host that is cooling down has no queue by that: its
@@ -515,19 +650,33 @@ impl HostLimiter {
                     None => (true, Duration::ZERO),
                 };
                 let h = s.host(host, now);
-                if let Some(u) = h.cooldown_until.filter(|u| *u > now) {
-                    return Err(NetError::Cooling {
-                        host: host.to_owned(),
-                        secs: u.duration_since(now).as_secs().max(1),
-                    });
+                let cooling = h.cooldown_until.filter(|u| *u > now);
+                if let Some(u) = cooling {
+                    let left = u.duration_since(now);
+                    // A host that has used its allowance up takes requests
+                    // again at its reset: a request that can wait that
+                    // long does. Any other cooldown, or a longer one, is
+                    // refused now.
+                    if !h.limited || start.elapsed() + left > MAX_SLOT_WAIT {
+                        return Err(NetError::Cooling {
+                            host: host.to_owned(),
+                            secs: left.as_secs().max(1),
+                        });
+                    }
                 }
-                h.bucket.refill(now, limits.host);
-                let took =
-                    domain_free && h.inflight < limits.host_concurrency && h.bucket.try_take();
+                let rate = host_rate(h, limits.host, now);
+                h.bucket.refill(now, rate);
+                let took = cooling.is_none()
+                    && domain_free
+                    && h.inflight < limits.host_concurrency
+                    && h.bucket.try_take();
                 if took {
                     h.inflight += 1;
                 }
-                let host_wait = slot_wait(&h.bucket, limits.host);
+                let host_wait = match cooling {
+                    Some(u) => u.duration_since(now).max(Duration::from_millis(5)),
+                    None => slot_wait(&h.bucket, rate),
+                };
                 if !took && !waiting.counted {
                     h.waiting += 1;
                     waiting.counted = true;
@@ -564,8 +713,15 @@ impl HostLimiter {
         }
     }
 
-    /// Frees a slot; with an outcome, records it for the breaker.
-    fn release(&self, host: &str, domain: Option<&str>, outcome: Option<SlotOutcome>) {
+    /// Frees a slot; with an outcome, records it for the breaker, and
+    /// with an allowance, paces the host by it.
+    fn release(
+        &self,
+        host: &str,
+        domain: Option<&str>,
+        outcome: Option<SlotOutcome>,
+        allowance: Option<Allowance>,
+    ) {
         let mut state = self.lock();
         let now = Instant::now();
         if let Some(d) = domain {
@@ -576,11 +732,27 @@ impl HostLimiter {
         s.inflight = s.inflight.saturating_sub(1);
         match outcome {
             None => {}
-            Some(SlotOutcome::Healthy) => s.consecutive_failures = 0,
+            Some(SlotOutcome::Healthy) => {
+                s.consecutive_failures = 0;
+                if let Some(a) = allowance {
+                    match a.pace() {
+                        Some(pace) => s.advised = Some((pace, after(now, a.reset_in))),
+                        // Nothing left to use before the reset: the host
+                        // is left alone until then, as after a refusal.
+                        None => {
+                            s.advised = None;
+                            s.cooldown_until =
+                                Some(after(now, a.reset_in.max(Duration::from_secs(1))));
+                            s.limited = true;
+                        }
+                    }
+                }
+            }
             Some(SlotOutcome::RateLimited(retry_after)) => {
                 // 429 / RateLimit-Remaining: 0: honour Retry-After, up to
                 // the bound.
                 s.cooldown_until = Some(after(now, retry_after.min(MAX_RETRY_AFTER)));
+                s.limited = true;
             }
             Some(SlotOutcome::Failed) => {
                 s.consecutive_failures += 1;
@@ -594,6 +766,7 @@ impl HostLimiter {
                         BREAKER_FIRST
                     };
                     s.cooldown_until = Some(after(now, d));
+                    s.limited = false;
                     s.trips += 1;
                     s.last_trip = Some(now);
                     s.consecutive_failures = 0;
@@ -798,7 +971,11 @@ fn retry_after(r: &OutboundResponse) -> Option<Duration> {
         .and_then(|v| v.parse::<u64>().ok())
         .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER));
     if r.status == 429 || remaining_zero {
-        Some(ra.unwrap_or(DEFAULT_RETRY_AFTER))
+        // Without `Retry-After`, the reset the host names is when it
+        // takes requests again; without either, the default.
+        let reset = Allowance::read(r, unix_now())
+            .map(|a| a.reset_in.clamp(Duration::from_secs(1), MAX_RETRY_AFTER));
+        Some(ra.or(reset).unwrap_or(DEFAULT_RETRY_AFTER))
     } else {
         None
     }
@@ -873,6 +1050,12 @@ impl Net {
     /// Whether `host` has a queue of requests ([`HostLimiter::has_queue`]).
     pub fn has_queue(&self, host: &str) -> bool {
         self.hosts.has_queue(host)
+    }
+
+    /// Whether `host` is cooling down because of its request limit
+    /// ([`HostLimiter::rate_limited`]).
+    pub fn rate_limited(&self, host: &str) -> bool {
+        self.hosts.rate_limited(host)
     }
 
     /// Whether a request to `host` could start now.
@@ -957,12 +1140,14 @@ impl Net {
             metrics::histogram!(m::PDS_REQUEST_SECONDS, "host" => label.clone(), "method" => method)
                 .record(elapsed);
         }
+        let mut allowance = None;
         let (result, outcome) = match r {
             Err(farsight_core::net::OutboundError::TooLarge(n)) => {
                 (Err(NetError::TooLarge(n)), SlotOutcome::Failed)
             }
             Err(e) => (Err(NetError::Transport(e.to_string())), SlotOutcome::Failed),
             Ok(resp) => {
+                allowance = Allowance::read(&resp, unix_now());
                 let ra = retry_after(&resp);
                 if resp.status == 200 {
                     let outcome = ra.map_or(SlotOutcome::Healthy, SlotOutcome::RateLimited);
@@ -987,7 +1172,7 @@ impl Net {
             }
         };
         if let Some(slot) = slot {
-            slot.release(outcome);
+            slot.release_with(outcome, allowance);
         }
         if let Err(e) = &result {
             metrics::counter!(m::PDS_ERRORS, "host" => label, "kind" => e.kind()).increment(1);
@@ -1087,6 +1272,177 @@ mod tests {
             .release(SlotOutcome::RateLimited(Duration::from_secs(60)));
         assert!(!l.has_capacity("down", None));
         assert!(!l.has_queue("down"));
+    }
+
+    #[test]
+    fn an_allowance_is_read_off_an_answers_headers() {
+        let read = |headers: &[(&str, &str)], now| Allowance::read(&response(200, headers), now);
+        // The reference PDS: a count and a Unix time for the reset.
+        let pds = [
+            ("ratelimit-limit", "1000"),
+            ("ratelimit-remaining", "650"),
+            ("ratelimit-reset", "1000000300"),
+        ];
+        let a = read(&pds, 1_000_000_000).expect("an allowance");
+        assert_eq!(
+            a,
+            Allowance {
+                remaining: 650,
+                limit: Some(1000),
+                reset_in: Duration::from_secs(300)
+            }
+        );
+        // 50 of the 1,000 stay unused; the other 600 last the 300 s.
+        assert_eq!(a.pace(), Some(2.0));
+        // The answer's own Date is the clock the reset is read against:
+        // this machine's, an hour off, changes nothing.
+        let dated = [
+            ("ratelimit-remaining", "10"),
+            ("ratelimit-reset", "1000000120"),
+            ("date", "Sun, 09 Sep 2001 01:46:40 GMT"),
+        ];
+        let a = read(&dated, 1_000_003_600).expect("an allowance");
+        assert_eq!(a.reset_in, Duration::from_secs(120));
+        assert_eq!(a.limit, None);
+        // A small number is seconds from now.
+        let delta = [("ratelimit-remaining", "10"), ("ratelimit-reset", "30")];
+        assert_eq!(read(&delta, 5).unwrap().reset_in, Duration::from_secs(30));
+        // A reset already past is no time at all, and one far off is
+        // believed for an hour.
+        let past = [
+            ("ratelimit-remaining", "10"),
+            ("ratelimit-reset", "1000000000"),
+        ];
+        assert_eq!(read(&past, 1_000_000_500).unwrap().reset_in, Duration::ZERO);
+        let far = [
+            ("ratelimit-remaining", "10"),
+            ("ratelimit-reset", "4000000000"),
+        ];
+        assert_eq!(
+            read(&far, 1_000_000_000).unwrap().reset_in,
+            MAX_ALLOWANCE_WINDOW
+        );
+        // Without both the count and the reset as whole numbers there
+        // is none.
+        assert_eq!(read(&[("ratelimit-remaining", "10")], 0), None);
+        assert_eq!(read(&[("ratelimit-reset", "30")], 0), None);
+        assert_eq!(
+            read(
+                &[("ratelimit-remaining", "many"), ("ratelimit-reset", "30")],
+                0
+            ),
+            None
+        );
+        assert_eq!(read(&[], 0), None);
+    }
+
+    #[test]
+    fn the_pace_uses_what_is_left_evenly_and_keeps_the_reserve() {
+        let a = |remaining, limit, secs| Allowance {
+            remaining,
+            limit,
+            reset_in: Duration::from_secs(secs),
+        };
+        // No limit stated: all of what is left.
+        assert_eq!(a(10, None, 5).pace(), Some(2.0));
+        // A reset that is now, or within the second: one second's worth.
+        assert_eq!(a(10, None, 0).pace(), Some(10.0));
+        // At the reserve or under it, nothing is left to use.
+        assert_eq!(a(50, Some(1000), 60).pace(), None);
+        assert_eq!(a(0, Some(1000), 60).pace(), None);
+        assert_eq!(a(0, None, 60).pace(), None);
+        assert_eq!(a(51, Some(1000), 60).pace(), Some(1.0 / 60.0));
+    }
+
+    #[tokio::test]
+    async fn a_host_is_paced_by_its_own_allowance_and_never_above_the_configured_rate() {
+        let l = HostLimiter::new(10, 4);
+        let allowance = |remaining, secs| {
+            Some(Allowance {
+                remaining,
+                limit: Some(1000),
+                reset_in: Duration::from_secs(secs),
+            })
+        };
+        // 500 usable requests in 100 s: five a second, under the ten
+        // configured.
+        l.acquire("h", None)
+            .await
+            .unwrap()
+            .release_with(SlotOutcome::Healthy, allowance(550, 100));
+        assert_eq!(l.paced("h"), Some(5.0));
+        // An allowance that supports more than the configured rate
+        // raises nothing.
+        l.acquire("h", None)
+            .await
+            .unwrap()
+            .release_with(SlotOutcome::Healthy, allowance(1000, 10));
+        assert_eq!(l.paced("h"), None);
+        // A host that states nothing is asked at the configured rate.
+        l.acquire("plain", None)
+            .await
+            .unwrap()
+            .release(SlotOutcome::Healthy);
+        assert_eq!(l.paced("plain"), None);
+        // An allowance used up to the reserve: the host is left alone
+        // until its reset, as one that refused a request is. That is its
+        // request limit, not the breaker.
+        l.acquire("spent", None)
+            .await
+            .unwrap()
+            .release_with(SlotOutcome::Healthy, allowance(40, 600));
+        assert!(l.cooling("spent").is_some_and(|s| s > 590));
+        assert!(l.rate_limited("spent"));
+        assert!(!l.has_capacity("spent", None));
+        // The breaker's cooldown is not a request limit.
+        for _ in 0..BREAKER_FAILURES {
+            l.acquire("down", None)
+                .await
+                .unwrap()
+                .release(SlotOutcome::Failed);
+        }
+        assert!(l.cooling("down").is_some());
+        assert!(!l.rate_limited("down"));
+    }
+
+    #[tokio::test]
+    async fn a_request_waits_out_a_short_limit_pause_and_is_refused_a_long_one() {
+        let l = HostLimiter::new(100, 2);
+        // The host takes requests again in a moment: the request waits.
+        l.acquire("soon", None)
+            .await
+            .unwrap()
+            .release(SlotOutcome::RateLimited(Duration::from_millis(60)));
+        let asked = Instant::now();
+        let slot = l
+            .acquire("soon", None)
+            .await
+            .expect("a slot after the pause");
+        assert!(asked.elapsed() >= Duration::from_millis(50));
+        slot.release(SlotOutcome::Healthy);
+        assert!(!l.rate_limited("soon"));
+        // A pause longer than a request waits for a slot: refused now.
+        l.acquire("later", None)
+            .await
+            .unwrap()
+            .release(SlotOutcome::RateLimited(MAX_SLOT_WAIT * 2));
+        let asked = Instant::now();
+        assert!(matches!(
+            l.acquire("later", None).await,
+            Err(NetError::Cooling { .. })
+        ));
+        assert!(asked.elapsed() < Duration::from_secs(1));
+        // The breaker's cooldown is never waited out, however short.
+        for _ in 0..BREAKER_FAILURES {
+            l.acquire("down", None)
+                .await
+                .unwrap()
+                .release(SlotOutcome::Failed);
+        }
+        assert!(matches!(
+            l.acquire("down", None).await,
+            Err(NetError::Cooling { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1250,6 +1606,28 @@ mod tests {
             retry_after(&response(200, &[("ratelimit-remaining", "0")])),
             Some(DEFAULT_RETRY_AFTER)
         );
+        // Without Retry-After, the reset the host names is when it takes
+        // requests again; with it, Retry-After is.
+        let spent = [("ratelimit-remaining", "0"), ("ratelimit-reset", "45")];
+        assert_eq!(
+            retry_after(&response(200, &spent)),
+            Some(Duration::from_secs(45))
+        );
+        let both = [
+            ("ratelimit-remaining", "0"),
+            ("ratelimit-reset", "45"),
+            ("retry-after", "7"),
+        ];
+        assert_eq!(
+            retry_after(&response(429, &both)),
+            Some(Duration::from_secs(7))
+        );
+        // A reset that is now still cools the host for a second.
+        let now = [("ratelimit-remaining", "0"), ("ratelimit-reset", "0")];
+        assert_eq!(
+            retry_after(&response(429, &now)),
+            Some(Duration::from_secs(1))
+        );
     }
 
     #[tokio::test]
@@ -1387,7 +1765,7 @@ mod tests {
                 let now = Instant::now();
                 prop_assert!(after(now, d) >= now);
                 let l = HostLimiter::new(100, 2);
-                l.release("h", None, Some(SlotOutcome::RateLimited(d)));
+                l.release("h", None, Some(SlotOutcome::RateLimited(d)), None);
                 let left = l.cooling("h");
                 prop_assert!(left.is_none_or(|s| (1..=MAX_RETRY_AFTER.as_secs()).contains(&s)));
                 prop_assert!(left.is_none_or(|s| s <= d.as_secs().max(1)));

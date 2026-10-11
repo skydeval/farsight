@@ -318,7 +318,7 @@ freshness. No parameters.
                 "openGaps": 0 },
   "backfill": { "sweep": { "cycle": 1, "source": "relay_collections",
                            "state": "running", "progress": 0.42,
-                           "etaSeconds": 612000 },
+                           "etaSeconds": 612000, "unreachable": 0 },
                 "queue": { "onDemand": 3, "active": 1201 },
                 "reposPerHour": 18500 },
   "freshness": { },
@@ -335,7 +335,12 @@ freshness. No parameters.
   the same holds for `sweep.progress`.
 - `backfill.sweep` is absent before the first cycle exists. Its
   `state` is `running`, `completed` or `paused` (open enum);
-  `completedAt` appears once the cycle is complete.
+  `completedAt` appears once the cycle is complete. `unreachable`
+  counts the cycle's members that could not be read and were settled
+  as unreachable; `progress` is the members settled, read or
+  unreachable, over the cycle's total, and is 1 for a completed
+  cycle. `progress` and `etaSeconds` are absent while the total is
+  not known.
   `queue.onDemand` counts the waiting entries of the scheduler's
   first tier: `requestBackfill` jobs, discoveries, list jobs and
   re-reads owed after a `#sync` or a refusal. `queue.active` counts

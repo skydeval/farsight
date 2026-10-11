@@ -9,10 +9,9 @@
 # command stops with an error that names it. Letters and digits only: it
 # is part of a URL.
 #
-# Disk: the farsight-pgdata volume holds the index. A first full sweep
-# was measured at about 180 GB (October 2026, a sweep 37% done scaled to
-# the whole); growth after it is not measured yet. 500 GB is
-# recommended. See docs/guide/storage.md.
+# Disk: the farsight-pgdata volume holds the index. A completed first
+# sweep was measured at about 95 GB (October 2026); growth after it is
+# not measured yet. 500 GB is recommended. See docs/guide/storage.md.
 
 name: farsight
 
