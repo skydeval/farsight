@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Before 1.0, a minor version may change addresses, settings or the
 database schema; each entry says so where it does.
 
+## [Unreleased]
+
+### Changed
+
+- Public pages: the line under the number on "Blocked By Lists" says
+  what the number is. It read "Moderation Lists which this user has
+  been added to", which made the number look like a count of lists;
+  it is the number of blocks on the account through those lists, one
+  for each account that subscribes to one of them as a block list.
+
 ## [0.6.4] - 2026-10-11
 
 ### Changed

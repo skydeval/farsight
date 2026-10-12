@@ -66,7 +66,7 @@
 <p class="tz-note">All times are in <span data-zone>UTC</span>.</p>
 <form class="find" method="get" action="{{ base }}#lists" role="search"><input type="hidden" name="tab" value="lists">{% if taken_down %}<input type="hidden" name="takendown" value="1">{% endif %}<input type="search" name="find" value="{{ find }}" placeholder="Filter by list or owner" aria-label="Filter this table" maxlength="100" autocomplete="off" spellcheck="false"></form>
 <h2><span class="sr-only">Blocked by lists </span><span class="count count-big" title="listblock records on the lists below">{% if let Some(n) = lists.count %}{{ n }}{% else %}—{% endif %}</span></h2>
-<p class="muted">Moderation Lists which this user has been added to.</p>
+<p class="muted">The number of blocks on this user through lists, not the number of lists.</p>
 </div>
 {% if let Some(n) = lists.note %}<p class="find-note" role="status">{{ n }}</p>{% endif %}
 {% if !lists.rows.is_empty() %}

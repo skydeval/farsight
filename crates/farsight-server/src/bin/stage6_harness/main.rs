@@ -1637,7 +1637,7 @@ async fn check_sections(c: &mut Checks, h: &H, w: &World) -> Result<(), String> 
     c.check(
         "Blocked By Lists: the heading is the listblock records on the lists shown, added up, with the description under it; the list links to its page; a hidden owner's list is left out and not added in",
         lists.contains(&format!("<span class=\"count count-big\" title=\"listblock records on the lists below\">{stored_count}</span>"))
-            && lists.contains("Moderation Lists which this user has been added to.")
+            && lists.contains("The number of blocks on this user through lists, not the number of lists.")
             && !lists.contains("listblock-badge")
             && lists.contains(&format!("href=\"{}\"", w.list))
             && lists.contains(&format!("data-card=\"/card/{}\"", w.o1))
