@@ -15,6 +15,15 @@ database schema; each entry says so where it does.
   takes: a little over two days with 0.6.3 or later, measured on a
   sweep of 3.7 million accounts.
 
+### Fixed
+
+- Dependencies: rustls 0.23.46, for RUSTSEC-2026-0346, -0347, -0348
+  and -0349. Farsight uses neither Encrypted Client Hello, the
+  `brotli` feature nor a session store of its own, so only the
+  last applies: a network attacker could make later outgoing TLS
+  connections to one host use classical key exchange in place of
+  the post-quantum hybrid.
+
 ## [0.6.5] - 2026-10-11
 
 ### Changed
