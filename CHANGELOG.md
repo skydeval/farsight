@@ -7,6 +7,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Before 1.0, a minor version may change addresses, settings or the
 database schema; each entry says so where it does.
 
+## [Unreleased]
+
+### Changed
+
+- Docs: the storage guide and the README say how long a first sweep
+  takes: a little over two days with 0.6.3 or later, measured on a
+  sweep of 3.7 million accounts.
+
 ## [0.6.5] - 2026-10-11
 
 ### Changed

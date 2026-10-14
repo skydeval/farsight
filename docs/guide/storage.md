@@ -33,6 +33,19 @@ inside the same storage budget. `storage.block_history_retention` bounds them
 (`"0s"` keeps them forever); `storage.block_history_enabled = false`
 stops recording.
 
+**A first sweep takes a little over two days** with 0.6.3 or later,
+for a network the size of October 2026's: the 3.7 million accounts
+that have block or list records. That is the same sweep's
+measurement. It ran 66 hours 50 minutes from start to finish, but it
+began on an earlier version, which read under 30,000 accounts an
+hour; from 0.6.3 it read about 70,000, which for the whole sweep is
+about 53 hours. Most of that time is spent waiting on the hosts it
+reads and on the PLC directory, each of which limits how fast it may
+be asked, so the time depends on them more than on the hardware.
+Accounts that cannot be read do not hold the sweep open: they are
+retried afterwards. The dashboard shows the time left while a sweep
+runs.
+
 - **Recommended:** 4 vCPU, 8 GB RAM, 500 GB SSD.
 - **A smaller disk:** supported. Choose one of these:
   - run firehose-only;

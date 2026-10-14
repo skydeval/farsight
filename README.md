@@ -88,9 +88,16 @@ preferences, who may read the API and which web interfaces to serve,
 then writes the config and starts ingesting. The default Jetstream
 source is Bluesky's two public v2 instances.
 
-Hardware: 4 vCPU, 8 GB RAM and a 500 GB SSD are recommended. A first
-full sweep stores about 95 GB; a smaller disk runs without the sweep,
-or with one that pauses at the space you allow.
+> [!IMPORTANT]
+> **As of October 2026, a first full sweep stores about 95 GB and
+> takes a little over two days (about 53 hours).** Until it completes,
+> answers are marked `partial`. See
+> [Storage and hardware](docs/guide/storage.md) for how these were
+> measured.
+
+Hardware: 4 vCPU, 8 GB RAM and a 500 GB SSD are recommended. A smaller
+disk runs without the sweep, or with one that pauses at the space you
+allow.
 
 ## Guide
 
