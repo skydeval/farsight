@@ -212,10 +212,11 @@ One use of `backfill.plc_url` is start-only in the server as well: the
 admin sign-in resolves the admin DID through the directory that was
 named when the process started, whatever a later save says
 ([web-ui.md](web-ui.md#the-oauth-flow)). Handles and profile cards
-follow the saved value at once.
+follow a saved `plc_url` or `backfill.lodestar_url` at once.
 
 From the admin UI, a save that changes `[auth]`, `[net]`,
-`backfill.plc_url` or `backfill.relay_url`, or that opens `[access]`
+`backfill.plc_url`, `backfill.lodestar_url` or `backfill.relay_url`,
+or that opens `[access]`
 further, is stored only in a session that signed in within the last
 10 minutes
 ([web-ui.md](web-ui.md#a-fresh-sign-in-for-sensitive-actions)). A
@@ -232,9 +233,9 @@ backfill process picks it up within a minute.
 
 The backfill process applies every change it can in place, the
 request limits (`backfill.per_host_*`, `backfill.per_domain_*`,
-`backfill.plc_rps`) among them. For a change of
-`storage.database_url`, `[metrics]`, `[net]`, `backfill.concurrency`,
-`backfill.plc_url`, `limits.large_hosts` or `limits.cdn_ranges_extra`
+`backfill.plc_rps`, `backfill.lodestar_rps`) among them. For a change
+of `storage.database_url`, `[metrics]`, `[net]`, `backfill.concurrency`,
+`backfill.plc_url`, `backfill.lodestar_url`, `limits.large_hosts` or `limits.cdn_ranges_extra`
 it rebuilds its tasks in-process: running jobs are stopped, their work
 goes back to the queue and is taken up under the new settings. The
 container is not restarted.
@@ -307,6 +308,8 @@ The resume plan, failover and seam repair are explained in
 | `per_domain_concurrency` | `8` | Concurrent requests towards all hosts of one registrable domain together. Never applied below `per_host_concurrency`. Large hosts are exempt. Positive. |
 | `plc_url` | `"https://plc.directory"` | PLC directory. An `http` or `https` URL. |
 | `plc_rps` | `20` | Request rate towards the PLC directory. Positive. Every account the sweep has not met before costs one request, so with every host being worked at once this rate is what paces a first sweep. |
+| `lodestar_url` | `""` | A [lodestar](lodestar.md) instance to read identities and verified handles from first; empty: not used, and everything goes to `plc_url` and Farsight's own checks. An `http` or `https` URL. |
+| `lodestar_rps` | `50` | Request rate towards the lodestar instance from the backfill process. Positive. A budget of its own, apart from `plc_rps`. |
 | `plc_seed_from_export` | `false` | Seed PDS resolution from the PLC export ([backfill.md](backfill.md#sources) says what that risks). |
 | `relay_url` | `"https://bsky.network"` | Relay used to enumerate repositories. An `http` or `https` URL. |
 | `request_fresh_window` | `"1h"` | A `requestBackfill` for an account done more recently than this adds no work unless forced ([api.md](api.md)). |
@@ -405,6 +408,7 @@ in [web-ui.md](web-ui.md) and
 | `handle_warming_enabled` | `true` | A background worker verifies the handles of accounts that pages had to show as bare DIDs. It governs the admin pages too and works with the public UI off. |
 | `handle_rps` | `20` | Handle verifications started per second, for pages, cards and the warming worker together. 1 to 200. Each is up to two outbound requests. |
 | `handle_pass_rps` | `0` | Rate of the handle pass, which works through every account Farsight holds; `0` is off, at most 200. It has its own pace and does not draw on `handle_rps`. |
+| `lodestar_sync_rps` | `1` | Requests a second of the handle sync, which reads the handles of every account Farsight holds from `backfill.lodestar_url`, 1,000 accounts a request ([lodestar.md](lodestar.md#the-handle-sync)); `0` is off, at most 20. Does nothing without a lodestar URL. |
 
 `record_viewer_url`, when not empty, must be an absolute `http` or
 `https` URL with a host and no credentials, at most 500 characters,
@@ -586,6 +590,7 @@ deadlock with the writers' flushes on a busy instance.
 | Counter flush | Writes the server's own counter deltas. |
 | Handle warming | Verifies handles for accounts that pages showed as bare DIDs, within `public_ui.handle_rps` and always leaving a reserve for page requests. Off with `handle_warming_enabled = false`. |
 | Handle pass | With `public_ui.handle_pass_rps` above 0: first the accounts named by a recent identity event, then a walk over every account without a stored answer. After the last account it rests 10 minutes. When more than half of a batch establishes nothing it backs off, from one minute up to 30. |
+| Handle sync | With `backfill.lodestar_url` set and `public_ui.lodestar_sync_rps` above 0: first the accounts named by an identity event in the last five minutes, then a walk over every account, 1,000 a request, storing what lodestar has verified since. After the last account it rests an hour. When lodestar cannot answer it backs off, from one minute up to 30 ([lodestar.md](lodestar.md#the-handle-sync)). |
 | Top lists | Looks once a minute. Once a day, for the day that ended at the last 10:00 UTC, counts the lists that `show_top_blockers` and `show_top_blocked` ask for; a switch turned on later gets its lists at the next look. A list's query may run for up to 20 minutes; the all-time "most blocked" list reads all of `blocks`. Trims the log of recent blocks hourly, at 49 hours. Pages read the stored result and never count. |
 | Sort-index builder | Builds four indexes that order the UI's tables by shown time, with `CREATE INDEX CONCURRENTLY`, after the server is serving and never in a migration. It does not build while the database plus the index's estimated size would exceed `storage.budget_bytes`, and looks again after 15 minutes; a failed build is retried after 10. Until an index is valid its table lists its rows by account. `farsight_ui_sort_indexes_ready` counts the valid ones. |
 
@@ -769,6 +774,8 @@ request. These counts are in memory only.
 | `farsight_backfill_pds_request_seconds` | histogram | `host`, `method` (the XRPC method's short name, such as `listRecords`) |
 | `farsight_backfill_pds_errors_total` | counter | `host`, `kind` (`cooling`, `rate_limited`, `server`, `client`, `transport`, `decode`) |
 | `farsight_backfill_plc_request_seconds` | histogram | |
+| `farsight_backfill_lodestar_request_seconds` | histogram | |
+| `farsight_backfill_lodestar_reads_total` | counter | `outcome` (`answered`, `fallback`) |
 
 The `host` label names the 50 hosts with the most requests and puts
 the rest under `other`, so it has at most 51 values. Request counts
@@ -791,6 +798,10 @@ admin dashboard.
 | `farsight_handle_pass_total` | counter | `outcome` (`handle`, `gone`, `unresolved`, `unknown`) |
 | `farsight_handle_pass_position` | gauge | |
 | `farsight_handle_pass_laps_total` | counter | |
+| `farsight_public_ui_lodestar_reads_total` | counter | `outcome` (`answered`, `fallback`) |
+| `farsight_handle_sync_total` | counter | `outcome` (`written`, `unchanged`, `unknown`) |
+| `farsight_handle_sync_position` | gauge | |
+| `farsight_handle_sync_laps_total` | counter | |
 | `farsight_ui_sort_indexes_ready` | gauge | 0 to 4 |
 
 ## Logs

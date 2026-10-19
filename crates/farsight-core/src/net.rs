@@ -302,6 +302,23 @@ impl SafeClient {
         self.read(url, req.send().await.map_err(map_reqwest)?).await
     }
 
+    /// `POST url` with a JSON body, under the same rules as
+    /// [`SafeClient::post_form`]: a redirect is returned as it is.
+    pub async fn post_json(
+        &self,
+        url: &Url,
+        body: Vec<u8>,
+    ) -> Result<OutboundResponse, OutboundError> {
+        check_url(url, &self.config)?;
+        let req = self
+            .http
+            .post(url.clone())
+            .header("content-type", "application/json")
+            .header("accept", "application/json")
+            .body(body);
+        self.read(url, req.send().await.map_err(map_reqwest)?).await
+    }
+
     async fn get_once(&self, url: &Url) -> Result<OutboundResponse, OutboundError> {
         let resp = self
             .http

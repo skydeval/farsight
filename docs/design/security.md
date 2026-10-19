@@ -664,6 +664,8 @@ left, so requests are never starved by it. The handle pass
   database, PLC directory, relay, firehose or backlink source of their
   own (`storage.database_url`, `backfill.plc_url`,
   `backfill.relay_url`, `firehose.urls`, `backfill.backlinks.url`), a
+  [lodestar](lodestar.md) instance of their own whose verified handles
+  the pages would show (`backfill.lodestar_url`), a
   hostname of their own (`server.hostname`), proxy trust that lets
   them forge client addresses (`proxy.*`), a host the outbound client
   may newly reach (`net.*`), a token they know (`auth.*`, `metrics.*`,

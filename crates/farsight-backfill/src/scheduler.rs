@@ -310,10 +310,22 @@ impl Drop for Running {
     }
 }
 
+/// How far the sweep's members have been asked of lodestar ahead of
+/// their jobs ([`Scheduler::prefetch_members`]).
+#[derive(Debug, Default)]
+struct Prefetch {
+    /// A batch is being asked for.
+    running: bool,
+    /// The last DID of the batch asked for last; the next is asked for
+    /// when the members dispatched reach it.
+    to: Option<String>,
+}
+
 /// The scheduler.
 pub struct Scheduler {
     ctx: Arc<Ctx>,
     st: Mutex<State>,
+    prefetch: Arc<Mutex<Prefetch>>,
     freed: Notify,
     /// Harness: run every job as a no-op that records its pick time.
     #[cfg(feature = "harness")]
@@ -339,6 +351,7 @@ impl Scheduler {
         Arc::new(Scheduler {
             ctx,
             st: Mutex::new(State::default()),
+            prefetch: Arc::default(),
             freed: Notify::new(),
             #[cfg(feature = "harness")]
             dry: false,
@@ -353,6 +366,7 @@ impl Scheduler {
         Arc::new(Scheduler {
             ctx,
             st: Mutex::new(State::default()),
+            prefetch: Arc::default(),
             freed: Notify::new(),
             dry: true,
             panic_dids: Mutex::default(),
@@ -614,6 +628,7 @@ impl Scheduler {
         .fetch_all(&self.ctx.pool)
         .await?;
         let blocked = self.ctx.net.blocked_hosts();
+        let open: Vec<i64> = cycles.iter().map(|(c, _)| c.get()).collect();
         let mut row: Option<(String, CycleKind)> = None;
         for (cycle, kind) in cycles {
             let did: Option<String> = sqlx::query_scalar(&format!(
@@ -648,6 +663,7 @@ impl Scheduler {
         match row {
             Some((did, kind)) => {
                 self.st().member_cursor = Some(did.clone());
+                self.prefetch_members(&did, open);
                 Ok(Some(Work::Member {
                     did,
                     requester: match kind {
@@ -659,9 +675,54 @@ impl Scheduler {
             None => {
                 // Wrap around: members not done yet are retried in turn.
                 self.st().member_cursor = None;
+                self.prefetch.lock().unwrap_or_else(|e| e.into_inner()).to = None;
                 Ok(None)
             }
         }
+    }
+
+    /// With a lodestar instance, resolves the members the sweep is about
+    /// to dispatch, [`farsight_core::lodestar::BATCH`] at a time and in one
+    /// request each, before their jobs ask: from `from`, in the DID order
+    /// they are dispatched in, across the `cycles` open. Starts the next
+    /// batch when the members dispatched reach the end of the last one;
+    /// runs beside the scheduler and never holds a pick up.
+    fn prefetch_members(&self, from: &str, cycles: Vec<i64>) {
+        if farsight_core::lodestar::base(&self.ctx.cfg().backfill.lodestar_url).is_none() {
+            return;
+        }
+        {
+            let mut p = self.prefetch.lock().unwrap_or_else(|e| e.into_inner());
+            if p.running || p.to.as_deref().is_some_and(|to| from < to) {
+                return;
+            }
+            p.running = true;
+        }
+        let (ctx, mark, from) = (self.ctx.clone(), self.prefetch.clone(), from.to_owned());
+        tokio::spawn(async move {
+            let dids: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT DISTINCT did FROM cycle_outstanding
+                 WHERE cycle_id = ANY($1) AND state = {MEMBER_OUTSTANDING} AND did >= $2
+                 ORDER BY did LIMIT $3"
+            ))
+            .bind(&cycles)
+            .bind(&from)
+            .bind(farsight_core::lodestar::BATCH as i64)
+            .fetch_all(&ctx.pool)
+            .await
+            .unwrap_or_default();
+            let parsed: Vec<Did> = dids.iter().filter_map(|d| Did::parse(d).ok()).collect();
+            ctx.resolver.prefetch(&parsed).await;
+            let mut p = mark.lock().unwrap_or_else(|e| e.into_inner());
+            p.running = false;
+            // A short batch reaches the last member: nothing more is
+            // asked for until the dispatch wraps around.
+            p.to = if dids.len() < farsight_core::lodestar::BATCH {
+                Some(char::MAX.to_string())
+            } else {
+                dids.last().cloned()
+            };
+        });
     }
 
     async fn pick(&self, concurrency: usize) -> Result<Option<(Tier, Work)>, sqlx::Error> {

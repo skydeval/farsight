@@ -79,15 +79,16 @@ const PUBLIC_UI_WIDENING: [&str; 6] = [
 ///
 /// - every `auth.*`, `net.*`, `proxy.*` and `metrics.*` key;
 /// - `storage.database_url`, `server.hostname`, `firehose.urls`,
-///   `backfill.plc_url`, `backfill.relay_url`, `backfill.backlinks.url`
-///   and `public_ui.record_viewer_url`;
+///   `backfill.plc_url`, `backfill.lodestar_url`, `backfill.relay_url`,
+///   `backfill.backlinks.url` and `public_ui.record_viewer_url`;
 /// - an `access.*` key that lets more callers in (`reads` towards
 ///   `public`, `cors` or `public_ui` switched on);
 /// - a public-UI switch that shows more ([`PUBLIC_UI_WIDENING`]) turned
 ///   on, and an account taken off `public_ui.excluded_dids`.
 ///
 /// With these a session could outlive its own end: a token it knows, a
-/// database, directory, relay, firehose or backlink source it runs, a
+/// database, directory, identity mirror (whose verified handles the
+/// pages show), relay, firehose or backlink source it runs, a
 /// proxy header it can forge, a host the outbound client may newly
 /// reach, links on public pages to a site of its choosing, or data
 /// served to people who could not read it before.
@@ -112,6 +113,7 @@ pub fn sensitive_changes(old: &config::Config, new: &config::Config) -> Vec<Stri
                         | "server.hostname"
                         | "firehose.urls"
                         | "backfill.plc_url"
+                        | "backfill.lodestar_url"
                         | "backfill.relay_url"
                         | "backfill.backlinks.url"
                         | "public_ui.record_viewer_url"
@@ -429,6 +431,10 @@ mod tests {
             ["backfill.plc_url"]
         );
         assert_eq!(
+            with(&|c| c.backfill.lodestar_url = "https://lodestar.evil.example".into()),
+            ["backfill.lodestar_url"]
+        );
+        assert_eq!(
             with(&|c| c.backfill.relay_url = "https://relay.evil.example".into()),
             ["backfill.relay_url"]
         );
@@ -472,6 +478,8 @@ mod tests {
         // Everything else is an ordinary change.
         assert!(with(&|c| c.server.contact = "mailto:x@example.com".into()).is_empty());
         assert!(with(&|c| c.backfill.plc_rps += 1).is_empty());
+        assert!(with(&|c| c.backfill.lodestar_rps += 1).is_empty());
+        assert!(with(&|c| c.public_ui.lodestar_sync_rps += 1).is_empty());
         assert!(with(&|c| c.public_ui.instance_description = "x".into()).is_empty());
         assert!(with(&|c| c.rate_limit.anon_rps += 1).is_empty());
         // The public UI: only what shows more.

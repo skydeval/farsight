@@ -19,8 +19,8 @@ proxy, rate-limit (except the query concurrency) and backfill keys apply immedia
 need a restart. Writes are atomic and notify the backfill process.</p>
 <p class="muted">The admin UI itself is switched with <code>access.admin_ui</code> in config.toml, at restart; a save
 here that would change it is refused.</p>
-<p class="muted" id="step-up-note">A save that changes <code>auth.*</code>, <code>net.*</code>, <code>backfill.plc_url</code> or
-<code>backfill.relay_url</code>, or that opens <code>access.reads</code>, <code>access.cors</code> or
+<p class="muted" id="step-up-note">A save that changes <code>auth.*</code>, <code>net.*</code>, <code>backfill.plc_url</code>,
+<code>backfill.lodestar_url</code> or <code>backfill.relay_url</code>, or that opens <code>access.reads</code>, <code>access.cors</code> or
 <code>access.public_ui</code> further, is made only within ten minutes of signing in. Later than that, the save is not
 stored: you sign in again and make the change once more.</p>
 {% if !env_keys.is_empty() %}<p>Locked by environment variables: {% for k in env_keys %}<code>{{ k }}</code> {% endfor %}</p>{% endif %}
@@ -152,6 +152,35 @@ advisory; scrapers that ignore it are bounded only by the rate limit. Some link-
 notice an inactive account gets. This changes what the public pages <strong>show</strong>, nothing else: the data stays stored,
 and <code>/xrpc/*</code> and the lookup pages here still return it.</div>
 <div class="row"><button type="submit">Save public UI settings</button></div>
+</form>
+
+<form class="stack card" method="post" action="/admin/settings/identity" id="identity">
+<h2>
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+<span>Identity source</span>
+</h2>
+<p class="muted">Where Farsight reads identities and verified handles from. By default it asks the PLC directory
+(<code>backfill.plc_url</code>) for DID documents and checks every handle itself, with a DNS lookup and a request to the
+handle's own host. A <a href="https://github.com/skydeval/lodestar" target="_blank" rel="noopener">lodestar</a> instance is
+a read-only copy of the PLC directory that has already verified every handle, and re-checks each one weekly. With one
+named here, Farsight asks it first: for DID resolution in the backfill, for the handles on pages and cards, for the
+"DID created" date and for the History tab. Whatever lodestar cannot answer (it is catching up, unreachable, or has not
+checked a handle yet) goes to the PLC directory and Farsight's own checks, as without it. Listing every identity for
+the <code>plc</code> sweep source and the admin sign-in stay with the PLC directory.</p>
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<label for="lodestar_url">Lodestar URL (<code>backfill.lodestar_url</code>)</label>
+<input type="url" id="lodestar_url" name="lodestar_url" maxlength="500" spellcheck="false" placeholder="https://lodestar.example" value="{{ ident.lodestar_url }}">
+<div class="hint">Empty: not used. The pages show the handles this instance says are verified, so a change needs a sign-in
+within the last ten minutes, as a change of the PLC directory does. Pages use a new address at once; the backfill process
+rebuilds its tasks to take it.</div>
+
+<label for="lodestar_sync_rps">Handle sync batches per second (<code>public_ui.lodestar_sync_rps</code>)</label>
+<input type="number" id="lodestar_sync_rps" name="lodestar_sync_rps" min="0" max="20" value="{{ ident.lodestar_sync_rps }}">
+<div class="hint">0 = off. With a lodestar URL, Farsight reads the handles of every account it holds from lodestar, up to
+1,000 accounts a request, and updates the stored handles that lodestar has re-checked since, so pages follow its weekly
+re-verification without anyone opening them. Accounts whose identity changes on the network are read first. After the
+last account it rests an hour, then starts again. Nothing is requested from any other server.</div>
+<div class="row"><button type="submit">Save identity source</button></div>
 </form>
 
 <div class="card" id="admin-did">

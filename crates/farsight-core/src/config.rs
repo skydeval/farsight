@@ -282,6 +282,15 @@ pub struct BackfillConfig {
     pub plc_rps: u32,
     /// Seed PDS resolution from the PLC export.
     pub plc_seed_from_export: bool,
+    /// Base URL of a lodestar instance (a read-only mirror of the PLC
+    /// directory that also verifies every handle): DID resolution, handle
+    /// verification and the public card's identity are read from it
+    /// first, and from `plc_url` and Farsight's own checks when it cannot
+    /// answer. Empty (the default): not used.
+    pub lodestar_url: String,
+    /// Requests per second towards the lodestar instance from the
+    /// backfill process. Its own budget, apart from `plc_rps`.
+    pub lodestar_rps: u32,
     /// Base URL of the relay whose listings enumerate repositories.
     pub relay_url: String,
     /// `requestBackfill` freshness window.
@@ -339,6 +348,8 @@ impl Default for BackfillConfig {
             plc_url: "https://plc.directory".to_owned(),
             plc_rps: 20,
             plc_seed_from_export: false,
+            lodestar_url: String::new(),
+            lodestar_rps: 50,
             relay_url: "https://bsky.network".to_owned(),
             request_fresh_window: ConfigDuration::hours(1),
             owner_fetch_cooldown: ConfigDuration::mins(10),
@@ -535,6 +546,8 @@ impl ThemeDefault {
 pub const MAX_EXCLUDED_DIDS: usize = 10_000;
 /// Upper bound of `public_ui.handle_rps`.
 pub const MAX_HANDLE_RPS: u32 = 200;
+/// Highest `public_ui.lodestar_sync_rps`.
+pub const MAX_LODESTAR_SYNC_RPS: u32 = 20;
 /// Longest `public_ui.instance_description`, in characters.
 pub const MAX_INSTANCE_DESCRIPTION: usize = 2_000;
 /// Longest `public_ui.contact`, in characters.
@@ -603,6 +616,11 @@ pub struct PublicUiConfig {
     /// = off, at most [`MAX_HANDLE_RPS`]. Its own pace: `handle_rps` is
     /// not drawn on. Each check is up to two outbound requests.
     pub handle_pass_rps: u32,
+    /// Batches a second in which the handle sync reads the handles of the
+    /// accounts Farsight holds from `backfill.lodestar_url`, up to
+    /// [`crate::lodestar::BATCH`] accounts each; 0 = off, at most
+    /// [`MAX_LODESTAR_SYNC_RPS`]. Does nothing without a lodestar URL.
+    pub lodestar_sync_rps: u32,
 }
 
 impl PublicUiConfig {
@@ -642,6 +660,7 @@ impl Default for PublicUiConfig {
             handle_warming_enabled: true,
             handle_rps: 20,
             handle_pass_rps: 0,
+            lodestar_sync_rps: 1,
         }
     }
 }
@@ -1361,6 +1380,7 @@ impl Config {
             ("backfill.per_domain_rps", b.per_domain_rps),
             ("backfill.per_domain_concurrency", b.per_domain_concurrency),
             ("backfill.plc_rps", b.plc_rps),
+            ("backfill.lodestar_rps", b.lodestar_rps),
             (
                 "backfill.list_fetch_max_attempts",
                 b.list_fetch_max_attempts,
@@ -1388,6 +1408,7 @@ impl Config {
         for (key, value, required) in [
             ("backfill.relay_url", b.relay_url.as_str(), true),
             ("backfill.plc_url", b.plc_url.as_str(), true),
+            ("backfill.lodestar_url", b.lodestar_url.as_str(), false),
             ("backfill.backlinks.url", b.backlinks.url.as_str(), false),
         ] {
             if (required || !value.is_empty()) && !is_http_url(value) {
@@ -1712,6 +1733,12 @@ impl Config {
             return Err(invalid(
                 "public_ui.handle_pass_rps",
                 "must be between 0 and 200",
+            ));
+        }
+        if p.lodestar_sync_rps > MAX_LODESTAR_SYNC_RPS {
+            return Err(invalid(
+                "public_ui.lodestar_sync_rps",
+                format!("must be between 0 and {MAX_LODESTAR_SYNC_RPS}"),
             ));
         }
         if !p.record_viewer_url.is_empty() {

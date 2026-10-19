@@ -8,6 +8,12 @@
 //! 2. take the first `at://` entry of `alsoKnownAs`;
 //! 3. resolve that handle forward and require the result to equal the DID.
 //!
+//! With a lodestar instance (`backfill.lodestar_url`, see
+//! `docs/design/lodestar.md`) its verification is asked for first, in one
+//! request: lodestar has made the same two checks itself. Steps 1–3 run
+//! only when it cannot say ([`from_lodestar`]): it is catching up, not at
+//! the directory's tip, unreachable, or has not checked the claim yet.
+//!
 //! At most one resolution per page view (the page's subject or list
 //! owner), under a process-wide budget. Rendering a row never waits for a
 //! resolution: it shows a handle only if one is already cached, and asks
@@ -40,7 +46,7 @@ use chrono::{DateTime, Utc};
 use farsight_api::ratelimit::Class;
 use farsight_core::config::Config;
 use farsight_core::net::{OutboundClient, SafeClient};
-use farsight_core::{Did, DidMethod};
+use farsight_core::{Did, DidMethod, lodestar};
 use farsight_storage::handles::Cached;
 
 use super::metrics as m;
@@ -58,6 +64,9 @@ pub const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
 pub const NONE_STALE_AFTER: Duration = Duration::from_secs(3600);
 /// Bucket key of the process-wide resolution budget.
 pub const BUDGET_KEY: &str = "process";
+/// How long a read from the lodestar instance may take before the PLC
+/// directory and Farsight's own checks are used instead.
+pub const LODESTAR_WAIT: Duration = Duration::from_millis(1500);
 
 /// How a resolution ended (`farsight_public_ui_handle_resolutions_total`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,8 +183,71 @@ pub(crate) fn classify(
     }
 }
 
-/// Verifies the handle of `did` in both directions (steps 1–3 above).
-pub(crate) async fn verify(safe: &SafeClient, cfg: &Config, did: &Did) -> (Outcome, Verified) {
+/// What the lodestar instance says of `did`:
+/// [`lodestar::Answer::Unavailable`] when there is none, or it did not
+/// answer within [`LODESTAR_WAIT`].
+pub(crate) async fn lodestar_account(
+    safe: &SafeClient,
+    cfg: &Config,
+    did: &Did,
+) -> lodestar::Answer {
+    let Some(url) = lodestar::base(&cfg.backfill.lodestar_url)
+        .and_then(|base| lodestar::account_url(base, did))
+    else {
+        return lodestar::Answer::Unavailable;
+    };
+    match tokio::time::timeout(LODESTAR_WAIT, safe.get(&url)).await {
+        Ok(Ok(r)) => lodestar::read_account(r.status, &r.body),
+        _ => lodestar::Answer::Unavailable,
+    }
+}
+
+/// A verification established by lodestar: what it says, and when it
+/// last checked the handle. `None` when lodestar cannot say, and
+/// Farsight checks for itself.
+pub(crate) fn from_lodestar(
+    answer: &lodestar::Answer,
+) -> Option<(Outcome, Verified, Option<DateTime<Utc>>)> {
+    use lodestar::{Answer, Verdict};
+    match answer {
+        // The directory has no such DID.
+        Answer::NotFound => Some((Outcome::Failed, Verified::Gone, None)),
+        Answer::Account(a) => match a.verdict() {
+            Verdict::Verified(h) => {
+                Some((Outcome::Resolved, Verified::Handle(h), a.handle_checked_at))
+            }
+            Verdict::NotTheirs if a.claimed_handle.is_none() => {
+                Some((Outcome::Failed, Verified::Gone, a.handle_checked_at))
+            }
+            Verdict::NotTheirs => Some((Outcome::Unverified, Verified::Gone, a.handle_checked_at)),
+            Verdict::Unreachable(c) => Some((Outcome::Unverified, Verified::Unresolved(c), None)),
+            Verdict::Unknown => None,
+        },
+        Answer::Unavailable => None,
+    }
+}
+
+/// Verifies the handle of `did` in both directions: lodestar's answer if
+/// it has one, else steps 1–3 above. With the answer comes when the
+/// handle was checked, if that was not now.
+pub(crate) async fn verify(
+    safe: &SafeClient,
+    cfg: &Config,
+    did: &Did,
+) -> (Outcome, Verified, Option<DateTime<Utc>>) {
+    if lodestar::base(&cfg.backfill.lodestar_url).is_some() {
+        let found = from_lodestar(&lodestar_account(safe, cfg, did).await);
+        m::lodestar_read(found.is_some());
+        if let Some(found) = found {
+            return found;
+        }
+    }
+    let (outcome, found) = verify_here(safe, cfg, did).await;
+    (outcome, found, None)
+}
+
+/// Steps 1–3, made by Farsight itself.
+async fn verify_here(safe: &SafeClient, cfg: &Config, did: &Did) -> (Outcome, Verified) {
     let Some(url) = document_url(cfg, did) else {
         return (Outcome::Failed, Verified::Unknown);
     };
@@ -270,7 +342,8 @@ pub(crate) async fn cached(st: &WebState, cfg: &Config, did: &Did) -> Option<Cac
 }
 
 /// Records how a verification of `did` ended and returns the handle to
-/// show.
+/// show. `at` is when the handle was checked, if not now (lodestar's
+/// check); the stored answer is dated by it.
 ///
 /// - A verified handle goes to the memory cache and to the table.
 /// - [`Verified::Gone`] removes whatever was shown: memory and table say
@@ -289,6 +362,7 @@ pub(crate) async fn settle(
     cfg: &Config,
     did: &Did,
     found: Verified,
+    at: Option<DateTime<Utc>>,
 ) -> Option<String> {
     use farsight_storage::handles as stored;
     let cache = &st.public.handles;
@@ -302,8 +376,8 @@ pub(crate) async fn settle(
     cache.insert(did.as_str(), shown.clone(), ttl);
     let written = match st.api.pool.acquire().await {
         Ok(mut conn) => match &found {
-            Verified::Handle(h) => stored::store(&mut conn, did, h).await,
-            Verified::Gone => stored::store_gone(&mut conn, did).await,
+            Verified::Handle(h) => stored::store(&mut conn, did, h, at).await,
+            Verified::Gone => stored::store_gone(&mut conn, did, at).await,
             // A stored handle other than the claim is replaced by
             // "nothing to show", whether or not memory still held it;
             // the claim itself is left as it is.
@@ -359,10 +433,10 @@ pub async fn page_handle(st: &WebState, cfg: &Config, did: &Did) -> PageHandle {
         };
     }
     match tokio::time::timeout(RESOLVE_WAIT, verify(&st.safe, cfg, did)).await {
-        Ok((outcome, found)) => {
+        Ok((outcome, found, at)) => {
             m::handle_resolution(outcome);
             PageHandle {
-                handle: settle(st, cfg, did, found).await,
+                handle: settle(st, cfg, did, found, at).await,
                 settled: true,
             }
         }
@@ -445,6 +519,59 @@ mod tests {
             ),
             (Outcome::Unverified, Verified::Gone)
         );
+    }
+
+    #[test]
+    fn lodestars_answers_as_verifications() {
+        use lodestar::Answer;
+        let account =
+            |v: serde_json::Value| Answer::Account(Box::new(lodestar::parse_account(&v).unwrap()));
+        let checked = "2026-10-17T09:48:38.796Z";
+        let at = DateTime::parse_from_rfc3339(checked)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            from_lodestar(&account(json!({"status": "active", "handle": "bsky.app",
+                "claimed_handle": "bsky.app", "handle_status": "verified",
+                "handle_checked_at": checked}))),
+            Some((
+                Outcome::Resolved,
+                Verified::Handle("bsky.app".into()),
+                Some(at)
+            ))
+        );
+        assert_eq!(
+            from_lodestar(&account(json!({"status": "active",
+                "claimed_handle": "bsky.app", "handle_status": "mismatch",
+                "handle_checked_at": checked}))),
+            Some((Outcome::Unverified, Verified::Gone, Some(at)))
+        );
+        assert_eq!(
+            from_lodestar(&account(
+                json!({"status": "active", "handle_status": "none"})
+            )),
+            Some((Outcome::Failed, Verified::Gone, None))
+        );
+        assert_eq!(
+            from_lodestar(&account(json!({"status": "active",
+                "claimed_handle": "a.example", "handle_status": "unreachable"}))),
+            Some((
+                Outcome::Unverified,
+                Verified::Unresolved("a.example".into()),
+                None
+            ))
+        );
+        assert_eq!(
+            from_lodestar(&Answer::NotFound),
+            Some((Outcome::Failed, Verified::Gone, None))
+        );
+        // Not checked yet, or no answer: Farsight checks for itself.
+        assert_eq!(
+            from_lodestar(&account(json!({"status": "active",
+                "claimed_handle": "a.example", "handle_status": "pending"}))),
+            None
+        );
+        assert_eq!(from_lodestar(&Answer::Unavailable), None);
     }
 
     #[test]

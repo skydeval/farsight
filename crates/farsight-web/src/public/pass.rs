@@ -4,7 +4,13 @@
 //!
 //! - **Identity changes first.** The firehose writer notes every account
 //!   an identity event names in `handle_due`; the pass serves those
-//!   before anything else, oldest first.
+//!   before anything else, oldest first. With a lodestar instance the
+//!   handle sync ([`super::sync`]) serves them first, and the pass takes
+//!   only those it could not settle within [`super::sync::CATCHUP`], and
+//!   checks them itself.
+//! - **Lodestar first.** With a lodestar instance (`backfill.lodestar_url`)
+//!   a check of the walk asks it for the account's verified handle, and
+//!   makes the two checks itself only when it cannot say.
 //! - **Then the walk.** `actors` in id order, a window of ids at a time,
 //!   taking the accounts with no stored answer, or a stored "nothing to
 //!   show" older than [`NONE_RETRY`]. Deactivated and deleted accounts
@@ -32,6 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use farsight_core::Did;
 use farsight_core::config::Config;
 use farsight_core::net::OutboundClient;
@@ -39,7 +46,9 @@ use farsight_storage::handles as store;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
-use super::handles::{NEGATIVE_TTL, claimed_handle, document_url};
+use super::handles::{
+    NEGATIVE_TTL, Verified, claimed_handle, document_url, from_lodestar, lodestar_account,
+};
 use crate::pages::{HandleError, WebState, handle_to_did};
 
 /// Ids one query of the walk looks at.
@@ -117,11 +126,42 @@ pub fn register() {
     ::metrics::gauge!(POSITION).set(0.0);
 }
 
-/// Checks the handle of `did`: its document, then the handle it names,
+impl From<Verified> for Checked {
+    fn from(v: Verified) -> Checked {
+        match v {
+            Verified::Handle(h) => Checked::Handle(h),
+            Verified::Gone => Checked::Gone,
+            Verified::Unresolved(c) => Checked::Unresolved(c),
+            Verified::Unknown => Checked::Unknown,
+        }
+    }
+}
+
+/// Checks the handle of `did`: lodestar's verification when `lodestar`
+/// is set and it can say, else its document, then the handle it names,
 /// resolved back.
 ///
-/// With an answer that is not a verified handle comes why, for the log.
-async fn check(st: &WebState, cfg: &Config, did: &Did) -> (Checked, Option<Why>) {
+/// With an answer that is not a verified handle comes why, for the log;
+/// with lodestar's answer, when it checked the handle.
+async fn check(
+    st: &WebState,
+    cfg: &Config,
+    did: &Did,
+    lodestar: bool,
+) -> (Checked, Option<Why>, Option<DateTime<Utc>>) {
+    if lodestar && farsight_core::lodestar::base(&cfg.backfill.lodestar_url).is_some() {
+        let found = from_lodestar(&lodestar_account(&st.safe, cfg, did).await);
+        super::metrics::lodestar_read(found.is_some());
+        if let Some((_, found, at)) = found {
+            return (found.into(), None, at);
+        }
+    }
+    let (found, why) = check_here(st, cfg, did).await;
+    (found, why, None)
+}
+
+/// The two checks, made by Farsight itself.
+async fn check_here(st: &WebState, cfg: &Config, did: &Did) -> (Checked, Option<Why>) {
     let Some(url) = document_url(cfg, did) else {
         return (Checked::Gone, None);
     };
@@ -210,19 +250,20 @@ static UNESTABLISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// One in this many checks that established nothing is logged.
 pub const LOG_EVERY: u64 = 50;
 
-/// Stores what a check found. The memory cache is touched only where it
-/// already holds the account: the pass must not push the accounts pages
-/// are showing out of it.
-async fn record(
+/// Stores what a check found, dated `at` when that was lodestar's check.
+/// The memory cache is touched only where it already holds the account:
+/// the pass must not push the accounts pages are showing out of it.
+pub(crate) async fn record(
     st: &WebState,
     cfg: &Config,
     did: &Did,
     found: &Checked,
+    at: Option<DateTime<Utc>>,
 ) -> farsight_storage::Result<()> {
     let mut conn = st.api.pool.acquire().await?;
     match found {
-        Checked::Handle(h) => store::store(&mut conn, did, h).await?,
-        Checked::Gone => store::store_gone(&mut conn, did).await?,
+        Checked::Handle(h) => store::store(&mut conn, did, h, at).await?,
+        Checked::Gone => store::store_gone(&mut conn, did, at).await?,
         Checked::Unresolved(claim) => {
             store::store_unresolved(&mut conn, did, claim).await?;
         }
@@ -263,9 +304,12 @@ async fn check_one(st: Arc<WebState>, item: Item) -> Option<(String, Option<Stri
     let Ok(did) = Did::parse(&item.did) else {
         return None;
     };
-    let (found, why) = tokio::time::timeout(CHECK_DEADLINE, check(&st, cfg, &did))
-        .await
-        .unwrap_or((Checked::Unknown, Some(Why::Deadline)));
+    // A queued account had its identity change: lodestar's answer may
+    // be older than the change, so the pass checks it itself.
+    let (found, why, at) =
+        tokio::time::timeout(CHECK_DEADLINE, check(&st, cfg, &did, !item.queued))
+            .await
+            .unwrap_or((Checked::Unknown, Some(Why::Deadline), None));
     let under = why.as_ref().and_then(failed_under);
     if let Some(why) = why {
         let n = UNESTABLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -285,7 +329,7 @@ async fn check_one(st: Arc<WebState>, item: Item) -> Option<(String, Option<Stri
     if found == Checked::Unknown && !item.again && !item.queued {
         return Some((item.did, under));
     }
-    if let Err(e) = record(&st, cfg, &did, &found).await {
+    if let Err(e) = record(&st, cfg, &did, &found, at).await {
         tracing::warn!(error = %e, "handle pass: an answer could not be stored");
         return None;
     }
@@ -327,9 +371,19 @@ struct Walk {
 
 /// The next accounts to check: queued identity changes, else the next of
 /// the walk. Empty when there is nothing to do now.
-async fn next_items(st: &WebState, walk: &mut Walk) -> farsight_storage::Result<Vec<Item>> {
+async fn next_items(
+    st: &WebState,
+    cfg: &Config,
+    walk: &mut Walk,
+) -> farsight_storage::Result<Vec<Item>> {
     let mut conn = st.api.pool.acquire().await?;
-    let due = store::due_take(&mut conn, DUE_BATCH).await?;
+    // With lodestar the handle sync has the first go at identity changes.
+    let wait = if super::sync::active(cfg) {
+        super::sync::CATCHUP.as_secs() as i64
+    } else {
+        0
+    };
+    let due = store::due_take(&mut conn, DUE_BATCH, wait).await?;
     if !due.is_empty() {
         return Ok(due
             .into_iter()
@@ -433,7 +487,8 @@ pub async fn run(st: Arc<WebState>, mut stop: watch::Receiver<bool>) {
                 })
                 .collect()
         } else {
-            match next_items(&st, &mut walk).await {
+            let cfg = st.api.config.current();
+            match next_items(&st, &cfg.config, &mut walk).await {
                 Ok(items) => items,
                 Err(e) => {
                     tracing::warn!(error = %e, "handle pass: the next accounts could not be read");

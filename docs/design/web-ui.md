@@ -379,8 +379,9 @@ whose sign-in completed **at most 10 minutes ago**
 
 - a settings save that changes any `auth.*`, `net.*`, `proxy.*` or
   `metrics.*` key, `storage.database_url`, `server.hostname`,
-  `firehose.urls`, `backfill.plc_url`, `backfill.relay_url`,
-  `backfill.backlinks.url` or `public_ui.record_viewer_url`;
+  `firehose.urls`, `backfill.plc_url`, `backfill.lodestar_url`,
+  `backfill.relay_url`, `backfill.backlinks.url` or
+  `public_ui.record_viewer_url`;
 - a settings save that opens access further: `access.reads` towards
   `public`, `access.cors` or `access.public_ui` switched on;
 - a settings save that shows more on the public pages:
@@ -616,7 +617,7 @@ backfill state at the right, then tabs:
 | Incoming listblocks | List, purpose, blocker, created |
 | Lists | The listblocked lists naming the account: list, purpose, owner, listblock count, added |
 | Blocking lists | The lists the account subscribes to as block lists, among lists this instance serves, with the listblock record. Always shown here, whatever `public_ui.show_outgoing_blocks` says |
-| History | Handle history and host history from the PLC audit log; removed blocks and removed list memberships with created, first and last seen, removed, and how each ended. Read only when the tab is asked for |
+| History | Handle history and host history from the PLC audit log, or from a lodestar instance's history of the account when one is set; removed blocks and removed list memberships with created, first and last seen, removed, and how each ended. Read only when the tab is asked for |
 
 Tables hold 50 rows with numbered page controls and exact count
 headings; the blocks, lists and blocking-lists tables have a filter box.
@@ -971,6 +972,13 @@ directions**:
    to equal the DID. TXT records that name different DIDs name none:
    the handle is then asked over HTTPS alone.
 
+With a [lodestar](lodestar.md) instance (`backfill.lodestar_url`),
+its own verification of the account is asked for first, in one
+request, and steps 1 to 3 are made only when it cannot say: it is
+catching up or not at the directory's tip, does not answer within 1.5
+seconds, or has not checked the handle yet. A stored handle it
+verified is dated by its check, not by Farsight's request.
+
 A handle that fails step 3 is not shown, on any page. A check that
 finds a handle is no longer the account's removes it at once, from
 memory and from `handle_cache`: the document names no handle, the
@@ -1136,9 +1144,20 @@ at most 200), a pace of its own that does not draw on `handle_rps`.
    account, so the pass does not push the accounts pages are showing
    out of it.
 
+With a lodestar instance the walk's checks ask it first, and identity
+changes are taken only once the handle sync has left them, five
+minutes after the event; those the pass checks itself.
+
 Metrics: `farsight_handle_pass_total{outcome}`,
 `farsight_handle_pass_position`, `farsight_handle_pass_laps_total`.
 Progress is on the dashboard's "Catching up".
+
+### The handle sync
+
+With a lodestar instance, a third worker keeps every stored handle in
+step with lodestar's weekly re-verification, 1,000 accounts a request,
+at `public_ui.lodestar_sync_rps` (default 1, `0` = off). It is
+described in [lodestar.md](lodestar.md#the-handle-sync).
 
 ## Profile cards and avatars
 
@@ -1161,7 +1180,10 @@ The request is handled in this order:
    3-second deadline for the whole card and no retry: the PLC audit
    log (or the `did:web` document) for the creation date and host,
    then the handle's forward resolution and the profile record side
-   by side;
+   by side. With a lodestar instance a `did:plc` account is read from
+   it instead (creation date, host and the handle's verification in
+   one request), and the audit log and the forward resolution only
+   when it cannot answer within 1.5 seconds;
 5. the fragment. A part whose fetch failed is left out.
 
 A card makes at most three outbound HTTP requests (the audit log or

@@ -107,8 +107,8 @@ addresses.
 
 Some changes are made only within **10 minutes of signing in**:
 
-- saving a setting under `[auth]` or `[net]`, `backfill.plc_url` or
-  `backfill.relay_url`;
+- saving a setting under `[auth]` or `[net]`, `backfill.plc_url`,
+  `backfill.lodestar_url` or `backfill.relay_url`;
 - opening access further: `access.reads` towards `public`, `access.cors`
   or the public UI switched on;
 - changing where Farsight gets its data or who it trusts: the database

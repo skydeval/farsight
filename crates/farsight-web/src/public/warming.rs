@@ -419,17 +419,17 @@ async fn verify_one(st: Arc<WebState>, did: Did) {
     let cfg = st.api.config.current();
     let cfg = &cfg.config;
     let found = tokio::time::timeout(VERIFY_DEADLINE, handles::verify(&st.safe, cfg, &did)).await;
-    let (outcome, found) = match found {
-        Ok((handles::Outcome::Resolved, v)) => (Outcome::Resolved, v),
-        Ok((handles::Outcome::Unverified, v)) => (Outcome::Unverified, v),
-        Ok((_, v)) => (Outcome::Failed, v),
+    let (outcome, found, at) = match found {
+        Ok((handles::Outcome::Resolved, v, at)) => (Outcome::Resolved, v, at),
+        Ok((handles::Outcome::Unverified, v, at)) => (Outcome::Unverified, v, at),
+        Ok((_, v, at)) => (Outcome::Failed, v, at),
         // Out of time: nothing was established.
-        Err(_) => (Outcome::Failed, handles::Verified::Unknown),
+        Err(_) => (Outcome::Failed, handles::Verified::Unknown, None),
     };
     // A failure is remembered too, so that the next render does not queue
     // the account again at once; a handle found to be someone else's, or
     // no longer named, is dropped here.
-    handles::settle(&st, cfg, &did, found).await;
+    handles::settle(&st, cfg, &did, found, at).await;
     count(outcome, 1);
 }
 

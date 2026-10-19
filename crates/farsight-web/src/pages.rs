@@ -204,6 +204,10 @@ pub fn router(state: Arc<WebState>) -> Router {
             post(crate::public_settings::save),
         )
         .route(
+            "/admin/settings/identity",
+            post(crate::public_settings::save_identity),
+        )
+        .route(
             "/admin/settings/public-ui/confirm",
             post(crate::public_settings::confirm),
         )

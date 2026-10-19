@@ -1,7 +1,11 @@
 //! DID → PDS resolution (see `docs/design/backfill.md` and
-//! `docs/design/security.md`): `did:plc` through the configured PLC
-//! directory (its own limiter, resolver half reserved), `did:web` through
-//! `https://<host>/.well-known/did.json`, both via the safe client.
+//! `docs/design/security.md`): `did:plc` through the lodestar instance
+//! when `backfill.lodestar_url` names one (its own limiter; see
+//! `docs/design/lodestar.md`), and through the configured PLC directory
+//! (its own limiter, resolver half reserved) when it does not or cannot
+//! answer; `did:web` through `https://<host>/.well-known/did.json`; all
+//! via the safe client. [`Resolver::prefetch`] asks lodestar for a page
+//! of accounts in one request and keeps the answers in memory.
 //! Results are cached on `actors.pds_host_id` (TTL 7 days; `identity`
 //! events invalidate) for interned DIDs and in memory for the rest (sweep
 //! members hold no row, and a repo job records the host once it has made
@@ -18,6 +22,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use farsight_core::lodestar::{self, Answer};
 use farsight_core::{Did, DidMethod};
 use farsight_storage::counters::{self, CounterSink, HostChange};
 use ipnet::IpNet;
@@ -79,6 +84,7 @@ pub struct Resolver {
     net: Arc<Net>,
     pool: PgPool,
     plc_url: String,
+    lodestar_url: Option<String>,
     allow_http: Vec<String>,
     large_hosts: Vec<String>,
     cdn_ranges: Vec<IpNet>,
@@ -117,7 +123,7 @@ pub fn address_bucket(ips: &[IpAddr], cdn_ranges: &[ipnet::IpNet]) -> Option<Str
 
 impl Resolver {
     /// A resolver with empty caches. From `config` it takes the PLC
-    /// directory's URL, the hosts allowed over plain HTTP, the large
+    /// directory's URL, the lodestar instance's, the hosts allowed over plain HTTP, the large
     /// hosts and the extra CDN ranges, and keeps them for its lifetime: a
     /// change to any of them restarts the run. `dns` looks up a host's
     /// address for its cap bucket. `counters` takes the usage that moves
@@ -135,6 +141,8 @@ impl Resolver {
             net,
             pool,
             plc_url: config.backfill.plc_url.trim_end_matches('/').to_owned(),
+            lodestar_url: farsight_core::lodestar::base(&config.backfill.lodestar_url)
+                .map(str::to_owned),
             allow_http: config
                 .net
                 .allow_http_hosts
@@ -204,20 +212,7 @@ impl Resolver {
     /// is confirmed with the directory before a repo is purged on its
     /// word (see `jobs::repo`).
     pub fn seed(&self, did: &str, endpoint: &str) {
-        if let Ok(u) = Url::parse(endpoint) {
-            let mut m = self.memory.lock().unwrap_or_else(|e| e.into_inner());
-            make_room(&mut m, MEMORY_CAP, |(_, at)| at.elapsed() >= MEMORY_TTL);
-            m.insert(
-                did.to_owned(),
-                (
-                    Pds {
-                        endpoint: endpoint.trim_end_matches('/').to_owned(),
-                        host: host_key(&u),
-                    },
-                    Instant::now(),
-                ),
-            );
-        }
+        self.remember(did, endpoint);
     }
 
     /// Records `pds` on the row of `did` when the row holds no host, and
@@ -295,7 +290,142 @@ impl Resolver {
         r.map(|pds| (pds, false))
     }
 
+    /// Keeps `endpoint` in memory as the PDS of `did`.
+    fn remember(&self, did: &str, endpoint: &str) {
+        if let Ok(u) = Url::parse(endpoint) {
+            let mut m = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+            make_room(&mut m, MEMORY_CAP, |(_, at)| at.elapsed() >= MEMORY_TTL);
+            m.insert(
+                did.to_owned(),
+                (
+                    Pds {
+                        endpoint: endpoint.trim_end_matches('/').to_owned(),
+                        host: host_key(&u),
+                    },
+                    Instant::now(),
+                ),
+            );
+        }
+    }
+
+    /// Asks lodestar, in one request per [`lodestar::BATCH`], for those
+    /// of `dids` (`did:plc` only) that no cache answers for, and keeps
+    /// what it says in memory: the PDS of each account it has, and the
+    /// DIDs it has not as nonexistent. Nothing happens without a lodestar
+    /// instance, and a batch it cannot answer leaves its DIDs to be
+    /// resolved one by one as before.
+    pub async fn prefetch(&self, dids: &[Did]) {
+        let Some(base) = self.lodestar_url.as_deref() else {
+            return;
+        };
+        let mut wanted: Vec<&str> = {
+            let m = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+            let neg = self.negative.lock().unwrap_or_else(|e| e.into_inner());
+            dids.iter()
+                .filter(|d| d.method() == DidMethod::Plc)
+                .map(Did::as_str)
+                .filter(|d| m.get(*d).is_none_or(|(_, at)| at.elapsed() >= MEMORY_TTL))
+                .filter(|d| neg.get(*d).is_none_or(|t| t.elapsed() >= NEGATIVE_TTL))
+                .collect()
+        };
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return;
+        }
+        // Accounts whose row holds a fresh resolution need no request.
+        let mut known: Vec<String> = sqlx::query_scalar(
+            "SELECT did FROM actors WHERE did = ANY($1) AND pds_host_id IS NOT NULL
+               AND pds_resolved_at > now() - $2 * interval '1 second'",
+        )
+        .bind(
+            wanted
+                .iter()
+                .map(|d| (*d).to_owned())
+                .collect::<Vec<String>>(),
+        )
+        .bind(CACHE_TTL.as_secs() as i64)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        known.sort_unstable();
+        wanted.retain(|d| known.binary_search_by(|k| k.as_str().cmp(d)).is_err());
+        let Some(url) = lodestar::accounts_url(base) else {
+            return;
+        };
+        for chunk in wanted.chunks(lodestar::BATCH) {
+            let body = lodestar::accounts_body(chunk.iter().copied());
+            let answers = match self.net.lodestar_post(&url, body).await {
+                Ok(b) => lodestar::read_batch(200, &b),
+                Err(_) => None,
+            };
+            let Some(answers) = answers else {
+                continue;
+            };
+            for (did, answer) in answers {
+                match answer {
+                    Answer::Account(a) if a.status == lodestar::Status::Active => {
+                        if let Some(p) = &a.pds {
+                            self.remember(&did, p);
+                        }
+                    }
+                    Answer::NotFound => {
+                        let mut neg = self.negative.lock().unwrap_or_else(|e| e.into_inner());
+                        make_room(&mut neg, NEGATIVE_CAP, |at| at.elapsed() >= NEGATIVE_TTL);
+                        neg.insert(did, Instant::now());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// What lodestar says of a `did:plc`; `None` when there is no lodestar
+    /// instance or it cannot answer, and the PLC directory is asked.
+    async fn ask_lodestar(&self, did: &Did) -> Option<Result<Pds, ResolveError>> {
+        let base = self.lodestar_url.as_deref()?;
+        let url = lodestar::account_url(base, did)?;
+        let answer = match self.net.lodestar_get(&url).await {
+            Ok(b) => lodestar::read_account(200, &b),
+            Err(NetError::Http { status, name }) => {
+                let body = serde_json::json!({ "error": name }).to_string();
+                lodestar::read_account(status, body.as_bytes())
+            }
+            Err(_) => Answer::Unavailable,
+        };
+        let found = match answer {
+            Answer::NotFound => Some(Err(ResolveError::NotFound)),
+            Answer::Account(a) => match a.status {
+                lodestar::Status::Tombstoned => Some(Err(ResolveError::Tombstoned)),
+                lodestar::Status::Active => Some(match &a.pds {
+                    Some(endpoint) => Url::parse(endpoint)
+                        .map(|u| Pds {
+                            endpoint: endpoint.clone(),
+                            host: host_key(&u),
+                        })
+                        .map_err(|e| ResolveError::Transient(e.to_string())),
+                    // As with a document that names no PDS.
+                    None => Err(ResolveError::NotFound),
+                }),
+                _ => None,
+            },
+            Answer::Unavailable => None,
+        };
+        let outcome = if found.is_some() {
+            "answered"
+        } else {
+            "fallback"
+        };
+        metrics::counter!(crate::metrics::LODESTAR_READS, "outcome" => outcome).increment(1);
+        found
+    }
+
     async fn resolve_uncached(&self, did: &Did) -> Result<Pds, ResolveError> {
+        if did.method() == DidMethod::Plc
+            && let Some(found) = self.ask_lodestar(did).await
+        {
+            return found;
+        }
         let doc = match did.method() {
             DidMethod::Plc => {
                 self.net.plc.acquire(PlcUse::Resolver).await;

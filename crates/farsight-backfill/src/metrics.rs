@@ -23,11 +23,17 @@ pub const PDS_REQUEST_SECONDS: &str = "farsight_backfill_pds_request_seconds";
 pub const PDS_ERRORS: &str = "farsight_backfill_pds_errors_total";
 /// `farsight_backfill_plc_request_seconds`.
 pub const PLC_REQUEST_SECONDS: &str = "farsight_backfill_plc_request_seconds";
+/// `farsight_backfill_lodestar_request_seconds`.
+pub const LODESTAR_REQUEST_SECONDS: &str = "farsight_backfill_lodestar_request_seconds";
+/// `farsight_backfill_lodestar_reads_total{outcome}`: DID resolutions
+/// asked of lodestar, by whether it answered or the PLC directory was
+/// asked instead (`answered`, `fallback`).
+pub const LODESTAR_READS: &str = "farsight_backfill_lodestar_reads_total";
 /// `farsight_abuse_capped_total{kind}`.
 pub const ABUSE_CAPPED: &str = "farsight_abuse_capped_total";
 
 /// Every backfill metric.
-pub const ALL: [&str; 9] = [
+pub const ALL: [&str; 11] = [
     QUEUE_DEPTH,
     REPOS_TOTAL,
     REPOS_PER_HOUR,
@@ -36,6 +42,8 @@ pub const ALL: [&str; 9] = [
     PDS_REQUEST_SECONDS,
     PDS_ERRORS,
     PLC_REQUEST_SECONDS,
+    LODESTAR_REQUEST_SECONDS,
+    LODESTAR_READS,
     ABUSE_CAPPED,
 ];
 
@@ -131,6 +139,9 @@ pub fn register() {
         metrics::gauge!(SWEEP_PROGRESS, "cycle_kind" => k).set(0.0);
     }
     metrics::gauge!(SWEEP_ETA).set(0.0);
+    for o in ["answered", "fallback"] {
+        metrics::counter!(LODESTAR_READS, "outcome" => o).increment(0);
+    }
     for c in farsight_storage::codes::CapType::ALL {
         metrics::counter!(ABUSE_CAPPED, "kind" => c.label()).increment(0);
     }

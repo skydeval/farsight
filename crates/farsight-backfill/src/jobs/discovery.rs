@@ -90,6 +90,16 @@ impl Run<'_> {
         }
     }
 
+    /// Resolves the authors of `links` with lodestar, a batch at a time,
+    /// before [`Run::verify`] asks for them one by one.
+    async fn prefetch(&self, links: &[Backlink]) {
+        let dids: Vec<Did> = links
+            .iter()
+            .filter_map(|l| Did::parse(&l.did).ok())
+            .collect();
+        self.ctx.resolver.prefetch(&dids).await;
+    }
+
     /// Fetches and parses one referenced record at its author's PDS.
     /// `None` when there is no such record to store; when that could not
     /// be found out, the run is marked truncated as well.
@@ -264,7 +274,9 @@ async fn run_inner(
         pending: Vec::new(),
     };
     // (a) Direct blocks of X.
-    for l in run.links(x.as_str(), Collection::Block.nsid()).await? {
+    let links = run.links(x.as_str(), Collection::Block.nsid()).await?;
+    run.prefetch(&links).await;
+    for l in links {
         if let Some((did, rkey, rec)) = run.verify(&l, Collection::Block).await
             && matches!(&rec, Record::Block(b) if b.subject == *x)
         {
@@ -273,7 +285,9 @@ async fn run_inner(
     }
     // (b) Listitems naming X, authored in the list's own repo.
     let mut lists: Vec<AtUri> = Vec::new();
-    for l in run.links(x.as_str(), Collection::ListItem.nsid()).await? {
+    let links = run.links(x.as_str(), Collection::ListItem.nsid()).await?;
+    run.prefetch(&links).await;
+    for l in links {
         if let Some((did, rkey, rec)) = run.verify(&l, Collection::ListItem).await
             && let Record::ListItem(i) = &rec
             && i.subject == *x
@@ -296,10 +310,11 @@ async fn run_inner(
     // (c) Listblocks on those lists (verified listblocks admit lists the
     // normal way).
     for list in &lists {
-        for l in run
+        let links = run
             .links(&list.to_string(), Collection::ListBlock.nsid())
-            .await?
-        {
+            .await?;
+        run.prefetch(&links).await;
+        for l in links {
             if let Some((did, rkey, rec)) = run.verify(&l, Collection::ListBlock).await
                 && matches!(&rec, Record::ListBlock(b) if b.subject == *list)
             {

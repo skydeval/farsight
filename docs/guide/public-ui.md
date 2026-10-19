@@ -183,6 +183,18 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
   `farsight_handle_pass_laps_total` on the metrics listener. A restart
   begins the walk again and passes over answered accounts without a
   request.
+- **A lodestar instance.** [Lodestar](../design/lodestar.md) is a
+  read-only copy of the PLC directory that has already verified every
+  handle and re-checks each one weekly; skydeval runs one at
+  `https://lodestar.nearhorizon.app`. Name one under Settings →
+  Identity source (`backfill.lodestar_url`) and Farsight asks it first
+  for handles, cards and the History tab, in one request where it
+  would otherwise make up to three, and falls back to the PLC
+  directory and its own checks for whatever it cannot answer. The
+  handle sync (`public_ui.lodestar_sync_rps`, one request a second by
+  default) then reads the handles of every account you hold from it,
+  1,000 at a time, so the stored handles follow lodestar's weekly
+  re-checks without anyone opening a page.
 
 ## How the pages behave
 
@@ -267,6 +279,7 @@ handle_cache_ttl = "1h"           # in memory; the stored copy refills it
 handle_warming_enabled = true     # verify handles of shown accounts in the background
 handle_rps = 20                   # handle checks per second, whole instance; 1-200
 handle_pass_rps = 0               # background checks of every account, per second; 0 = off, at most 200
+lodestar_sync_rps = 1             # with backfill.lodestar_url: handle sync requests per second, 1,000 accounts each; 0 = off
 excluded_dids = []                # at most 10,000
 ```
 
@@ -284,3 +297,6 @@ host, the account's server); these are not counted in
 `backfill.plc_rps`, so lower one of the two if your PLC source has a
 tight limit. With the budget used up, cards show the DID only. A PLC
 mirror must serve `/{did}/log/audit` for cards to show a creation date.
+With a lodestar instance a card is one request to it plus the
+account's server, and the PLC directory and the handle's host are
+asked only when lodestar cannot answer.

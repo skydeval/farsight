@@ -50,6 +50,8 @@ pub struct SettingsPage {
     pub admin_handle: Option<String>,
     /// The Public UI subsection's values.
     pub p: crate::public_settings::View,
+    /// The Identity source subsection's values.
+    pub ident: crate::public_settings::IdentityView,
 }
 
 const REDACTED: &str = "<redacted>";
@@ -138,6 +140,7 @@ pub(crate) fn settings_base(st: &WebState, s: &Admin) -> SettingsPage {
             .cached_handle(&cur.config.access.admin_did)
             .flatten(),
         p: crate::public_settings::View::of(&cur.config),
+        ident: crate::public_settings::IdentityView::of(&cur.config),
     }
 }
 

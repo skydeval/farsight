@@ -35,6 +35,7 @@ pub mod pages;
 pub mod paging;
 pub mod pass;
 pub mod search;
+pub mod sync;
 pub mod text;
 pub mod top;
 pub mod warming;

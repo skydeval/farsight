@@ -18,6 +18,11 @@ pub const HANDLE_RESOLUTIONS: &str = "farsight_public_ui_handle_resolutions_tota
 pub const WITHHELD: &str = "farsight_public_ui_withheld_total";
 /// `farsight_public_ui_cards_total{outcome}`.
 pub const CARDS: &str = "farsight_public_ui_cards_total";
+/// `farsight_public_ui_lodestar_reads_total{outcome}`: reads of the
+/// lodestar instance for handles, cards and the History tab, by whether
+/// it answered (`answered`) or the PLC directory and Farsight's own
+/// checks were used instead (`fallback`).
+pub const LODESTAR_READS: &str = "farsight_public_ui_lodestar_reads_total";
 
 /// The route a public request matched: the `page` label of the request
 /// counter and of the duration histogram.
@@ -95,8 +100,17 @@ pub fn withheld(r: WithheldReason) {
     ::metrics::counter!(WITHHELD, "reason" => r.label()).increment(1);
 }
 
+/// Counts one read of the lodestar instance.
+pub fn lodestar_read(answered: bool) {
+    let outcome = if answered { "answered" } else { "fallback" };
+    ::metrics::counter!(LODESTAR_READS, "outcome" => outcome).increment(1);
+}
+
 /// Registers every series at zero so it is visible before first use.
 pub fn register() {
+    for o in ["answered", "fallback"] {
+        ::metrics::counter!(LODESTAR_READS, "outcome" => o).increment(0);
+    }
     for p in Page::ALL {
         ::metrics::counter!(REQUESTS, "page" => p.label(), "status" => "2xx").increment(0);
     }

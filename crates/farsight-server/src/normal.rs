@@ -59,7 +59,7 @@ pub const TASKS_SHARD: i16 = 1;
 
 /// The supervised tasks of normal mode, by the name their panics are
 /// counted under (the periodic jobs are counted under their own names).
-pub const TASKS: [&str; 10] = [
+pub const TASKS: [&str; 11] = [
     "counter_flush",
     "coverage_snapshot",
     "housekeeping",
@@ -67,6 +67,7 @@ pub const TASKS: [&str; 10] = [
     "metrics_listener",
     "handle_warming",
     "handle_pass",
+    "handle_sync",
     "top_lists",
     "sort_index_builder",
     farsight_web::public::warming::CHECK_TASK,
@@ -226,6 +227,7 @@ pub async fn run(
     farsight_web::public::metrics::register();
     farsight_web::public::warming::register();
     farsight_web::public::pass::register();
+    farsight_web::public::sync::register();
     farsight_core::task::register(&TASKS);
     farsight_core::task::register(&tasks::job_names());
     // Which UI sections sort by shown time: read once before serving, then
@@ -399,6 +401,10 @@ pub async fn run(
         let (web, stop) = (web.clone(), stop_rx.clone());
         move || farsight_web::public::pass::run(web.clone(), stop.clone())
     }));
+    let sync = tokio::spawn(supervise("handle_sync", {
+        let (web, stop) = (web.clone(), stop_rx.clone());
+        move || farsight_web::public::sync::run(web.clone(), stop.clone())
+    }));
     let top_lists = tokio::spawn(supervise("top_lists", {
         let (web, stop) = (web.clone(), stop_rx.clone());
         move || farsight_web::public::top::run(web.clone(), stop.clone())
@@ -497,6 +503,7 @@ pub async fn run(
     housekeeping.abort();
     warming.abort();
     pass.abort();
+    sync.abort();
     top_lists.abort();
     // An interrupted build leaves an invalid index; the next start drops
     // it and builds again.

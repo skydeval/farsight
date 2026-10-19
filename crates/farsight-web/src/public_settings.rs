@@ -450,11 +450,90 @@ impl Settings {
     }
 }
 
+/// What the "Identity source" form shows: the lodestar instance and the
+/// handle sync's pace, as typed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityView {
+    /// `backfill.lodestar_url`; empty: none.
+    pub lodestar_url: String,
+    /// `public_ui.lodestar_sync_rps`.
+    pub lodestar_sync_rps: String,
+}
+
+impl IdentityView {
+    /// The form filled from config `c`.
+    pub fn of(c: &Config) -> IdentityView {
+        IdentityView {
+            lodestar_url: c.backfill.lodestar_url.clone(),
+            lodestar_sync_rps: c.public_ui.lodestar_sync_rps.to_string(),
+        }
+    }
+
+    /// The form as it was submitted.
+    pub fn submitted(form: &HashMap<String, String>) -> IdentityView {
+        let s = |k: &str| form.get(k).cloned().unwrap_or_default();
+        IdentityView {
+            lodestar_url: s("lodestar_url"),
+            lodestar_sync_rps: s("lodestar_sync_rps"),
+        }
+    }
+}
+
+/// The values of the "Identity source" form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentitySettings {
+    /// `backfill.lodestar_url`: trimmed, without a trailing slash; the
+    /// loader checks that it is an http(s) URL.
+    pub lodestar_url: String,
+    /// `public_ui.lodestar_sync_rps`.
+    pub lodestar_sync_rps: u32,
+}
+
+impl IdentitySettings {
+    /// Validates a submitted form.
+    pub fn parse(v: &IdentityView) -> Result<IdentitySettings, SettingsError> {
+        Ok(IdentitySettings {
+            lodestar_url: v.lodestar_url.trim().trim_end_matches('/').to_owned(),
+            lodestar_sync_rps: number(
+                "Handle sync batches per second",
+                &v.lodestar_sync_rps,
+                0,
+                config::MAX_LODESTAR_SYNC_RPS,
+            )?,
+        })
+    }
+
+    /// Writes the values into a `config.toml` table.
+    pub fn apply(&self, t: &mut toml::Table) -> Result<(), SettingsError> {
+        for (name, key, value) in [
+            (
+                "backfill",
+                "lodestar_url",
+                toml::Value::from(self.lodestar_url.clone()),
+            ),
+            (
+                "public_ui",
+                "lodestar_sync_rps",
+                toml::Value::from(i64::from(self.lodestar_sync_rps)),
+            ),
+        ] {
+            t.entry(name)
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| SettingsError::NotATable(name.to_owned()))?
+                .insert(key.into(), value);
+        }
+        Ok(())
+    }
+}
+
 /// A settings change that waits for confirmation.
 #[derive(Debug, Clone)]
 pub enum Change {
     /// The Public UI form.
     Form(Box<Settings>),
+    /// The "Identity source" form.
+    Identity(IdentitySettings),
     /// The whole file, from the raw editor (secrets already put back).
     File {
         /// The text to store.
@@ -463,6 +542,18 @@ pub enum Change {
         /// change is stored only while the file is still that one.
         base: [u8; 32],
     },
+}
+
+impl Change {
+    /// Writes a form's values into a `config.toml` table; a whole file
+    /// writes nothing here.
+    fn apply(&self, t: &mut toml::Table) -> Result<(), SettingsError> {
+        match self {
+            Change::Form(s) => s.apply(t),
+            Change::Identity(s) => s.apply(t),
+            Change::File { .. } => Ok(()),
+        }
+    }
 }
 
 /// What the confirmation page says will become reachable.
@@ -527,10 +618,10 @@ fn dry_run(st: &WebState, change: &Change) -> Result<Config, SettingsError> {
     }
     let text = match change {
         Change::File { text, .. } => text.clone(),
-        Change::Form(s) => {
+        Change::Form(_) | Change::Identity(_) => {
             let current = store.file_text()?;
             let mut table: toml::Table = current.parse()?;
-            s.apply(&mut table)?;
+            change.apply(&mut table)?;
             toml::to_string_pretty(&table)?
         }
     };
@@ -555,9 +646,13 @@ pub(crate) fn is_sensitive(st: &WebState, change: &Change) -> bool {
 pub(crate) async fn commit(st: &WebState, change: &Change) -> Result<EditReport, SettingsError> {
     let store = &st.api.config;
     let r = match change {
-        Change::Form(s) => {
+        Change::Form(_) | Change::Identity(_) => {
             store
-                .edit(|t| s.apply(t).map_err(|e| EditError::Invalid(e.to_string())))
+                .edit(|t| {
+                    change
+                        .apply(t)
+                        .map_err(|e| EditError::Invalid(e.to_string()))
+                })
                 .await
         }
         Change::File { text, base } => store.replace_from(Some(base), text).await,
@@ -614,6 +709,7 @@ fn outcome(
     admin: &Admin,
     result: Result<EditReport, SettingsError>,
     typed: Option<View>,
+    typed_identity: Option<IdentityView>,
     note: Option<String>,
 ) -> Response {
     let mut page = crate::pages::settings_base(st, admin);
@@ -643,6 +739,9 @@ fn outcome(
             if let Some(v) = typed {
                 page.p = v;
             }
+            if let Some(v) = typed_identity {
+                page.ident = v;
+            }
         }
     }
     let mut r = render_private(&page);
@@ -670,7 +769,7 @@ pub async fn save(
     let typed = View::submitted(&form, &st.api.config.current().config);
     let settings = match Settings::parse(&typed) {
         Ok(s) => s,
-        Err(e) => return outcome(&st, &admin, Err(e), Some(typed), None),
+        Err(e) => return outcome(&st, &admin, Err(e), Some(typed), None, None),
     };
     let note = settings.burst_raised.then(|| {
         format!(
@@ -686,13 +785,43 @@ pub async fn save(
         return r;
     }
     match confirmation(&st, &admin, change.clone()) {
-        Err(e) => outcome(&st, &admin, Err(e), Some(typed), None),
+        Err(e) => outcome(&st, &admin, Err(e), Some(typed), None, None),
         Ok(Some(confirm)) => confirm,
         Ok(None) => {
             let r = commit(&st, &change).await;
-            outcome(&st, &admin, r, Some(typed), note)
+            outcome(&st, &admin, r, Some(typed), None, note)
         }
     }
+}
+
+/// `POST /admin/settings/identity`: saves the "Identity source" form. A
+/// change of the lodestar instance needs a fresh sign-in, like a change
+/// of the PLC directory: the pages show the handles it verifies.
+pub async fn save_identity(
+    State(st): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let admin = match gate(&st, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = check_form(&admin, &headers, &form) {
+        return r;
+    }
+    let typed = IdentityView::submitted(&form);
+    let settings = match IdentitySettings::parse(&typed) {
+        Ok(s) => s,
+        Err(e) => return outcome(&st, &admin, Err(e), None, Some(typed), None),
+    };
+    let change = Change::Identity(settings);
+    if is_sensitive(&st, &change)
+        && let Err(r) = step_up(&admin, Return::Settings)
+    {
+        return r;
+    }
+    let r = commit(&st, &change).await;
+    outcome(&st, &admin, r, None, Some(typed), None)
 }
 
 /// `POST /admin/settings/public-ui/confirm`: the second request. Commits the
@@ -741,7 +870,7 @@ pub async fn confirm(
         return r;
     }
     let r = commit(&st, &change).await;
-    outcome(&st, &admin, r, None, None)
+    outcome(&st, &admin, r, None, None, None)
 }
 
 #[cfg(test)]
@@ -888,6 +1017,46 @@ mod tests {
         ] {
             assert!(Settings::parse(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_identity_form_writes_its_two_keys() {
+        let mut form = HashMap::new();
+        form.insert(
+            "lodestar_url".to_owned(),
+            " https://lodestar.example/ ".to_owned(),
+        );
+        form.insert("lodestar_sync_rps".to_owned(), "2".to_owned());
+        let s = IdentitySettings::parse(&IdentityView::submitted(&form)).unwrap();
+        assert_eq!(s.lodestar_url, "https://lodestar.example");
+        let mut t: toml::Table = "[backfill]\nplc_url = \"https://plc.directory\"\n"
+            .parse()
+            .unwrap();
+        s.apply(&mut t).unwrap();
+        assert_eq!(
+            t["backfill"]["lodestar_url"].as_str(),
+            Some("https://lodestar.example")
+        );
+        assert_eq!(
+            t["backfill"]["plc_url"].as_str(),
+            Some("https://plc.directory")
+        );
+        assert_eq!(t["public_ui"]["lodestar_sync_rps"].as_integer(), Some(2));
+        form.insert("lodestar_sync_rps".to_owned(), "21".to_owned());
+        assert!(IdentitySettings::parse(&IdentityView::submitted(&form)).is_err());
+        // Empty: lodestar is not used.
+        form.insert("lodestar_url".to_owned(), String::new());
+        form.insert("lodestar_sync_rps".to_owned(), "1".to_owned());
+        let s = IdentitySettings::parse(&IdentityView::submitted(&form)).unwrap();
+        assert_eq!(s.lodestar_url, "");
+        let c = Config::default();
+        assert_eq!(
+            IdentityView::of(&c),
+            IdentityView {
+                lodestar_url: String::new(),
+                lodestar_sync_rps: "1".into()
+            }
+        );
     }
 
     #[test]

@@ -621,6 +621,7 @@ pub fn restart_needed(old: &Config, new: &Config) -> bool {
         || old.metrics != new.metrics
         || old.backfill.concurrency != new.backfill.concurrency
         || old.backfill.plc_url != new.backfill.plc_url
+        || old.backfill.lodestar_url != new.backfill.lodestar_url
         || old.net != new.net
         || old.limits.large_hosts != new.limits.large_hosts
         || old.limits.cdn_ranges_extra != new.limits.cdn_ranges_extra
@@ -725,6 +726,10 @@ mod tests {
         ));
         assert!(restart_needed(
             &base,
+            &with(|c| c.backfill.lodestar_url = "https://lodestar.example".into())
+        ));
+        assert!(restart_needed(
+            &base,
             &with(|c| c.storage.database_url = "postgres://other".into())
         ));
         // Request limits are taken by the next request.
@@ -734,6 +739,7 @@ mod tests {
             |c| c.backfill.per_domain_rps = 2,
             |c| c.backfill.per_domain_concurrency = 2,
             |c| c.backfill.plc_rps = 3,
+            |c| c.backfill.lodestar_rps = 3,
             |c| c.backfill.on_demand_reserved = 0,
             |c| c.backfill.sweep.enabled = !c.backfill.sweep.enabled,
         ] {

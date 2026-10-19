@@ -120,6 +120,52 @@ pub enum Client {
 }
 
 impl Client {
+    async fn post_json(&self, url: &Url, body: Vec<u8>) -> Result<OutboundResponse, OutboundError> {
+        match self {
+            Client::Safe(c) => c.post_json(url, body).await,
+            #[cfg(feature = "harness")]
+            Client::Plain(c) => {
+                let r = c
+                    .post(url.clone())
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|e| OutboundError::Transport(e.to_string()))?;
+                Self::plain_response(url, r).await
+            }
+        }
+    }
+
+    #[cfg(feature = "harness")]
+    async fn plain_response(
+        url: &Url,
+        r: reqwest::Response,
+    ) -> Result<OutboundResponse, OutboundError> {
+        let status = r.status().as_u16();
+        let headers = r
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let body = r
+            .bytes()
+            .await
+            .map_err(|e| OutboundError::Transport(e.to_string()))?
+            .to_vec();
+        Ok(OutboundResponse {
+            status,
+            headers,
+            body,
+            final_url: url.clone(),
+        })
+    }
+
     async fn get(&self, url: &Url) -> Result<OutboundResponse, OutboundError> {
         match self {
             Client::Safe(c) => c.get(url).await,
@@ -130,28 +176,7 @@ impl Client {
                     .send()
                     .await
                     .map_err(|e| OutboundError::Transport(e.to_string()))?;
-                let status = r.status().as_u16();
-                let headers = r
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.as_str().to_ascii_lowercase(),
-                            String::from_utf8_lossy(v.as_bytes()).into_owned(),
-                        )
-                    })
-                    .collect();
-                let body = r
-                    .bytes()
-                    .await
-                    .map_err(|e| OutboundError::Transport(e.to_string()))?
-                    .to_vec();
-                Ok(OutboundResponse {
-                    status,
-                    headers,
-                    body,
-                    final_url: url.clone(),
-                })
+                Self::plain_response(url, r).await
             }
         }
     }
@@ -869,6 +894,52 @@ impl PlcLimiter {
     }
 }
 
+/// The lodestar limiter: `backfill.lodestar_rps` for every request the
+/// backfill process makes to the lodestar instance, apart from the PLC
+/// directory's budget and from the per-host limits.
+#[derive(Debug)]
+pub struct LodestarLimiter {
+    bucket: Mutex<Bucket>,
+    rate: Mutex<Rate>,
+}
+
+impl LodestarLimiter {
+    fn rate_of(rps: u32) -> Rate {
+        Rate::one_second(f64::from(rps.max(1)))
+    }
+
+    /// A limiter for `rps` requests per second.
+    pub fn new(rps: u32) -> LodestarLimiter {
+        let rate = Self::rate_of(rps);
+        LodestarLimiter {
+            bucket: Mutex::new(Bucket::full(rate, Instant::now())),
+            rate: Mutex::new(rate),
+        }
+    }
+
+    /// Changes the rate to `rps` requests per second.
+    pub fn set_rps(&self, rps: u32) {
+        *self.rate.lock().unwrap_or_else(|e| e.into_inner()) = Self::rate_of(rps);
+    }
+
+    /// Waits for a token.
+    pub async fn acquire(&self) {
+        let asked = Instant::now();
+        loop {
+            let rate = *self.rate.lock().unwrap_or_else(|e| e.into_inner());
+            let wait = {
+                let mut b = self.bucket.lock().unwrap_or_else(|e| e.into_inner());
+                PlcLimiter::take_at(&mut b, rate, Instant::now())
+            };
+            match wait {
+                None => break,
+                Some(w) => tokio::time::sleep(w).await,
+            }
+        }
+        waited_turn(TURN_PLC, asked);
+    }
+}
+
 tokio::task_local! {
     /// The outbound requests of the job running in this task, counted as
     /// they are made: the scheduler charges a job's requester from it
@@ -882,7 +953,7 @@ tokio::task_local! {
     /// The time, in milliseconds, the job running in this task has spent
     /// waiting for its turn and not for an answer: [`TURN_SLOT`] for a
     /// request slot of a host, [`TURN_PLC`] for a token of the PLC
-    /// directory's limiter. The line a finished job logs carries both.
+    /// directory's limiter or of lodestar's. The line a finished job logs carries both.
     pub static TURN_MS: Arc<[AtomicU64; 2]>;
 }
 
@@ -937,6 +1008,9 @@ pub struct Net {
     /// before a request to the directory; requests to that host skip
     /// `hosts`.
     pub plc: PlcLimiter,
+    /// The lodestar instance's own limiter, taken by
+    /// [`Net::lodestar_get`] and [`Net::lodestar_post`].
+    pub lodestar: LodestarLimiter,
 }
 
 /// The host part of a URL used as the limiter key (`host[:port]`).
@@ -1006,6 +1080,7 @@ impl Net {
             settings: RwLock::new(Self::settings(client, cfg)),
             hosts: HostLimiter::with(HostLimits::from_config(cfg)),
             plc: PlcLimiter::new(cfg.backfill.plc_rps),
+            lodestar: LodestarLimiter::new(cfg.backfill.lodestar_rps),
         }
     }
 
@@ -1028,11 +1103,12 @@ impl Net {
     }
 
     /// Applies the request limits of `cfg` (`backfill.per_host_*`,
-    /// `backfill.per_domain_*`, `backfill.plc_rps`) to the requests that
-    /// follow.
+    /// `backfill.per_domain_*`, `backfill.plc_rps`,
+    /// `backfill.lodestar_rps`) to the requests that follow.
     pub fn set_limits(&self, cfg: &Config) {
         self.hosts.set_limits(HostLimits::from_config(cfg));
         self.plc.set_rps(cfg.backfill.plc_rps);
+        self.lodestar.set_rps(cfg.backfill.lodestar_rps);
     }
 
     /// The registrable domain `host` is limited under with the other
@@ -1088,6 +1164,56 @@ impl Net {
     pub async fn get_text(&self, url: &Url) -> Result<String, NetError> {
         let body = self.request(url, "export", true).await?;
         String::from_utf8(body).map_err(|e| NetError::Decode(e.to_string()))
+    }
+
+    /// `GET url` from the lodestar instance, under its own limiter: the
+    /// body of a `200`. Any other status is [`NetError::Http`] with the
+    /// answer's `error` word as its name.
+    pub async fn lodestar_get(&self, url: &Url) -> Result<Vec<u8>, NetError> {
+        self.lodestar_request(url, None).await
+    }
+
+    /// `POST url` with a JSON body to the lodestar instance, as
+    /// [`Net::lodestar_get`].
+    pub async fn lodestar_post(&self, url: &Url, body: Vec<u8>) -> Result<Vec<u8>, NetError> {
+        self.lodestar_request(url, Some(body)).await
+    }
+
+    async fn lodestar_request(
+        &self,
+        url: &Url,
+        body: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, NetError> {
+        self.lodestar.acquire().await;
+        let client = self
+            .settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .client
+            .clone();
+        let _ = METER.try_with(|m| m.fetch_add(1, Ordering::Relaxed));
+        let started = Instant::now();
+        let r = match body {
+            Some(b) => client.post_json(url, b).await,
+            None => client.get(url).await,
+        };
+        let waited = started.elapsed();
+        let _ = WAITED_MS.try_with(|m| {
+            m.fetch_add(
+                u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            )
+        });
+        metrics::histogram!(m::LODESTAR_REQUEST_SECONDS).record(waited.as_secs_f64());
+        match r {
+            Err(farsight_core::net::OutboundError::TooLarge(n)) => Err(NetError::TooLarge(n)),
+            Err(e) => Err(NetError::Transport(e.to_string())),
+            Ok(resp) if resp.status == 200 => Ok(resp.body),
+            Ok(resp) => Err(NetError::Http {
+                status: resp.status,
+                name: error_name(&resp.body),
+            }),
+        }
     }
 
     /// `GET url` through the per-host limiter: the body of a `200`.

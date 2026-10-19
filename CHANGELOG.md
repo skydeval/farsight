@@ -9,7 +9,37 @@ database schema; each entry says so where it does.
 
 ## [Unreleased]
 
+### Added
+
+- Identities from lodestar: a new setting, `backfill.lodestar_url`
+  (Settings → Identity source in the admin UI), names a
+  [lodestar](https://github.com/skydeval/lodestar) instance, a
+  read-only copy of the PLC directory that verifies every handle and
+  re-checks each one weekly. With one set, Farsight asks it first for
+  DID resolution in the backfill (a sweep's next 1,000 members in one
+  request), for the handles on pages and cards, and for a card's
+  creation date and the History tab; whatever it cannot answer goes to
+  the PLC directory and Farsight's own checks as before. Listing
+  identities for the `plc` sweep source and the admin sign-in stay with
+  the PLC directory. Empty, the default, changes nothing. See
+  `docs/design/lodestar.md`.
+- The handle sync: with a lodestar instance, the stored handles of
+  every account follow lodestar's weekly re-verification, 1,000
+  accounts a request (`public_ui.lodestar_sync_rps`, default 1, 0 =
+  off), and an account's identity change is settled from lodestar once
+  it has re-checked the handle.
+- `backfill.lodestar_rps` (default 50): the backfill's request rate to
+  the lodestar instance, a budget of its own apart from
+  `backfill.plc_rps`.
+- Metrics: `farsight_backfill_lodestar_reads_total`,
+  `farsight_backfill_lodestar_request_seconds`,
+  `farsight_public_ui_lodestar_reads_total` and
+  `farsight_handle_sync_{total,position,laps_total}`.
+
 ### Changed
+
+- A change of `backfill.lodestar_url` from the admin UI needs a
+  sign-in within the last ten minutes, as `backfill.plc_url` does.
 
 - Docs: the storage guide and the README say how long a first sweep
   takes: a little over two days with 0.6.3 or later, measured on a

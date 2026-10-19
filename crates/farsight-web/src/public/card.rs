@@ -16,7 +16,11 @@
 //!    `docs/design/security.md`), with one deadline for the whole card
 //!    and no retry: the PLC audit log (or the did:web document), then
 //!    the handle's forward resolution and the profile record side by
-//!    side;
+//!    side. With a lodestar instance (`backfill.lodestar_url`, see
+//!    `docs/design/lodestar.md`) a did:plc's account is read from it
+//!    instead, in one request that also brings the handle's
+//!    verification; the audit log and the forward resolution are read
+//!    only when it cannot answer;
 //! 5. the fragment. A part whose fetch failed is left out.
 //!
 //! **The avatar is never fetched by the server.** The fragment names the
@@ -148,6 +152,9 @@ pub struct Identity {
     pub claim: Option<String>,
     /// Its PDS endpoint, as written.
     pub pds: Option<String>,
+    /// The handle's verification, when the identity was read from a
+    /// lodestar instance that could say ([`handles::from_lodestar`]).
+    pub verified: Option<(handles::Outcome, handles::Verified, Option<DateTime<Utc>>)>,
 }
 
 /// Reads a PLC audit log: the creation time from the first entry, and
@@ -173,6 +180,7 @@ pub fn read_audit_log(body: &[u8]) -> Option<Identity> {
         created: Some(created),
         claim,
         pds,
+        verified: None,
     })
 }
 
@@ -265,8 +273,70 @@ pub enum History {
     Unavailable,
 }
 
-/// Reads the account's PLC audit log for its History tab: one request,
-/// through the safe client, under the card budget and the card deadline.
+/// Most pages of `/account/{did}/history` read for one History tab.
+pub const HISTORY_PAGES: usize = 5;
+
+/// A lodestar history, newest first, as the History tab's lists: oldest
+/// first, a repeated value adding nothing, a PDS reduced to its host.
+pub fn lodestar_history(changes: &[farsight_core::lodestar::Change]) -> LogHistory {
+    let mut out = LogHistory::default();
+    for c in changes.iter().rev() {
+        let host = c
+            .pds
+            .as_deref()
+            .and_then(|p| Url::parse(p).ok())
+            .and_then(|u| u.host_str().map(str::to_owned));
+        for (list, value) in [
+            (&mut out.handles, c.handle_claim.clone()),
+            (&mut out.hosts, host),
+        ] {
+            if let Some(value) = value
+                && list.last().is_none_or(|h| h.value != value)
+            {
+                list.push(Held {
+                    value,
+                    since: c.changed_at,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The account's history from the lodestar instance, up to
+/// [`HISTORY_PAGES`] pages by `deadline`; `None` when there is none or
+/// it cannot answer.
+async fn history_from_lodestar(
+    st: &WebState,
+    cfg: &Config,
+    did: &Did,
+    deadline: tokio::time::Instant,
+) -> Option<LogHistory> {
+    use farsight_core::lodestar;
+    let base = lodestar::base(&cfg.backfill.lodestar_url)?;
+    let mut changes = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..HISTORY_PAGES {
+        let url = lodestar::history_url(base, did, cursor.as_deref())?;
+        let r = tokio::time::timeout_at(deadline, st.safe.get(&url))
+            .await
+            .ok()?
+            .ok()?;
+        let (page, next) = lodestar::read_history(r.status, &r.body)?;
+        changes.extend(page);
+        match next {
+            Some(n) => cursor = Some(n),
+            None => return Some(lodestar_history(&changes)),
+        }
+    }
+    // More changes than the pages read: the oldest are left out.
+    Some(lodestar_history(&changes))
+}
+
+/// Reads the account's history for its History tab, through the safe
+/// client, under the card budget and the card deadline: from the lodestar
+/// instance if there is one and it answers, else the PLC audit log in one
+/// request.
 pub async fn history(st: &WebState, cfg: &Config, did: &Did) -> History {
     if did.method() != DidMethod::Plc {
         return History::NoLog;
@@ -280,6 +350,15 @@ pub async fn history(st: &WebState, cfg: &Config, did: &Did) -> History {
     {
         return History::Unavailable;
     }
+    let deadline = tokio::time::Instant::now() + CARD_DEADLINE;
+    if farsight_core::lodestar::base(&cfg.backfill.lodestar_url).is_some() {
+        let lodestar_deadline = deadline.min(tokio::time::Instant::now() + handles::LODESTAR_WAIT);
+        let found = history_from_lodestar(st, cfg, did, lodestar_deadline).await;
+        m::lodestar_read(found.is_some());
+        if let Some(h) = found {
+            return History::Log(h);
+        }
+    }
     let Ok(url) = Url::parse(&format!(
         "{}/{}/log/audit",
         cfg.backfill.plc_url.trim_end_matches('/'),
@@ -287,7 +366,7 @@ pub async fn history(st: &WebState, cfg: &Config, did: &Did) -> History {
     )) else {
         return History::Unavailable;
     };
-    match tokio::time::timeout(CARD_DEADLINE, st.safe.get(&url)).await {
+    match tokio::time::timeout_at(deadline, st.safe.get(&url)).await {
         Ok(Ok(r)) if r.status == 200 => {
             read_history(&r.body).map_or(History::Unavailable, History::Log)
         }
@@ -312,6 +391,7 @@ pub fn read_did_document(body: &[u8]) -> Option<Identity> {
         created: None,
         claim: claimed_handle(&doc),
         pds,
+        verified: None,
     })
 }
 
@@ -519,14 +599,15 @@ async fn avatar(
     Ok(cid.and_then(|c| avatar_url(cfg, did, endpoint, &c)))
 }
 
-/// The handle of a card: the cached answer, or the account's claim
-/// verified forward and cached like a page's. `Err`: the resolution did
-/// not finish in time; nothing is cached.
+/// The handle of a card: the cached answer, lodestar's verification if
+/// the identity was read from it, or the account's claim verified
+/// forward; cached like a page's. `Err`: the resolution did not finish
+/// in time; nothing is cached.
 async fn handle(
     st: &WebState,
     cfg: &Config,
     did: &Did,
-    claim: Option<&str>,
+    ident: &Identity,
     deadline: tokio::time::Instant,
 ) -> Result<Option<String>, ()> {
     if let Some(c) = handles::cached(st, cfg, did).await {
@@ -536,6 +617,11 @@ async fn handle(
             Cached::None => None,
         });
     }
+    if let Some((outcome, found, at)) = ident.verified.clone() {
+        m::handle_resolution(outcome);
+        return Ok(handles::settle(st, cfg, did, found, at).await);
+    }
+    let claim = ident.claim.as_deref();
     // The account's identity was read: no claim means it names no
     // handle, and a claim that resolves to another account is not its
     // handle either. Both drop a handle shown until now.
@@ -554,7 +640,40 @@ async fn handle(
     };
     let (outcome, found) = handles::classify(did, claim.map(str::to_owned), back, answered);
     m::handle_resolution(outcome);
-    Ok(handles::settle(st, cfg, did, found).await)
+    Ok(handles::settle(st, cfg, did, found, None).await)
+}
+
+/// A did:plc's identity from the lodestar instance. `Err`: it cannot
+/// answer, and the audit log is read. `Ok(None)`: the DID is unknown or
+/// tombstoned, as an audit log would say.
+async fn identity_from_lodestar(
+    safe: &SafeClient,
+    cfg: &Config,
+    did: &Did,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Identity>, ()> {
+    use farsight_core::lodestar::{Answer, Status};
+    let lodestar_deadline = deadline.min(tokio::time::Instant::now() + handles::LODESTAR_WAIT);
+    let answer =
+        tokio::time::timeout_at(lodestar_deadline, handles::lodestar_account(safe, cfg, did))
+            .await
+            .unwrap_or(Answer::Unavailable);
+    let found = match &answer {
+        Answer::NotFound => Ok(None),
+        Answer::Account(a) => match a.status {
+            Status::Active => Ok(Some(Identity {
+                created: a.created_at,
+                claim: a.claimed_handle.clone(),
+                pds: a.pds.clone(),
+                verified: handles::from_lodestar(&answer),
+            })),
+            Status::Tombstoned => Ok(None),
+            _ => Err(()),
+        },
+        Answer::Unavailable => Err(()),
+    };
+    m::lodestar_read(found.is_ok());
+    found
 }
 
 async fn identity(
@@ -563,6 +682,12 @@ async fn identity(
     did: &Did,
     deadline: tokio::time::Instant,
 ) -> Option<Identity> {
+    if did.method() == DidMethod::Plc
+        && farsight_core::lodestar::base(&cfg.backfill.lodestar_url).is_some()
+        && let Ok(found) = identity_from_lodestar(safe, cfg, did, deadline).await
+    {
+        return found;
+    }
     let url = match did.method() {
         DidMethod::Plc => Url::parse(&format!(
             "{}/{}/log/audit",
@@ -727,16 +852,13 @@ async fn card(
         return fragment(cfg, who, &view, Cache::NoStore);
     };
     let show_avatars = cfg.public_ui.show_avatars;
-    let (handle, avatar) = tokio::join!(
-        handle(st, cfg, &did, ident.claim.as_deref(), deadline),
-        async {
-            if show_avatars {
-                avatar(st, cfg, &did, ident.pds.as_deref(), deadline).await
-            } else {
-                Ok(None)
-            }
+    let (handle, avatar) = tokio::join!(handle(st, cfg, &did, &ident, deadline), async {
+        if show_avatars {
+            avatar(st, cfg, &did, ident.pds.as_deref(), deadline).await
+        } else {
+            Ok(None)
         }
-    );
+    });
     // 5. The fragment.
     let failed = handle.is_err() || avatar.is_err();
     let view = CardView {
@@ -936,6 +1058,46 @@ mod tests {
             Some(LogHistory::default())
         );
         assert_eq!(read_history(b"{}"), None);
+    }
+
+    #[test]
+    fn lodestars_history_reads_like_the_log() {
+        use farsight_core::lodestar::Change;
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let c = |t: &str, h: Option<&str>, p: &str| Change {
+            changed_at: at(t),
+            handle_claim: h.map(str::to_owned),
+            pds: Some(p.to_owned()),
+        };
+        // Newest first, as lodestar gives them.
+        let changes = [
+            c(
+                "2023-05-01T00:00:00Z",
+                Some("first.example"),
+                "https://new.example:8443",
+            ),
+            c(
+                "2023-03-01T00:00:00Z",
+                Some("second.example"),
+                "https://old.example",
+            ),
+            c("2023-02-01T00:00:00Z", None, "https://old.example"),
+            c(
+                "2023-01-01T00:00:00Z",
+                Some("first.example"),
+                "https://old.example",
+            ),
+        ];
+        let h = lodestar_history(&changes);
+        let names = |v: &[Held]| v.iter().map(|x| x.value.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            names(&h.handles),
+            ["first.example", "second.example", "first.example"]
+        );
+        assert_eq!(names(&h.hosts), ["old.example", "new.example"]);
+        assert_eq!(h.handles[1].since, at("2023-03-01T00:00:00Z"));
+        assert_eq!(h.hosts[1].since, at("2023-05-01T00:00:00Z"));
+        assert_eq!(lodestar_history(&[]), LogHistory::default());
     }
 
     #[test]

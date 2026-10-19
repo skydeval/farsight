@@ -212,16 +212,23 @@ pub async fn stored(conn: &mut PgConnection, dids: &[String]) -> Result<Vec<Stor
         .collect())
 }
 
-/// Stores `handle` as the handle of `did`, verified now. Replaces what
-/// was stored for the DID.
-pub async fn store(conn: &mut PgConnection, did: &Did, handle: &str) -> Result<()> {
+/// Stores `handle` as the handle of `did`, verified at `at` (a lodestar
+/// instance's check), or now. Replaces what was stored for the DID.
+pub async fn store(
+    conn: &mut PgConnection,
+    did: &Did,
+    handle: &str,
+    at: Option<DateTime<Utc>>,
+) -> Result<()> {
     sqlx::query(
-        "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, $2, now())
+        "INSERT INTO handle_cache (did, handle, resolved_at)
+         VALUES ($1, $2, LEAST(COALESCE($3, now()), now()))
          ON CONFLICT (did) DO UPDATE
            SET handle = EXCLUDED.handle, resolved_at = EXCLUDED.resolved_at",
     )
     .bind(did.as_str())
     .bind(handle)
+    .bind(at)
     .execute(conn)
     .await?;
     Ok(())
@@ -269,15 +276,22 @@ pub async fn avatar_store(conn: &mut PgConnection, did: &Did, cid: Option<&str>)
     Ok(())
 }
 
-/// Records that `did` definitely has no handle to show, as of now. A
-/// handle stored for it is replaced: its document no longer names it, or
-/// the handle now belongs to another account.
-pub async fn store_gone(conn: &mut PgConnection, did: &Did) -> Result<()> {
+/// Records that `did` definitely has no handle to show, as of `at` (a
+/// lodestar instance's check) or now. A handle stored for it is
+/// replaced: its document no longer names it, or the handle now belongs
+/// to another account.
+pub async fn store_gone(
+    conn: &mut PgConnection,
+    did: &Did,
+    at: Option<DateTime<Utc>>,
+) -> Result<()> {
     sqlx::query(
-        "INSERT INTO handle_cache (did, handle, resolved_at) VALUES ($1, '', now())
+        "INSERT INTO handle_cache (did, handle, resolved_at)
+         VALUES ($1, '', LEAST(COALESCE($2, now()), now()))
          ON CONFLICT (did) DO UPDATE SET handle = '', resolved_at = EXCLUDED.resolved_at",
     )
     .bind(did.as_str())
+    .bind(at)
     .execute(conn)
     .await?;
     Ok(())
@@ -340,12 +354,40 @@ pub async fn store_unknown(conn: &mut PgConnection, did: &Did) -> Result<()> {
 }
 
 /// The accounts whose handle is to be checked first: the oldest entries
-/// of `handle_due` that may be served now.
-pub async fn due_take(conn: &mut PgConnection, limit: i64) -> Result<Vec<String>> {
+/// of `handle_due` that may be served now and were asked for at least
+/// `min_age_secs` ago.
+pub async fn due_take(
+    conn: &mut PgConnection,
+    limit: i64,
+    min_age_secs: i64,
+) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar(
-        "SELECT did FROM handle_due WHERE asked_at <= now() ORDER BY asked_at LIMIT $1",
+        "SELECT did FROM handle_due WHERE asked_at <= now() - $2 * interval '1 second'
+         ORDER BY asked_at LIMIT $1",
     )
     .bind(limit)
+    .bind(min_age_secs)
+    .fetch_all(conn)
+    .await?)
+}
+
+/// The entries of `handle_due` asked for between `max_age_secs` and
+/// `min_age_secs` ago, oldest first, with when each was asked for.
+pub async fn due_window(
+    conn: &mut PgConnection,
+    limit: i64,
+    min_age_secs: i64,
+    max_age_secs: i64,
+) -> Result<Vec<(String, DateTime<Utc>)>> {
+    Ok(sqlx::query_as(
+        "SELECT did, asked_at FROM handle_due
+         WHERE asked_at <= now() - $2 * interval '1 second'
+           AND asked_at > now() - $3 * interval '1 second'
+         ORDER BY asked_at LIMIT $1",
+    )
+    .bind(limit)
+    .bind(min_age_secs)
+    .bind(max_age_secs)
     .fetch_all(conn)
     .await?)
 }
@@ -413,6 +455,45 @@ pub async fn pass_batch(
         _ => end,
     };
     Ok((rows.into_iter().map(|(_, did)| did).collect(), reached))
+}
+
+/// One account of a step of the handle sync, with what is stored for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRow {
+    /// `actors.id`.
+    pub id: i64,
+    /// The account.
+    pub did: String,
+    /// Its stored handle and when that was established, if anything is
+    /// stored; an empty handle is "nothing to show".
+    pub stored: Option<(String, DateTime<Utc>)>,
+}
+
+/// A row of [`sync_batch`]'s query: id, DID, stored handle and its date.
+type SyncTuple = (i64, String, Option<String>, Option<DateTime<Utc>>);
+
+/// One step of the handle sync's walk: the next `limit` accounts after
+/// `after` in id order that no table hides for good (not deactivated,
+/// not deleted), with what `handle_cache` holds for each.
+pub async fn sync_batch(conn: &mut PgConnection, after: i64, limit: i64) -> Result<Vec<SyncRow>> {
+    let rows: Vec<SyncTuple> = sqlx::query_as(&format!(
+        "SELECT a.id, a.did, h.handle, h.resolved_at FROM actors a
+             LEFT JOIN handle_cache h ON h.did = a.did
+             WHERE a.id > $1 AND a.status NOT IN {GONE}
+             ORDER BY a.id LIMIT $2"
+    ))
+    .bind(after)
+    .bind(limit)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, did, handle, at)| SyncRow {
+            id,
+            did,
+            stored: handle.zip(at),
+        })
+        .collect())
 }
 
 #[cfg(test)]

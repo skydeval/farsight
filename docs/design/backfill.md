@@ -134,8 +134,11 @@ For a DID `D`:
    witness clock at job start.
 3. **Resolve** `D` to its PDS through the outbound client that
    refuses private addresses (see [security.md](security.md)).
-   `did:plc` goes to `backfill.plc_url` under the PLC limiter;
-   `did:web` to `https://<host>/.well-known/did.json`. The result is
+   `did:plc` goes to the lodestar instance at `backfill.lodestar_url`
+   if one is set, under its own limiter, and to `backfill.plc_url`
+   under the PLC limiter when lodestar cannot answer or none is set
+   ([lodestar.md](lodestar.md)); `did:web` to
+   `https://<host>/.well-known/did.json`. The result is
    cached in `actors` for 7 days; an `identity` event for a known DID
    clears the cache. A tombstoned DID sets the account `deleted` and
    ends the job **inactive**. A DID that does not resolve is a failure.
@@ -498,6 +501,7 @@ Every outbound request waits for a slot on its host:
 | Token bucket, requests per second over all hosts of one registrable domain | `backfill.per_domain_rps` | 20 |
 | Concurrent requests over all hosts of one registrable domain | `backfill.per_domain_concurrency` | 8 |
 | PLC directory, requests per second in total | `backfill.plc_rps` | 20 |
+| Lodestar instance, requests per second in total | `backfill.lodestar_rps` | 50 |
 
 - A host is its name and port. The registrable domain is the one the
   cap buckets use (eTLD+1 by the public suffix list), so an operator
@@ -545,6 +549,8 @@ Every outbound request waits for a slot on its host:
   minutes; beyond 10,000 hosts the others are forgotten.
 - Half of `plc_rps` is reserved for DID resolution; enumeration of the
   PLC export uses the other half only.
+- Requests to a lodestar instance take neither a host slot nor a PLC
+  token: `lodestar_rps` is their own budget.
 - The User-Agent is `farsight/<version> (+https://<hostname>;
   <contact>)`.
 
@@ -589,7 +595,13 @@ Every member has to be resolved before it can be read, so for a large
 source expect resolution at `plc_rps` to set the pace of the first
 sweep; the number of DIDs divided by `plc_rps` is its lower bound. A
 PLC mirror with a
-higher limit (`backfill.plc_url`, `backfill.plc_rps`) shortens that.
+higher limit (`backfill.plc_url`, `backfill.plc_rps`) shortens that,
+and so does a lodestar instance (`backfill.lodestar_url`): the
+scheduler asks it for the next 1,000 members it is about to dispatch
+in one request and keeps their hosts in memory, so a member's job
+finds its account already resolved
+([lodestar.md](lodestar.md)). Subject discovery does the same with
+each page of backlinks.
 With the `plc` source, `backfill.plc_seed_from_export = true` takes
 each account's PDS from the export itself. The export is a history:
 the endpoint of an operation may have been replaced by a later one
