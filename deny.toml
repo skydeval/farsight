@@ -17,7 +17,13 @@ all-features = true
 version = 2
 # A yanked version in Cargo.lock fails the check, like a vulnerability.
 yanked = "deny"
-ignore = []
+ignore = [
+    # basic-toml is unmaintained and has no successor release. It comes in
+    # only through askama_derive, at compile time, to read the repo's own
+    # askama.toml; it never sees runtime or network input. Every askama
+    # release up to 0.16.1 still depends on it. Revisit when askama drops it.
+    { id = "RUSTSEC-2026-0374", reason = "build-time only, through askama_derive; reads only the repo's askama.toml" },
+]
 
 [licenses]
 version = 2

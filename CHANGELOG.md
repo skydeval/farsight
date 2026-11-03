@@ -33,6 +33,20 @@ database schema; each entry says so where it does.
   are purged, and its lists end `dead`. Lists already stuck this way
   clear at their next weekly check. Either answer alone still deletes
   nothing.
+- Dependencies: rustls-webpki 0.103.16, webpki-roots 1.0.11, tokio
+  1.54.1, zstd 0.13.4, zstd-safe 7.4.0 and zstd-sys 2.1.2, for
+  RUSTSEC-2026-0381, -0382, -0386, -0391, -0398, -0403 and -0410. Three
+  apply to Farsight. In its outgoing TLS, certificate checks could
+  accept distrusted intermediates (-0382), and the bundled roots still
+  trusted the distrusted emSign intermediates (-0381). In the
+  decompression of the frames a Jetstream instance sends, a failed
+  legacy-format frame could expose uninitialised memory (-0403). The
+  others do not apply: Farsight builds no `AsyncFd`, gives each frame a
+  decoder of its own, reads no seekable frames, and is not built for
+  WebAssembly. `basic-toml`, which the template macros use to read
+  their configuration at build time, is unmaintained and has no
+  successor (RUSTSEC-2026-0374). cargo-deny now ignores that advisory,
+  with the reason recorded in `deny.toml`.
 
 ## [0.7.0] - 2026-10-19
 
