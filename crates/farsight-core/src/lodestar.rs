@@ -21,6 +21,8 @@ use crate::Did;
 
 /// Most DIDs one `POST /accounts` asks for.
 pub const BATCH: usize = 1_000;
+/// Most identities one page of `GET /accounts` holds.
+pub const LISTING_PAGE: u32 = 1_000;
 /// Entries one page of `/account/{did}/history` is asked for.
 pub const HISTORY_PAGE: u32 = 200;
 
@@ -51,6 +53,18 @@ pub fn history_url(base: &str, did: &Did, cursor: Option<&str>) -> Option<url::U
 /// `POST {base}/accounts`.
 pub fn accounts_url(base: &str) -> Option<url::Url> {
     url::Url::parse(&format!("{base}/accounts")).ok()
+}
+
+/// `GET {base}/accounts`: the listing of every identity, `count` (at
+/// most [`LISTING_PAGE`]) from `cursor`, or from the first without one.
+pub fn listing_url(base: &str, count: u32, cursor: Option<&str>) -> Option<url::Url> {
+    let mut u = accounts_url(base)?;
+    u.query_pairs_mut()
+        .append_pair("count", &count.clamp(1, LISTING_PAGE).to_string());
+    if let Some(c) = cursor {
+        u.query_pairs_mut().append_pair("cursor", c);
+    }
+    Some(u)
 }
 
 /// The body of a `POST /accounts` for `dids` (at most [`BATCH`]).
@@ -251,6 +265,41 @@ impl Account {
     }
 }
 
+/// One page of `GET /accounts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// Each identity with its account, in the order they were created.
+    pub accounts: Vec<(String, Account)>,
+    /// The position after the last entry, opaque; `None` only when
+    /// lodestar gave none.
+    pub next_cursor: Option<String>,
+    /// Whether lodestar was at the directory's tip. Every page but the
+    /// last is whole either way; a short page that is not fresh is not
+    /// the end of the listing, only of what lodestar has read so far.
+    pub fresh: bool,
+}
+
+/// Reads a page of `GET /accounts`. `None` when it gives nothing to go
+/// by, and when any entry is not an account with a DID: dropped, it
+/// would make the page look shorter than it is, and a short page ends
+/// the listing.
+pub fn read_listing(status: u16, body: &[u8]) -> Option<Listing> {
+    if status != 200 {
+        return None;
+    }
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let accounts = v["accounts"]
+        .as_array()?
+        .iter()
+        .map(|a| Some((a["did"].as_str()?.to_owned(), parse_account(a)?)))
+        .collect::<Option<Vec<_>>>()?;
+    Some(Listing {
+        accounts,
+        next_cursor: v["next_cursor"].as_str().map(str::to_owned),
+        fresh: fresh(&v),
+    })
+}
+
 /// One change of an account's handle claim or PDS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
@@ -435,6 +484,49 @@ mod tests {
     }
 
     #[test]
+    fn listing_pages() {
+        let page = |accounts: Value, fresh: bool| {
+            serde_json::to_vec(&json!({
+                "accounts": accounts,
+                "next_cursor": "1668645559084000_did:plc:b",
+                "source": source(fresh)
+            }))
+            .unwrap()
+        };
+        let body = page(
+            json!([
+                {"did": "did:plc:a", "status": "active", "pds": "https://pds.example/",
+                 "created_at": "2022-11-17T00:35:16.391Z", "created_at_kind": "plc_genesis"},
+                {"did": "did:web:b.example", "status": "unresolvable",
+                 "created_at": "2024-01-01T00:00:00Z", "created_at_kind": "first_seen"},
+                {"did": "did:plc:c", "status": "tombstoned", "handle_status": "none"}
+            ]),
+            true,
+        );
+        let l = read_listing(200, &body).unwrap();
+        let dids: Vec<&str> = l.accounts.iter().map(|(d, _)| d.as_str()).collect();
+        assert_eq!(dids, ["did:plc:a", "did:web:b.example", "did:plc:c"]);
+        assert_eq!(l.accounts[0].1.pds.as_deref(), Some("https://pds.example"));
+        assert_eq!(l.accounts[2].1.status, Status::Tombstoned);
+        assert_eq!(l.next_cursor.as_deref(), Some("1668645559084000_did:plc:b"));
+        assert!(l.fresh);
+        // A page that is not fresh is still read; the caller decides.
+        let stale = read_listing(200, &page(json!([]), false)).unwrap();
+        assert!(!stale.fresh && stale.accounts.is_empty());
+        // An entry without a DID or a status fails the page.
+        assert_eq!(
+            read_listing(200, &page(json!([{"status": "active"}]), true)),
+            None
+        );
+        assert_eq!(
+            read_listing(200, &page(json!([{"did": "did:plc:a"}]), true)),
+            None
+        );
+        assert_eq!(read_listing(503, br#"{"error":"unavailable"}"#), None);
+        assert_eq!(read_listing(200, b"<html>"), None);
+    }
+
+    #[test]
     fn urls() {
         assert_eq!(base(" https://l.example/ "), Some("https://l.example"));
         assert_eq!(base(""), None);
@@ -448,6 +540,18 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "https://l.example/account/did:plc:z72i7hdynmk6r22z27h6tvur/history?limit=200&cursor=3"
+        );
+        assert_eq!(
+            listing_url("https://l.example", 5000, None)
+                .unwrap()
+                .as_str(),
+            "https://l.example/accounts?count=1000"
+        );
+        assert_eq!(
+            listing_url("https://l.example", 0, Some("1668645559084000_did:plc:b"))
+                .unwrap()
+                .as_str(),
+            "https://l.example/accounts?count=1&cursor=1668645559084000_did%3Aplc%3Ab"
         );
     }
 }

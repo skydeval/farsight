@@ -29,11 +29,18 @@ pub const LODESTAR_REQUEST_SECONDS: &str = "farsight_backfill_lodestar_request_s
 /// asked of lodestar, by whether it answered or the PLC directory was
 /// asked instead (`answered`, `fallback`).
 pub const LODESTAR_READS: &str = "farsight_backfill_lodestar_reads_total";
+/// `farsight_backfill_sweep_plc_pages_total{source}`: pages of the `plc`
+/// sweep source read, by where from (`lodestar`, `export`).
+pub const SWEEP_PLC_PAGES: &str = "farsight_backfill_sweep_plc_pages_total";
+/// `farsight_backfill_sweep_plc_fallbacks_total`: times a `plc` cycle
+/// went on from the PLC directory's export because lodestar's listing
+/// failed.
+pub const SWEEP_PLC_FALLBACKS: &str = "farsight_backfill_sweep_plc_fallbacks_total";
 /// `farsight_abuse_capped_total{kind}`.
 pub const ABUSE_CAPPED: &str = "farsight_abuse_capped_total";
 
 /// Every backfill metric.
-pub const ALL: [&str; 11] = [
+pub const ALL: [&str; 13] = [
     QUEUE_DEPTH,
     REPOS_TOTAL,
     REPOS_PER_HOUR,
@@ -44,6 +51,8 @@ pub const ALL: [&str; 11] = [
     PLC_REQUEST_SECONDS,
     LODESTAR_REQUEST_SECONDS,
     LODESTAR_READS,
+    SWEEP_PLC_PAGES,
+    SWEEP_PLC_FALLBACKS,
     ABUSE_CAPPED,
 ];
 
@@ -142,6 +151,10 @@ pub fn register() {
     for o in ["answered", "fallback"] {
         metrics::counter!(LODESTAR_READS, "outcome" => o).increment(0);
     }
+    for s in ["lodestar", "export"] {
+        metrics::counter!(SWEEP_PLC_PAGES, "source" => s).increment(0);
+    }
+    metrics::counter!(SWEEP_PLC_FALLBACKS).increment(0);
     for c in farsight_storage::codes::CapType::ALL {
         metrics::counter!(ABUSE_CAPPED, "kind" => c.label()).increment(0);
     }

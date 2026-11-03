@@ -576,7 +576,7 @@ from `sweep_incomplete` to complete coverage.
 |---|---|---|
 | `relay_collections` (default) | `com.atproto.sync.listReposByCollection` on the relay, for `block`, `listblock` and `list` in turn | Only accounts that have one of those collections; as complete as the relay's collection directory |
 | `relay_repos` | `com.atproto.sync.listRepos` on the relay | Every repository the relay knows; expect most to hold none of the four collections and end after one `describeRepo` |
-| `plc` | the PLC directory's `/export`, in order | Every `did:plc` ever registered, and no `did:web` |
+| `plc` | the PLC directory's `/export`, in order; with `backfill.lodestar_url` set, lodestar's listing of every identity, falling back to the export ([lodestar.md](lodestar.md#the-plc-sweep-source)) | Every `did:plc` ever registered; through lodestar, also the `did:web` identities it knows |
 
 The relay is `backfill.relay_url` (default `https://bsky.network`).
 Before every `relay_collections` cycle the process probes the relay

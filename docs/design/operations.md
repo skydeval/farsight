@@ -331,7 +331,7 @@ The resume plan, failover and seam repair are explained in
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Whether the systematic sweep runs. `admin.pauseSweep` and the Operations page set this. |
-| `source` | `"relay_collections"` | Enumeration source: `relay_collections` (the relay's per-collection repository listing), `relay_repos` (the relay's `listRepos`) or `plc` (the PLC export, exhaustive and slow). |
+| `source` | `"relay_collections"` | Enumeration source: `relay_collections` (the relay's per-collection repository listing), `relay_repos` (the relay's `listRepos`) or `plc` (the PLC export, or lodestar's listing with `lodestar_url` set; exhaustive and slow). |
 | `max_repos_per_hour` | `0` | Pacing cap; `0` means bounded only by the per-host limits. |
 | `full_every_days` | `0` | Interval of a periodic full cycle; `0` means never. |
 | `max_outstanding` | `10_000_000` | Bound on cycle members handed out and not yet finished. At least 1. The default holds a whole `relay_collections` listing, which is what spreads the work over every host ([backfill.md](backfill.md)); a member outstanding costs about 160 bytes. |
@@ -776,6 +776,8 @@ request. These counts are in memory only.
 | `farsight_backfill_plc_request_seconds` | histogram | |
 | `farsight_backfill_lodestar_request_seconds` | histogram | |
 | `farsight_backfill_lodestar_reads_total` | counter | `outcome` (`answered`, `fallback`) |
+| `farsight_backfill_sweep_plc_pages_total` | counter | `source` (`lodestar`, `export`) |
+| `farsight_backfill_sweep_plc_fallbacks_total` | counter | |
 
 The `host` label names the 50 hosts with the most requests and puts
 the rest under `other`, so it has at most 51 values. Request counts

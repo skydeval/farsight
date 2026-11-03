@@ -68,8 +68,10 @@ pub struct Cycle {
     /// `sweep_cycles.checkpoint`: where the next page starts, in the
     /// source's own terms: `<collection index>|<cursor>` for
     /// `relay_collections`, the relay's cursor for `relay_repos`, the
-    /// last operation's `createdAt` for the PLC export, the last DID for
-    /// known DIDs. `None` before the first page.
+    /// last operation's `createdAt` for the PLC export or
+    /// `lodestar:<time>|<cursor>` for lodestar's listing (both `plc`;
+    /// see [`LODESTAR_CP`]), the last DID for known DIDs. `None` before
+    /// the first page.
     pub checkpoint: Option<String>,
     /// Repair lower bound (`min(from_at)` of covered gaps).
     pub repair_from: Option<DateTime<Utc>>,
@@ -744,41 +746,7 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
             let done = next.is_none();
             Ok((members, next.or(cp), done))
         }
-        CycleSource::Plc => {
-            // A page too large to read is asked for again at half the
-            // size: at the same size it would be too large every time.
-            let mut count = room.clamp(1, 1000);
-            let mut ops = loop {
-                match xrpc::plc_export(&ctx.net, &cfg.backfill.plc_url, cp.as_deref(), count).await
-                {
-                    Err(crate::net::NetError::TooLarge(_)) if count > 1 => count /= 2,
-                    r => break r.map_err(SweepError::from)?,
-                }
-            };
-            let full = ops.len() >= count as usize;
-            let done = !full;
-            let (used, next) = xrpc::export_step(&ops, full);
-            let next = next.map(str::to_owned).or(cp);
-            ops.truncate(used);
-            // The directory decides how many operations a page holds, so
-            // DIDs are told apart with a set, not by searching the page.
-            let mut members = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for op in ops.into_iter().filter(|o| !o.nullified) {
-                if cfg.backfill.plc_seed_from_export
-                    && let Some(p) = &op.pds
-                {
-                    ctx.resolver.seed(&op.did, p);
-                }
-                if seen.insert(op.did.clone()) {
-                    members.push(Member {
-                        did: op.did,
-                        reactivated: false,
-                    });
-                }
-            }
-            Ok((members, next, done))
-        }
+        CycleSource::Plc => Ok(plc_page(ctx, cp, room).await?),
         CycleSource::KnownDids => {
             // KNOWN_DIDS: every DID in backfill_state plus owners of
             // tracked lists, in DID order; checkpoint = last DID.
@@ -810,6 +778,224 @@ async fn next_page(ctx: &Ctx, c: &Cycle, room: u32) -> Result<Page, PageError> {
             ))
         }
     }
+}
+
+/// The start of a `plc` cycle's checkpoint that is a position in
+/// lodestar's listing: `lodestar:<creation time of the last identity
+/// stored>|<lodestar's cursor>`. Any other checkpoint of a `plc` cycle is
+/// the `createdAt` of the export's last operation. The two are never read
+/// as each other.
+const LODESTAR_CP: &str = "lodestar:";
+/// Tries of a page of lodestar's listing before the cycle goes on from
+/// the export.
+const LISTING_ATTEMPTS: u32 = 3;
+/// Wait before a page of the listing is asked for again.
+const LISTING_RETRY_WAIT: Duration = Duration::from_secs(2);
+
+/// Where a `plc` cycle stands.
+#[derive(Debug, PartialEq, Eq)]
+enum PlcPosition<'a> {
+    /// Before the first page, which either source can give.
+    Start,
+    /// In lodestar's listing: the creation time of the last identity
+    /// stored (empty when none had one), and the cursor after it.
+    Lodestar {
+        created_at: &'a str,
+        cursor: &'a str,
+    },
+    /// In the export, after this `createdAt`.
+    Export(&'a str),
+}
+
+fn plc_position(cp: Option<&str>) -> PlcPosition<'_> {
+    let Some(cp) = cp else {
+        return PlcPosition::Start;
+    };
+    match cp.strip_prefix(LODESTAR_CP) {
+        Some(rest) => {
+            let (created_at, cursor) = rest.split_once('|').unwrap_or(("", rest));
+            PlcPosition::Lodestar { created_at, cursor }
+        }
+        None => PlcPosition::Export(cp),
+    }
+}
+
+/// Where the export takes over from lodestar's listing: a second before
+/// the creation of the last identity stored, so that one created in the
+/// same instant and not listed yet is not skipped. Members already stored
+/// are not stored twice. `None`, the export's start, when there is no
+/// time to go by.
+fn export_resume(created_at: &str) -> Option<String> {
+    let t = DateTime::parse_from_rfc3339(created_at).ok()?;
+    Some(
+        (t.with_timezone(&Utc) - chrono::Duration::seconds(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+}
+
+/// A page of the `plc` source. A cycle that starts while
+/// `backfill.lodestar_url` names an instance reads lodestar's listing of
+/// every identity, one entry per identity in the order they were created;
+/// any other reads the PLC directory's `/export`. When a page of the
+/// listing fails, or the setting is emptied, the cycle goes on from the
+/// export, from where the listing stood, and stays on it.
+async fn plc_page(ctx: &Ctx, cp: Option<String>, room: u32) -> Res<Page> {
+    let base = farsight_core::lodestar::base(&ctx.cfg().backfill.lodestar_url).map(str::to_owned);
+    let after = match (plc_position(cp.as_deref()), base) {
+        (PlcPosition::Export(after), _) => Some(after.to_owned()),
+        (PlcPosition::Start, None) => None,
+        (position, base) => {
+            let (created_at, cursor) = match position {
+                PlcPosition::Lodestar { created_at, cursor } => (created_at, Some(cursor)),
+                _ => ("", None),
+            };
+            let why = match base {
+                Some(base) => match lodestar_page(ctx, &base, created_at, cursor, room).await {
+                    Ok(page) => {
+                        metrics::counter!(m::SWEEP_PLC_PAGES, "source" => "lodestar").increment(1);
+                        return Ok(page);
+                    }
+                    Err(why) => why,
+                },
+                None => "no lodestar instance is set any more".to_owned(),
+            };
+            let after = export_resume(created_at);
+            metrics::counter!(m::SWEEP_PLC_FALLBACKS).increment(1);
+            tracing::warn!(
+                reason = %why,
+                after = after.as_deref().unwrap_or("the start"),
+                "lodestar's listing failed; the plc cycle goes on from the PLC directory's export"
+            );
+            after
+        }
+    };
+    let page = export_page(ctx, after, room).await?;
+    metrics::counter!(m::SWEEP_PLC_PAGES, "source" => "export").increment(1);
+    Ok(page)
+}
+
+/// A page of lodestar's listing from `cursor` (from the first without
+/// one); `created_at` is the creation time stored with the cursor. `Err`
+/// says why it gives nothing to go by: an error, an answer that cannot be
+/// read, or a last page from an instance not at the directory's tip,
+/// whose listing would end early.
+async fn lodestar_page(
+    ctx: &Ctx,
+    base: &str,
+    created_at: &str,
+    cursor: Option<&str>,
+    room: u32,
+) -> Result<Page, String> {
+    use farsight_core::lodestar;
+    let mut count = room.clamp(1, lodestar::LISTING_PAGE);
+    // A failed connection, a timeout, a 429 or a 5xx (a proxy in front of
+    // lodestar answers the odd request with a 502) is tried again before
+    // the cycle leaves the listing for good. Another error would only
+    // repeat itself.
+    let mut attempts = 1;
+    let listing = loop {
+        let url = lodestar::listing_url(base, count, cursor)
+            .ok_or_else(|| "the lodestar URL is not a URL".to_owned())?;
+        match ctx.net.lodestar_get(&url).await {
+            Ok(body) => {
+                break lodestar::read_listing(200, &body)
+                    .ok_or_else(|| "a page of the listing could not be read".to_owned())?;
+            }
+            // As with the export: at the same size it would be too large
+            // every time.
+            Err(crate::net::NetError::TooLarge(_)) if count > 1 => count /= 2,
+            Err(
+                crate::net::NetError::Transport(_)
+                | crate::net::NetError::Http {
+                    status: 429 | 500..,
+                    ..
+                },
+            ) if attempts < LISTING_ATTEMPTS => {
+                attempts += 1;
+                tokio::time::sleep(LISTING_RETRY_WAIT).await;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let done = listing.accounts.len() < count as usize;
+    if done && !listing.fresh {
+        return Err(
+            "lodestar is not at the directory's tip, so its listing would end early".into(),
+        );
+    }
+    let created_at = listing
+        .accounts
+        .iter()
+        .rev()
+        .find_map(|(_, a)| a.created_at)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+        .unwrap_or_else(|| created_at.to_owned());
+    let next = listing
+        .next_cursor
+        .or_else(|| cursor.map(str::to_owned))
+        .map(|c| format!("{LODESTAR_CP}{created_at}|{c}"));
+    let seed = ctx.cfg().backfill.plc_seed_from_export;
+    // A `did:web` whose document lodestar could not read for two weeks
+    // would only fail its job for a week and end unreachable; a later
+    // cycle takes it once lodestar reads it again. The page stays as long
+    // as it was for `done` and the cursor.
+    let members = listing
+        .accounts
+        .into_iter()
+        .filter(|(_, a)| a.status != lodestar::Status::Unresolvable)
+        .map(|(did, a)| {
+            if seed
+                && a.status == lodestar::Status::Active
+                && did.starts_with("did:plc:")
+                && let Some(p) = &a.pds
+            {
+                ctx.resolver.seed(&did, p);
+            }
+            Member {
+                did,
+                reactivated: false,
+            }
+        })
+        .collect();
+    Ok((members, next, done))
+}
+
+/// A page of the PLC directory's `/export` after `after` (from its start
+/// without one).
+async fn export_page(ctx: &Ctx, after: Option<String>, room: u32) -> Res<Page> {
+    let cfg = ctx.cfg();
+    // A page too large to read is asked for again at half the size: at
+    // the same size it would be too large every time.
+    let mut count = room.clamp(1, 1000);
+    let mut ops = loop {
+        match xrpc::plc_export(&ctx.net, &cfg.backfill.plc_url, after.as_deref(), count).await {
+            Err(crate::net::NetError::TooLarge(_)) if count > 1 => count /= 2,
+            r => break r?,
+        }
+    };
+    let full = ops.len() >= count as usize;
+    let done = !full;
+    let (used, next) = xrpc::export_step(&ops, full);
+    let next = next.map(str::to_owned).or(after);
+    ops.truncate(used);
+    // The directory decides how many operations a page holds, so DIDs
+    // are told apart with a set, not by searching the page.
+    let mut members = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for op in ops.into_iter().filter(|o| !o.nullified) {
+        if cfg.backfill.plc_seed_from_export
+            && let Some(p) = &op.pds
+        {
+            ctx.resolver.seed(&op.did, p);
+        }
+        if seen.insert(op.did.clone()) {
+            members.push(Member {
+                did: op.did,
+                reactivated: false,
+            });
+        }
+    }
+    Ok((members, next, done))
 }
 
 /// Repos changed since `from − slack − lag`, repos the relay reports
@@ -1183,5 +1369,45 @@ mod tests {
         );
         assert_eq!(invalid, 5);
         assert_eq!(valid_members(Vec::new()), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn the_two_plc_checkpoints_are_told_apart() {
+        assert_eq!(plc_position(None), PlcPosition::Start);
+        assert_eq!(
+            plc_position(Some("2023-04-12T04:53:57.057Z")),
+            PlcPosition::Export("2023-04-12T04:53:57.057Z")
+        );
+        assert_eq!(
+            plc_position(Some(
+                "lodestar:2022-11-17T00:39:19.084Z|1668645559084000_did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+            )),
+            PlcPosition::Lodestar {
+                created_at: "2022-11-17T00:39:19.084Z",
+                cursor: "1668645559084000_did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+        );
+        // A cursor with no time stored before it.
+        assert_eq!(
+            plc_position(Some("lodestar:|c")),
+            PlcPosition::Lodestar {
+                created_at: "",
+                cursor: "c"
+            }
+        );
+    }
+
+    #[test]
+    fn the_export_takes_over_a_second_early() {
+        assert_eq!(
+            export_resume("2022-11-17T00:39:19.084Z").as_deref(),
+            Some("2022-11-17T00:39:18.084Z")
+        );
+        assert_eq!(
+            export_resume("2024-01-01T00:00:00.123456Z").as_deref(),
+            Some("2023-12-31T23:59:59.123Z")
+        );
+        assert_eq!(export_resume(""), None);
+        assert_eq!(export_resume("not a time"), None);
     }
 }

@@ -23,14 +23,11 @@ has.
 | The card's "DID created" and its host | The PLC audit log | `GET /account/{did}` (`created_at`, `pds`) |
 | The History tab's handles and hosts | The PLC audit log | `GET /account/{did}/history`, up to five pages of 200 |
 | The stored handles of every account ([below](#the-handle-sync)) | Re-checked one by one, only by the handle pass or a page view | `POST /accounts`, 1,000 accounts a request |
+| Every identity, for the `plc` sweep source ([below](#the-plc-sweep-source)) | The directory's `/export`, an operation at a time | `GET /accounts`, 1,000 identities a page |
 
-Two things always stay with the PLC directory:
-
-- **The `plc` sweep source.** It lists every identity from the
-  directory's `/export`; lodestar keeps no operation log to list from.
-- **Admin sign-in.** OAuth reads the admin's keys and services from the
-  source, at the address the process started with
-  ([web-ui.md](web-ui.md#admin-sign-in)).
+Admin sign-in always stays with the PLC directory: OAuth reads the
+admin's keys and services from the source, at the address the process
+started with ([web-ui.md](web-ui.md#admin-sign-in)).
 
 `did:web` accounts are resolved in the backfill as before, from their
 own host. Their handles go through lodestar like any other, since it
@@ -63,6 +60,39 @@ does not answer: a stored handle equal to the claim is kept for two
 weeks after its last verification. Asking the PLC directory again for
 every such answer would bring back the lookups lodestar exists to
 save.
+
+## The `plc` sweep source
+
+A full cycle of the `plc` sweep source
+([backfill.md](backfill.md#sources)) that starts while
+`backfill.lodestar_url` is set reads lodestar's listing of every
+identity, `GET /accounts`, instead of the directory's `/export`. The
+listing has one entry per identity, as it is now, in the order the
+identities were created; the export has one per operation, so an
+identity recurs and nullified operations appear. A cycle from the
+start enumerates the same `did:plc` identities either way, tombstoned
+ones included. The listing also holds the `did:web` identities
+lodestar knows, which the export never had; they are members like any
+other, except one lodestar marks `unresolvable` (its document could not
+be read for two weeks), which would only fail; a later cycle takes it
+once lodestar reads it again. With `backfill.plc_seed_from_export`, each active `did:plc`
+member's PDS is taken from its entry, which is its current one rather
+than one from the history.
+
+The cycle's checkpoint says which of the two it is in: lodestar's
+cursor, stored with the creation time of the last identity stored, or
+the export's last `createdAt`. Neither is ever read as the other.
+
+A failed connection, a timeout, a `429` or a `5xx` is tried again,
+three tries in all, two seconds apart. If a page of the listing still
+fails (or fails with another error, cannot be read, or is a last page
+from an instance that is not at the directory's tip, whose listing
+would end early), or
+`backfill.lodestar_url` is emptied, the cycle goes on from the export,
+from a second before the creation time stored, and stays on it.
+Starting a little early skips nothing; members already stored are not
+stored twice. A cycle that started on the export stays on it when the
+setting is filled in.
 
 ## The handle sync
 
@@ -134,6 +164,8 @@ the server uses it from the next request.
 | Name | Type | Labels |
 |---|---|---|
 | `farsight_backfill_lodestar_reads_total` | counter | `outcome` (`answered`, `fallback`) |
+| `farsight_backfill_sweep_plc_pages_total` | counter | `source` (`lodestar`, `export`) |
+| `farsight_backfill_sweep_plc_fallbacks_total` | counter | |
 | `farsight_backfill_lodestar_request_seconds` | histogram | |
 | `farsight_public_ui_lodestar_reads_total` | counter | `outcome` (`answered`, `fallback`) |
 | `farsight_handle_sync_total` | counter | `outcome` (`written`, `unchanged`, `unknown`) |

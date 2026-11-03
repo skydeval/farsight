@@ -7,6 +7,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Before 1.0, a minor version may change addresses, settings or the
 database schema; each entry says so where it does.
 
+## [Unreleased]
+
+### Changed
+
+- The `plc` sweep source reads lodestar's listing of every identity
+  when `backfill.lodestar_url` is set: one entry per identity instead
+  of one per operation, and the `did:web` identities lodestar knows as
+  well, except those it cannot resolve. If the listing fails mid-cycle, the cycle goes on from the PLC
+  directory's export where the listing stood. A lodestar instance
+  without the listing (before 0.2) fails the first page, and the cycle
+  uses the export as before. Two new metrics count the pages from each
+  source and the fallbacks. See `docs/design/lodestar.md`.
+
 ## [0.7.0] - 2026-10-19
 
 ### Added
