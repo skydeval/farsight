@@ -369,10 +369,19 @@ or a refused connection. On one:
    account is inactive with a hidden status, the status is stored and
    the outcome is **inactive**. `throttled` and `desynchronized`
    repositories are not hidden and count as a failure here.
-3. Otherwise the outcome is **failed**.
+3. If the PDS the directory names answered `RepoNotFound`, and the
+   relay answers `RepoNotFound` too, the account is gone: neither the
+   host nor the relay holds it. The status `deleted` is stored, which
+   asks for the purge of the account's rows, and the outcome is
+   **inactive**. A relay that does not know the account deletes
+   nothing on its own: after any other repo-level error, or where the
+   directory could not be read again, the outcome is **failed**.
+4. Otherwise the outcome is **failed**.
 
 An account's status is set only from the relay, Jetstream or the PLC
-directory, never from what a PDS says about itself.
+directory, never from what a PDS says about itself. The relay's
+`RepoNotFound` is its answer that it holds no such account; it is
+acted on only together with the host's.
 
 A failed job records `last_error`, increments `attempts`, and is put
 back in the queue in its tier with a delay from
@@ -914,7 +923,9 @@ passes without a request. Otherwise:
 4. On the second attempt: a missing record is *not found*. On
    `RepoNotFound` the relay's `getRepoStatus` decides: not active is
    *owner inactive* (and the status is stored), active is *not found*,
-   no answer is an *error*. On another repo-level error the relay is
+   `RepoNotFound` is *owner inactive* with the status `deleted` stored
+   (neither the owner's host nor the relay holds the account), and no
+   answer is an *error*. On another repo-level error the relay is
    asked too: not active is *owner inactive*, anything else an
    *error*. Every other failure is an *error*.
 

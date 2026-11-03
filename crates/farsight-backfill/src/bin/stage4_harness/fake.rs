@@ -47,6 +47,9 @@ pub struct World {
     /// Relay `getRepoStatus` failures: for these DIDs the relay answers
     /// 500 instead of a status.
     pub status_down: HashSet<String>,
+    /// Relay `getRepoStatus`: DIDs the relay does not know (`RepoNotFound`)
+    /// although the PDS holds a repo for them.
+    pub status_unknown: HashSet<String>,
     /// Relay `listReposByCollection`: collection → DIDs (sorted).
     pub by_collection: BTreeMap<String, BTreeSet<String>>,
     /// Relay `listRepos`: `(did, rev, active)`, in order.
@@ -105,6 +108,9 @@ async fn xrpc(State(s): State<Shared>, Path(method): Path<String>, Query(q): Q) 
         "getRepoStatus" => {
             if world.status_down.contains(&did) {
                 return err(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError");
+            }
+            if world.status_unknown.contains(&did) {
+                return err(StatusCode::BAD_REQUEST, "RepoNotFound");
             }
             if let Some((active, status)) = world.status.get(&did).cloned() {
                 return Json(json!({"did": did, "active": active, "status": status}))

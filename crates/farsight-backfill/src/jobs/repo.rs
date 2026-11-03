@@ -793,6 +793,10 @@ pub enum RelayVerdict {
     Shown(Option<String>),
     /// The relay stated that the account is active.
     Active,
+    /// The relay answered `RepoNotFound`: it holds no such account. Taken
+    /// as a deletion only where the account's own host, read from the
+    /// directory, also said the repo does not exist.
+    Gone,
     /// The relay gave no answer to act on: an error, a cooling host, a
     /// timeout, or a response that does not say whether the account is
     /// active.
@@ -801,8 +805,10 @@ pub enum RelayVerdict {
 
 /// Reads the relay's answer. Only an answer is a verdict: an error says
 /// nothing about the account, so it neither confirms nor lifts a status.
+/// `RepoNotFound` is the relay's answer that it holds no such account.
 pub fn relay_verdict_of(answer: &Result<xrpc::RepoStatus, crate::net::NetError>) -> RelayVerdict {
     match answer {
+        Err(e) if xrpc::is_repo_not_found(e) => RelayVerdict::Gone,
         Err(e) => RelayVerdict::Unknown(e.to_string()),
         Ok(s) if !s.stated => RelayVerdict::Unknown("the relay's answer has no `active`".into()),
         Ok(s) if s.active => RelayVerdict::Active,
@@ -1136,6 +1142,12 @@ async fn attempt(
                     "relay status of a hidden account: {why}"
                 ))));
             }
+            // Without the host's word the relay's alone deletes nothing.
+            RelayVerdict::Gone => {
+                return Err(e(Stop::Failed(
+                    "relay status of a hidden account: the relay does not know it".into(),
+                )));
+            }
         }
     }
     let mut stamp = run.stamp;
@@ -1188,21 +1200,44 @@ async fn attempt(
         .await;
         match listed {
             Ok(o) => return Ok((o, stamp.map(|s| s.rev))),
-            Err(Stop::RepoLevel(err)) if !bypass => {
-                // Re-resolve bypassing the cache; if the PDS changed,
-                // retry there.
-                bypass = true;
-                match ctx.resolver.resolve(did, true).await {
-                    Ok(p2) if p2 != pds => {
-                        // A stamp read at the old host says nothing of
-                        // the repo at the new one.
-                        if !resumed {
-                            stamp = None;
+            Err(Stop::RepoLevel(err)) => {
+                // Re-resolve bypassing the cache, unless this turn's host
+                // was already read that way; if the PDS changed, retry
+                // there.
+                let confirmed = if bypass {
+                    true
+                } else {
+                    bypass = true;
+                    match ctx.resolver.resolve(did, true).await {
+                        Ok(p2) if p2 != pds => {
+                            // A stamp read at the old host says nothing of
+                            // the repo at the new one.
+                            if !resumed {
+                                stamp = None;
+                            }
+                            continue;
                         }
-                        continue;
+                        Ok(_) => true,
+                        Err(_) => false,
                     }
-                    _ => return Err((Stop::RepoLevel(err), stamp.map(|s| s.rev))),
+                };
+                if confirmed && xrpc::is_repo_not_found(&err) {
+                    // The host the directory names has no such repo: the
+                    // relay decides, once. Neither holding it is a
+                    // deletion.
+                    return match relay_verdict(ctx, did, cost).await {
+                        RelayVerdict::Gone => {
+                            record_hidden(ctx, did, Some("deleted".into())).await;
+                            Ok((Outcome::Inactive, stamp.map(|s| s.rev)))
+                        }
+                        RelayVerdict::Hidden(status) => {
+                            record_hidden(ctx, did, status).await;
+                            Ok((Outcome::Inactive, stamp.map(|s| s.rev)))
+                        }
+                        _ => Err((Stop::Failed(err.to_string()), stamp.map(|s| s.rev))),
+                    };
                 }
+                return Err((Stop::RepoLevel(err), stamp.map(|s| s.rev)));
             }
             Err(Stop::Unconfirmed) if !bypass => {
                 bypass = true;
@@ -1520,7 +1555,7 @@ mod tests {
             },
             NetError::Http {
                 status: 400,
-                name: "RepoNotFound".into(),
+                name: "RepoDeactivated".into(),
             },
             NetError::Cooling {
                 host: "relay.example".into(),
@@ -1535,6 +1570,16 @@ mod tests {
                 "{e}"
             );
         }
+        // The relay holds no such account: an answer, but not a status.
+        // The hidden path does not lift a status on it, and only a host
+        // that also has no such repo makes it a deletion.
+        assert_eq!(
+            relay_verdict_of(&Err(NetError::Http {
+                status: 400,
+                name: "RepoNotFound".into(),
+            })),
+            RelayVerdict::Gone
+        );
         // An answer that does not say whether the account is active.
         assert!(matches!(
             relay_verdict_of(&Ok(answer(true, false, None))),

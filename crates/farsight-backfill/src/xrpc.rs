@@ -30,6 +30,13 @@ pub fn is_repo_level(e: &NetError) -> bool {
     }
 }
 
+/// Whether `e` says the repo does not exist at the host that answered
+/// (`RepoNotFound`, which a reference PDS's "Could not find repo" also
+/// reads as).
+pub fn is_repo_not_found(e: &NetError) -> bool {
+    e.xrpc_name() == Some(REPO_NOT_FOUND)
+}
+
 fn url(base: &str, path: &str, q: &[(&str, &str)]) -> Result<Url, NetError> {
     let mut u = Url::parse(base.trim_end_matches('/'))
         .and_then(|b| b.join(path))
@@ -529,6 +536,32 @@ mod tests {
             status: 500,
             name: String::new()
         }));
+    }
+
+    #[test]
+    fn only_repo_not_found_says_the_repo_does_not_exist() {
+        let http = |name: &str| NetError::Http {
+            status: 400,
+            name: name.into(),
+        };
+        // A reference PDS's "Could not find repo" is read as RepoNotFound.
+        let pds = crate::net::error_name(
+            br#"{"error":"InvalidRequest","message":"Could not find repo: did:plc:x"}"#,
+        );
+        assert!(is_repo_not_found(&http(&pds)));
+        assert!(is_repo_not_found(&http("RepoNotFound")));
+        for other in [
+            "RepoDeactivated",
+            "RepoTakendown",
+            "RecordNotFound",
+            "InvalidRequest",
+            "",
+        ] {
+            assert!(!is_repo_not_found(&http(other)), "{other}");
+        }
+        assert!(!is_repo_not_found(&NetError::Transport(
+            "connection refused".into()
+        )));
     }
 
     #[test]

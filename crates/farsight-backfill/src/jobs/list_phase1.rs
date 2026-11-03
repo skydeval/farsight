@@ -422,6 +422,18 @@ async fn record_check(ctx: &Ctx, l: &ListRow, cost: &mut u64) -> Check {
                             Check::OwnerInactive
                         }
                         Ok(_) => Check::NotFound,
+                        // Neither the owner's host nor the relay holds the
+                        // account: it was deleted.
+                        Err(r) if xrpc::is_repo_not_found(&r) => {
+                            let _ = crate::jobs::repo::apply_status(
+                                ctx,
+                                &l.owner,
+                                false,
+                                Some("deleted".into()),
+                            )
+                            .await;
+                            Check::OwnerInactive
+                        }
                         Err(_) => Check::Error(e.to_string()),
                     };
                 }

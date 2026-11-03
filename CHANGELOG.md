@@ -20,6 +20,20 @@ database schema; each entry says so where it does.
   uses the export as before. Two new metrics count the pages from each
   source and the fallbacks. See `docs/design/lodestar.md`.
 
+### Fixed
+
+- Accounts deleted upstream are now recognised. The relay answers
+  `RepoNotFound` for an account it no longer holds, and Farsight took
+  that for no answer. Such an account stayed active, with its blocks
+  and listblocks still served. Its block lists stayed `unavailable` and
+  were checked again every week, so `checkBlocks` reported every
+  account subscribed to one in `partialFor` with `list_unavailable`.
+  When the host the PLC directory names and the relay both answer
+  `RepoNotFound`, the account is now stored as `deleted` and its rows
+  are purged, and its lists end `dead`. Lists already stuck this way
+  clear at their next weekly check. Either answer alone still deletes
+  nothing.
+
 ## [0.7.0] - 2026-10-19
 
 ### Added

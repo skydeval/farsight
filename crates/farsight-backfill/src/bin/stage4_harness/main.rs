@@ -444,6 +444,10 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
         ("extra: work survives a stop", 15),
         ("extra: hosts that never finish, and bounded work", 16),
         ("extra: a cycle left with failing members only", 17),
+        (
+            "extra: an account that neither its host nor the relay holds",
+            18,
+        ),
     ];
     for (name, n) in checks {
         c.section(name);
@@ -463,6 +467,7 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
             15 => check_survives(&h, c).await,
             16 => check_bounds(&h, c).await,
             17 => check_completes_past_failing(&h, c).await,
+            18 => check_gone(&h, c).await,
             _ => check_discovery(&h, c).await,
         };
         if let Err(x) = r {
@@ -3807,6 +3812,149 @@ async fn check_completes_past_failing(h: &H, c: &mut Checks) -> Res<()> {
         c.backfill.terminal_after = ConfigDuration::secs(5);
         c.backfill.retry_schedule = vec![ConfigDuration::secs(1)];
     });
+    Ok(())
+}
+
+// ------------------------------------------------- extra: gone accounts
+
+/// An account that its own host, read from the directory, and the relay
+/// both say they do not hold is deleted, in list phase 1 and in a repo
+/// job. The host's word alone, or the relay's alone, deletes nothing.
+async fn check_gone(h: &H, c: &mut Checks) -> Res<()> {
+    let status_of = |d: &str| format!("SELECT status::BIGINT FROM actors WHERE did = '{d}'");
+    let blocks_of = |d: &str| {
+        format!(
+            "SELECT count(*) FROM blocks b JOIN actors x ON x.id = b.author_id WHERE x.did = '{d}'"
+        )
+    };
+    // A: list phase 1. The owner is in the directory, on no repo of its
+    // host and unknown to the relay. A block it wrote before it went is
+    // stored.
+    let owner = did("gna", 1);
+    w(&h.world).plc.insert(owner.clone(), h.pds.clone());
+    h.fh(
+        &owner,
+        Collection::Block,
+        &tid_now(),
+        block_v(&did("sub", 90)),
+    )
+    .await?;
+    let rk = tid_now();
+    h.fh(
+        &did("gnb", 1),
+        Collection::ListBlock,
+        &tid_now(),
+        lb_v(&list_uri(&owner, &rk)),
+    )
+    .await?;
+    let lid = h.list_id(&owner, &rk).await?;
+    jobs::list_phase1::run(&h.ctx, ListId::new(lid)).await;
+    let status = h.i64(&status_of(&owner)).await?;
+    let job = h
+        .bool(&format!(
+            "SELECT EXISTS (SELECT 1 FROM list_jobs WHERE list_id = {lid})"
+        ))
+        .await?;
+    let asked = h
+        .i64(&format!(
+            "SELECT count(*) FROM account_purges p JOIN actors x ON x.id = p.actor_id WHERE x.did = '{owner}'"
+        ))
+        .await?;
+    let relay_asked = h.hits("getRepoStatus", &owner, "");
+    farsight_storage::janitor::run_account_purges(
+        h.pool(),
+        &h.ctx.limits(),
+        &h.ctx.counters,
+        20,
+        25,
+    )
+    .await
+    .map_err(e)?;
+    h.purges().await?;
+    let blocks = h.i64(&blocks_of(&owner)).await?;
+    let (track, rec): (i16, i16) =
+        sqlx::query_as("SELECT track_state, record_state FROM lists WHERE id = $1")
+            .bind(lid)
+            .fetch_one(h.pool())
+            .await
+            .map_err(e)?;
+    c.check(
+        "list phase 1, owner held by neither its host nor the relay: owner deleted, no phase-1 retry, purge asked; the purge removes its block and its list ends dead",
+        status == 4 && !job && asked == 1 && relay_asked == 1 && blocks == 0 && rec == 2 && track == 7,
+        format!("status {status}, list_jobs {job}, purge requests {asked}, relay asked {relay_asked}, blocks {blocks}, list (track, record) ({track}, {rec})"),
+    );
+
+    // B: a repo job for such an account.
+    let gone = did("gnc", 1);
+    w(&h.world).plc.insert(gone.clone(), h.pds.clone());
+    h.fh(
+        &gone,
+        Collection::Block,
+        &tid_now(),
+        block_v(&did("sub", 91)),
+    )
+    .await?;
+    let r = h.job(&gone, 1, "token:1").await?;
+    let status = h.i64(&status_of(&gone)).await?;
+    let relay_asked = h.hits("getRepoStatus", &gone, "");
+    c.check(
+        "repo job, account held by neither its host nor the relay: inactive, status deleted, the relay asked once",
+        r.outcome == Outcome::Inactive && status == 4 && relay_asked == 1,
+        format!("outcome {:?}, status {status}, relay asked {relay_asked}", r.outcome),
+    );
+
+    // C: the host holds no such repo, the relay says the account is
+    // active: it moved, or the host is behind. Nothing is deleted.
+    let moving = did("gnd", 1);
+    w(&h.world).plc.insert(moving.clone(), h.pds.clone());
+    w(&h.world).status.insert(moving.clone(), (true, None));
+    h.fh(
+        &moving,
+        Collection::Block,
+        &tid_now(),
+        block_v(&did("sub", 92)),
+    )
+    .await?;
+    let r = h.job(&moving, 1, "token:1").await?;
+    let status = h.i64(&status_of(&moving)).await?;
+    let blocks = h.i64(&blocks_of(&moving)).await?;
+    c.check(
+        "repo job, host holds no such repo but the relay says active: failed, status active, rows kept",
+        matches!(r.outcome, Outcome::Failed { terminal: false, .. }) && status == 0 && blocks == 1,
+        format!("outcome {:?}, status {status}, blocks {blocks}", r.outcome),
+    );
+
+    // D: the host answers with another repo-level error (the repo is
+    // deactivated there) and the relay does not know the account. The
+    // relay's word alone deletes nothing.
+    let deactivated = did("gne", 1);
+    h.put_repo(&deactivated, vec![]);
+    h.edit_repo(&deactivated, |r| {
+        r.repo_error = Some("RepoDeactivated".into())
+    });
+    w(&h.world).status_unknown.insert(deactivated.clone());
+    h.fh(
+        &deactivated,
+        Collection::Block,
+        &tid_now(),
+        block_v(&did("sub", 93)),
+    )
+    .await?;
+    let r = h.job(&deactivated, 1, "token:1").await?;
+    let status = h.i64(&status_of(&deactivated)).await?;
+    let blocks = h.i64(&blocks_of(&deactivated)).await?;
+    let relay_asked = h.hits("getRepoStatus", &deactivated, "");
+    c.check(
+        "repo job, host says deactivated and the relay does not know the account: failed, status active, rows kept, the relay asked",
+        matches!(&r.outcome, Outcome::Failed { terminal: false, error } if error.contains("RepoDeactivated"))
+            && status == 0
+            && blocks == 1
+            && relay_asked == 1,
+        format!(
+            "outcome {:?}, status {status}, blocks {blocks}, relay asked {relay_asked}",
+            r.outcome
+        ),
+    );
     Ok(())
 }
 
