@@ -107,22 +107,23 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
 
 ## What visitors' browsers and Farsight fetch from others
 
-- **Avatars come from the account's own server** (`show_avatars`, on by
-  default) unless `avatar_thumbnails` is on: the visitor's browser
-  fetches the image there, so that server's operator sees the
-  visitor's address. Set `show_avatars` to `false` and visitors'
-  browsers talk only to your instance; cards keep everything else.
-- **Avatar thumbnails** (`avatar_thumbnails`, off by default). By
-  default a visitor's browser loads each avatar, and a list's image,
-  as the original upload from the account's own server: about 300 kB
-  on average, up to 1 MB. With the setting on it loads a thumbnail of
-  a few kB from Bluesky's image service (`cdn.bsky.app`), which a
-  browser keeps for a week. That service then sees the visitor's
-  address in place of each account's server, and an image appears
-  only if the service has it. Either way Farsight stores which image
-  an account uses (table `avatar_cache`, read again after a day), so
-  a card does not read the profile record every time, and never the
-  image.
+- **Avatars come from Bluesky's image service** (`show_avatars` and
+  `avatar_thumbnails`, both on by default). A visitor's browser loads
+  each avatar, and a list's image, as a thumbnail of a few kB from
+  `cdn.bsky.app`, which it keeps for a week. That service sees the
+  visitor's address, as it does for anyone using Bluesky; no
+  account's own server does. An image appears only if the service
+  has it. Set `show_avatars` to `false` and visitors' browsers talk
+  only to your instance; cards keep everything else.
+- **Originals from each account's server** (`avatar_thumbnails =
+  false`). The browser then loads the original upload from the
+  account's own server instead: about 300 kB on average, up to 1 MB.
+  **That server's operator sees the visitor's address and the time.**
+  On a page listing who blocks an account, a blocker who runs their
+  own server can log who looks. Either way Farsight stores which
+  image an account uses (table `avatar_cache`, read again after a
+  day), so a card does not read the profile record every time, and
+  never the image.
 - **Profile cards.** Resting the pointer on an account in a row (or
   focusing it with the keyboard) opens a card with its avatar, verified
   handle, DID and the date the DID was created, with its age. Farsight
@@ -134,7 +135,7 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
   description its owner gave it, as plain text (no links, at most 300
   characters), and its image. Farsight stores the text and which image
   it is; the image itself is fetched by the visitor's browser (from
-  the owner's server, or as a thumbnail: see "Avatar thumbnails"), and only with
+  the image service, or from the owner's server: see above), and only with
   `show_avatars`.
 
 ## Handles
@@ -266,7 +267,7 @@ show_top_blockers = false         # home page: the accounts that block the most
 show_top_blocked = false          # home page: the accounts that are blocked the most
 record_viewer_url = ""            # admin lookup pages; "" = records are not links
 show_avatars = true               # false = cards carry no image
-avatar_thumbnails = false         # true = small thumbnails from cdn.bsky.app, not originals from each account's server
+avatar_thumbnails = true          # false = originals from each account's server, whose operator sees the visitor
 card_rps = 4                      # cards fetched per second, all visitors
 card_burst = 8
 show_opengraph_image = true

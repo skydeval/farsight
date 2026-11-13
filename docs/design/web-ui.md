@@ -1199,13 +1199,14 @@ referrer:
 | Setting | Where the browser loads the avatar from | Who sees the visitor's address |
 |---|---|---|
 | `show_avatars = false` | Nowhere; the card has no image, and the CSP allows none | Only this instance |
-| `show_avatars = true` (default), `avatar_thumbnails = false` (default) | The original blob, `com.atproto.sync.getBlob` on the account's own server; only for an `https` endpoint the safe client has just read the profile from | That server's operator |
-| `show_avatars = true`, `avatar_thumbnails = true` | A thumbnail of a few kB from Bluesky's image service (`cdn.bsky.app`) | That service; an image appears only if the service has it |
+| `show_avatars = true`, `avatar_thumbnails = true` (both default) | A thumbnail of a few kB from Bluesky's image service (`cdn.bsky.app`) | That service; an image appears only if the service has it |
+| `show_avatars = true`, `avatar_thumbnails = false` | The original blob, `com.atproto.sync.getBlob` on the account's own server; only for an `https` endpoint the safe client has just read the profile from | That server's operator |
 
-The first default is a privacy trade the operator should weigh: on a
+The defaults never send a visitor's browser to an account's own
+server. The last row is a privacy trade an operator chooses: on a
 page listing who blocks an account, a blocker who runs their own
 server can log who looks. That is why the choice is stated on the
-confirmation page.
+confirmation page and on the setting.
 
 What the server does store is **which image** an account uses:
 

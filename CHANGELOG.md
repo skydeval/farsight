@@ -7,6 +7,24 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Before 1.0, a minor version may change addresses, settings or the
 database schema; each entry says so where it does.
 
+## [Unreleased]
+
+### Changed
+
+- `public_ui.avatar_thumbnails` is now on by default. An instance left
+  at its defaults no longer sends visitors' browsers to any account's
+  own server: avatars and list images load as thumbnails from
+  Bluesky's image service. With the setting off, a visitor's browser
+  fetched each image from the account's own server, whose operator
+  then saw the visitor's address and the time: on a page listing who
+  blocks an account, a blocker who runs their own server could log who
+  looks. **Existing instances keep their setting.** The setup wizard
+  and the Settings page write every setting into `config.toml`, so an
+  instance set up before this release most likely has
+  `avatar_thumbnails = false` written there. To stop the exposure,
+  tick "Load avatars as small thumbnails" under Settings → Public UI,
+  or set `avatar_thumbnails = true` in the `[public_ui]` section.
+
 ## [0.7.1] - 2026-11-03
 
 ### Changed

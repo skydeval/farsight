@@ -591,11 +591,13 @@ pub struct PublicUiConfig {
     /// Placeholders: `{authority}`, `{collection}`, `{rkey}`.
     pub record_viewer_url: String,
     /// Profile cards carry the account's avatar, which the visitor's
-    /// browser fetches from the account's own server.
+    /// browser fetches: from Bluesky's image service with
+    /// `avatar_thumbnails`, else from the account's own server.
     pub show_avatars: bool,
     /// Avatars and list images are named on Bluesky's image service as
     /// small thumbnails, not on the account's own server as the
-    /// original upload. Off by default. Only with `show_avatars`.
+    /// original upload. On by default, so that an account's own server
+    /// never sees who looks at it. Only with `show_avatars`.
     pub avatar_thumbnails: bool,
     /// Profile cards the process fetches per second, for all visitors
     /// together.
@@ -654,7 +656,7 @@ impl Default for PublicUiConfig {
             excluded_dids: Vec::new(),
             record_viewer_url: String::new(),
             show_avatars: true,
-            avatar_thumbnails: false,
+            avatar_thumbnails: true,
             card_rps: 4,
             card_burst: 8,
             handle_warming_enabled: true,

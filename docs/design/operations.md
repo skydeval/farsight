@@ -402,7 +402,7 @@ in [web-ui.md](web-ui.md) and
 | `excluded_dids` | `[]` | DIDs the public pages withhold. At most 10,000 valid DIDs. |
 | `record_viewer_url` | `""` | URL template of a record viewer for the admin lookup pages; empty means records are not links. See below. |
 | `show_avatars` | `true` | Profile cards and headers carry the account's avatar, which the visitor's browser fetches. |
-| `avatar_thumbnails` | `false` | Name avatars and list images on Bluesky's image service (`cdn.bsky.app`) as small thumbnails, instead of the original on the account's own server. Only with `show_avatars`. Farsight itself stores no image either way. |
+| `avatar_thumbnails` | `true` | Name avatars and list images on Bluesky's image service (`cdn.bsky.app`) as small thumbnails, instead of the original on the account's own server. `false` makes a visitor's browser fetch each image from the account's own server, whose operator then sees the visitor's address: on a page listing who blocks an account, a blocker who runs their own server can log who looks. Only with `show_avatars`. Farsight itself stores no image either way. |
 | `card_rps` | `4` | Profile cards the process fetches per second, for all visitors together. Positive. |
 | `card_burst` | `8` | Burst of the same. Positive; a value below `card_rps` is raised to it, with a warning. |
 | `handle_warming_enabled` | `true` | A background worker verifies the handles of accounts that pages had to show as bare DIDs. It governs the admin pages too and works with the public UI off. |

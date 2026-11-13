@@ -23,11 +23,12 @@
 //!    only when it cannot answer;
 //! 5. the fragment. A part whose fetch failed is left out.
 //!
-//! **The avatar is never fetched by the server.** The fragment names the
-//! blob on the account's own PDS and the visitor's browser fetches it
-//! there, so the image is emitted only for an `https` endpoint the safe
-//! client has just read the profile record from, and only while
-//! `public_ui.show_avatars` is on.
+//! **The avatar is never fetched by the server.** The fragment names an
+//! image the visitor's browser fetches, only while
+//! `public_ui.show_avatars` is on: by default a thumbnail on Bluesky's
+//! image service; with `public_ui.avatar_thumbnails` off, the blob on
+//! the account's own PDS, and then only for an `https` endpoint the
+//! safe client has just read the profile record from.
 //!
 //! Two things are stored: the verified handle (`handle_cache`) and which
 //! image the profile uses (`avatar_cache`, the blob's CID, read again
@@ -1171,7 +1172,13 @@ mod tests {
             )
         );
         assert_eq!(thumbnail_url(&did, "x/../y"), None);
+        // By default no image is named on an account's own server.
         let mut cfg = Config::default();
+        assert!(
+            avatar_url(&cfg, &did, Some("https://pds.example"), cid)
+                .is_some_and(|u| u.starts_with(THUMBNAILS))
+        );
+        cfg.public_ui.avatar_thumbnails = false;
         assert!(
             avatar_url(&cfg, &did, Some("https://pds.example"), cid).is_some_and(
                 |u| u.starts_with("https://pds.example/xrpc/com.atproto.sync.getBlob?")

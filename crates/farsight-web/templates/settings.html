@@ -72,17 +72,17 @@ follows a record link there is sent to this site.</div>
 
 <label><input type="checkbox" name="show_avatars"{% if p.show_avatars %} checked{% endif %}> Show avatars in profile cards (<code>show_avatars</code>)</label>
 <div class="hint">Resting the pointer on an account opens a card with its handle, DID and creation date. With this on, the card
-also has the account's picture, and <strong>the visitor's browser fetches it from the account's own server</strong>, whose
-operator then sees the visitor's address and the time. On a page listing who blocks an account, a blocker who runs their own
-server can log who looks. Off: cards keep everything else, and visitors' browsers contact only this instance. Cards already
-cached keep or lack the image for up to five minutes.</div>
+also has the account's picture, which the visitor's browser fetches: from Bluesky's image service with thumbnails (below, the
+default), else from the account's own server. Off: cards keep everything else, and visitors' browsers contact only this
+instance. Cards already cached keep or lack the image for up to five minutes.</div>
 
 <label><input type="checkbox" name="avatar_thumbnails"{% if p.avatar_thumbnails %} checked{% endif %}> Load avatars as small thumbnails from Bluesky's image service (<code>avatar_thumbnails</code>)</label>
-<div class="hint">Off: a visitor's browser fetches each avatar, and a list's image, as the original upload from the account's own
-server, about 300 kB each on average. On: it fetches a thumbnail of a few kB from <code>cdn.bsky.app</code>, which browsers
-keep for a week, so cards and headers load faster. Bluesky's image service then sees the visitor's address, not each
-account's server, and an image appears only if that service has it. Farsight stores which image an account uses (its CID,
-read again after a day), never the image. Only with avatars on.</div>
+<div class="hint">On (the default): a visitor's browser fetches a thumbnail of a few kB from <code>cdn.bsky.app</code>, which browsers
+keep for a week. Bluesky's image service sees the visitor's address, as it does for anyone using Bluesky, and an image
+appears only if that service has it. Off: the browser fetches each avatar, and a list's image, as the original upload from
+the account's own server, about 300 kB each on average, and <strong>that server's operator sees the visitor's address and
+the time</strong>. On a page listing who blocks an account, a blocker who runs their own server can log who looks. Farsight
+stores which image an account uses (its CID, read again after a day), never the image. Only with avatars on.</div>
 
 <label for="card_rps">Profile cards per second, for all visitors together (<code>card_rps</code>)</label>
 <input type="number" id="card_rps" name="card_rps" min="1" value="{{ p.card_rps }}">

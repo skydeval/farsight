@@ -1066,7 +1066,9 @@ mod tests {
         form.insert("show_outgoing_blocks".to_owned(), "on".to_owned());
         let v = View::submitted(&form, &c);
         assert!(v.show_outgoing_blocks && !v.enabled && !v.crawlable && !v.show_opengraph_image);
-        // Avatars default to on in the config; an unchecked box is still off.
-        assert!(!v.show_avatars);
+        // Avatars and thumbnails default to on in the config; an unchecked
+        // box is still off.
+        assert!(c.public_ui.show_avatars && c.public_ui.avatar_thumbnails);
+        assert!(!v.show_avatars && !v.avatar_thumbnails);
     }
 }

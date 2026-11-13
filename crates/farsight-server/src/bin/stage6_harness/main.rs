@@ -1242,6 +1242,7 @@ async fn check_enable_flow(c: &mut Checks, h: &mut H, w: &World) -> Result<(), S
         "show_outgoing_blocks",
         "record_viewer_url",
         "show_avatars",
+        "avatar_thumbnails",
         "card_rps",
         "card_burst",
         "show_opengraph_image",
@@ -3342,7 +3343,7 @@ async fn check_cards_live(c: &mut Checks, l: &mut H, w: &World) -> Result<(), St
         format!("created {created}; {}", support::truncate(&r.text, 200)),
     );
     c.check(
-        "show_avatars = true: the card names the avatar blob on the account's own PDS — the endpoint in its PLC log — and Farsight serves no image itself",
+        "show_avatars = true, avatar_thumbnails = false: the card names the avatar blob on the account's own PDS — the endpoint in its PLC log — and Farsight serves no image itself",
         img.starts_with(&format!("{pds}/xrpc/com.atproto.sync.getBlob?did=did%3Aplc%3A"))
             && cid.starts_with("baf")
             && cid.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
@@ -4146,6 +4147,10 @@ async fn start(
     let server = Server::start(name, Some(&cfg), &format!("127.0.0.1:{port}"), &[])?;
     let http = Http::new(Some("127.0.0.250".parse().expect("ip")));
     server.wait_live(&http, Duration::from_secs(90)).await?;
+    // `avatar_thumbnails` is left out, so every save turns it off: the
+    // cards here name images on the account's own server, the opt-in
+    // path the live card check reads a real blob through. The default
+    // (thumbnails on) is the unit tests' and the stage 8 harness's.
     let mut form: BTreeMap<&'static str, String> = BTreeMap::new();
     for (k, v) in [
         ("show_opengraph_image", "on"),

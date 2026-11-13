@@ -741,11 +741,13 @@ so the public pages are deliberately narrower than the API:
   data.
 - **No stored images.** Farsight stores which image an account's
   profile uses (`avatar_cache`) and never the image.
-- **Visitors and third parties.** With `show_avatars` on, a visitor's
-  browser fetches each avatar from the account's own server, whose
-  operator then sees the visitor's address; with
-  `public_ui.avatar_thumbnails` it is Bluesky's image service that
-  sees it. With `show_avatars = false` a visitor's browser talks to
+- **Visitors and third parties.** With the defaults (`show_avatars`
+  and `public_ui.avatar_thumbnails` on) a visitor's browser fetches
+  avatars as thumbnails from Bluesky's image service, which sees the
+  visitor's address; no account's own server does. With
+  `avatar_thumbnails = false` it fetches each avatar from the
+  account's own server, whose operator then sees the visitor's
+  address. With `show_avatars = false` a visitor's browser talks to
   your instance alone.
 - **Link previews and titles** carry no data: every page is titled
   "Farsight", and the preview image is one static file.
@@ -766,7 +768,9 @@ their blocks. The design draws the line in three places:
   the lists it subscribes to), `public_ui.show_top_blockers` and
   `public_ui.show_top_blocked` (the home page's rankings; the second
   names the most-blocked accounts on the front page, and its setting
-  says so).
+  says so). Loading avatars from each account's own server, which
+  lets a blocker who runs one log who looks, is off by default too
+  (`public_ui.avatar_thumbnails = false` turns it on).
 - **Some things have no switch.** Removed records, record addresses
   and one-click copying of identifiers are never on a public page.
 
