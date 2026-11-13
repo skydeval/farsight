@@ -1179,7 +1179,7 @@ async fn check_wizard(c: &mut Checks, pg: &Pg) -> Result<(), String> {
     );
     c.check(
         "the public UI box says what it publishes, the avatar fetch included; the admin token is on the step",
-        page.text.contains("each visitor's browser fetches from the account's own server")
+        page.text.contains("each visitor's browser fetches as thumbnails from Bluesky's image service")
             && page.text.contains("name=\"token_saved\""),
         String::new(),
     );

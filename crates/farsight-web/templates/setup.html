@@ -184,7 +184,8 @@ shown.</p>
 <label class="switch" for="public_ui">Enable public UI</label>
 <div class="hint">A lookup site at this hostname's root, open to anyone without login: for any account, which accounts
 block it and which listblocked lists it is on; for any list, its members and who blocks it. Profile cards show avatars,
-which each visitor's browser fetches from the account's own server, so that server's operator sees the visitor's address.
+which each visitor's browser fetches as thumbnails from Bluesky's image service, so that service sees the visitor's address;
+no account's own server does.
 Needs "Read queries: Public". The next page lists everything that becomes public and asks you to confirm.</div>
 <input type="checkbox" class="switch reveals" id="admin_ui" name="admin_ui"{% if w.admin_ui %} checked{% endif %}>
 <label class="switch" for="admin_ui">Enable admin UI</label>

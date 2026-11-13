@@ -1268,7 +1268,7 @@ async fn check_enable_flow(c: &mut Checks, h: &mut H, w: &World) -> Result<(), S
             )
             && settings
                 .text
-                .contains("fetches it from the account's own server"),
+                .contains("<strong>that server's operator sees the visitor's address"),
         format!("missing: {missing:?}"),
     );
     // A direct second POST, with no first: nothing happens.
