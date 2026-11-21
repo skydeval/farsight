@@ -339,7 +339,7 @@ Counts, firehose status, backfill progress and the instance-wide
 freshness. No parameters.
 
 ```json
-{ "service": { "version": "0.7.2",
+{ "service": { "version": "0.8.0",
                "hostname": "farsight.example",
                "contact": "mailto:ops@example" },
   "counts": { "blocks": 0, "listBlocks": 0, "lists": 0,
