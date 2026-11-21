@@ -45,12 +45,24 @@ pub enum Class {
     /// Public UI profile-card fetches: one bucket for the whole process
     /// (`public_ui.card_rps`, `public_ui.card_burst`).
     PublicCardBudget,
+    /// The account holder's sign-in at `/account` (starts, callbacks,
+    /// changes), per IP. Shares no bucket with the admin sign-in.
+    Optout,
+    /// The account holder's sign-in starts: one bucket for the whole
+    /// process, charged before any outbound request. No address is
+    /// exempt.
+    OptoutStart,
 }
 
 /// Admin sign-in flows the whole process may start per second.
 pub const UI_LOGIN_START_RPS: f64 = 1.0;
 /// Burst of the same budget.
 pub const UI_LOGIN_START_BURST: f64 = 10.0;
+
+/// Account holders' sign-in flows the whole process may start per second.
+pub const OPTOUT_START_RPS: f64 = 1.0;
+/// Burst of the same budget.
+pub const OPTOUT_START_BURST: f64 = 10.0;
 
 /// Profile-card requests per second per client address. Cards have their
 /// own class so that moving the pointer down a table does not spend the
@@ -74,6 +86,8 @@ impl Class {
             Class::PublicHandle => "public_ui_handle",
             Class::PublicCard => "public_ui_card",
             Class::PublicCardBudget => "public_ui_card_budget",
+            Class::Optout => "optout",
+            Class::OptoutStart => "optout_start",
         }
     }
 
@@ -115,6 +129,8 @@ impl Class {
                 f64::from(config.public_ui.card_rps),
                 f64::from(config.public_ui.effective_card_burst()),
             ),
+            Class::Optout => Limit::new(5.0 / 60.0, 5.0),
+            Class::OptoutStart => Limit::new(OPTOUT_START_RPS, OPTOUT_START_BURST),
         }
     }
 }
@@ -705,6 +721,92 @@ mod tests {
             Class::PublicCardBudget.limit(&c, None),
             Limit::new(6.0, 6.0)
         );
+    }
+
+    #[test]
+    fn the_account_holders_sign_in_shares_no_bucket() {
+        let c = Config::default();
+        assert_eq!(Class::Optout.limit(&c, None), Limit::new(5.0 / 60.0, 5.0));
+        assert_eq!(Class::OptoutStart.limit(&c, None), Limit::new(1.0, 10.0));
+        assert_eq!(
+            (Class::Optout.label(), Class::OptoutStart.label()),
+            ("optout", "optout_start")
+        );
+        let l = RateLimiter::default();
+        let t0 = Instant::now();
+        let ip: IpAddr = "192.0.2.9".parse().unwrap();
+        // An address that has spent its opt-out budget, and a process
+        // that has spent its start budget, ...
+        for _ in 0..5 {
+            assert!(
+                l.check_ip_at(Class::Optout, ip, Class::Optout.limit(&c, None), t0)
+                    .is_ok()
+            );
+        }
+        assert!(
+            l.check_ip_at(Class::Optout, ip, Class::Optout.limit(&c, None), t0)
+                .is_err()
+        );
+        for _ in 0..10 {
+            assert!(
+                l.check_at(
+                    Class::OptoutStart,
+                    "process",
+                    Class::OptoutStart.limit(&c, None),
+                    t0
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            l.check_at(
+                Class::OptoutStart,
+                "process",
+                Class::OptoutStart.limit(&c, None),
+                t0
+            )
+            .is_err()
+        );
+        // ... has taken nothing from the admin's sign-in or from the
+        // pages' handle checks under the same keys.
+        for _ in 0..5 {
+            assert!(
+                l.check_ip_at(Class::UiLogin, ip, Class::UiLogin.limit(&c, None), t0)
+                    .is_ok()
+            );
+        }
+        for _ in 0..10 {
+            assert!(
+                l.check_at(
+                    Class::UiLoginStart,
+                    "process",
+                    Class::UiLoginStart.limit(&c, None),
+                    t0
+                )
+                .is_ok()
+            );
+        }
+        for _ in 0..20 {
+            assert!(
+                l.check_at(
+                    Class::PublicHandle,
+                    "process",
+                    Class::PublicHandle.limit(&c, None),
+                    t0
+                )
+                .is_ok()
+            );
+        }
+        // The labels are distinct from every other class's.
+        for other in [
+            Class::UiLogin,
+            Class::UiLoginStart,
+            Class::PublicHandle,
+            Class::PublicUi,
+        ] {
+            assert_ne!(other.label(), Class::Optout.label());
+            assert_ne!(other.label(), Class::OptoutStart.label());
+        }
     }
 
     #[test]

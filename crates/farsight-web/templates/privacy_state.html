@@ -1,0 +1,30 @@
+{% extends "public_base.html" %}
+{% block content %}
+<div class="card privacy">
+<h1>Signed in</h1>
+<p>Signed in as {% if let Some(h) = handle %}<strong>{{ h }}</strong> (<code>{{ did }}</code>){% else %}<code>{{ did }}</code>{% endif %}.</p>
+<details class="guide privacy-drawer">
+<summary><svg class="guide-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 6 15 12 9 18"/></svg><span>Your pages on this site</span></summary>
+<div class="guide-panel">
+<p class="privacy-choice">{% if hidden %}You have asked this site to hide your pages.{% else %}You have not asked this site to hide your pages.{% endif %}</p>
+<h2>What hiding your pages does</h2>
+<p>This site stops showing your account's page and the pages of lists you own.</p>
+<h2>What it does not do</h2>
+<ul>
+<li>Farsight keeps recording blocks and lists. They are public on the network.</li>
+<li>This site's API still answers about your account.</li>
+<li>Your account's name still appears on other accounts' and lists' pages and in the top lists, without a link, picture or profile card.</li>
+<li>Your lists' names still appear where they name other accounts.</li>
+<li>Other Farsight instances and other sites are not affected: this applies to this site only.</li>
+</ul>
+<p>Someone who sees your name elsewhere on this site can tell that you hid your page.</p>
+<form class="privacy-form" method="post" action="/account/set">
+<input type="hidden" name="token" value="{{ token }}">
+<input type="hidden" name="to" value="{% if hidden %}shown{% else %}hidden{% endif %}">
+<button type="submit">{% if hidden %}Stop hiding my pages{% else %}Hide my pages{% endif %}</button>
+</form>
+<p class="muted">This sign-in allows one change, within ten minutes. To change it again later, sign in again.</p>
+</div>
+</details>
+</div>
+{% endblock %}

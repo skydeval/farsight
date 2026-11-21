@@ -17,6 +17,7 @@
 {% if e.top_blockers %}<li><strong>Top blockers</strong>: the home page names the 20 accounts that made the most blocks, in the last day and of all time (<code>show_top_blockers</code> is on).</li>{% endif %}
 {% if e.top_blocked %}<li><strong>Most blocked</strong>: the home page names the 20 accounts that the most others block, in the last day and of all time (<code>show_top_blocked</code> is on).</li>{% endif %}
 {% if let Some(v) = e.record_viewer %}<li><strong>Record links</strong>: block and listblock records link to <code>{{ v }}</code> (<code>record_viewer_url</code>).</li>{% endif %}
+{% if e.self_optout %}<li><strong>Sign-in for account holders</strong>: anyone can sign in at <code>/account</code> with their own account to hide that account's page and its lists' pages here (<code>self_optout</code> is on). Each sign-in makes this instance contact <strong>that account's own server</strong>.</li>{% endif %}
 <li>Removed records are <strong>not</strong> public. They stay on the history pages of the admin interface, after login.</li>
 </ul>
 <p>{% if e.crawlable %}Search engines <strong>will</strong> be allowed to index the account and list pages (<code>crawlable</code> is on).{% else %}Search engines are asked not to index the pages (<code>crawlable</code> is off).{% endif %}

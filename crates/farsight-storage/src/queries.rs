@@ -128,6 +128,9 @@ pub struct ListRef {
     pub purpose: Option<ListPurpose>,
     /// `lists.name`: the record's name, as truncated when it was stored.
     pub name: Option<String>,
+    /// The list is marked taken down: the configured AppView no longer
+    /// serves it (`lists.appview_absent_since`).
+    pub taken_down: bool,
 }
 
 /// One (list, blocker) pair (`getIncomingListBlocks`).
@@ -170,13 +173,14 @@ pub async fn incoming_list_blocks_at(
         String,
         String,
         Option<DateTime<Utc>>,
+        bool,
     );
     let rows: Vec<Row> = sqlx::query_as(&format!(
         "SELECT p.id, p.owner_did, p.lrkey, p.purpose, p.name, p.author_id, ba.did, p.rkey,
-                p.created_at
+                p.created_at, p.taken_down
          FROM (
            SELECT l.id, o.did AS owner_did, l.rkey AS lrkey, l.purpose, l.name, b.author_id,
-                  b.rkey, b.created_at
+                  b.rkey, b.created_at, l.appview_absent_since IS NOT NULL AS taken_down
            FROM lists l
            JOIN actors o ON o.id = l.owner_id
            JOIN list_blocks b ON b.list_id = l.id
@@ -196,7 +200,18 @@ pub async fn incoming_list_blocks_at(
     Ok(rows
         .into_iter()
         .map(
-            |(id, owner_did, lrkey, purpose, name, author_id, blocker, rkey, created_at)| {
+            |(
+                id,
+                owner_did,
+                lrkey,
+                purpose,
+                name,
+                author_id,
+                blocker,
+                rkey,
+                created_at,
+                taken_down,
+            )| {
                 IncomingListBlock {
                     list: ListRef {
                         id,
@@ -204,6 +219,7 @@ pub async fn incoming_list_blocks_at(
                         rkey: lrkey,
                         purpose: purpose.map(ListPurpose::from_code),
                         name,
+                        taken_down,
                     },
                     author_id,
                     blocker,
@@ -262,7 +278,8 @@ pub async fn incoming_list_blocks(
         "AND $4::bigint IS NULL AND $5::bigint IS NULL AND $6::text IS NULL"
     };
     let sql = format!(
-        "SELECT l.id, o.did, l.rkey, l.purpose, l.name, b.author_id, ba.did, b.rkey, b.created_at
+        "SELECT l.id, o.did, l.rkey, l.purpose, l.name, b.author_id, ba.did, b.rkey, b.created_at,
+                l.appview_absent_since IS NOT NULL
          FROM lists l
          JOIN actors o ON o.id = l.owner_id
          JOIN list_blocks b ON b.list_id = l.id
@@ -284,6 +301,7 @@ pub async fn incoming_list_blocks(
         String,
         String,
         Option<DateTime<Utc>>,
+        bool,
     );
     let rows: Vec<Row> = sqlx::query_as(&sql)
         .bind(subject_id)
@@ -298,7 +316,18 @@ pub async fn incoming_list_blocks(
     Ok(rows
         .into_iter()
         .map(
-            |(id, owner_did, lrkey, purpose, name, author_id, blocker, rkey, created_at)| {
+            |(
+                id,
+                owner_did,
+                lrkey,
+                purpose,
+                name,
+                author_id,
+                blocker,
+                rkey,
+                created_at,
+                taken_down,
+            )| {
                 IncomingListBlock {
                     list: ListRef {
                         id,
@@ -306,6 +335,7 @@ pub async fn incoming_list_blocks(
                         rkey: lrkey,
                         purpose: purpose.map(ListPurpose::from_code),
                         name,
+                        taken_down,
                     },
                     author_id,
                     blocker,
@@ -352,9 +382,11 @@ pub async fn lists_naming(
         i32,
         Option<DateTime<Utc>>,
         String,
+        bool,
     );
     let rows: Vec<Row> = sqlx::query_as(&format!(
-        "SELECT l.id, o.did, l.rkey, l.purpose, l.name, l.listblock_count, x.created_at, x.rkey
+        "SELECT l.id, o.did, l.rkey, l.purpose, l.name, l.listblock_count, x.created_at, x.rkey,
+                l.appview_absent_since IS NOT NULL
          FROM (SELECT DISTINCT ON (li.list_id) li.list_id, li.rkey, li.created_at
                FROM list_items li
                WHERE li.subject_id = $1 AND ($4::bigint IS NULL OR li.list_id > $4)
@@ -376,17 +408,20 @@ pub async fn lists_naming(
     Ok(rows
         .into_iter()
         .map(
-            |(id, owner_did, rkey, purpose, name, count, added_at, item_rkey)| ListNaming {
-                list: ListRef {
-                    id,
-                    owner_did,
-                    rkey,
-                    purpose: purpose.map(ListPurpose::from_code),
-                    name,
-                },
-                listblock_count: count,
-                added_at,
-                item_rkey,
+            |(id, owner_did, rkey, purpose, name, count, added_at, item_rkey, taken_down)| {
+                ListNaming {
+                    list: ListRef {
+                        id,
+                        owner_did,
+                        rkey,
+                        purpose: purpose.map(ListPurpose::from_code),
+                        name,
+                        taken_down,
+                    },
+                    listblock_count: count,
+                    added_at,
+                    item_rkey,
+                }
             },
         )
         .collect())
@@ -490,6 +525,9 @@ pub struct ListInfo {
     /// `lists.admitted_at`: time of the current admission, on the
     /// database's clock; `None` for a list never admitted.
     pub admitted_at: Option<DateTime<Utc>>,
+    /// Marked taken down since then: the configured AppView no longer
+    /// serves the list (`lists.appview_absent_since`).
+    pub taken_down_since: Option<DateTime<Utc>>,
 }
 
 impl ListInfo {
@@ -538,11 +576,12 @@ pub async fn list_info(
         Option<DateTime<Utc>>,
         Option<TrackState>,
         Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
     );
     let row: Option<Row> = sqlx::query_as(
         "SELECT l.id, o.did, o.status, l.rkey, l.record_state, l.purpose, l.name,
                 l.listblock_count, l.track_state, l.capped, l.item_count, l.fetched_witness,
-                l.purge_then, l.admitted_at
+                l.purge_then, l.admitted_at, l.appview_absent_since
          FROM lists l JOIN actors o ON o.id = l.owner_id
          WHERE o.did = $1 AND l.rkey = $2",
     )
@@ -565,6 +604,7 @@ pub async fn list_info(
         fetched_witness: r.11,
         purge_then: r.12,
         admitted_at: r.13,
+        taken_down_since: r.14,
     }))
 }
 
@@ -665,6 +705,9 @@ pub struct PartyList {
     pub listblock_count: i32,
     /// Coverage point of the last fetch run.
     pub fetched_witness: Option<DateTime<Utc>>,
+    /// The list is marked taken down: the configured AppView no longer
+    /// serves it. It still blocks here; the answer says it is marked.
+    pub taken_down: bool,
 }
 
 impl PartyList {
@@ -770,6 +813,7 @@ pub async fn check_rows_capped(
         Option<TrackState>,
         i32,
         Option<DateTime<Utc>>,
+        bool,
     );
     // Per party, its lists in id order, one more than are weighed: the
     // extra row says that there are more. `list_blocks_by_author_list`
@@ -778,7 +822,8 @@ pub async fn check_rows_capped(
     let cap = i64::try_from(per_party).unwrap_or(i64::MAX - 1);
     let rows: Vec<LRow> = sqlx::query_as(
         "SELECT p.id, l.id, o.did, o.status, l.rkey, l.track_state,
-                l.record_state, l.capped, l.purge_then, l.listblock_count, l.fetched_witness
+                l.record_state, l.capped, l.purge_then, l.listblock_count, l.fetched_witness,
+                l.appview_absent_since IS NOT NULL
          FROM unnest($1::BIGINT[]) AS p(id)
          CROSS JOIN LATERAL (
            SELECT DISTINCT b.list_id FROM list_blocks b
@@ -809,6 +854,7 @@ pub async fn check_rows_capped(
             purge_then: r.8,
             listblock_count: r.9,
             fetched_witness: r.10,
+            taken_down: r.11,
         });
     }
     // Only the items a pair can turn on: X on the others' lists, the

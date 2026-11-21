@@ -1,14 +1,15 @@
-//! The ATProto OAuth client behind the admin sign-in (see
-//! `docs/design/web-ui.md`).
+//! The ATProto OAuth client behind the admin sign-in and the account
+//! holders' sign-in at `/account` (see `docs/design/web-ui.md`).
 //!
 //! Farsight is a public client that asks for the `atproto` scope only: it
-//! authenticates one account, the configured admin DID, reads `sub` from
-//! the token response and discards the tokens. This module is the whole
-//! client: the two client identities (hosted and loopback), discovery of
-//! the account's authorization server, pushed authorization requests,
-//! PKCE, DPoP proofs with the one nonce retry, the token request, and the
-//! in-memory store of flows in progress. The handlers that use it are in
-//! [`crate::enter`].
+//! authenticates one account, reads `sub` from the token response and
+//! discards the tokens. This module is the whole client: the two client
+//! identities (hosted and loopback), discovery of the account's
+//! authorization server, pushed authorization requests, PKCE, DPoP proofs
+//! with the one nonce retry, the token request, and the in-memory store of
+//! flows in progress. The handlers that use it are in [`crate::enter`]
+//! (the admin) and [`crate::privacy`] (account holders); both flows share
+//! the one client metadata document.
 //!
 //! Every request goes through the safe outbound client (see
 //! `docs/design/security.md`). Nothing here logs a code, a state, a
@@ -31,8 +32,11 @@ use url::Url;
 
 /// Path of the client metadata document (hosted mode).
 pub const METADATA_PATH: &str = "/.well-known/atproto-oauth-client-metadata";
-/// Path the authorization server sends the browser back to.
-pub const CALLBACK_PATH: &str = "/enter/callback";
+/// Path the authorization server sends the browser back to after the
+/// admin's sign-in.
+pub const ADMIN_CALLBACK: &str = "/enter/callback";
+/// Path it sends the browser back to after an account holder's sign-in.
+pub const PRIVACY_CALLBACK: &str = "/account/callback";
 /// The one scope Farsight asks for: authentication, no PDS access.
 pub const SCOPE: &str = "atproto";
 /// How long a started flow may take.
@@ -143,14 +147,20 @@ pub fn is_local_client(ip: std::net::IpAddr) -> bool {
 /// names a loopback address **and** the request's client is local
 /// (`local`, from [`is_local_client`] of the resolved client address);
 /// otherwise none. The header alone does not select loopback mode: any
-/// client can send `Host: 127.0.0.1`.
-pub fn client_for(hostname: &str, host_header: &str, local: bool) -> Option<Client> {
+/// client can send `Host: 127.0.0.1`. `callback` is the path the browser
+/// comes back to: [`ADMIN_CALLBACK`] or [`PRIVACY_CALLBACK`].
+pub fn client_for(
+    hostname: &str,
+    host_header: &str,
+    local: bool,
+    callback: &str,
+) -> Option<Client> {
     let host = host_header.trim().to_ascii_lowercase();
     if is_loopback_host(&host) {
         if !local {
             return None;
         }
-        let redirect_uri = format!("http://{host}{CALLBACK_PATH}");
+        let redirect_uri = format!("http://{host}{callback}");
         let encoded: String =
             url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect();
         return Some(Client {
@@ -163,19 +173,27 @@ pub fn client_for(hostname: &str, host_header: &str, local: bool) -> Option<Clie
     let host = host.strip_suffix(":443").unwrap_or(&host);
     (hosted_possible(&hostname) && host == hostname).then(|| Client {
         client_id: format!("https://{hostname}{METADATA_PATH}"),
-        redirect_uri: format!("https://{hostname}{CALLBACK_PATH}"),
+        redirect_uri: format!("https://{hostname}{callback}"),
         loopback: false,
     })
 }
 
-/// The client metadata document served at [`METADATA_PATH`].
+/// The client metadata document served at [`METADATA_PATH`]: one for the
+/// instance, whichever flows are switched on. It names both callbacks
+/// always, because authorization servers keep a copy of it: one that
+/// listed only the flows on now would leave a kept copy refusing the
+/// other callback for its lifetime after a toggle. Its name says which
+/// instance asks.
 pub fn client_metadata(hostname: &str) -> Value {
     let hostname = hostname.to_ascii_lowercase();
     json!({
         "client_id": format!("https://{hostname}{METADATA_PATH}"),
-        "client_name": format!("Farsight admin ({hostname})"),
+        "client_name": format!("Farsight ({hostname})"),
         "client_uri": format!("https://{hostname}/"),
-        "redirect_uris": [format!("https://{hostname}{CALLBACK_PATH}")],
+        "redirect_uris": [
+            format!("https://{hostname}{ADMIN_CALLBACK}"),
+            format!("https://{hostname}{PRIVACY_CALLBACK}"),
+        ],
         "grant_types": ["authorization_code"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
@@ -563,6 +581,9 @@ pub struct Flow {
     /// are held apart from the others ([`RESERVED_FLOWS`]), so that
     /// flows started by anyone else never push one out.
     pub known: bool,
+    /// An account holder's sign-in: the handle the visitor typed, when
+    /// it resolved to `did`. Shown back to them, never logged.
+    pub handle: Option<String>,
 }
 
 /// Pushes the authorization request (PAR) and returns the flow record
@@ -625,6 +646,7 @@ pub async fn start(
             back: "/admin",
             replaces: None,
             known: false,
+            handle: None,
         },
         to,
     ))
@@ -682,6 +704,13 @@ pub fn read_token_response(body: &Value) -> Result<String, OAuthError> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .ok_or(OAuthError::Response("the token response has no sub"))
+}
+
+/// Whether the token response's `sub` names `did`, compared as DIDs in
+/// canonical form: a did:web host may come back in another case. A `sub`
+/// that is not a DID names no account.
+pub fn sub_is(sub: &str, did: &Did) -> bool {
+    Did::parse(sub).is_ok_and(|s| s == *did)
 }
 
 /// What a callback's `state` and cookie matched.
@@ -920,12 +949,19 @@ mod tests {
             issuer: "https://as.example".into(),
             token: Url::parse("https://as.example/token").unwrap(),
             did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            client: client_for("farsight.example", "farsight.example", false).unwrap(),
+            client: client_for(
+                "farsight.example",
+                "farsight.example",
+                false,
+                ADMIN_CALLBACK,
+            )
+            .unwrap(),
             cookie_sha256: cookie,
             created,
             back: "/admin",
             replaces: None,
             known: false,
+            handle: None,
         }
     }
 
@@ -957,7 +993,10 @@ mod tests {
 
     #[test]
     fn client_modes() {
-        let hosted = client_for("farsight.example", "Farsight.Example", false).unwrap();
+        let admin = |hostname: &str, host: &str, local: bool| {
+            client_for(hostname, host, local, ADMIN_CALLBACK)
+        };
+        let hosted = admin("farsight.example", "Farsight.Example", false).unwrap();
         assert!(!hosted.loopback);
         assert_eq!(
             hosted.client_id,
@@ -968,39 +1007,49 @@ mod tests {
             "https://farsight.example/enter/callback"
         );
         assert_eq!(
-            client_for("farsight.example", "farsight.example:443", true),
-            Some(hosted)
+            admin("farsight.example", "farsight.example:443", true),
+            Some(hosted.clone())
+        );
+        // The account holders' flow: the same client, its own callback.
+        let privacy = client_for(
+            "farsight.example",
+            "farsight.example",
+            false,
+            PRIVACY_CALLBACK,
+        )
+        .unwrap();
+        assert_eq!(privacy.client_id, hosted.client_id);
+        assert_eq!(
+            privacy.redirect_uri,
+            "https://farsight.example/account/callback"
         );
         // Another name, a port, an IP or a single label is not hosted mode.
-        assert_eq!(client_for("farsight.example", "other.example", true), None);
+        assert_eq!(admin("farsight.example", "other.example", true), None);
         assert_eq!(
-            client_for("farsight.example", "farsight.example:8080", true),
+            admin("farsight.example", "farsight.example:8080", true),
             None
         );
         assert_eq!(
-            client_for("farsight.example:8080", "farsight.example:8080", true),
+            admin("farsight.example:8080", "farsight.example:8080", true),
             None
         );
-        assert_eq!(client_for("203.0.113.7", "203.0.113.7", true), None);
-        assert_eq!(client_for("farsight", "farsight", true), None);
-        assert_eq!(client_for("farsight.example", "localhost:8080", true), None);
+        assert_eq!(admin("203.0.113.7", "203.0.113.7", true), None);
+        assert_eq!(admin("farsight", "farsight", true), None);
+        assert_eq!(admin("farsight.example", "localhost:8080", true), None);
         assert_eq!(
-            client_for("farsight.example", "127.0.0.1.evil.example", true),
+            admin("farsight.example", "127.0.0.1.evil.example", true),
             None
         );
-        assert_eq!(
-            client_for("farsight.example", "127.0.0.1:99999", true),
-            None
-        );
+        assert_eq!(admin("farsight.example", "127.0.0.1:99999", true), None);
         // Loopback, whatever the hostname is.
         for (host, redirect) in [
             ("127.0.0.1:18093", "http://127.0.0.1:18093/enter/callback"),
             ("127.0.0.1", "http://127.0.0.1/enter/callback"),
             ("[::1]:8080", "http://[::1]:8080/enter/callback"),
         ] {
-            let c = client_for("203.0.113.7:8080", host, true).unwrap();
+            let c = admin("203.0.113.7:8080", host, true).unwrap();
             // The same Host from a client that is not local: no client.
-            assert_eq!(client_for("203.0.113.7:8080", host, false), None);
+            assert_eq!(admin("203.0.113.7:8080", host, false), None);
             assert!(c.loopback);
             assert_eq!(c.redirect_uri, redirect);
             let u = Url::parse(&c.client_id).unwrap();
@@ -1021,10 +1070,16 @@ mod tests {
             m["client_id"],
             "https://farsight.example/.well-known/atproto-oauth-client-metadata"
         );
+        // One document for both flows, with both callbacks, and a name
+        // that says which instance asks.
         assert_eq!(
             m["redirect_uris"],
-            json!(["https://farsight.example/enter/callback"])
+            json!([
+                "https://farsight.example/enter/callback",
+                "https://farsight.example/account/callback"
+            ])
         );
+        assert_eq!(m["client_name"], "Farsight (farsight.example)");
         assert_eq!(m["grant_types"], json!(["authorization_code"]));
         assert_eq!(m["response_types"], json!(["code"]));
         assert_eq!(m["token_endpoint_auth_method"], "none");
@@ -1170,6 +1225,32 @@ mod tests {
             json!({"token_type": "DPoP", "scope": "atproto", "sub": ""}),
         ] {
             assert!(read_token_response(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn sub_is_compared_as_a_canonical_did() {
+        let web = Did::parse("did:web:alice.example").unwrap();
+        // A did:web host in another case is the same account.
+        let sub = read_token_response(
+            &json!({"token_type": "DPoP", "scope": "atproto", "sub": "did:web:Alice.Example"}),
+        )
+        .unwrap();
+        assert!(sub_is(&sub, &web));
+        assert!(sub_is("did:web:alice.example", &web));
+        let plc = Did::parse("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        assert!(sub_is("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", &plc));
+        // Another account, or a sub that is not a DID, is refused.
+        assert!(!sub_is("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", &plc));
+        assert!(!sub_is("did:web:bob.example", &web));
+        for bad in [
+            "",
+            "alice.example",
+            "did:",
+            "did:plc:",
+            "DID:WEB:alice.example x",
+        ] {
+            assert!(!sub_is(bad, &web), "{bad}");
         }
     }
 

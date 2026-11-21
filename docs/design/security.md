@@ -460,7 +460,9 @@ or Authenticated Origin Pulls closes that.
 
 Read responses do not depend on who asks, which is what makes shared
 caching safe. Public pages read no cookie and set none, and no request
-header changes their body.
+header changes their body. The account holders' sign-in under
+`/account` is the one exception on the public side: it reads and sets
+cookies, so it is never cached.
 
 | Response | `Cache-Control` |
 |---|---|
@@ -473,8 +475,9 @@ header changes their body.
 | `/` as the public home | `public, max-age=60`; `no-store` while rows are held back |
 | `/` as the redirect to the admin UI | `no-store, private` |
 | `/` as the text page of an API-only instance | `public, max-age=300` |
-| `/did/…`, `/list/…` | `public, max-age=30`; `no-store` while rows are held back for a handle check |
-| `/card/{did}` | `public, max-age=300` for a complete card: one whose every fetch answered (the account's identity, its handle's check, its profile record), whether or not the account has a handle, an avatar or a creation date to show. `no-store` when a fetch failed, timed out or was not made for want of budget. An admin card is always `no-store, private` |
+| `/did/…`, `/list/…` | `public, max-age=30`, the withheld notice included; `no-store` while rows are held back for a handle check |
+| `/card/{did}` | `public, max-age=300` for a complete card: one whose every fetch answered (the account's identity, its handle's check, its profile record), whether or not the account has a handle, an avatar or a creation date to show. `no-store` when a fetch failed, timed out or was not made for want of budget, and for the `404` of an account that is unknown, withheld or opted out. An admin card is always `no-store, private`. A kept complete card may outlive an opt-out by up to its five minutes |
+| Everything under `/account` | `no-store, private`, with `X-Robots-Tag: noindex, nofollow`; the callback sends `Referrer-Policy: same-origin`, not `no-referrer`, because under `no-referrer` a browser sends `Origin: null` with the page's form and the origin check refuses it |
 | `/search`, public error pages | `no-store` |
 | `/robots.txt` | `public, max-age=300` |
 | Static assets under `/static/` | `public, max-age=3600`, with `X-Content-Type-Options: nosniff`; served in every configuration |
@@ -549,6 +552,12 @@ dropping it never hands its caller a new allowance.
 | Handle verification (`public_ui_handle`) | `public_ui.handle_rps` (20/s, at most 200) | the rate, at least 10 | whole process |
 | Sign-in attempts (`ui_login`) | 5 a minute | 5 | address |
 | Sign-in starts (`ui_login_start`) | 1/s | 10 | whole process; an address with a successful sign-in in the last 7 days is not charged |
+| Account holders' sign-in (`optout`): `POST /account`, its callback, `POST /account/set` | 5 a minute | 5 | address |
+| Account holders' sign-in starts (`optout_start`), charged after `optout` and before any outbound request, the handle's resolution included | 1/s | 10 | whole process; no address is exempt |
+
+The two account holders' classes share no bucket with `ui_login`,
+`ui_login_start` or `public_ui_handle`: a flood of their starts takes
+nothing from the admin's sign-in or from the pages' handle checks.
 
 A `429` carries `Retry-After`.
 
@@ -605,11 +614,27 @@ left, so requests are never starved by it. The handle pass
 - **Off means absent.** With `access.public_ui = false` a public route
   answers like any unknown route. `public_ui = true` requires
   `reads = "public"`; a config that says otherwise is refused.
-- **No way out.** A public page links only to public pages and, if the
-  operator configured one, a record viewer. It has no sign-in link and
-  names no admin route.
-- **No writes.** A public page view never interns a row and never
-  queues backfill work.
+- **No way out.** A public page links only to public pages, to a
+  record viewer if the operator configured one, and to the account
+  holders' own sign-in at `/account` (a plain link in the header, the
+  same for every visitor). It names no admin route.
+- **No writes.** A public page view never interns a row, never queues
+  backfill work and never writes. `POST /account/set` writes one
+  `public_optouts` row, or removes it, and nothing else; it needs a
+  change grant that only a completed sign-in issues.
+- **The account holders' sign-in** asks for the `atproto` scope only:
+  it proves who the visitor is and gives Farsight no access to the
+  account. The tokens are discarded when `sub` is read, and `sub` must
+  be the DID the flow was started for, compared in canonical form. Its
+  outbound requests (the handle's resolution, the DID document, the
+  account's server's metadata, the pushed request and the token
+  request) go through the safe client, to hosts that the visitor's own
+  DID document or handle names; they are bounded by `optout_start` and
+  by deadlines of 10 seconds for a start and 10 for a callback. It
+  reads and writes no `handle_cache` row and none of the admin flow's
+  caches, and its flows are a store of their own, so they never
+  displace the admin's. No log line names an account that used it, and
+  its failures are logged at debug as a fixed reason word.
 - **Content Security Policy** on every public response:
 
   ```
@@ -665,7 +690,9 @@ left, so requests are never starved by it. The handle pass
   own (`storage.database_url`, `backfill.plc_url`,
   `backfill.relay_url`, `firehose.urls`, `backfill.backlinks.url`), a
   [lodestar](lodestar.md) instance of their own whose verified handles
-  the pages would show (`backfill.lodestar_url`), a
+  the pages would show (`backfill.lodestar_url`), an AppView of their
+  own whose answers mark lists taken down
+  (`backfill.list_takedowns.appview_url`), a
   hostname of their own (`server.hostname`), proxy trust that lets
   them forge client addresses (`proxy.*`), a host the outbound client
   may newly reach (`net.*`), a token they know (`auth.*`, `metrics.*`,
@@ -714,9 +741,10 @@ left, so requests are never starved by it. The handle pass
   'none'`. The pages carry no inline script or style, so injected
   markup cannot run or restyle, and they cannot be framed. Images over
   `https` are allowed for the avatars on profile cards. The sign-in
-  page alone has `form-action 'self' https:` (plus plain `http` to the
-  hosts in `net.allow_http_hosts`, if any), because its form is
-  answered with a redirect to the account's authorization server.
+  page and the account holders' `/account` page alone have
+  `form-action 'self' https:` (plus plain `http` to the hosts in
+  `net.allow_http_hosts`, if any), because their form is answered with
+  a redirect to the account's authorization server.
 
 ### Privacy positions of the public UI
 
@@ -735,10 +763,19 @@ so the public pages are deliberately narrower than the API:
   have no page of their own either: the four statuses are withheld
   alike.
 - **`public_ui.excluded_dids`** (at most 10,000) withholds accounts:
-  no page, no row, and the same neutral notice as for an account that
-  is hidden for any other reason, so that exclusion cannot be told
-  apart. It changes the public pages only; the API still returns the
-  data.
+  no page, no row, no card, and the same neutral notice as for an
+  account that is hidden for any other reason, so that exclusion
+  cannot be told apart. It changes the public pages only; the API
+  still returns the data.
+- **An account's own opt-out.** Its holder can sign in at `/account`
+  and withhold its page and its lists' pages; its card answers `404`.
+  Its rows stay on other pages, as plain text with no link, avatar or
+  card, so a visitor who finds it in a row can tell that it hid its
+  page itself: the notice and the `404` are the same as for every
+  other reason, the rows are not, and the page tells the holder so.
+  Neither the account holder's pages nor the operator's say whether a
+  given account opted out: the dashboard shows a count, and the table
+  holds the DID alone. It changes the public pages only.
 - **No stored images.** Farsight stores which image an account's
   profile uses (`avatar_cache`) and never the image.
 - **Visitors and third parties.** With the defaults (`show_avatars`
@@ -833,6 +870,20 @@ counted where a query or the dashboard can see it.
   admits at most 10 + *t* starts in *t* seconds and 256 are held, so
   one is safe for about four minutes (246 s). The admin token API is
   not affected.
+- **The account holders' sign-in budget.** The same arithmetic holds
+  for `optout_start` and its own store of 256 flows: addresses that
+  keep it empty make other holders' starts `429`, and evict a holder's
+  flow only when that sign-in takes longer than about four minutes.
+  The admin's sign-in and the pages' handle checks are not affected.
+- **Opt-out rows.** Rows of `public_optouts` are written only by a
+  completed sign-in, so anyone who can mint accounts (a `did:web` on a
+  server of their own, for one) can add rows at the rate
+  `optout_start` allows: at most 86,400 a day, about 10 MB. A row is
+  about 120 bytes with its index; the table is not otherwise bounded.
+- **Opt-out requests to hosts a visitor names.** Each start makes this
+  instance contact the hosts named by the visitor's handle or DID
+  document, as search's handle resolution already does, within
+  `optout_start` and the deadlines.
 - **Connection slots.** One address (IPv6: one /48) holds at most 128
   of the 2,048 connections of the public listener, so a single host
   cannot fill it with requests sent a byte at a time. Sixteen

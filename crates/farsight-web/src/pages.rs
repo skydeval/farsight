@@ -185,6 +185,15 @@ pub fn router(state: Arc<WebState>) -> Router {
         .route("/enter", get(crate::enter::page).post(crate::enter::submit))
         .route("/enter/callback", get(crate::enter::callback))
         .route(
+            "/account",
+            get(crate::privacy::page).post(crate::privacy::start),
+        )
+        .route(
+            crate::oauth::PRIVACY_CALLBACK,
+            get(crate::privacy::callback),
+        )
+        .route("/account/set", post(crate::privacy::set))
+        .route(
             crate::oauth::METADATA_PATH,
             get(crate::enter::client_metadata),
         )

@@ -17,6 +17,13 @@ token = "fsk_…"   # API key with read + backfill scopes
 4. **A relation names at most 100 lists.** When `blocksActor` or
    `blockedByActor` carries `"listsTruncated": true`, more lists hold
    the block than `lists` shows. The block is there either way.
+5. **Lists an AppView has taken down.** If the instance runs the
+   taken-down list checks (`[backfill.list_takedowns]`), a relation can
+   carry `takenDown`: the lists among `lists` that the AppView it asks
+   no longer serves. They still count as blocks in Farsight's answer.
+   To block as that AppView does, treat the relation as holding only if
+   `direct` is true or a list in `lists` is not in `takenDown`. See
+   [api.md](../design/api.md#lists-an-appview-has-taken-down).
 
 `requestBackfill` indexes the account's own repo. Knowing who blocks
 that account requires either a completed network sweep, or the

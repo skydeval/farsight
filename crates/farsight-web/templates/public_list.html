@@ -7,7 +7,7 @@
 </div>
 </div>
 
-<div class="profile-main-row"{% if let Some(i) = image %} data-list-image="{{ i }}" data-owner="{{ owner.did }}" data-owner-card="{{ owner.card }}"{% if let Some(s) = image_src %} data-list-image-src="{{ s }}"{% endif %}{% endif %}>
+<div class="profile-main-row"{% if !owner.quiet %}{% if let Some(i) = image %} data-list-image="{{ i }}" data-owner="{{ owner.did }}" data-owner-card="{{ owner.card }}"{% if let Some(s) = image_src %} data-list-image-src="{{ s }}"{% endif %}{% endif %}{% endif %}>
 <div class="profile-id-block">
 <h1 class="subject">
 {% if let Some(n) = name %}<span class="handle">{{ n }}</span>{% endif %}
@@ -16,7 +16,7 @@
 <div class="list-owner-row">
 <span class="owner-label">Owner:</span>
 {% if let Some(h) = owner.handle %}<span class="handle">{{ h }}</span>{% endif %}
-<a href="{{ owner.href }}" class="owner-link"><code>{{ owner.did }}</code></a>
+{% if owner.quiet %}<code>{{ owner.did }}</code>{% else %}<a href="{{ owner.href }}" class="owner-link"><code>{{ owner.did }}</code></a>{% endif %}
 <span class="list-state-pill">State: {{ state }}{% if capped %} <span class="muted">This instance stores only part of this list.</span>{% endif %}</span>
 </div>
 {% if !description.is_empty() %}<p class="list-description">{% for l in description %}{{ l }}{% if !loop.last %}<br>{% endif %}{% endfor %}</p>{% endif %}

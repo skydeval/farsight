@@ -621,10 +621,11 @@ fn is_public(path: &str) -> bool {
 }
 
 /// Whether a link on a public page stays inside the public UI: its pages,
-/// its assets, or an anchor.
+/// its assets, an anchor, or the account holders' own sign-in.
 fn own_href(href: &str) -> bool {
     href == "/"
-        || ["/search", "/did/", "/list/", "/static/", "#"]
+        || href == "/account"
+        || ["/?", "/search", "/did/", "/list/", "/static/", "#"]
             .iter()
             .any(|p| href.starts_with(p))
 }
@@ -2624,6 +2625,405 @@ async fn check_withheld(c: &mut Checks, h: &mut H, w: &World) -> Result<(), Stri
     Ok(())
 }
 
+// ------------------------------------------- 8b. the account holder's opt-out
+
+/// An API answer without its `freshness`, which dates the answer and moves
+/// on its own between two calls.
+async fn api_answer(h: &H, method: &str, q: &str) -> Result<String, String> {
+    let mut v = h.xrpc(method, q).await?;
+    if let Some(o) = v.as_object_mut() {
+        o.remove("freshness");
+    }
+    Ok(v.to_string())
+}
+
+/// The heading count and the number of rows of a section.
+fn shape(sec: &str) -> (Option<String>, usize) {
+    (
+        between(sec, "<span class=\"count count-big\">", "</span>")
+            .first()
+            .map(|s| (*s).to_owned()),
+        sec.matches("<tr class=\"data-row").count(),
+    )
+}
+
+/// The bar of a page.
+fn bar_of(html: &str) -> String {
+    between(html, "<nav class=\"public-nav\"", "</nav>")
+        .first()
+        .map(|s| (*s).to_owned())
+        .unwrap_or_default()
+}
+
+/// The opt-out as the pages, cards and rows apply it. The row is written
+/// here directly; the sign-in that writes it is the stage 7 harness's.
+async fn check_optout(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> {
+    c.section("8b. an account that withheld its own pages");
+    // O1 owns the list naming S: it is a row (an owner) on S's page.
+    let o = w.o1.clone();
+    let sign_in = "<a class=\"nav-sign-in\" href=\"/account\">Sign in</a>";
+    let link = format!("href=\"{}\"", path_did(&o));
+    let card_attr = format!("data-card=\"/card/{o}\"");
+    let list_q = format!(
+        "list={}&limit=1000",
+        enc(&format!("at://{o}/app.bsky.graph.list/{LIST}"))
+    );
+    let naming_q = format!("actor={}&limit=1000", enc(&o));
+
+    // The bar's link, and the page holding the sign-in.
+    let home = h.get("/").await?;
+    let spage = h.get(&path_did(&w.s)).await?;
+    let odd = h
+        .get_with(
+            &h.fresh(),
+            &path_did(&w.s),
+            &[
+                ("host", "evil.example"),
+                ("cookie", "farsight_account=x; farsight_admin=y"),
+            ],
+        )
+        .await?;
+    c.check(
+        "every public page's bar carries a plain \"Sign in\" link to /account — a link, not a form — and the bar is byte-identical whatever Host header or cookies the request sent",
+        bar_of(&home.text).contains(sign_in)
+            && bar_of(&spage.text).contains(sign_in)
+            && bar_of(&spage.text) == bar_of(&odd.text)
+            && !bar_of(&spage.text).contains("action=\"/account"),
+        support::truncate(&bar_of(&spage.text), 200),
+    );
+    let here = h
+        .get_with(&h.fresh(), "/account", &[("host", HOSTNAME)])
+        .await?;
+    let elsewhere = h.get("/account").await?;
+    let csp = here.header("content-security-policy").unwrap_or_default();
+    c.check(
+        "GET /account on the hostname: 200, the form posting to /account, the sign-in CSP (form-action allows https:), no-store, private, noindex; a plain sign-in that says it gives no access to the account and does not explain opting out",
+        here.status == 200
+            && here.text.contains("action=\"/account\"")
+            && here.text.contains("name=\"account\"")
+            && csp.contains("form-action 'self' https:")
+            && here.header("cache-control").as_deref() == Some("no-store, private")
+            && here.header("x-robots-tag").as_deref() == Some("noindex, nofollow")
+            && here.text.contains("gives Farsight no access to your account")
+            && !here.text.contains("hide your pages")
+            && !here.text.contains("What hiding your pages does"),
+        format!("{} {csp}", here.short()),
+    );
+    let posted = h
+        .fresh()
+        .post_form(
+            &format!("{}/account", h.base),
+            &[("host", "evil.example")],
+            &[("account", o.as_str())],
+        )
+        .await?;
+    c.check(
+        "on another Host, /account has no form and says where to sign in; POST /account there is 400 and starts nothing",
+        elsewhere.status == 200
+            && !elsewhere.text.contains("action=\"/account\"")
+            && elsewhere.text.contains(&format!("https://{HOSTNAME}/account"))
+            && posted.status == 400
+            && posted.header("location").is_none()
+            && set_cookie(&posted, "farsight_account_flow").is_none(),
+        format!("{} / {}", elsewhere.status, posted.status),
+    );
+
+    // Before.
+    let unknown_card = h.get(&format!("/card/{}", w.unknown)).await?;
+    let before_card = h.get(&format!("/card/{o}")).await?;
+    let before_lists = section(&spage.text, "lists").unwrap_or("").to_owned();
+    let api_list = api_answer(h, "query.getListMembers", &list_q).await?;
+    let api_naming = api_answer(h, "query.getListsNaming", &naming_q).await?;
+    c.check(
+        "before: the account's page is a page, its list's page is a page, and S's page names it as a link with its card",
+        h.get(&path_did(&o)).await?.text.contains("<section")
+            && h.get(&w.list).await?.text.contains("<section")
+            && before_lists.contains(&link)
+            && before_lists.contains(&card_attr),
+        support::truncate(&before_lists, 200),
+    );
+    let metrics_before = h.metrics_text().await?;
+
+    // Opted out.
+    h.sql(&format!("INSERT INTO public_optouts (did) VALUES ('{o}')"))
+        .await?;
+    let own = h.get(&path_did(&o)).await?;
+    let own_list = h.get(&w.list).await?;
+    c.check(
+        "opted out: the account's page and its list's page answer the withheld notice — 200, the bar, no section, public max-age=30, noindex",
+        own.status == 200
+            && own.text.contains(WITHHELD_ACCOUNT)
+            && !own.text.contains("<section")
+            && own.header("cache-control").as_deref() == Some("public, max-age=30")
+            && own.header("x-robots-tag").as_deref() == Some("noindex, nofollow")
+            && own_list.status == 200
+            && own_list.text.contains(WITHHELD_LIST)
+            && !own_list.text.contains("<section"),
+        format!("{} / {}", own.short(), own_list.short()),
+    );
+    let tabbed = h.get(&format!("{}?tab=history", path_did(&o))).await?;
+    c.check(
+        "the History tab is withheld with the page",
+        tabbed.status == 200
+            && tabbed.text.contains(WITHHELD_ACCOUNT)
+            && !tabbed.text.contains("id=\"history\""),
+        tabbed.short(),
+    );
+    let card = h.get(&format!("/card/{o}")).await?;
+    c.check(
+        "its card is the same 404 as an unknown account's, no-store",
+        card.status == 404
+            && card.text == unknown_card.text
+            && card.header("cache-control") == unknown_card.header("cache-control")
+            && before_card.status != 404,
+        format!("before {} / after {}", before_card.status, card.status),
+    );
+    let after = h.get(&path_did(&w.s)).await?;
+    let after_lists = section(&after.text, "lists").unwrap_or("").to_owned();
+    c.check(
+        "on S's page the account is still a row, its name plain text: no link to its page, no avatar, no card attribute; the section's count and its rows are unchanged, and the list's own link stays",
+        after.status == 200
+            && after_lists.contains("<span class=\"who-quiet\">")
+            && after_lists.contains(&o)
+            && !after_lists.contains(&link)
+            && !after_lists.contains(&card_attr)
+            && !after_lists.contains("<img")
+            && shape(&after_lists) == shape(&before_lists)
+            && after_lists.contains(&format!("href=\"/list/{o}/{LIST}\"")),
+        format!("{:?} vs {:?}", shape(&before_lists), shape(&after_lists)),
+    );
+    // A top list names it, quietly.
+    h.set(&[("show_top_blockers", Some("on"))]).await?;
+    let end = farsight_storage::top::day_end(chrono::Utc::now()).to_rfc3339();
+    let rows = serde_json::json!([[o.as_str(), 99], [w.s.as_str(), 50]]).to_string();
+    for kind in ["blockers_all", "blockers_day"] {
+        h.sql(&format!(
+            "INSERT INTO top_lists (kind, computed_at, rows) VALUES ('{kind}', '{end}'::timestamptz, '{rows}')
+             ON CONFLICT (kind) DO UPDATE SET computed_at = EXCLUDED.computed_at, rows = EXCLUDED.rows"
+        ))
+        .await?;
+    }
+    let top = h.get("/").await?;
+    let tables = between(&top.text, "<section id=\"", "</section>").join("");
+    c.check(
+        "in a top list the account keeps its place, its name plain text with no link or card; the next row is an ordinary link",
+        top.status == 200
+            && tables.contains("<span class=\"who-quiet\">")
+            && tables.contains(&o)
+            && !tables.contains(&link)
+            && !tables.contains(&card_attr)
+            && tables.contains(&format!("href=\"{}\"", path_did(&w.s))),
+        support::truncate(&tables, 300),
+    );
+    h.set(&[("show_top_blockers", None)]).await?;
+    h.sql("DELETE FROM top_lists WHERE kind IN ('blockers_all', 'blockers_day')")
+        .await?;
+    c.check(
+        "the API's answers about the account are the same before and after (getListMembers of its list, getListsNaming; freshness aside)",
+        api_answer(h, "query.getListMembers", &list_q).await? == api_list
+            && api_answer(h, "query.getListsNaming", &naming_q).await? == api_naming,
+        "compared",
+    );
+    // A page already open keeps working: what its script asks for again
+    // answers, and the link it still holds leads to the notice.
+    let again = h
+        .get_with(&h.fresh(), &path_did(&w.s), &[("hx-request", "true")])
+        .await?;
+    let held = h
+        .get_with(&h.fresh(), &path_did(&o), &[("hx-request", "true")])
+        .await?;
+    c.check(
+        "an open page that becomes withheld keeps working: S's page read again is 200 with its rows, the account's own page read again is the notice (200), and its card is a 404 the script shows as no profile",
+        again.status == 200
+            && section(&again.text, "lists").is_some()
+            && held.status == 200
+            && held.text.contains(WITHHELD_ACCOUNT),
+        format!("{} / {}", again.status, held.status),
+    );
+    let metrics_after = h.metrics_text().await?;
+    let opted = metric(
+        &metrics_after,
+        "farsight_public_ui_withheld_total",
+        &[("reason", "self_opt_out")],
+    ) - metric(
+        &metrics_before,
+        "farsight_public_ui_withheld_total",
+        &[("reason", "self_opt_out")],
+    );
+    c.check(
+        "farsight_public_ui_withheld_total counts the notices under self_opt_out, a label with no DID",
+        opted >= 3.0 && !metrics_after.contains(&o),
+        format!("+{opted}"),
+    );
+    let dash = h.admin_get("/admin").await?;
+    c.check(
+        "the admin dashboard shows how many accounts opted out, and not which",
+        dash.text.contains("Accounts opted out of public pages") && !dash.text.contains(&o),
+        "count only",
+    );
+    // A failed read of the opt-out is the page's 503, never the page.
+    h.sql("ALTER TABLE public_optouts RENAME TO public_optouts_away")
+        .await?;
+    let failed_page = h.get(&path_did(&w.s)).await;
+    let failed_own = h.get(&path_did(&o)).await;
+    let failed_card = h.get(&format!("/card/{}", w.s)).await;
+    h.sql("ALTER TABLE public_optouts_away RENAME TO public_optouts")
+        .await?;
+    let (failed_page, failed_own, failed_card) = (failed_page?, failed_own?, failed_card?);
+    c.check(
+        "fail closed: with the opt-out unreadable, a page with rows, the account's page and a card answer 503, never the page",
+        failed_page.status == 503 && failed_own.status == 503 && failed_card.status == 503,
+        format!(
+            "{} / {} / {}",
+            failed_page.status, failed_own.status, failed_card.status
+        ),
+    );
+    // Switched off: the routes and the link go, the opt-out stays.
+    let text = h.config_text()?;
+    let off = h
+        .post_config(&text.replacen("[public_ui]\n", "[public_ui]\nself_optout = false\n", 1))
+        .await?;
+    let gone = h
+        .get_with(&h.fresh(), "/account", &[("host", HOSTNAME)])
+        .await?;
+    let unknown = h.get("/no-such-route").await?;
+    let still = h.get(&path_did(&o)).await?;
+    let plain = h.get(&path_did(&w.s)).await?;
+    c.check(
+        "public_ui.self_optout = false, without restart: /account is the bare 404 of an unknown route, the bar has no link, and the stored opt-out is still honoured",
+        off.text.contains("Saved.")
+            && gone.status == 404
+            && gone.text == unknown.text
+            && !bar_of(&plain.text).contains("/account")
+            && still.text.contains(WITHHELD_ACCOUNT),
+        format!("{} / {}", gone.status, banner(&off.text)),
+    );
+    let on = h.post_config(&text).await?;
+    // Opting back in.
+    h.sql(&format!("DELETE FROM public_optouts WHERE did = '{o}'"))
+        .await?;
+    let back = h.get(&path_did(&o)).await?;
+    let back_list = h.get(&w.list).await?;
+    let back_s = h.get(&path_did(&w.s)).await?;
+    c.check(
+        "opted back in: the account's page and its list's page are pages again, and S's page links it with its card",
+        on.text.contains("Saved.")
+            && back.status == 200
+            && back.text.contains("<section")
+            && back_list.text.contains("<section")
+            && section(&back_s.text, "lists").is_some_and(|s| s.contains(&link) && s.contains(&card_attr)),
+        format!("{} / {}", back.short(), banner(&on.text)),
+    );
+    Ok(())
+}
+
+/// A list marked taken down (the configured AppView no longer serves
+/// it). The mark is written here directly; the checker that writes it is
+/// the stage 4 harness's.
+async fn check_list_takedown(c: &mut Checks, h: &H, w: &World) -> Result<(), String> {
+    c.section("8c. a list the AppView no longer serves");
+    let o = w.o1.clone();
+    let uri = format!("at://{o}/app.bsky.graph.list/{LIST}");
+    let link = format!("href=\"/list/{o}/{LIST}\"");
+    let blocker = did("lbk", 1);
+    let check_q = format!("actor={}&others={}", enc(&blocker), enc(&w.s));
+    let naming_q = format!("actor={}&limit=1000", enc(&w.s));
+    let members_q = format!("list={}&limit=1", enc(&uri));
+    let before_page = h.get(&path_did(&w.s)).await?;
+    let before_lists = section(&before_page.text, "lists").unwrap_or("").to_owned();
+    let before_check = h.xrpc("query.checkBlocks", &check_q).await?;
+    c.check(
+        "before: S's page links the list, its page is a page, and checkBlocks names it with no takenDown",
+        before_lists.contains(&link)
+            && h.get(&w.list).await?.text.contains("<section")
+            && before_check.to_string().contains(&uri)
+            && !before_check.to_string().contains("takenDown"),
+        support::truncate(&before_check.to_string(), 300),
+    );
+
+    h.sql(&format!(
+        "UPDATE lists SET appview_absent_since = now() - interval '2 hours'
+         WHERE rkey = '{LIST}' AND owner_id = (SELECT id FROM actors WHERE did = '{o}')"
+    ))
+    .await?;
+    let page = h.get(&w.list).await?;
+    c.check(
+        "its page: 200, the list's name and owner, the Taken down mark and one line; no section (no members, no subscribers); public max-age=30, noindex",
+        page.status == 200
+            && page.text.contains("taken-down-pill")
+            && page.text.contains("This list has been taken down, so its members and subscribers are not shown.")
+            && page.text.contains(&uri)
+            && page.text.contains(&format!("href=\"{}\"", path_did(&o)))
+            && !page.text.contains("<section")
+            && !page.text.contains("<script>alert(1)</script>")
+            && page.header("cache-control").as_deref() == Some("public, max-age=30")
+            && page.header("x-robots-tag").as_deref() == Some("noindex, nofollow"),
+        page.short(),
+    );
+    let after = h.get(&path_did(&w.s)).await?;
+    let after_lists = section(&after.text, "lists").unwrap_or("").to_owned();
+    c.check(
+        "on S's page the list is still a row, its name plain text with the mark and no link to its page; the owner cell and the row count are unchanged",
+        after_lists.contains("list-taken-down")
+            && after_lists.contains("taken-down-pill")
+            && !after_lists.contains(&link)
+            && shape(&after_lists) == shape(&before_lists),
+        format!("{:?} vs {:?}", shape(&before_lists), shape(&after_lists)),
+    );
+    let check = h.xrpc("query.checkBlocks", &check_q).await?;
+    let rel = check["results"]
+        .as_array()
+        .and_then(|r| r.iter().find(|x| x["did"] == w.s.as_str()))
+        .map(|x| x["blockedByActor"].clone())
+        .unwrap_or_default();
+    c.check(
+        "checkBlocks: the list is still in `lists` and the relation still holds; `takenDown` names it",
+        rel["lists"].as_array().is_some_and(|l| l.iter().any(|u| u == uri.as_str()))
+            && rel["takenDown"] == serde_json::json!([uri]),
+        support::truncate(&rel.to_string(), 300),
+    );
+    let naming = h.xrpc("query.getListsNaming", &naming_q).await?;
+    let members = h.xrpc("query.getListMembers", &members_q).await?;
+    let named = naming["lists"]
+        .as_array()
+        .and_then(|l| l.iter().find(|x| x["uri"] == uri.as_str()))
+        .cloned()
+        .unwrap_or_default();
+    c.check(
+        "getListsNaming and getListMembers say takenDown: true, and getListMembers still returns members",
+        named["takenDown"] == serde_json::json!(true)
+            && members["takenDown"] == serde_json::json!(true)
+            && members["members"].as_array().is_some_and(|m| !m.is_empty()),
+        format!("{} / {}", named, support::truncate(&members.to_string(), 200)),
+    );
+    let dash = h.admin_get("/admin").await?;
+    c.check(
+        "the admin dashboard says the checks are off (the default)",
+        dash.text.contains("Takedown checks"),
+        "dashboard",
+    );
+
+    h.sql(&format!(
+        "UPDATE lists SET appview_absent_since = NULL
+         WHERE rkey = '{LIST}' AND owner_id = (SELECT id FROM actors WHERE did = '{o}')"
+    ))
+    .await?;
+    let back = h.get(&w.list).await?;
+    let back_s = h.get(&path_did(&w.s)).await?;
+    c.check(
+        "cleared: its page is a page again, S's page links it, and checkBlocks has no takenDown",
+        back.text.contains("<section")
+            && section(&back_s.text, "lists").is_some_and(|s| s.contains(&link))
+            && !h
+                .xrpc("query.checkBlocks", &check_q)
+                .await?
+                .to_string()
+                .contains("takenDown"),
+        back.short(),
+    );
+    Ok(())
+}
+
 // --------------------------------------------- 9–13. settings and headers
 
 async fn check_opengraph(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> {
@@ -2917,9 +3317,9 @@ async fn check_keys(c: &mut Checks, h: &mut H, w: &World) -> Result<(), String> 
         }
     }
     c.check(
-        "crawlable = true: robots.txt keeps crawlers out of the admin UI, sign-in, the wizard, the API, search and cards and the health endpoints, and allows the rest; cards, search, error and withheld pages stay noindex",
+        "crawlable = true: robots.txt keeps crawlers out of the admin UI, both sign-ins, the wizard, the API, search and cards and the health endpoints, and allows the rest; cards, search, error and withheld pages stay noindex",
         robots.text
-            == "User-agent: *\nDisallow: /admin\nDisallow: /enter\nDisallow: /setup\nDisallow: /xrpc/\nDisallow: /search\nDisallow: /card/\nDisallow: /health\nDisallow: /livez\nAllow: /\n"
+            == "User-agent: *\nDisallow: /admin\nDisallow: /enter\nDisallow: /account\nDisallow: /setup\nDisallow: /xrpc/\nDisallow: /search\nDisallow: /card/\nDisallow: /health\nDisallow: /livez\nAllow: /\n"
             && bad.is_empty(),
         if bad.is_empty() { robots.text.replace('\n', " / ") } else { bad.join("; ") },
     );
@@ -3868,10 +4268,13 @@ async fn check_metrics(c: &mut Checks, h: &H) -> Result<(), String> {
         format!("{outcomes:?}"),
     );
     c.check(
-        "farsight_public_ui_duration_seconds, handle_resolutions and withheld series exist",
+        "farsight_public_ui_duration_seconds, handle_resolutions and withheld series exist, the opt-out's among them, and the opt-out changes by choice (no DID label)",
         m.contains("farsight_public_ui_duration_seconds")
             && m.contains("farsight_public_ui_handle_resolutions_total{outcome=\"skipped\"}")
             && m.contains("farsight_public_ui_withheld_total{reason=\"operator_excluded\"}")
+            && m.contains("farsight_public_ui_withheld_total{reason=\"self_opt_out\"}")
+            && m.contains("farsight_public_optout_changes_total{to=\"hidden\"}")
+            && m.contains("farsight_public_optout_changes_total{to=\"shown\"}")
             && m.contains("farsight_block_history_written_total"),
         "present",
     );
@@ -4243,6 +4646,8 @@ async fn phase_ui(
     }
 
     check_withheld(c, &mut h, &w).await?;
+    check_optout(c, &mut h, &w).await?;
+    check_list_takedown(c, &h, &w).await?;
     check_keys(c, &mut h, &w).await?;
     check_limits(c, &mut h, &w).await?;
     check_off_and_raw_editor(c, &mut h, &w).await?;

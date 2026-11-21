@@ -156,6 +156,9 @@ complete as the sweep, and responses say so.</div>
 <li><strong>Profile cards</strong>: for any account in a row, its handle, DID and the date the DID was created, fetched from
 the network when a visitor asks. The card has the account's avatar, which <strong>each visitor's browser fetches from the
 account's own server</strong> (<code>show_avatars</code> is on): that server's operator sees the visitor's address.</li>
+<li><strong>Sign-in for account holders</strong>: when the hostname is a domain name, anyone can sign in at
+<code>/account</code> with their own account to hide that account's page and its lists' pages here (<code>self_optout</code>
+is on). Each sign-in makes this instance contact <strong>that account's own server</strong>.</li>
 <li>Removed records are <strong>not</strong> public.</li>
 </ul>
 <p>Search engines are asked not to index the pages (<code>crawlable</code> is off). Accounts that are not active are not

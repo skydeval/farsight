@@ -14,9 +14,14 @@ budget in the setup wizard) is in
 
 ## Schema version and migrations
 
-The schema is one migration file, `0001_initial.sql`, in
-`crates/farsight-storage/migrations/`, embedded in the binaries. The
-schema version is **1**.
+The schema is three migration files in
+`crates/farsight-storage/migrations/`, embedded in the binaries:
+`0001_initial.sql` creates the whole schema as it was through 0.7,
+`0002_public_optouts.sql` adds `public_optouts`
+([Tables for the web UI](#tables-for-the-web-ui)), and
+`0003_list_takedowns.sql` adds the `appview_*` columns of `lists`, their
+two indexes and `list_takedown_checks` ([Records](#records)). The
+schema version is **3**.
 
 - `schema_version` holds one row with one column, `version`. Each
   migration ends with `UPDATE schema_version SET version = <n>`, where
@@ -24,12 +29,26 @@ schema version is **1**.
   last migration applied.
 - Only `farsight-server` runs migrations, at start. After running them
   it reads `schema_version` and refuses to continue unless the value
-  equals the version the build expects (`SCHEMA_VERSION = 1`).
+  equals the version the build expects (`SCHEMA_VERSION = 3`).
 - `farsight-backfill` never migrates. At start it polls
   `schema_version` every 5 seconds and begins work only when the value
-  equals its own `SCHEMA_VERSION`.
+  equals its own `SCHEMA_VERSION`. Both binaries take the number from
+  the storage crate, so the two of one release always agree; a
+  `farsight-backfill` of an earlier release waits forever for its own
+  version, so **both binaries are upgraded together**.
 - A build fails its tests if the number of migration files differs from
   `SCHEMA_VERSION`, or if a migration does not set its version.
+- **No downgrade.** A server of an earlier release finds a migration it
+  does not know and refuses to start. Undoing versions 2 and 3 by hand
+  means:
+  - dropping `public_optouts`, `list_takedown_checks`, the indexes
+    `lists_appview_due` and `lists_appview_absent`, and the columns
+    `appview_absent_since`, `appview_checked_at`, `appview_misses` and
+    `appview_due_at` of `lists`;
+  - deleting the rows of migrations 2 and 3 from `_sqlx_migrations`;
+  - setting `schema_version` to 1;
+  - removing `public_ui.self_optout` and `[backfill.list_takedowns]`
+    from the config, which an earlier release refuses as unknown keys.
 
 Indexes that take long to build on a large table are not created by a
 migration; see [the sort indexes](#the-sort-indexes).
@@ -195,9 +214,27 @@ CREATE TABLE lists (
   next_retry_at     TIMESTAMPTZ,
   description       TEXT,
   avatar_cid        TEXT,
+  -- 0003_list_takedowns.sql
+  appview_absent_since TIMESTAMPTZ,
+  appview_checked_at   TIMESTAMPTZ,
+  appview_misses       SMALLINT NOT NULL DEFAULT 0,
+  appview_due_at       TIMESTAMPTZ,
   UNIQUE (owner_id, rkey)
 );
 CREATE INDEX lists_by_state ON lists (track_state) WHERE track_state <> 0;
+-- 0003_list_takedowns.sql
+CREATE INDEX lists_appview_due ON lists (appview_due_at NULLS FIRST, id)
+  WHERE listblock_count > 0 AND record_state = 1;
+CREATE INDEX lists_appview_absent ON lists (id) WHERE appview_absent_since IS NOT NULL;
+
+CREATE TABLE list_takedown_checks (
+  id            SMALLINT PRIMARY KEY DEFAULT 1,  -- one row
+  last_pass_at  TIMESTAMPTZ,
+  last_checks   INT NOT NULL DEFAULT 0,
+  last_errors   INT NOT NULL DEFAULT 0,
+  last_error    TEXT,
+  last_error_at TIMESTAMPTZ
+);
 
 CREATE TABLE list_items (
   owner_id   BIGINT NOT NULL,
@@ -248,7 +285,22 @@ CREATE INDEX tombstones_by_age ON tombstones (deleted_at);
   2 ceiling, 3 host cap, 4 lists cap, 5 owner re-admissions), the two
   exact counts `listblock_count` and `item_count`, and the fetch
   bookkeeping. The states and their transitions are in
-  [list indexing](list-indexing.md).
+  [list indexing](list-indexing.md). The `appview_*` columns are the
+  taken-down list checks' (`[backfill.list_takedowns]`), written by the
+  backfill process only:
+  - `appview_absent_since`: set when the list is marked taken down;
+  - `appview_checked_at`: the last conclusive answer, which is the first
+    "not found" while `appview_misses` is 1;
+  - `appview_misses`: the "not found" answers in a row;
+  - `appview_due_at`: the next check, NULL for a list never checked.
+
+  `lists_appview_due` hands the checker the lists it looks at (a present
+  record and a counted listblock), never-checked first.
+  `lists_appview_absent` counts and clears the marked ones. See
+  [list indexing](list-indexing.md#lists-an-appview-has-taken-down).
+- `list_takedown_checks`: the checker's last pass (when, how many lists
+  it asked about, how many answers gave nothing to go by, and the last
+  such answer), for the admin dashboard.
 - `list_items`: one row per `app.bsky.graph.listitem` record of a
   tracked list. Items of untracked lists are not stored.
 - `tombstones`: the rev of a recent delete per record key; `collection`
@@ -768,6 +820,11 @@ CREATE TABLE top_lists (
   computed_at TIMESTAMPTZ NOT NULL,
   rows        TEXT NOT NULL
 );
+
+-- 0002_public_optouts.sql
+CREATE TABLE public_optouts (
+  did TEXT COLLATE "C" PRIMARY KEY
+);
 ```
 
 - `handle_cache`: one row per DID whose handle has been checked: the
@@ -811,6 +868,18 @@ CREATE TABLE top_lists (
 
 All five can be emptied at any time: the UI fills them again. Their use
 is described in [web UI](web-ui.md).
+
+- `public_optouts`: the accounts whose holders withheld their own
+  public pages ([web UI](web-ui.md#the-account-holders-sign-in)), one
+  row per DID in canonical form and nothing else: no time, handle,
+  address or session. It is keyed by DID, not `actors.id`, because an
+  account may opt out before this instance has interned it and a page
+  view never interns. A completed sign-in inserts the row
+  (`ON CONFLICT DO NOTHING`) or deletes it; the public pages, cards and
+  rows read it on every view. Unlike the five above it is **not**
+  refilled: emptying it shows every opted-out account's pages again. A
+  config reset keeps it, like every database content. About 120 bytes
+  a row with its index: a million opt-outs is about 120 MB.
 
 ### The sort indexes
 
@@ -1352,6 +1421,7 @@ row counts are estimates of the network's size.
 | `lists` | ~1 million | ~130 + ~72 ≈ 200 B | ~0.2 GB |
 | `backfill_state` | ~3–6 million | ~110 B | ~0.5 GB |
 | the three history tables | one per removal | ~210–255 B | ~0.2 GB per million rows |
+| `public_optouts` | one per opted-out account | ~120 B | ~0.1 GB per million rows |
 | tombstones, queues, the rest | | | < 0.5 GB |
 
 By the same model the sort indexes cost about 53–62 bytes per entry

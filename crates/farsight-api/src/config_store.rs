@@ -80,7 +80,8 @@ const PUBLIC_UI_WIDENING: [&str; 6] = [
 /// - every `auth.*`, `net.*`, `proxy.*` and `metrics.*` key;
 /// - `storage.database_url`, `server.hostname`, `firehose.urls`,
 ///   `backfill.plc_url`, `backfill.lodestar_url`, `backfill.relay_url`,
-///   `backfill.backlinks.url` and `public_ui.record_viewer_url`;
+///   `backfill.backlinks.url`, `backfill.list_takedowns.appview_url` and
+///   `public_ui.record_viewer_url`;
 /// - an `access.*` key that lets more callers in (`reads` towards
 ///   `public`, `cors` or `public_ui` switched on);
 /// - a public-UI switch that shows more ([`PUBLIC_UI_WIDENING`]) turned
@@ -116,6 +117,7 @@ pub fn sensitive_changes(old: &config::Config, new: &config::Config) -> Vec<Stri
                         | "backfill.lodestar_url"
                         | "backfill.relay_url"
                         | "backfill.backlinks.url"
+                        | "backfill.list_takedowns.appview_url"
                         | "public_ui.record_viewer_url"
                 )
         })
@@ -437,6 +439,10 @@ mod tests {
         assert_eq!(
             with(&|c| c.backfill.relay_url = "https://relay.evil.example".into()),
             ["backfill.relay_url"]
+        );
+        assert_eq!(
+            with(&|c| c.backfill.list_takedowns.appview_url = "https://appview.evil.example".into()),
+            ["backfill.list_takedowns.appview_url"]
         );
         assert_eq!(
             with(&|c| c.net.allow_http_hosts = vec!["198.51.100.1".into()]),

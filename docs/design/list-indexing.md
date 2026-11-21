@@ -262,6 +262,12 @@ columns of the record, and always happen after the list lock for that
 row is held, so two writers of the same `lists` row are already
 serialized by the list lock.
 
+The taken-down list checker
+([below](#lists-an-appview-has-taken-down)) is the one writer that
+takes no list lock. It writes only its own `appview_*` columns, one row
+per statement and outside any transaction, so it holds no other lock
+while it waits for that row's.
+
 Deadlock aborts remain possible in principle (hash collisions,
 autovacuum). Every apply transaction retries on SQLSTATE `40P01` and
 on a lock set that changed while it was taken, and neither kind of
@@ -503,3 +509,64 @@ refuses no item. A capped tracked list is counted in the exception
 There is no minimum number of listblockers for admission: one counted
 listblock admits a list, because a higher threshold would hide real
 blocks.
+
+## Lists an AppView has taken down
+
+An AppView's moderation can take a list down while the list's record
+stays in its owner's repository. The AppView then stops enforcing the
+list, but Farsight, which reads the records, would still count it.
+With `[backfill.list_takedowns]` on
+([operations.md](operations.md#backfilllist_takedowns)), the backfill
+process asks one AppView whether it still serves each list, and marks
+the lists it no longer serves. It is off by default: Farsight asks no
+AppView unless the operator turns it on.
+
+**Which lists are asked about.** Lists with a present record and at
+least one counted listblock. Lists asked about before and due again
+go first, longest due first, because they are few and their answers
+confirm or clear a mark. Lists never asked about follow, in the order
+Farsight first saw them, so a list that has just gained its first
+listblock waits behind the lists still in the first pass. A list whose record is deleted, or
+which has no counted listblock left, is no longer asked about, and the
+next pass clears its mark.
+
+**The question.** `app.bsky.graph.getList?list=<uri>&limit=1`, paced
+at `rps` by a limiter of its own. A pass runs every 15 seconds and
+asks about the lists that are due, as many as `rps` allows in a
+minute. It stops early at a `429`.
+
+**The rule.** "Not found" is a `400` whose `error` is `InvalidRequest`
+or `NotFound` and whose message says the list was not found. The
+Bluesky AppView gives that answer both for a list it has taken down
+and for one that never existed. Farsight holds the record, so the
+answer means the AppView no longer serves the list.
+- A list is **marked** after two such answers at least `confirm_after`
+  apart with no other conclusive answer between them, and only once the
+  record's `createdAt` is older than `confirm_after`. The two answers
+  and the age allow for an AppView that has not indexed a new list yet.
+- A `200` with the list **clears** the mark and the count of misses.
+- Every other answer changes nothing but the time of the next check,
+  which is `confirm_after` later: another status, a timeout, a
+  refused connection, or a `429`. An AppView that is down or limiting
+  never marks a list.
+- A served list is asked about again after `recheck` (a day), a marked
+  one after `recheck_taken_down` (6 hours), so a takedown that is
+  reversed clears.
+
+There is no separate check of the owner's account. If the AppView has
+taken the owner's whole account down, it no longer enforces that
+account's lists either, and marking them matches what it enforces.
+
+**What a mark changes.** In the index, nothing: the list keeps its
+state, its items and its listblocks, and still counts as a block in
+every answer. The answers say which lists are marked: `takenDown` in
+`checkBlocks`, `getListMembers` and `getListsNaming`, and
+`listTakenDown` in `getIncomingListBlocks`
+([api.md](api.md#lists-an-appview-has-taken-down)). Whether a marked
+list blocks is the caller's choice. On the public pages the list's
+page shows the mark and neither its members nor its subscribers, and
+its rows show its name as plain text with the mark
+([web-ui.md](web-ui.md)).
+
+Turning the checks off clears every mark at the next pass, so no mark
+is left that nothing would check again.

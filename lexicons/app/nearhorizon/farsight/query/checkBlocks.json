@@ -141,6 +141,15 @@
         "listsTruncated": {
           "type": "boolean",
           "description": "Present and true when more than 100 lists carry the relation; `lists` then holds the first 100."
+        },
+        "takenDown": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "at-uri"
+          },
+          "maxLength": 100,
+          "description": "Present when non-empty: those of `lists` that the AppView this instance asks (`backfill.list_takedowns`) no longer serves although their record is present. They have been taken down by that AppView's moderation, which no longer enforces them. They are still in `lists` and still count as blocks here; a caller that follows the AppView treats the relation as holding only if `direct` is true or `lists` has a URI not in `takenDown`."
         }
       }
     },

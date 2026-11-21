@@ -23,6 +23,9 @@ pub const CARDS: &str = "farsight_public_ui_cards_total";
 /// it answered (`answered`) or the PLC directory and Farsight's own
 /// checks were used instead (`fallback`).
 pub const LODESTAR_READS: &str = "farsight_public_ui_lodestar_reads_total";
+/// `farsight_public_optout_changes_total{to}`: changes stored through
+/// `/account`, by the choice stored (`hidden` or `shown`). No DID.
+pub const OPTOUT_CHANGES: &str = "farsight_public_optout_changes_total";
 
 /// The route a public request matched: the `page` label of the request
 /// counter and of the duration histogram.
@@ -106,10 +109,19 @@ pub fn lodestar_read(answered: bool) {
     ::metrics::counter!(LODESTAR_READS, "outcome" => outcome).increment(1);
 }
 
+/// Counts one change an account holder stored at `/account`.
+pub fn optout_change(hidden: bool) {
+    let to = if hidden { "hidden" } else { "shown" };
+    ::metrics::counter!(OPTOUT_CHANGES, "to" => to).increment(1);
+}
+
 /// Registers every series at zero so it is visible before first use.
 pub fn register() {
     for o in ["answered", "fallback"] {
         ::metrics::counter!(LODESTAR_READS, "outcome" => o).increment(0);
+    }
+    for to in ["hidden", "shown"] {
+        ::metrics::counter!(OPTOUT_CHANGES, "to" => to).increment(0);
     }
     for p in Page::ALL {
         ::metrics::counter!(REQUESTS, "page" => p.label(), "status" => "2xx").increment(0);
@@ -120,10 +132,7 @@ pub fn register() {
     for o in super::card::Outcome::ALL {
         ::metrics::counter!(CARDS, "outcome" => o.label()).increment(0);
     }
-    for r in [
-        WithheldReason::HiddenStatus,
-        WithheldReason::OperatorExcluded,
-    ] {
+    for r in WithheldReason::ALL {
         ::metrics::counter!(WITHHELD, "reason" => r.label()).increment(0);
     }
 }

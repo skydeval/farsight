@@ -592,12 +592,17 @@ async fn check_modes(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<(), String> {
     let m = &meta.body;
     let id = format!("https://{HOSTNAME}/.well-known/atproto-oauth-client-metadata");
     c.check(
-        "the client metadata is served on the instance's hostname: JSON, public max-age=3600, every field of the profile, authorization_code only",
+        "the client metadata is served on the instance's hostname: JSON, public max-age=3600, every field of the profile, authorization_code only, both callbacks (the admin's and the account holders'), and a name that says which instance asks",
         meta.status == 200
             && meta.header("content-type").as_deref() == Some("application/json")
             && meta.header("cache-control").as_deref() == Some("public, max-age=3600")
             && m["client_id"] == id.as_str()
-            && m["redirect_uris"] == serde_json::json!([format!("https://{HOSTNAME}/enter/callback")])
+            && m["redirect_uris"]
+                == serde_json::json!([
+                    format!("https://{HOSTNAME}/enter/callback"),
+                    format!("https://{HOSTNAME}/account/callback")
+                ])
+            && m["client_name"] == format!("Farsight ({HOSTNAME})").as_str()
             && m["grant_types"] == serde_json::json!(["authorization_code"])
             && m["response_types"] == serde_json::json!(["code"])
             && m["token_endpoint_auth_method"] == "none"
@@ -990,8 +995,8 @@ async fn check_loopback_flow(c: &mut Checks, ctx: &Ctx, a: &Srv) -> Result<Strin
         .await?;
     let migrations = ctx.n("SELECT max(version) FROM _sqlx_migrations").await?;
     c.check(
-        "admin_sessions has six columns, and one migration creates the schema",
-        schema == 6 && migrations == 1,
+        "admin_sessions has six columns, and three migrations create the schema (the second adds public_optouts, the third the taken-down list columns)",
+        schema == 6 && migrations == 3,
         format!("{schema} columns, migration {migrations}"),
     );
     Ok(admin_cookie)
@@ -1516,6 +1521,7 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
     let mut disabled = Vec::new();
     let mut off = Vec::new();
     let mut api_only = None;
+    let mut public_meta = None;
     for public_ui in [true, false] {
         let s = Srv::with_config(
             "adminoff",
@@ -1542,6 +1548,16 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
             ("/enter/callback?state=x", ""),
             ("/.well-known/atproto-oauth-client-metadata", HOSTNAME),
         ] {
+            // With the public UI on, the account holders' sign-in exists
+            // (`public_ui.self_optout`, on by default), and it needs the
+            // client metadata: checked below.
+            if public_ui && p.starts_with("/.well-known/") {
+                public_meta = Some(
+                    http.get(&format!("{}{p}", s.base), &[("host", host)])
+                        .await?,
+                );
+                continue;
+            }
             let headers: Vec<(&str, &str)> = if host.is_empty() {
                 vec![]
             } else {
@@ -1583,9 +1599,22 @@ async fn check_gates(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
         ctx.retire(s);
     }
     c.check(
-        "admin_ui = false: every admin page, /admin/card, /enter (GET and POST), /enter/callback, the client metadata and logout are the bare 404, with or without the public UI",
+        "admin_ui = false: every admin page, /admin/card, /enter (GET and POST), /enter/callback and logout are the bare 404, with or without the public UI; the client metadata too, without the public UI",
         disabled.is_empty(),
         disabled.join("; "),
+    );
+    c.check(
+        "admin_ui = false with the public UI on: the client metadata is still served for the account holders' sign-in, the same document with both callbacks",
+        public_meta.as_ref().is_some_and(|m| {
+            m.status == 200
+                && m.body["redirect_uris"]
+                    == serde_json::json!([
+                        format!("https://{HOSTNAME}/enter/callback"),
+                        format!("https://{HOSTNAME}/account/callback")
+                    ])
+                && m.body["client_name"] == format!("Farsight ({HOSTNAME})").as_str()
+        }),
+        public_meta.as_ref().map(Resp::short).unwrap_or_default(),
     );
     c.check(
         "neither UI: / is a short text page — 200, text/plain, starting \"Farsight\", public, max-age=300 — so that an API-only instance does not look broken",
@@ -2535,6 +2564,352 @@ fn check_logging(c: &mut Checks, ctx: &Ctx) {
     );
 }
 
+// ------------------------------------- 15. the account holders' sign-in
+
+/// An account holder.
+const HOLDER: &str = "did:plc:holderaaaaaaaaaaaaaaaaaa";
+/// An account whose directory entry never answers.
+const HANG: &str = "did:plc:hangaaaaaaaaaaaaaaaaaaaa";
+/// A handle typed into the form; it resolves nowhere.
+const HOLDER_HANDLE: &str = "holder-handle.invalid";
+
+impl Ctx {
+    /// `POST /account` on the hostname for `account`.
+    async fn privacy_start(&self, s: &Srv, http: &Http, account: &str) -> Result<Started, String> {
+        let r = http
+            .post_form(
+                &format!("{}/account", s.base),
+                &[("host", HOSTNAME)],
+                &[("account", account)],
+            )
+            .await?;
+        let cookie = set_cookie(&r, "farsight_account_flow");
+        if let Some(c) = &cookie {
+            self.secret(c.split_once('=').map_or("", |x| x.1));
+        }
+        Ok(Started {
+            location: r.header("location"),
+            cookie,
+            resp: r,
+        })
+    }
+
+    /// A whole account holder's sign-in: the state page, and the grant's
+    /// cookie (`name=value`) and token.
+    async fn privacy_sign_in(
+        &self,
+        s: &Srv,
+        http: &Http,
+        account: &str,
+    ) -> Result<(Resp, Option<String>, Option<String>), String> {
+        let st = self.privacy_start(s, http, account).await?;
+        let (Some(loc), Some(cookie)) = (st.location, st.cookie) else {
+            return Err(format!("privacy start: {}", st.resp.short()));
+        };
+        let cb = self.approve(&loc).await?;
+        let r = self.callback(s, http, &cb, Some(&cookie)).await?;
+        let grant = set_cookie(&r, "farsight_account");
+        if let Some(g) = &grant {
+            self.secret(g.split_once('=').map_or("", |x| x.1));
+        }
+        let token = token_of(&r.text);
+        if let Some(t) = &token {
+            self.secret(t);
+        }
+        Ok((r, grant, token))
+    }
+
+    /// `POST /account/set`.
+    async fn privacy_set(
+        &self,
+        s: &Srv,
+        http: &Http,
+        cookie: &str,
+        token: &str,
+        to: &str,
+    ) -> Result<Resp, String> {
+        http.post_form(
+            &format!("{}/account/set", s.base),
+            &[("host", HOSTNAME), ("cookie", cookie)],
+            &[("token", token), ("to", to)],
+        )
+        .await
+    }
+}
+
+/// The change grant's token in a state page.
+fn token_of(html: &str) -> Option<String> {
+    let k = "name=\"token\" value=\"";
+    let i = html.find(k)? + k.len();
+    Some(html[i..][..html[i..].find('"')?].to_owned())
+}
+
+/// Every `Set-Cookie` of a response, joined.
+fn set_cookies(r: &Resp) -> String {
+    r.headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// The `public_optouts` rows of `did`.
+async fn optouts_of(ctx: &Ctx, did: &str) -> Result<i64, String> {
+    ctx.n(&format!(
+        "SELECT count(*) FROM public_optouts WHERE did = '{did}'"
+    ))
+    .await
+}
+
+async fn check_privacy(c: &mut Checks, ctx: &Ctx) -> Result<(), String> {
+    c.section("15. the account holders' sign-in at /account");
+    let s = Srv::with_config(
+        "privacy",
+        &ctx.config(
+            HOSTNAME,
+            &format!("admin_ui = true\npublic_ui = true\nadmin_did = \"{D1}\""),
+        ),
+        &[],
+    )
+    .await?;
+    ctx.standin.client_metadata_at(&s.base, HOSTNAME);
+    ctx.standin.reset();
+    ctx.standin.take_events();
+
+    // A sign-in, end to end.
+    let http = ctx.fresh();
+    let st = ctx.privacy_start(&s, &http, HOLDER).await?;
+    let loc = st.location.clone().unwrap_or_default();
+    let flow_cookie = set_cookies(&st.resp);
+    let pars = ctx.standin.take_events();
+    let par = pars.iter().find(|e| e.kind == "par" && e.status == 201);
+    c.check(
+        "POST /account for a DID starts the flow as the instance's one hosted client, with the /account/callback redirect, the atproto scope and the account as login_hint; the flow cookie is Path=/account, SameSite=Lax, HttpOnly",
+        st.resp.status == 303
+            && query_of(&loc, "client_id").as_deref()
+                == Some(format!("https://{HOSTNAME}/.well-known/atproto-oauth-client-metadata").as_str())
+            && par.is_some_and(|p| {
+                p.form.get("redirect_uri").map(String::as_str)
+                    == Some(format!("https://{HOSTNAME}/account/callback").as_str())
+                    && p.form.get("scope").map(String::as_str) == Some("atproto")
+                    && p.form.get("login_hint").map(String::as_str) == Some(HOLDER)
+            })
+            && flow_cookie.contains("farsight_account_flow=")
+            && flow_cookie.contains("Path=/account")
+            && flow_cookie.contains("SameSite=Lax")
+            && flow_cookie.contains("HttpOnly")
+            && st.resp.header("cache-control").as_deref() == Some("no-store, private")
+            && st.resp.header("x-robots-tag").as_deref() == Some("noindex, nofollow"),
+        format!("{} {flow_cookie}", st.resp.short()),
+    );
+    let cb = ctx.approve(&loc).await?;
+    let state = ctx.callback(&s, &http, &cb, st.cookie.as_deref()).await?;
+    let grant = set_cookie(&state, "farsight_account").unwrap_or_default();
+    let token = token_of(&state.text).unwrap_or_default();
+    ctx.secret(grant.split_once('=').map_or("", |x| x.1));
+    ctx.secret(&token);
+    let cookies = set_cookies(&state);
+    c.check(
+        "the callback on https://farsight.test/account/callback answers 200 (not a redirect): the account's DID, \"You have not asked this site to hide your pages.\", one button; Referrer-Policy same-origin (no-referrer would make a browser send Origin: null with the button's post), no-store; a SameSite=Strict grant cookie on /account, the flow cookie cleared",
+        cb.starts_with(&format!("https://{HOSTNAME}/account/callback?"))
+            && state.status == 200
+            && state.text.contains(HOLDER)
+            && state.text.contains("You have not asked this site to hide your pages.")
+            && state.text.contains("name=\"to\" value=\"hidden\"")
+            && state.header("referrer-policy").as_deref() == Some("same-origin")
+            && state.header("cache-control").as_deref() == Some("no-store, private")
+            && cookies.contains("farsight_account=")
+            && cookies.contains("SameSite=Strict")
+            && cookies.contains("Path=/account")
+            && cookies.contains("farsight_account_flow=; Path=/account")
+            && !token.is_empty(),
+        format!("{} {cookies}", state.short()),
+    );
+    let none = ctx.n("SELECT count(*) FROM public_optouts").await?;
+    let set = ctx.privacy_set(&s, &http, &grant, &token, "hidden").await?;
+    let stored = optouts_of(ctx, HOLDER).await?;
+    c.check(
+        "POST /account/set to=hidden with the grant: \"This site will not show your pages.\", one public_optouts row for the account that signed in, the grant cookie cleared; nothing before it",
+        none == 0
+            && set.status == 200
+            && set.text.contains("This site will not show your pages.")
+            && set.text.contains("within a few minutes")
+            && set.text.contains("not under this site's control")
+            && stored == 1
+            && set_cookies(&set).contains("farsight_account=; Path=/account"),
+        format!("{} stored {stored}", set.short()),
+    );
+    let replay = ctx.privacy_set(&s, &http, &grant, &token, "shown").await?;
+    let page = ctx
+        .fresh()
+        .get(&format!("{}/did/{HOLDER}", s.base), &[])
+        .await?;
+    c.check(
+        "the grant is spent: the same form again is refused (400, the one refusal text) and changes nothing; the account's page answers the withheld notice",
+        replay.status == 400
+            && replay.text.contains(REFUSED)
+            && optouts_of(ctx, HOLDER).await? == 1
+            && page.status == 200
+            && page.text.contains("Data for this account is not shown on this instance."),
+        format!("{} / {}", replay.status, page.short()),
+    );
+    // Signing in again shows the choice and reverses it.
+    // Each request from its own address: `optout` allows five a minute.
+    let (again, grant2, token2) = ctx.privacy_sign_in(&s, &ctx.fresh(), HOLDER).await?;
+    let other_cookie = "farsight_account=not-the-grant-cookie";
+    let wrong = ctx
+        .privacy_set(
+            &s,
+            &ctx.fresh(),
+            other_cookie,
+            token2.as_deref().unwrap_or_default(),
+            "shown",
+        )
+        .await?;
+    let back = ctx
+        .privacy_set(
+            &s,
+            &ctx.fresh(),
+            grant2.as_deref().unwrap_or_default(),
+            token2.as_deref().unwrap_or_default(),
+            "shown",
+        )
+        .await?;
+    c.check(
+        "a second sign-in says \"You have asked this site to hide your pages.\"; the token with another cookie is refused and does not spend the grant; with its own cookie to=shown removes the row: \"This site no longer hides your pages at your request.\"",
+        again.text.contains("You have asked this site to hide your pages.")
+            && again.text.contains("name=\"to\" value=\"shown\"")
+            && wrong.status == 400
+            && back.status == 200
+            && back.text.contains("This site no longer hides your pages at your request.")
+            && optouts_of(ctx, HOLDER).await? == 0,
+        format!("{} / {}", wrong.status, back.short()),
+    );
+    // Another account at the authorization server.
+    ctx.standin.set(Knobs {
+        sub: Some(OTHER.to_owned()),
+        ..Knobs::default()
+    });
+    let (mismatch, mgrant, _) = ctx.privacy_sign_in(&s, &ctx.fresh(), HOLDER).await?;
+    ctx.standin.reset();
+    c.check(
+        "a flow that completes for another account (sub) is refused, 403, the one refusal text, no grant",
+        mismatch.status == 403 && mismatch.text.contains(REFUSED) && mgrant.is_none(),
+        mismatch.short(),
+    );
+    let cross = ctx
+        .fresh()
+        .post_form(
+            &format!("{}/account", s.base),
+            &[("host", HOSTNAME), ("origin", "https://evil.example")],
+            &[("account", HOLDER)],
+        )
+        .await?;
+    let handle = ctx.privacy_start(&s, &ctx.fresh(), HOLDER_HANDLE).await?;
+    c.check(
+        "a cross-origin POST /account is refused (403); a handle that resolves nowhere fails as any start does (502, nothing started)",
+        cross.status == 403
+            && handle.resp.status == 502
+            && handle.location.is_none()
+            && handle.cookie.is_none(),
+        format!("{} / {}", cross.status, handle.resp.short()),
+    );
+
+    // A directory that never answers: the start fails within its
+    // deadline, and the admin signs in meanwhile.
+    ctx.standin.set(Knobs {
+        hang_did: Some(HANG.to_owned()),
+        ..Knobs::default()
+    });
+    let t0 = Instant::now();
+    let hang_http = ctx.fresh();
+    let admin_http = ctx.fresh();
+    let loopback = s.loopback();
+    let (hung, admin) = tokio::join!(
+        async {
+            let r = ctx.privacy_start(&s, &hang_http, HANG).await;
+            (r, t0.elapsed())
+        },
+        ctx.sign_in(&s, &admin_http, &loopback)
+    );
+    ctx.standin.reset();
+    let (hung, took) = (hung.0?, hung.1);
+    let admin = admin?;
+    c.check(
+        "a stand-in that never answers: the start fails with 502 within its 10-second deadline (well before the safe client's own 30 s), and the admin's sign-in completes meanwhile",
+        hung.resp.status == 502
+            && hung.cookie.is_none()
+            && took >= Duration::from_secs(9)
+            && took < Duration::from_secs(20)
+            && admin.status == 200
+            && set_cookie(&admin, "farsight_admin").is_some(),
+        format!("{} after {took:?}; admin {}", hung.resp.status, admin.status),
+    );
+
+    // A flood of starts from many addresses.
+    let mut limited = 0;
+    let mut answered = 0;
+    for _ in 0..20 {
+        let r = ctx.privacy_start(&s, &ctx.fresh(), UNKNOWN).await?;
+        match r.resp.status {
+            429 => limited += 1,
+            _ => answered += 1,
+        }
+    }
+    let admin = ctx.sign_in(&s, &ctx.fresh(), &s.loopback()).await?;
+    let search = ctx
+        .fresh()
+        .get(&format!("{}/search?q=someone-else.invalid", s.base), &[])
+        .await?;
+    c.check(
+        "a flood of opt-out starts is held by optout_start (some 429), and does not touch the admin's sign-in (completes) or the pages' handle budget (a search's handle check is answered, not 429 or 503)",
+        limited > 0
+            && answered > 0
+            && admin.status == 200
+            && search.status != 429
+            && search.status != 503,
+        format!("{answered} answered, {limited} limited; admin {}; search {}", admin.status, search.status),
+    );
+    let gone = ctx
+        .fresh()
+        .get(
+            &format!("{}/account/callback?state=x", s.base),
+            &[("host", HOSTNAME)],
+        )
+        .await?;
+    c.check(
+        "a callback without a flow is the one refusal (400)",
+        gone.status == 400 && gone.text.contains(REFUSED),
+        gone.short(),
+    );
+    let log = s.log();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("farsight_web::privacy"))
+        .collect();
+    c.check(
+        "the log of the whole run names no opted-out account: no DID, handle or host of it anywhere; the opt-out flow's own lines are DEBUG reason words with no DID, host or URL",
+        !log.contains(HOLDER)
+            && !log.contains(HANG)
+            && !log.contains(HOLDER_HANDLE)
+            && !lines.is_empty()
+            && lines.iter().all(|l| {
+                l.contains("\"DEBUG\"")
+                    && !l.contains("did:")
+                    && !l.contains(STANDIN_ADDR)
+                    && !l.contains("http")
+            }),
+        format!(
+            "{} lines, e.g. {}",
+            lines.len(),
+            support::truncate(lines.first().copied().unwrap_or_default(), 200)
+        ),
+    );
+    ctx.retire(s);
+    Ok(())
+}
+
 // ----------------------------------------------------------- 14. browser
 
 async fn check_browser(c: &mut Checks, ctx: &Ctx, cfg: &str) -> Result<(), String> {
@@ -2663,6 +3038,7 @@ async fn run(c: &mut Checks, pg: &Pg, browser: bool) -> Result<(), String> {
     check_gates(c, &ctx).await?;
     check_rates(c, &ctx, &cfg_a).await?;
     check_unconfigured(c, &ctx).await?;
+    check_privacy(c, &ctx).await?;
     if browser {
         check_browser(c, &ctx, &cfg_a).await?;
     }

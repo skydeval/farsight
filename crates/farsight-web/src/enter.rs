@@ -112,7 +112,14 @@ fn sign_in_page(
     again: Option<Return>,
 ) -> Response {
     let hostname = cfg.config.server.hostname.clone();
-    let kind = if oauth::client_for(&hostname, host_header(headers), local).is_some() {
+    let kind = if oauth::client_for(
+        &hostname,
+        host_header(headers),
+        local,
+        oauth::ADMIN_CALLBACK,
+    )
+    .is_some()
+    {
         "signin"
     } else {
         "elsewhere"
@@ -274,9 +281,12 @@ pub async fn submit(
         _ => None,
     };
     let again = form_return(&form, replaces.is_some());
-    let Some(oauth_client) =
-        oauth::client_for(&cfg.config.server.hostname, host_header(&headers), local)
-    else {
+    let Some(oauth_client) = oauth::client_for(
+        &cfg.config.server.hostname,
+        host_header(&headers),
+        local,
+        oauth::ADMIN_CALLBACK,
+    ) else {
         return status(
             sign_in_page(&cfg, &headers, local, None, again),
             StatusCode::BAD_REQUEST,
@@ -529,18 +539,32 @@ pub async fn callback(
     r
 }
 
+/// Whether the client metadata document exists under `cfg`: while either
+/// flow can run.
+fn metadata_served(cfg: &LoadedConfig) -> bool {
+    cfg.admin_auth() != AdminAuth::Disabled || crate::privacy::optout_live(&cfg.config)
+}
+
 /// `GET /.well-known/atproto-oauth-client-metadata`: the hosted client's
-/// metadata, served only on the hostname it describes; 404 when the UI is
-/// disabled or the hostname cannot be a hosted client.
+/// metadata, served only on the hostname it describes, while the admin UI
+/// is enabled or the account holders' sign-in can run
+/// ([`crate::privacy::optout_live`]); 404 otherwise, or when the hostname
+/// cannot be a hosted client. The document is the same in every one of
+/// those configurations.
 pub async fn client_metadata(State(st): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     let cfg = st.api.config.current();
-    if cfg.admin_auth() == AdminAuth::Disabled {
+    if !metadata_served(&cfg) {
         return common::not_found();
     }
     let hostname = &cfg.config.server.hostname;
     // Only the hosted client has a metadata document, so whether the
     // client is local does not matter here.
-    match oauth::client_for(hostname, host_header(&headers), false) {
+    match oauth::client_for(
+        hostname,
+        host_header(&headers),
+        false,
+        oauth::ADMIN_CALLBACK,
+    ) {
         Some(c) if !c.loopback => (
             [
                 (header::CONTENT_TYPE, "application/json"),
@@ -571,6 +595,49 @@ mod tests {
             flow_cookie(None, false),
             "farsight_flow=; Path=/enter; HttpOnly; SameSite=Lax; Max-Age=0"
         );
+    }
+
+    #[test]
+    fn the_metadata_is_one_document_wherever_it_is_served() {
+        let loaded = |admin_ui: bool, public_ui: bool, self_optout: bool| {
+            let mut c = farsight_core::config::Config::default();
+            c.server.hostname = "farsight.example".into();
+            c.access.admin_ui = admin_ui;
+            c.access.admin_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into();
+            c.access.public_ui = public_ui;
+            c.public_ui.self_optout = self_optout;
+            LoadedConfig {
+                config: c,
+                env_keys: Vec::new(),
+                warnings: Vec::new(),
+                from_env_only: false,
+            }
+        };
+        let mut served = 0;
+        for admin_ui in [true, false] {
+            for public_ui in [true, false] {
+                for self_optout in [true, false] {
+                    let cfg = loaded(admin_ui, public_ui, self_optout);
+                    let on = metadata_served(&cfg);
+                    assert_eq!(on, admin_ui || (public_ui && self_optout));
+                    if !on {
+                        continue;
+                    }
+                    served += 1;
+                    // The document depends on the hostname alone.
+                    let m = oauth::client_metadata(&cfg.config.server.hostname);
+                    assert_eq!(m["client_name"], "Farsight (farsight.example)");
+                    assert_eq!(
+                        m["redirect_uris"],
+                        serde_json::json!([
+                            "https://farsight.example/enter/callback",
+                            "https://farsight.example/account/callback"
+                        ])
+                    );
+                }
+            }
+        }
+        assert_eq!(served, 5);
     }
 
     #[test]

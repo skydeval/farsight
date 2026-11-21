@@ -60,6 +60,11 @@ pub struct World {
     pub backlinks: Vec<(String, String, String, String)>,
     /// Request log: `(method, did, collection)`.
     pub hits: Vec<(String, String, String)>,
+    /// AppView `getList`: list URIs it answers "List not found" for, as
+    /// the Bluesky AppView does for a list it has taken down.
+    pub appview_gone: HashSet<String>,
+    /// AppView `getList`: answer 502 for every list.
+    pub appview_down: bool,
 }
 
 /// Shared handle.
@@ -105,6 +110,20 @@ async fn xrpc(State(s): State<Shared>, Path(method): Path<String>, Query(q): Q) 
     }
     let world = w(&s);
     match short.as_str() {
+        "getList" => {
+            let list = q.get("list").cloned().unwrap_or_default();
+            if world.appview_down {
+                return err(StatusCode::BAD_GATEWAY, "UpstreamFailure");
+            }
+            if world.appview_gone.contains(&list) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "InvalidRequest", "message": "List not found"})),
+                )
+                    .into_response();
+            }
+            Json(json!({"list": {"uri": list, "name": "a list"}, "items": []})).into_response()
+        }
         "getRepoStatus" => {
             if world.status_down.contains(&did) {
                 return err(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError");

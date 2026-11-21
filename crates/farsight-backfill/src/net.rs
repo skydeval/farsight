@@ -894,24 +894,25 @@ impl PlcLimiter {
     }
 }
 
-/// The lodestar limiter: `backfill.lodestar_rps` for every request the
-/// backfill process makes to the lodestar instance, apart from the PLC
-/// directory's budget and from the per-host limits.
+/// The limiter of an outside service with a budget of its own, apart
+/// from the PLC directory's and from the per-host limits: the lodestar
+/// instance (`backfill.lodestar_rps`) and the AppView asked about
+/// taken-down lists (`backfill.list_takedowns.rps`).
 #[derive(Debug)]
-pub struct LodestarLimiter {
+pub struct ServiceLimiter {
     bucket: Mutex<Bucket>,
     rate: Mutex<Rate>,
 }
 
-impl LodestarLimiter {
+impl ServiceLimiter {
     fn rate_of(rps: u32) -> Rate {
         Rate::one_second(f64::from(rps.max(1)))
     }
 
     /// A limiter for `rps` requests per second.
-    pub fn new(rps: u32) -> LodestarLimiter {
+    pub fn new(rps: u32) -> ServiceLimiter {
         let rate = Self::rate_of(rps);
-        LodestarLimiter {
+        ServiceLimiter {
             bucket: Mutex::new(Bucket::full(rate, Instant::now())),
             rate: Mutex::new(rate),
         }
@@ -1010,7 +1011,9 @@ pub struct Net {
     pub plc: PlcLimiter,
     /// The lodestar instance's own limiter, taken by
     /// [`Net::lodestar_get`] and [`Net::lodestar_post`].
-    pub lodestar: LodestarLimiter,
+    pub lodestar: ServiceLimiter,
+    /// The AppView's own limiter, taken by [`Net::appview_get`].
+    pub appview: ServiceLimiter,
 }
 
 /// The host part of a URL used as the limiter key (`host[:port]`).
@@ -1080,7 +1083,8 @@ impl Net {
             settings: RwLock::new(Self::settings(client, cfg)),
             hosts: HostLimiter::with(HostLimits::from_config(cfg)),
             plc: PlcLimiter::new(cfg.backfill.plc_rps),
-            lodestar: LodestarLimiter::new(cfg.backfill.lodestar_rps),
+            lodestar: ServiceLimiter::new(cfg.backfill.lodestar_rps),
+            appview: ServiceLimiter::new(cfg.backfill.list_takedowns.rps),
         }
     }
 
@@ -1104,11 +1108,13 @@ impl Net {
 
     /// Applies the request limits of `cfg` (`backfill.per_host_*`,
     /// `backfill.per_domain_*`, `backfill.plc_rps`,
-    /// `backfill.lodestar_rps`) to the requests that follow.
+    /// `backfill.lodestar_rps`, `backfill.list_takedowns.rps`) to the
+    /// requests that follow.
     pub fn set_limits(&self, cfg: &Config) {
         self.hosts.set_limits(HostLimits::from_config(cfg));
         self.plc.set_rps(cfg.backfill.plc_rps);
         self.lodestar.set_rps(cfg.backfill.lodestar_rps);
+        self.appview.set_rps(cfg.backfill.list_takedowns.rps);
     }
 
     /// The registrable domain `host` is limited under with the other
@@ -1213,6 +1219,27 @@ impl Net {
                 status: resp.status,
                 name: error_name(&resp.body),
             }),
+        }
+    }
+
+    /// `GET url` from the AppView, under its own limiter: the status and
+    /// body of whatever it answered. Only a request that got no answer is
+    /// an error.
+    pub async fn appview_get(&self, url: &Url) -> Result<(u16, Vec<u8>), NetError> {
+        self.appview.acquire().await;
+        let client = self
+            .settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .client
+            .clone();
+        let started = Instant::now();
+        let r = client.get(url).await;
+        metrics::histogram!(m::APPVIEW_REQUEST_SECONDS).record(started.elapsed().as_secs_f64());
+        match r {
+            Err(farsight_core::net::OutboundError::TooLarge(n)) => Err(NetError::TooLarge(n)),
+            Err(e) => Err(NetError::Transport(e.to_string())),
+            Ok(resp) => Ok((resp.status, resp.body)),
         }
     }
 

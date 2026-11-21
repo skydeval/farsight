@@ -24,9 +24,9 @@ for example with `FARSIGHT_PORT=127.0.0.1:8080` in `.env`.
      may be cached. A cache that ignores the query string would keep
      serving the old files for that hour.
    - Bypass the cache for `/admin*`, `/enter*` (the sign-in and its
-     callback), `/setup*`, `/xrpc/app.nearhorizon.farsight.admin.*`,
-     `/health` and `/livez`. That list is complete: no admin page lives
-     outside `/admin*`.
+     callback), `/account*` (the account holders' sign-in), `/setup*`,
+     `/xrpc/app.nearhorizon.farsight.admin.*`, `/health` and `/livez`.
+     That list is complete: no admin page lives outside `/admin*`.
 4. Lock the origin with Cloudflare Tunnel or Authenticated Origin
    Pulls. Firewalling the origin to Cloudflare's IP ranges alone is not
    enough.

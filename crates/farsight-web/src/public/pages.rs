@@ -18,7 +18,7 @@
 //! (see [`super::coverage`]); removed records are an admin page
 //! ([`crate::history`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use askama::Template;
@@ -43,7 +43,7 @@ use super::text::{Stamp, card_href, clean, did_href, list_href, list_uri, paragr
 use super::warming::{Asked, Known};
 use super::{
     COUNT_CAP, Cache, Chrome, CountKey, Fail, OG_ACCOUNT, OG_INSTANCE, OG_LIST, PAGE_ROWS, Req,
-    Which, Withheld, chrome, metrics as m, page, redirect,
+    Which, Withheld, WithheldReason, chrome, metrics as m, page, redirect,
 };
 use crate::pages::handle_to_did;
 use farsight_storage::ids::ActorId;
@@ -65,8 +65,11 @@ pub const DEFAULT_DESCRIPTION: &str = "Farsight is an independent index of publi
 /// An account as a row names it: `@handle` when its handle is verified,
 /// the DID when the check found none. Either way a link to the account's
 /// page whose `title` is the DID, and on which the script opens the
-/// profile card. Rendering a row never waits for an outbound request: an
-/// account shown as a DID is handed to the warming worker.
+/// profile card; for an account whose holder withheld its pages
+/// (`quiet`), plain text with no link, no avatar and none of the
+/// attributes the script opens a card from. Rendering a row never waits
+/// for an outbound request: an account shown as a DID is handed to the
+/// warming worker.
 #[derive(Debug, Clone, Template)]
 #[template(path = "_who.html")]
 pub struct Who {
@@ -82,6 +85,8 @@ pub struct Who {
     /// What a host has done to the account, if anything: `takendown` (taken
     /// down) or `suspended`.
     pub tag: Option<&'static str>,
+    /// The account's holder withheld its pages: the name is plain text.
+    pub quiet: bool,
 }
 
 /// `None`: the account has not been checked yet and the worker has been
@@ -105,6 +110,7 @@ fn who(r: &Req<'_>, asked: &mut Asked, shown: &Shown<'_>, did: &str) -> Option<W
         card: card_href(did),
         handle,
         tag,
+        quiet: shown.quiet(did),
     })
 }
 
@@ -335,15 +341,27 @@ pub(crate) fn purpose_words(p: &str) -> &'static str {
     }
 }
 
-async fn actor_row(r: &Req<'_>, did: &Did) -> Result<Option<ActorRef>, Fail> {
+/// The page's account (an account page's subject, a list page's owner):
+/// its actor row, and whether its holder withheld its pages, read on the
+/// same connection with one primary-key read. The opt-out is read on
+/// every view, whatever else applies, and a failed read is the page's
+/// `503`, never the page.
+async fn actor_row(r: &Req<'_>, did: &Did) -> Result<(Option<ActorRef>, bool), Fail> {
     let mut conn = r.st.api.pool.acquire().await?;
-    Ok(queries::actor(&mut conn, did).await?)
+    let actor = queries::actor(&mut conn, did).await?;
+    let opted_out = farsight_storage::optouts::opted_out(&mut conn, did)
+        .await
+        .map_err(|_| Fail::Busy)?;
+    Ok((actor, opted_out))
 }
 
-/// The batched status lookup of a page's DIDs (the withheld rule).
+/// The batched status lookup of a page's DIDs (the withheld rule), and
+/// which of them withheld their own pages (rows naming them are quiet).
 struct Shown<'a> {
     withheld: &'a Withheld,
     status: HashMap<String, ActorRef>,
+    /// The DIDs among the page's whose holder opted out.
+    quiet: HashSet<String>,
     /// Taken-down accounts are shown (the page's switch is on).
     taken_down: bool,
 }
@@ -355,19 +373,31 @@ impl Shown<'_> {
         dids: Vec<String>,
         taken_down: bool,
     ) -> Result<Shown<'a>, Fail> {
-        let status = if dids.is_empty() {
-            HashMap::new()
+        let (status, quiet) = if dids.is_empty() {
+            (HashMap::new(), HashSet::new())
         } else {
             let mut tx = r.st.api.read_tx().await?;
             let s = queries::actors(&mut tx, &dids).await?;
+            // In the same transaction. A failed read fails the page: a
+            // row is never shown with a link its account withheld.
+            let q = farsight_storage::optouts::among(&mut tx, &dids)
+                .await
+                .map_err(|_| Fail::Busy)?;
             tx.rollback().await?;
-            s
+            (s, q)
         };
         Ok(Shown {
             withheld,
             status,
+            quiet,
             taken_down,
         })
+    }
+
+    /// Whether a row naming `did` is quiet: its holder withheld its
+    /// pages. It changes no count, order or page boundary: the row stays.
+    fn quiet(&self, did: &str) -> bool {
+        self.quiet.contains(did)
     }
 
     /// Whether a row naming `did`, in any role, may be shown: never an
@@ -723,6 +753,44 @@ fn withheld_page(r: &Req<'_>, subject: &str, what: &'static str, path: &str) -> 
     )
 }
 
+/// The page of a list marked taken down: its name and owner, the mark
+/// and one line; neither its members nor its subscribers.
+#[derive(Template)]
+#[template(path = "public_list_taken_down.html")]
+struct TakenDownPage {
+    c: Chrome,
+    uri: String,
+    name: Option<String>,
+    owner_did: String,
+    owner_href: String,
+    owner_handle: Option<String>,
+}
+
+fn taken_down_page(
+    r: &Req<'_>,
+    uri: &str,
+    name: Option<String>,
+    owner: &Did,
+    owner_handle: Option<String>,
+    path: &str,
+) -> Response {
+    let cfg = r.config();
+    page(
+        &TakenDownPage {
+            c: chrome(cfg, name.as_deref().unwrap_or(uri), OG_LIST, path),
+            uri: uri.to_owned(),
+            name,
+            owner_did: owner.to_string(),
+            owner_href: did_href(owner.as_str()),
+            owner_handle,
+        },
+        StatusCode::OK,
+        cfg,
+        Cache::Public(30),
+        false,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Home
 
@@ -830,6 +898,7 @@ async fn top_groups(
                         card: card_href(did),
                         handle: None,
                         tag: shown.tag(did),
+                        quiet: shown.quiet(did),
                     }
                 }),
                 count: thousands(*n),
@@ -1017,6 +1086,9 @@ pub struct ListRow {
     pub owner: Who,
     /// `addedAt`, as stated by the list's owner.
     pub added: Option<Stamp>,
+    /// The list is marked taken down: its name is shown as plain text,
+    /// with the mark, and not linked (its page does not open).
+    pub taken_down: bool,
 }
 
 #[derive(Template)]
@@ -1062,9 +1134,15 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
     let o_page = paging::number(q, "out", &base)?;
     let ol_page = paging::number(q, "outlists", &base)?;
     let withheld = r.withheld().await?;
-    let actor = actor_row(r, did).await?;
+    let (actor, opted_out) = actor_row(r, did).await?;
     if let Some(reason) = withheld.reason(did.as_str(), actor.map(|a| a.status)) {
         m::withheld(reason);
+        return Ok(withheld_page(r, did.as_str(), "account", &base));
+    }
+    // The account's holder withheld its page: the same notice. Its rows
+    // on other pages stay, quieted.
+    if opted_out {
+        m::withheld(WithheldReason::SelfOptOut);
         return Ok(withheld_page(r, did.as_str(), "account", &base));
     }
     // One resolution per page view at most, only for a known subject, and
@@ -1236,6 +1314,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
                 name: l.name.as_deref().map(clean).filter(|n| !n.is_empty()),
                 owner,
                 added: l.added_at.map(Stamp::of),
+                taken_down: l.taken_down,
             })
         })
         .collect();
@@ -1343,6 +1422,7 @@ pub async fn did(r: &Req<'_>, did: &Did, q: &Params) -> Result<Response, Fail> {
                     name: l.name.as_deref().map(clean).filter(|n| !n.is_empty()),
                     owner,
                     added: l.created_at.map(Stamp::of),
+                    taken_down: l.taken_down,
                 })
             })
             .collect();
@@ -1514,9 +1594,14 @@ pub async fn list(
     let m_page = paging::number(q, "page", &base)?;
     let k_page = paging::number(q, "subscribers", &base)?;
     let withheld = r.withheld().await?;
-    let actor = actor_row(r, owner).await?;
+    let (actor, opted_out) = actor_row(r, owner).await?;
     if let Some(reason) = withheld.reason(owner.as_str(), actor.map(|a| a.status)) {
         m::withheld(reason);
+        return Ok(withheld_page(r, &uri, "list", &base));
+    }
+    // The owner's holder withheld the pages of the lists it owns.
+    if opted_out {
+        m::withheld(WithheldReason::SelfOptOut);
         return Ok(withheld_page(r, &uri, "list", &base));
     }
     let info = {
@@ -1533,6 +1618,13 @@ pub async fn list(
     let owner_handle = page_handle(r.st, cfg, owner).await;
     let handle_settled = owner_handle.settled;
     let handle = owner_handle.handle.map(|h| clean(&h));
+    // A list the configured AppView no longer serves: the mark, and
+    // neither its members nor its subscribers.
+    if info.taken_down_since.is_some() {
+        m::withheld(WithheldReason::ListTakenDown);
+        let name = info.name.as_deref().map(clean).filter(|n| !n.is_empty());
+        return Ok(taken_down_page(r, &uri, name, owner, handle, &base));
+    }
     let about = {
         let mut conn = r.st.api.pool.acquire().await?;
         queries::list_about(&mut conn, info.id).await?
@@ -1713,6 +1805,9 @@ pub async fn list(
             card: card_href(owner.as_str()),
             handle,
             tag: None,
+            // An owner that opted out has no list pages: the page answered
+            // the notice above.
+            quiet: opted_out,
         },
         state,
         capped: listing["capped"].as_bool().unwrap_or(false),
@@ -1782,6 +1877,53 @@ mod tests {
             state_words("quarantined"),
             ("State: quarantined.".to_owned(), false)
         );
+    }
+
+    fn who_of(did: &str, handle: Option<&str>, tag: Option<&'static str>, quiet: bool) -> Who {
+        Who {
+            did: did.to_owned(),
+            href: did_href(did),
+            card: card_href(did),
+            handle: handle.map(str::to_owned),
+            tag,
+            quiet,
+        }
+    }
+
+    #[test]
+    fn a_quiet_row_is_plain_text() {
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        for (handle, tag) in [
+            (None, None),
+            (Some("alice.example"), None),
+            (Some("alice.example"), Some(SUSPENDED)),
+            (None, Some(TAKEN_DOWN)),
+        ] {
+            let html = who_of(did, handle, tag, true).render().unwrap();
+            // No link to the page, no avatar, nothing the script opens a
+            // card from.
+            for absent in [
+                "href",
+                "<a ",
+                "<img",
+                "data-card",
+                "/card/",
+                "/did/",
+                "who-wrap",
+                "title=",
+            ] {
+                assert!(!html.contains(absent), "{absent} in {html}");
+            }
+            // The name is there: the handle when verified, else the DID.
+            assert!(html.contains(handle.unwrap_or(did)), "{html}");
+            if tag.is_some() {
+                assert!(html.contains("acct-tag"), "{html}");
+            }
+            // The same account not opted out is a link with its card.
+            let open = who_of(did, handle, tag, false).render().unwrap();
+            assert!(open.contains(&format!("href=\"{}\"", did_href(did))));
+            assert!(open.contains(&format!("data-card=\"{}\"", card_href(did))));
+        }
     }
 
     #[test]

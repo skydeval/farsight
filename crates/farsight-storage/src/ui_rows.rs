@@ -417,6 +417,8 @@ pub struct NamingRow {
     /// Owner-claimed `createdAt` of the listitem naming the account (the
     /// one with the lowest record key if it is named twice).
     pub added_at: Option<DateTime<Utc>>,
+    /// The list is marked taken down (`lists.appview_absent_since`).
+    pub taken_down: bool,
 }
 
 /// Which lists name `$1` and may be shown; `$2` is the excluded owners.
@@ -440,7 +442,8 @@ fn naming_from(ids: u8, pattern: u8) -> String {
 
 fn naming_sql() -> String {
     format!(
-        "SELECT o.did, l.rkey, l.name, l.listblock_count, x.created_at, l.purpose
+        "SELECT o.did, l.rkey, l.name, l.listblock_count, x.created_at, l.purpose,
+                l.appview_absent_since IS NOT NULL
          FROM (SELECT DISTINCT ON (li.list_id) li.list_id, li.created_at, li.first_seen
                FROM list_items li WHERE li.subject_id = $1
                ORDER BY li.list_id, li.rkey) x
@@ -472,6 +475,7 @@ pub async fn lists_naming(
         i32,
         Option<DateTime<Utc>>,
         Option<i16>,
+        bool,
     );
     let rows: Vec<Raw> = sqlx::query_as(&naming_sql())
         .bind(subject_id)
@@ -485,13 +489,14 @@ pub async fn lists_naming(
     Ok(rows
         .into_iter()
         .map(
-            |(owner_did, rkey, name, listblock_count, added_at, purpose)| NamingRow {
+            |(owner_did, rkey, name, listblock_count, added_at, purpose, taken_down)| NamingRow {
                 owner_did,
                 rkey,
                 name,
                 listblock_count,
                 purpose: purpose.map(ListPurpose::from_code),
                 added_at,
+                taken_down,
             },
         )
         .collect())
@@ -539,6 +544,8 @@ pub struct BlockedList {
     pub block_rkey: String,
     /// The listblock's stated `createdAt`.
     pub created_at: Option<DateTime<Utc>>,
+    /// The list is marked taken down (`lists.appview_absent_since`).
+    pub taken_down: bool,
 }
 
 /// The `WHERE` of [`lists_blocked`] and its count. `$1` the author, `$2`
@@ -579,9 +586,11 @@ pub async fn lists_blocked(
         Option<i16>,
         String,
         Option<DateTime<Utc>>,
+        bool,
     );
     let rows: Vec<Raw> = sqlx::query_as(&format!(
-        "SELECT o.did, l.rkey, l.name, l.purpose, b.rkey, b.created_at
+        "SELECT o.did, l.rkey, l.name, l.purpose, b.rkey, b.created_at,
+                l.appview_absent_since IS NOT NULL
          FROM list_blocks b
          JOIN lists l ON l.id = b.list_id
          JOIN actors o ON o.id = l.owner_id
@@ -601,13 +610,14 @@ pub async fn lists_blocked(
     Ok(rows
         .into_iter()
         .map(
-            |(owner_did, rkey, name, purpose, block_rkey, created_at)| BlockedList {
+            |(owner_did, rkey, name, purpose, block_rkey, created_at, taken_down)| BlockedList {
                 owner_did,
                 rkey,
                 name,
                 purpose: purpose.map(ListPurpose::from_code),
                 block_rkey,
                 created_at,
+                taken_down,
             },
         )
         .collect())

@@ -32,6 +32,7 @@ pub mod net;
 pub mod resolve;
 pub mod scheduler;
 pub mod sweep;
+pub mod takedowns;
 pub mod xrpc;
 
 use std::path::{Path, PathBuf};
@@ -83,7 +84,7 @@ const BIND_RETRY: Duration = Duration::from_secs(30);
 const METRICS_DRAIN: Duration = Duration::from_secs(3);
 
 /// The supervised tasks, by the name their panics are counted under.
-pub const TASKS: [&str; 9] = [
+pub const TASKS: [&str; 10] = [
     "backfill_scheduler",
     scheduler::JOB_TASK,
     "backfill_sweep",
@@ -93,6 +94,7 @@ pub const TASKS: [&str; 9] = [
     "backfill_gauges",
     "backfill_counter_flush",
     "backfill_metrics_listener",
+    "backfill_list_takedowns",
 ];
 
 /// The config file path: `FARSIGHT_CONFIG` if set, else the default the
@@ -485,6 +487,30 @@ async fn run_normal(
             }
         },
     ));
+    tasks.spawn(every(
+        "backfill_list_takedowns",
+        takedowns::PASS_EVERY,
+        stop.clone(),
+        {
+            let (ctx, stop) = (ctx.clone(), stop.clone());
+            move || {
+                let (ctx, stop) = (ctx.clone(), stop.clone());
+                async move {
+                    match takedowns::pass(&ctx, &stop).await {
+                        Ok(r) if r.marked > 0 || r.cleared > 0 => tracing::info!(
+                            checked = r.checks,
+                            inconclusive = r.errors,
+                            marked = r.marked,
+                            cleared = r.cleared,
+                            "taken-down list pass"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "taken-down list pass failed"),
+                    }
+                }
+            }
+        },
+    ));
     tasks.spawn({
         let (ctx, mut stop) = (ctx.clone(), stop.clone());
         async move {
@@ -740,6 +766,9 @@ mod tests {
             |c| c.backfill.per_domain_concurrency = 2,
             |c| c.backfill.plc_rps = 3,
             |c| c.backfill.lodestar_rps = 3,
+            |c| c.backfill.list_takedowns.rps = 3,
+            |c| c.backfill.list_takedowns.enabled = true,
+            |c| c.backfill.list_takedowns.appview_url = "https://appview.example".into(),
             |c| c.backfill.on_demand_reserved = 0,
             |c| c.backfill.sweep.enabled = !c.backfill.sweep.enabled,
         ] {

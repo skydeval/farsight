@@ -145,7 +145,8 @@ pub struct DashboardData {
     /// Work still catching up, in words; empty when there is none.
     pub catching: Vec<Stat>,
     /// `getStats.counts`: blocks, listblocks, lists, tracked lists, list
-    /// items and accounts known.
+    /// items and accounts known; then how many accounts opted out of the
+    /// public pages (a count only).
     pub counts: Vec<Stat>,
     /// The firehose as `getStats` reports it: connected, protocol, lag
     /// and source lag in seconds, then how many unhealed gaps are closed
@@ -292,6 +293,27 @@ fn handles_line(rps: u32, cursor: i64, last: i64, laps: u64) -> Option<String> {
     ))
 }
 
+/// The taken-down list checker's last pass in words.
+fn takedown_line(p: &farsight_storage::takedowns::Pass) -> String {
+    let Some(at) = p.at else {
+        return "on, no pass yet".into();
+    };
+    let mut line = format!(
+        "last pass {} · {} checked · {} inconclusive",
+        at.format("%Y-%m-%d %H:%M UTC"),
+        crate::public::text::thousands(i64::from(p.checks)),
+        crate::public::text::thousands(i64::from(p.errors)),
+    );
+    if let Some((why, when)) = &p.last_error {
+        line.push_str(&format!(
+            " · last inconclusive answer {} ({})",
+            when.format("%Y-%m-%d %H:%M UTC"),
+            crate::public::text::clean(why)
+        ));
+    }
+    line
+}
+
 /// A count for an admin page, with thousands separators.
 pub(crate) fn count(label: &str, n: i64) -> Stat {
     stat(label, crate::public::text::thousands(n))
@@ -335,6 +357,12 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, DashboardError> 
         ("actors", "Accounts known"),
     ] {
         d.counts.push(count(l, c[k].as_i64().unwrap_or(0)));
+    }
+    // How many accounts withheld their own public pages: the number only,
+    // never which (read at most once a minute).
+    if let Some(n) = st.public.privacy.count(&st.api.pool).await {
+        d.counts
+            .push(count("Accounts opted out of public pages", n));
     }
     let f = &stats["firehose"];
     let connected = f["connected"].as_bool().unwrap_or(false);
@@ -490,6 +518,24 @@ async fn dashboard_data(st: &WebState) -> Result<DashboardData, DashboardError> 
     }
     for (s, n) in farsight_storage::queries::lists_by_state(&mut conn).await? {
         d.lists.push(count(s.api_name(), n));
+    }
+    // Lists the configured AppView no longer serves, and how its checks
+    // stand.
+    if st
+        .api
+        .config
+        .current()
+        .config
+        .backfill
+        .list_takedowns
+        .enabled
+    {
+        let n = farsight_storage::takedowns::count(&mut conn).await?;
+        d.lists.push(count("taken down", n));
+        let pass = farsight_storage::takedowns::last_pass(&mut conn).await?;
+        d.lists.push(stat("Takedown checks", takedown_line(&pass)));
+    } else {
+        d.lists.push(stat("Takedown checks", "off"));
     }
     for (bucket, interned, blocks, items, _, _, mask) in
         farsight_storage::queries::top_buckets(&mut conn, 10).await?

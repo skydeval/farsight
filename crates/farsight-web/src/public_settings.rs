@@ -578,6 +578,10 @@ pub struct Exposure {
     pub top_blocked: bool,
     /// Crawlers will be allowed.
     pub crawlable: bool,
+    /// Account holders will be able to sign in at `/account` to withhold
+    /// their own pages, which makes this instance contact their
+    /// account's server.
+    pub self_optout: bool,
 }
 
 impl Exposure {
@@ -595,6 +599,7 @@ impl Exposure {
             top_blockers: c.public_ui.show_top_blockers,
             top_blocked: c.public_ui.show_top_blocked,
             crawlable: c.public_ui.crawlable,
+            self_optout: crate::privacy::optout_live(c),
         }
     }
 }

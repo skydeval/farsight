@@ -3,7 +3,8 @@
 //! Setup mode serves the first-run wizard; normal mode serves the admin
 //! sign-in, the dashboard, lookups, operations, settings, reset and the
 //! admin history pages, and — when the operator turns it on — the
-//! public UI at the root.
+//! public UI at the root, with the account holders' sign-in at
+//! `/account`.
 
 #![warn(missing_docs)]
 // Handlers return early with a ready `Response` as the error value; boxing
@@ -16,6 +17,7 @@ pub mod enter;
 pub mod history;
 pub mod oauth;
 pub mod pages;
+pub mod privacy;
 pub mod public;
 pub mod public_settings;
 pub mod rows;

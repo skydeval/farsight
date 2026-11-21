@@ -1,0 +1,22 @@
+{% extends "public_base.html" %}
+{% block content %}
+<div class="profile-hero-card card list-taken-down-card">
+<div class="profile-meta-bar">
+<div class="list-badges"><span class="pill taken-down-pill">Taken down</span></div>
+</div>
+<div class="profile-main-row">
+<div class="profile-id-block">
+<h1 class="subject">
+{% if let Some(n) = name %}<span class="handle">{{ n }}</span>{% endif %}
+<code class="did-code">{{ uri }}</code>
+</h1>
+<div class="list-owner-row">
+<span class="owner-label">Owner:</span>
+{% if let Some(h) = owner_handle %}<span class="handle">{{ h }}</span>{% endif %}
+<a href="{{ owner_href }}" class="owner-link"><code>{{ owner_did }}</code></a>
+</div>
+<p class="list-description">This list has been taken down, so its members and subscribers are not shown.</p>
+</div>
+</div>
+</div>
+{% endblock %}

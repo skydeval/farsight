@@ -995,6 +995,16 @@ details.guide[open] > dl, details.guide[open] > .guide-panel {
   details.guide[open] > dl, details.guide[open] > .guide-panel { animation: none; }
 }
 
+details.privacy-drawer {
+  margin-top: 1.25rem;
+}
+details.privacy-drawer > summary {
+  padding: 0.45rem 1rem;
+}
+details.privacy-drawer > .guide-panel {
+  margin-top: 1rem;
+}
+
 details.home-guide {
   max-width: 44rem;
   margin: 2.25rem auto 0;
@@ -1043,6 +1053,60 @@ details.nav-guide > .guide-panel {
 /* The home page's bar has neither the search form nor the guide. */
 nav.public-nav > .brand + .theme-toggle {
   margin-left: auto;
+}
+/* The account holder's sign-in: a plain link at the end of the bar. */
+nav.public-nav .nav-sign-in {
+  font-size: 0.88rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+nav.public-nav .nav-sign-in:hover {
+  color: var(--fg);
+}
+/* Without script the theme toggle stays hidden; the link takes its place. */
+nav.public-nav .theme-toggle[hidden] + .nav-sign-in {
+  margin-left: auto;
+}
+/* An account that withheld its own page, named in a row: plain text. */
+.who-quiet {
+  color: var(--fg);
+}
+/* The account holder's sign-in at /account. */
+.privacy {
+  max-width: 44rem;
+  margin: 1.5rem auto;
+}
+.privacy h2 {
+  font-size: 1rem;
+  margin: 1.2rem 0 0.4rem;
+}
+.privacy-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 1rem 0 0.5rem;
+}
+.privacy-form label {
+  flex: 1 1 100%;
+  font-weight: 600;
+}
+.privacy-form input[type=text] {
+  flex: 1 1 16rem;
+  min-width: 0;
+  padding: 0.45rem 0.85rem;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--line);
+  background: var(--card-glass);
+  color: var(--fg);
+  font: inherit;
+}
+.privacy-error {
+  color: var(--bad, #c0392b);
+  font-weight: 600;
+}
+.privacy-choice {
+  font-weight: 600;
 }
 nav.pager a, nav.pager span {
   display: inline-flex;
@@ -1704,6 +1768,21 @@ footer {
 .list-link:hover {
   color: var(--accent);
   text-decoration: underline;
+}
+/* A list marked taken down: plain text, muted, with its mark. */
+.list-taken-down,
+.list-taken-down:hover {
+  color: var(--muted);
+  text-decoration: none;
+  font-weight: 500;
+}
+.taken-down-pill {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.05rem 0.45rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 /* Empty States */

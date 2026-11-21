@@ -38,9 +38,22 @@ pub const SWEEP_PLC_PAGES: &str = "farsight_backfill_sweep_plc_pages_total";
 pub const SWEEP_PLC_FALLBACKS: &str = "farsight_backfill_sweep_plc_fallbacks_total";
 /// `farsight_abuse_capped_total{kind}`.
 pub const ABUSE_CAPPED: &str = "farsight_abuse_capped_total";
+/// `farsight_backfill_appview_request_seconds`: requests to the AppView
+/// asked about taken-down lists.
+pub const APPVIEW_REQUEST_SECONDS: &str = "farsight_backfill_appview_request_seconds";
+/// `farsight_backfill_list_takedown_checks_total{outcome}`: lists asked
+/// about, by what the AppView answered: `served`, `not_served`,
+/// `inconclusive` (any other answer, or none), `rate_limited`.
+pub const LIST_TAKEDOWN_CHECKS: &str = "farsight_backfill_list_takedown_checks_total";
+/// `farsight_backfill_lists_taken_down`: lists marked taken down, as of
+/// the checker's last pass.
+pub const LISTS_TAKEN_DOWN: &str = "farsight_backfill_lists_taken_down";
+
+/// The outcomes of [`LIST_TAKEDOWN_CHECKS`].
+pub const TAKEDOWN_OUTCOMES: [&str; 4] = ["served", "not_served", "inconclusive", "rate_limited"];
 
 /// Every backfill metric.
-pub const ALL: [&str; 13] = [
+pub const ALL: [&str; 16] = [
     QUEUE_DEPTH,
     REPOS_TOTAL,
     REPOS_PER_HOUR,
@@ -54,6 +67,9 @@ pub const ALL: [&str; 13] = [
     SWEEP_PLC_PAGES,
     SWEEP_PLC_FALLBACKS,
     ABUSE_CAPPED,
+    APPVIEW_REQUEST_SECONDS,
+    LIST_TAKEDOWN_CHECKS,
+    LISTS_TAKEN_DOWN,
 ];
 
 /// Named hosts at most (the rest are `other`).
@@ -155,6 +171,10 @@ pub fn register() {
         metrics::counter!(SWEEP_PLC_PAGES, "source" => s).increment(0);
     }
     metrics::counter!(SWEEP_PLC_FALLBACKS).increment(0);
+    for o in TAKEDOWN_OUTCOMES {
+        metrics::counter!(LIST_TAKEDOWN_CHECKS, "outcome" => o).increment(0);
+    }
+    metrics::gauge!(LISTS_TAKEN_DOWN).set(0.0);
     for c in farsight_storage::codes::CapType::ALL {
         metrics::counter!(ABUSE_CAPPED, "kind" => c.label()).increment(0);
     }

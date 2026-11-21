@@ -151,7 +151,8 @@ flattened to (list, blocker) pairs.
 ```
 
 `list`, `listPurpose`, `blocker` and `listblockUri` are always present
-in an item. Order: list (by Farsight's own list id), then blocker, then
+in an item. `listTakenDown: true` is present when the list is marked
+taken down ([below](#lists-an-appview-has-taken-down)). Order: list (by Farsight's own list id), then blocker, then
 listblock record key. A subject named twice in one list yields one pair
 per listblock, not one per listitem. Every stored listblock on such a
 list is returned, including one that does not count towards the list's
@@ -190,7 +191,8 @@ listblocks it; a list nobody listblocks never appears here.
 ```
 
 `uri`, `purpose`, `listblockCount` and `itemUri` are always present in a
-list. Order: list (by Farsight's own list id). A subject named twice in
+list. `takenDown: true` is present when the list is marked taken down
+([below](#lists-an-appview-has-taken-down)). Order: list (by Farsight's own list id). A subject named twice in
 one list appears once; `itemUri` is then the listitem with the lowest
 record key, and `addedAt` belongs to it. `listblockCount` is the number
 of *counted* listblocks on the list.
@@ -219,7 +221,10 @@ The members of one list.
 ```
 
 `list`, `state`, `capped`, `listblockCount`, `members` and `freshness`
-are always present; in a member, `did` and `itemUri` are. Order:
+are always present; in a member, `did` and `itemUri` are. `takenDown:
+true` is present, beside `name`, when the list is marked taken down
+([below](#lists-an-appview-has-taken-down)); its members are still
+returned. Order:
 member (by Farsight's own actor id), then listitem record key.
 
 `state` is an open enum:
@@ -289,6 +294,12 @@ through the viewer's whole incoming set.
   the object also has `"listsTruncated": true` and `lists` holds the
   first 100. The field is absent otherwise. The relation itself is
   reported either way.
+- `takenDown`, present only when not empty, holds those of `lists`
+  that are marked taken down
+  ([below](#lists-an-appview-has-taken-down)), in the same order. They
+  stay in `lists` and the relation is reported as before. A caller
+  that blocks as the AppView does treats the relation as holding only
+  if `direct` is true or `lists` has a URI that is not in `takenDown`.
 - One call weighs at most 1,000 lists per account (the actor and each
   of the `others`). An account that holds listblocks on more is
   `partial` with the reason `listblocks_truncated`: at response level
@@ -301,6 +312,26 @@ through the viewer's whole incoming set.
   `partialFor`; every pair listed there is `partial`.
 
 There is no cursor: the answer is one page by construction.
+
+### Lists an AppView has taken down
+
+With `[backfill.list_takedowns]` on, Farsight asks one AppView whether
+it still serves each subscribed list, and marks a list that it no
+longer serves although Farsight holds the list's record. Such a list
+has been taken down by that AppView's moderation, which no longer
+enforces it ([list-indexing.md](list-indexing.md#lists-an-appview-has-taken-down)).
+The mark changes no count, state, coverage or `partialFor`: the list
+still blocks in every answer, and the answers say it is marked.
+
+| Endpoint | Field |
+|---|---|
+| `checkBlocks` | `takenDown` in a relation: the marked URIs among its `lists` |
+| `getListMembers` | `takenDown: true` |
+| `getListsNaming` | `takenDown: true` on the list |
+| `getIncomingListBlocks` | `listTakenDown: true` on the item |
+
+Each field is absent while the list is not marked, and always absent
+while the checks are off, so callers that do not read it see no change.
 
 ### `query.getStats`
 

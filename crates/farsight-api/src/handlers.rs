@@ -226,6 +226,9 @@ pub async fn get_incoming_list_blocks(st: &Arc<ApiState>, p: &Params) -> Result<
             );
             m.insert("listPurpose".into(), json!(purpose_name(r.list.purpose)));
             insert_opt(&mut m, "listName", r.list.name.clone());
+            if r.list.taken_down {
+                m.insert("listTakenDown".into(), json!(true));
+            }
             m.insert("blocker".into(), json!(r.blocker));
             m.insert(
                 "listblockUri".into(),
@@ -290,6 +293,9 @@ pub async fn get_lists_naming(st: &Arc<ApiState>, p: &Params) -> Result<Reply, X
             );
             m.insert("purpose".into(), json!(purpose_name(r.list.purpose)));
             insert_opt(&mut m, "name", r.list.name.clone());
+            if r.list.taken_down {
+                m.insert("takenDown".into(), json!(true));
+            }
             m.insert("listblockCount".into(), json!(r.listblock_count));
             insert_opt(&mut m, "addedAt", opt_ts(r.added_at));
             m.insert(
@@ -504,6 +510,9 @@ async fn list_members(st: &Arc<ApiState>, p: &Params, any_owner: bool) -> Result
             body.insert("purpose".into(), json!(purpose_name(i.purpose)));
         }
         insert_opt(&mut body, "name", i.name.clone());
+        if i.taken_down_since.is_some() {
+            body.insert("takenDown".into(), json!(true));
+        }
     }
     body.insert(
         "listblockCount".into(),
@@ -624,6 +633,9 @@ pub(crate) struct Relation {
     pub lists: Vec<String>,
     /// More lists than `lists` holds carry the relation.
     pub lists_truncated: bool,
+    /// Those of `lists` that are marked taken down (the configured
+    /// AppView no longer serves them), in the same order.
+    pub taken_down: Vec<String>,
 }
 
 impl Relation {
@@ -632,13 +644,17 @@ impl Relation {
         self.direct || !self.lists.is_empty()
     }
 
-    /// The `#relation` object. `listsTruncated` is present only when set.
+    /// The `#relation` object. `listsTruncated` and `takenDown` are
+    /// present only when set.
     pub fn json(&self) -> Value {
         let mut m = Map::new();
         m.insert("direct".into(), json!(self.direct));
         m.insert("lists".into(), json!(self.lists));
         if self.lists_truncated {
             m.insert("listsTruncated".into(), json!(true));
+        }
+        if !self.taken_down.is_empty() {
+            m.insert("takenDown".into(), json!(self.taken_down));
         }
         Value::Object(m)
     }
@@ -677,7 +693,7 @@ impl<'a> PairIndex<'a> {
         if !self.inc && self.hidden(author) {
             return Relation::default();
         }
-        let mut lists: Vec<String> = self
+        let mut lists: Vec<(String, bool)> = self
             .rows
             .listblocks
             .get(&author)
@@ -686,15 +702,21 @@ impl<'a> PairIndex<'a> {
             .filter(|l| self.rows.items.contains(&(**l, subject)))
             .filter_map(|l| self.rows.lists.get(l))
             .filter(|l| l.blocks(self.inc))
-            .map(|l| uri(&l.owner_did, Collection::List, &l.rkey))
+            .map(|l| (uri(&l.owner_did, Collection::List, &l.rkey), l.taken_down))
             .collect();
         lists.sort();
         let lists_truncated = lists.len() > MAX_RELATION_LISTS;
         lists.truncate(MAX_RELATION_LISTS);
+        let taken_down = lists
+            .iter()
+            .filter(|(_, t)| *t)
+            .map(|(u, _)| u.clone())
+            .collect();
         Relation {
             direct: self.direct.contains(&(author, subject)),
-            lists,
+            lists: lists.into_iter().map(|(u, _)| u).collect(),
             lists_truncated,
+            taken_down,
         }
     }
 }
@@ -955,6 +977,7 @@ mod tests {
             fetched_witness: None,
             purge_then: None,
             admitted_at: None,
+            taken_down_since: None,
         }
     }
 
@@ -977,6 +1000,7 @@ mod tests {
                     purge_then: None,
                     listblock_count: 1,
                     fetched_witness: None,
+                    taken_down: false,
                 },
             );
             rows.items.insert((id, x));
@@ -1022,6 +1046,22 @@ mod tests {
         rows.status.insert(b, ActorStatus::Takendown);
         assert!(!PairIndex::new(&rows, false).relation(b, x).any());
         assert!(PairIndex::new(&rows, true).relation(b, x).direct);
+    }
+
+    #[test]
+    fn a_relation_names_its_taken_down_lists_and_still_counts_them() {
+        let (x, a) = (ActorId::new(1), ActorId::new(2));
+        let mut rows = dense_rows(x, &[a], 3);
+        let r = PairIndex::new(&rows, false).relation(a, x);
+        assert!(r.taken_down.is_empty());
+        assert!(r.json().get("takenDown").is_none(), "absent unless set");
+        if let Some(l) = rows.lists.get_mut(&ListId::new(1)) {
+            l.taken_down = true;
+        }
+        let r = PairIndex::new(&rows, false).relation(a, x);
+        assert_eq!(r.lists.len(), 3, "a taken-down list still blocks");
+        assert_eq!(r.taken_down, [r.lists[1].clone()]);
+        assert_eq!(r.json()["takenDown"], json!([r.lists[1]]));
     }
 
     #[test]

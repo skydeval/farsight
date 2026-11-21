@@ -22,11 +22,13 @@ pub mod history;
 pub mod ids;
 pub mod janitor;
 pub mod keys;
+pub mod optouts;
 pub mod public;
 pub mod queries;
 pub mod queue;
 pub mod recount;
 pub mod repo_events;
+pub mod takedowns;
 pub mod top;
 pub mod tracking;
 pub mod transition;
@@ -41,13 +43,16 @@ use sqlx::postgres::PgPoolOptions;
 pub use error::{Result, StorageError};
 
 /// The embedded migration set: `0001_initial.sql` creates the whole
-/// schema.
+/// schema, `0002_public_optouts.sql` the table of accounts that withheld
+/// their own public pages, `0003_list_takedowns.sql` the columns that mark
+/// lists the configured AppView no longer serves.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The schema version this build expects: the number of the last
 /// migration, which each migration writes into `schema_version`.
-/// `farsight-backfill` polls for it before starting work.
-pub const SCHEMA_VERSION: i32 = 1;
+/// `farsight-backfill` polls for it before starting work, so both
+/// binaries of one release expect the same version.
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// How often `farsight-backfill` polls `schema_version`.
 pub const SCHEMA_POLL: Duration = Duration::from_secs(5);
@@ -145,6 +150,8 @@ mod tests {
             ("auth.rs", include_str!("auth.rs")),
             ("backfill_api.rs", include_str!("backfill_api.rs")),
             ("handles.rs", include_str!("handles.rs")),
+            ("optouts.rs", include_str!("optouts.rs")),
+            ("takedowns.rs", include_str!("takedowns.rs")),
         ] {
             let lower = src.to_ascii_lowercase();
             assert!(

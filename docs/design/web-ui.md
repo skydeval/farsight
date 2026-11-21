@@ -333,7 +333,15 @@ trusted proxy in front.
 
 In hostname mode the authorization server fetches the client metadata
 document, which Farsight serves only on the hostname it describes
-(`404` otherwise, and with the admin UI off). Loopback mode needs
+(`404` otherwise), while the admin UI is on or the account holders'
+sign-in exists ([below](#the-account-holders-sign-in)). It is one
+document for both flows: `client_name` is `Farsight (<hostname>)`, so
+that a consent screen says which instance asks, and `redirect_uris`
+lists both `https://<hostname>/enter/callback` and
+`https://<hostname>/account/callback` whatever is switched on, because
+authorization servers keep a copy of it and one that listed only the
+flows on now would refuse the other callback after a toggle. A
+callback whose flow is off answers like any unknown route. Loopback mode needs
 nothing reachable from outside and is how an instance on an IP
 address, a port or a private network is administered: on the machine
 itself or through an SSH tunnel. `localhost` is not accepted as a
@@ -485,14 +493,16 @@ control. These rules hold in every mode.
   itself. A `Location` is never built from the request's raw path,
   which could name another host.
 - **Cookies** are host-only (no `Domain`), `Path`-scoped, `HttpOnly`
-  and `SameSite=Strict`. The one exception is `farsight_flow`
-  (`Path=/enter`, `Max-Age=600`), which is `SameSite=Lax` because the
-  OAuth callback is a cross-site top-level navigation and must carry
-  it. It authorizes nothing by itself: it ties a callback to the
-  browser that started the flow. The admin session cookie carries the
-  `__Host-` prefix over HTTPS. The flow cookie and the setup cookie
-  are scoped to `/enter` and `/setup`, and the prefix requires
-  `Path=/`, so they do not carry it.
+  and `SameSite=Strict`. The two exceptions are the flow cookies,
+  `farsight_flow` (`Path=/enter`, `Max-Age=600`) and
+  `farsight_account_flow` (`Path=/account`, `Max-Age=600`), which are
+  `SameSite=Lax` because the OAuth callback is a cross-site top-level
+  navigation and must carry them. Neither authorizes anything by
+  itself: each ties a callback to the browser that started the flow.
+  The admin session cookie carries the `__Host-` prefix over HTTPS.
+  The flow cookies, the account holders' grant cookie and the setup
+  cookie are scoped to `/enter`, `/account` and `/setup`, and the
+  prefix requires `Path=/`, so they do not carry it.
 - **`Secure`** is set on a cookie when the request arrived with
   `X-Forwarded-Proto: https` from a trusted proxy. Farsight does not
   terminate TLS itself, so that header is its only evidence of HTTPS.
@@ -509,7 +519,10 @@ control. These rules hold in every mode.
 - **Public responses do not depend on the caller.** A public page is a
   function of the path, the query string and the instance's state: no
   cookie is read or set and no request header changes the body. That
-  is what makes `Cache-Control: public` safe.
+  is what makes `Cache-Control: public` safe. The `/account*`
+  responses are outside this rule: they read and set cookies, and are
+  `no-store, private`. Every other public response stays the same for
+  every caller, the header's "Sign in" link included.
 
 A proxy may restrict who reaches `/admin*` and `/enter*`; it cannot
 rename them.
@@ -560,7 +573,10 @@ by the 10-second poll.
   way (accounts re-read so far). A line disappears when its work is done,
   and the block disappears with its last line.
 - **Index**: blocks, listblocks, lists, tracked lists, list items,
-  accounts known.
+  accounts known, and how many accounts opted out of the public pages
+  (`SELECT count(*) FROM public_optouts`, read at most once a minute).
+  That number is all the admin UI says about opt-outs: the DID and
+  list lookups show nothing of them.
 - **Firehose**: connected, protocol, lag, source lag, gaps to repair,
   gaps still open, and the unhealed gaps themselves.
 - **Backfill**: the sweep's cycle, source, state, progress and ETA;
@@ -570,7 +586,11 @@ by the 10-second poll.
 - **Exceptions**: the coverage exception counts, as `getStats` reports
   them.
 - **Lists by state**: one count per list state
-  ([List indexing](list-indexing.md#list-state)).
+  ([List indexing](list-indexing.md#list-state)). Then the taken-down
+  list checks: "off", or how many lists are marked taken down and the
+  checker's last pass (when, lists asked about, answers that gave
+  nothing to go by, and the last such answer)
+  ([List indexing](list-indexing.md#lists-an-appview-has-taken-down)).
 - **API usage**: one row per API endpoint with requests, errors
   (status 400 and above other than 429), rate-limited (429) and the
   time of the last call, counted in memory since the server started.
@@ -704,7 +724,9 @@ the index was last updated; incoming blocks for any account; the
 lists naming any account; list memberships; outgoing blocks if
 `show_outgoing_blocks` is on; profile cards and where visitors'
 browsers will fetch avatars from; the top lists if their switches are
-on. It also states what stays private: removed records. Only a second
+on; and, with `self_optout`, that account holders can sign in to hide
+their own pages, which makes this instance contact their account's
+server. It also states what stays private: removed records. Only a second
 request writes the change. In Settings that request must carry the
 confirmation token of the first and the session's CSRF token, within
 10 minutes.
@@ -718,7 +740,15 @@ confirmation token of the first and the session's CSRF token, within
 | `GET /did/{did}` | Account page | `public_ui` |
 | `GET /list/{did}/{rkey}` | List page | `public_ui` |
 | `GET /card/{did}` | Profile-card fragment, fetched by script | `public_ui_card` |
+| `GET /account` | The account holders' sign-in: the form, and that signing in gives no access to the account ([below](#the-account-holders-sign-in)) | `public_ui` |
+| `POST /account` | Starts an account holder's sign-in | `optout`, then `optout_start` |
+| `GET /account/callback` | Where the account's authorization server sends the browser back | `optout` |
+| `POST /account/set` | Stores the account holder's choice | `optout` |
 | `GET /robots.txt` | Served in every normal-mode configuration | — |
+
+The four `/account` routes exist only while the public UI is on,
+`public_ui.self_optout` is on and `server.hostname` is a domain name;
+otherwise they answer like any unknown route.
 
 Page views are limited per client address
 (`public_ui.rate_limit_rps` / `rate_limit_burst`) and renders are
@@ -741,23 +771,30 @@ An unknown root path is the bare `404` also while the public UI is on;
 the public not-found page is for public routes whose subject does not
 exist. `robots.txt` disallows everything unless the public UI is on
 and `public_ui.crawlable` is set; then it closes `/admin`, `/enter`,
-`/setup`, `/xrpc/`, `/search`, `/card/` and the health endpoints and
-allows the rest. Pages that are not offered to crawlers also carry
-`X-Robots-Tag: noindex, nofollow`; search, cards and every error page
-always do.
+`/account`, `/setup`, `/xrpc/`, `/search`, `/card/` and the health
+endpoints and allows the rest. Pages that are not offered to crawlers
+also carry `X-Robots-Tag: noindex, nofollow`; search, cards, every
+`/account` response and every error page always do.
 
 ### Rules every public handler keeps
 
 - **Off means absent.** With the toggle off, a public route answers
   like any unknown route.
-- **No way out.** A public page links only to public pages. It carries
-  no login link and names no admin route.
-- **No writes.** A public page view never interns a row and never
-  enqueues backfill work. Its only side effects are handle and avatar
-  cache entries and requests to the warming queue.
-- **One withheld rule.** An account in a hidden status, or in
-  `public_ui.excluded_dids`, has no page, and the notice is the same
-  for both; the page never says which.
+- **No way out.** A public page links only to public pages, to the
+  record viewer if one is configured, and to the account holders' own
+  sign-in at `/account`. It names no admin route.
+- **No writes.** A public page view never interns a row, never
+  enqueues backfill work and never writes. Its only side effects are
+  handle and avatar cache entries and requests to the warming queue.
+  `POST /account/set` writes one `public_optouts` row, or removes it,
+  and nothing else.
+- **One withheld rule, two tiers.** An account in a hidden status, or
+  in `public_ui.excluded_dids`, has no page, appears in no row and has
+  no profile card. An account whose holder opted out at `/account` has
+  no page and no profile card, and its rows stay, quieted: where a row
+  names it, the name is plain text, with no link to its page, no
+  avatar and no card. The notice is the same for every reason; the
+  page never says which.
 
 ### What a page shows and never shows
 
@@ -797,11 +834,28 @@ by the status of the account in the row:
 | Taken down by its host | Left out unless the table's switch is on (`?takendown=1`); then shown, tagged "taken down" | Withheld |
 | Deactivated, deleted | Never shown | Withheld |
 | In `excluded_dids` | Never shown | Withheld |
+| Opted out by the account | Shown in rows as plain text, no link, avatar or card | Withheld |
+
+Lists follow a rule of their own. A list marked taken down (the
+configured AppView no longer serves it,
+[List indexing](list-indexing.md#lists-an-appview-has-taken-down)):
+
+- **Its page** shows its name, its owner, a "Taken down" mark and one
+  line saying that its members and subscribers are not shown. It is
+  cached like the withheld notice, and counted under
+  `list_taken_down` in `farsight_public_ui_withheld_total`. An owner's
+  opt-out, exclusion or hidden status is checked first and still
+  withholds the page outright.
+- **In an account's tables** ("Blocked By Lists", "Blocking Lists") it
+  stays a row, its name plain text with the mark and no link.
+
+No count changes with it.
 
 Where the switch exists, the heading states both counts ("4,114
 (6,234 counting taken down accounts)"). The rule is a property of the
 public pages only: the API's hidden set and the admin tables are
-unchanged by it.
+unchanged by it. Whether a row is quiet changes no count, order or
+page boundary.
 
 ### Tables
 
@@ -879,7 +933,8 @@ the search box, and three totals from `getStats`: blocks indexed,
 lists tracked, accounts seen. A guide, "How to read a page", is
 collapsed under its heading; the other public pages have the same
 guide behind a button in the bar, which otherwise holds the icon, the
-search form and the theme toggle.
+search form, the theme toggle and, while the account holders' sign-in
+exists, a plain "Sign in" link to `/account`.
 
 A page left open keeps itself current. Once a minute, while the tab
 is visible, the script reads the page again and replaces what counts
@@ -941,7 +996,8 @@ on the caller.
 
 | Response | `Cache-Control` |
 |---|---|
-| Account or list page, complete | `public, max-age=30` |
+| Account or list page, complete, and the withheld notice | `public, max-age=30` |
+| Every `/account` response | `no-store, private` |
 | Home page, complete | `public, max-age=60` |
 | A page that held rows back, or a top list still waiting for handles | `no-store` |
 | An account or list page whose own handle could not be checked this time (no budget, or no answer within 2 seconds) | `no-store` |
@@ -956,6 +1012,75 @@ to change: its script re-reads the same address until the missing
 rows are in, and a cached copy, in the browser or at an edge, would
 hand the same incomplete page back to it and to every other visitor
 for the cache's lifetime.
+
+An opt-out has no cache of its own: it applies on this instance's next
+response, and a copy kept in front of it ages out within its
+`max-age`, 30 seconds for a page and five minutes for a card.
+
+### The account holders' sign-in
+
+An account holder can sign in at `/account` with their ATProto account
+and **withhold their own pages** here: `GET /did/{did}` for their DID
+and `GET /list/{did}/{rkey}` for every list they own answer the
+withheld notice, and their profile card answers the same `404` as an
+unknown account's. Nothing else changes. Farsight keeps indexing their
+records, the API answers about them as before, the admin pages show
+them as before, and rows naming them on other pages and in the top
+lists stay, quieted ([the display rule](#the-display-rule-for-inactive-accounts)).
+It applies to this instance only. Because the rows stay, a visitor who
+finds the account in a row can tell that it hid its page itself; the
+page says so to the holder.
+
+- **Entry.** While the routes exist, every public page's bar ends with
+  a plain "Sign in" link to `/account`. It is a link, not a form, and
+  its markup is the same for every visitor: it reads no cookie, shows
+  no signed-in state and does not depend on `Host`. No other text on
+  the public pages points at the opt-out.
+- **The flow.** A second flow beside the admin's, with the same client
+  identity (hostname mode only; there is no loopback mode) and the
+  same checks in the same order. The form takes a handle or a DID, as
+  search does; a handle is resolved through the safe client, charged
+  to `optout_start` and never to the pages' handle budget, and never
+  read from or written to `handle_cache`. Discovery is not cached and
+  reads the PLC directory pinned at start. The scope is `atproto`
+  only: the tokens are discarded when `sub` is read, and `sub` must be
+  the DID the flow was started for, compared in canonical form. One
+  start (resolution, discovery and the pushed request) has 10 seconds
+  in all, and one callback's token request 10 seconds; past either it
+  fails like any other failure. Flows are held in a store of their own
+  (10 minutes, at most 256, the oldest evicted), so a flood of
+  account holders' starts never evicts the admin's.
+- **No session.** The callback answers `200` (with
+  `Referrer-Policy: same-origin`, so that its form's post carries a
+  real `Origin`): the signed-in page, with the
+  account's DID and a drawer, "Your pages on this site", closed until
+  opened. The drawer holds what hiding does and does not do, the
+  account's choice ("You have asked this site to hide your pages." or
+  "You have not asked this site to hide your pages.") and one button
+  for the other choice. The sign-in page itself only signs in. That button spends a **change grant**: a token in the form
+  and a `SameSite=Strict` cookie, `farsight_account` (`Path=/account`,
+  10 minutes), held in memory by the token's SHA-256, at most 256,
+  spent by its first use. `POST /account/set` writes for the grant's
+  account only (the form never names it) and posts the wanted state,
+  so a repeated submit changes nothing. A later change is a new
+  sign-in.
+- **What the pages say.** Neither the callback page nor the result
+  page says whether the account's page is shown now: an account in
+  `excluded_dids` or in a hidden status is withheld whatever it
+  chooses, and saying so would tell it which. Opting back in promises
+  only that this site no longer hides the pages at the holder's
+  request. The result page says that this site's own pages follow at
+  once, a cache in front of it within a few minutes, and that copies
+  kept elsewhere are not under this site's control.
+- **Storage.** `public_optouts` holds the DID and nothing else
+  ([storage.md](storage.md)); it is read on every page view, card and
+  batch of rows, and a failed read is the page's `503`, never the page.
+- **Operators** see a count on the dashboard, and nothing else: no
+  admin page, log line or metric names an account that opted out.
+- **`public_ui.self_optout`** (default on) switches the routes and the
+  link; off, flows in progress fail at their next step and stored
+  opt-outs are still honoured, though a holder cannot reverse one
+  until it is on again.
 
 ## Handles
 
@@ -1164,15 +1289,21 @@ described in [lodestar.md](lodestar.md#the-handle-sync).
 A profile card is an HTML fragment (`GET /card/{did}`) that the
 script shows when the pointer rests on an account in a row or the
 link takes keyboard focus. Touch devices get no cards. The same fetch
-fills the header of an account page.
+fills the header of an account page. A row naming an account whose
+holder opted out carries no card: its name is plain text, without the
+attributes the script opens a card from.
 
 A card shows what the network publishes about the account: the
 avatar, the verified handle, the DID, and when the DID was created.
 The request is handled in this order:
 
 1. the per-address class `public_ui_card`; over it, `429`;
-2. one status lookup: an account this instance does not hold, or does
-   not show, gets the same `404` and nothing is fetched for it;
+2. one status lookup, with the account's opt-out read on the same
+   connection: an account this instance does not hold, does not show,
+   or whose holder withheld its pages gets the same `404` and nothing
+   is fetched for it. A failed read of the opt-out is `503`, never the
+   card. A complete card may be kept for five minutes, so a cache in
+   front of Farsight can serve one for that long after an opt-out;
 3. the process-wide budget (`public_ui.card_rps`, default 4, and
    `card_burst`, default 8): with none left a short card (the DID and
    what is cached) is returned and nothing is fetched;
@@ -1239,10 +1370,10 @@ the account page's header shows as "Hosted on").
 
 `GET /admin/card/{did}` serves the same fragment to admin tables. It
 differs in three ways: without a valid session it is the bare `404`
-and never a redirect; the withheld rule is not applied, since the
-operator's tables show those accounts; and every answer is `no-store,
-private`. It draws on the same per-address class and the same
-process-wide budget.
+and never a redirect; the withheld rule, the opt-out included, is not
+applied, since the operator's tables show those accounts; and every
+answer is `no-store, private`. It draws on the same per-address class
+and the same process-wide budget.
 
 ## Times
 

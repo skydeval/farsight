@@ -8,8 +8,11 @@
 //! DID was created. In order:
 //!
 //! 1. the per-address class (`public_ui_card`); over it: 429;
-//! 2. one status lookup: an account this instance does not hold, or does
-//!    not show, gets the same 404 and nothing is fetched for it;
+//! 2. one status lookup, with the account's opt-out: an account this
+//!    instance does not hold, does not show, or whose holder withheld its
+//!    pages (`public_optouts`) gets the same 404 and nothing is fetched
+//!    for it. A complete card is kept for five minutes, so a cache in
+//!    front of Farsight may serve one for that long after an opt-out;
 //! 3. the process-wide budget (`public_ui.card_rps` / `card_burst`): with
 //!    none left the *short card* is returned and nothing is fetched;
 //! 4. the fetches, through the safe client (see
@@ -814,13 +817,27 @@ async fn card(
         let Ok(mut conn) = st.api.pool.acquire().await else {
             return busy();
         };
-        match queries::actor(&mut conn, &did).await {
+        let found = match queries::actor(&mut conn, &did).await {
             Ok(Some(a)) => withheld
                 .as_ref()
                 .is_none_or(|w| w.reason(did.as_str(), Some(a.status)).is_none()),
             Ok(None) => false,
             Err(_) => return busy(),
-        }
+        };
+        // An account whose holder withheld its pages has no public card
+        // either: read with the actor row, on the same connection, and a
+        // failed read is `503`, never the card. The operator's card is
+        // unchanged.
+        let opted_out = match who {
+            For::Public if found => {
+                match farsight_storage::optouts::opted_out(&mut conn, &did).await {
+                    Ok(b) => b,
+                    Err(_) => return busy(),
+                }
+            }
+            _ => false,
+        };
+        found && !opted_out
     };
     if !shown {
         // Unknown and withheld accounts answer alike.

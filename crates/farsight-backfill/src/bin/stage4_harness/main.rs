@@ -448,6 +448,7 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
             "extra: an account that neither its host nor the relay holds",
             18,
         ),
+        ("extra: lists the AppView no longer serves", 19),
     ];
     for (name, n) in checks {
         c.section(name);
@@ -468,6 +469,7 @@ async fn run(c: &mut Checks, pg: &Pg, skip_live: bool) -> Res<()> {
             16 => check_bounds(&h, c).await,
             17 => check_completes_past_failing(&h, c).await,
             18 => check_gone(&h, c).await,
+            19 => check_takedowns(&h, c).await,
             _ => check_discovery(&h, c).await,
         };
         if let Err(x) = r {
@@ -3820,6 +3822,181 @@ async fn check_completes_past_failing(h: &H, c: &mut Checks) -> Res<()> {
 /// An account that its own host, read from the directory, and the relay
 /// both say they do not hold is deleted, in list phase 1 and in a repo
 /// job. The host's word alone, or the relay's alone, deletes nothing.
+/// `[backfill.list_takedowns]`: the real checker pass against the fake
+/// AppView's `getList`. The spacing between two misses is the real rule;
+/// the harness moves the stored times back instead of waiting.
+async fn check_takedowns(h: &H, c: &mut Checks) -> Res<()> {
+    use farsight_backfill::takedowns;
+    let (_stop_tx, stop) = watch::channel(false);
+    let owner = did("tdo", 1);
+    let sub = did("tds", 1);
+    let (gone_rk, kept_rk) = (tid_now(), tid_now());
+    h.put_repo(&owner, Vec::new());
+    for rk in [&gone_rk, &kept_rk] {
+        h.fh(&owner, Collection::List, rk, list_v("watched"))
+            .await?;
+        h.fh(
+            &sub,
+            Collection::ListBlock,
+            &tid_now(),
+            lb_v(&list_uri(&owner, rk)),
+        )
+        .await?;
+    }
+    let gone = h.list_id(&owner, &gone_rk).await?;
+    let kept = h.list_id(&owner, &kept_rk).await?;
+    let marked =
+        |id: i64| format!("SELECT appview_absent_since IS NOT NULL FROM lists WHERE id = {id}");
+    let misses = |id: i64| format!("SELECT appview_misses::BIGINT FROM lists WHERE id = {id}");
+    let due_now = |id: i64| {
+        format!("UPDATE lists SET appview_due_at = now() - interval '1 second' WHERE id = {id}")
+    };
+    w(&h.world).appview_gone.insert(list_uri(&owner, &gone_rk));
+
+    // Off (the default): nothing is asked.
+    let asked_before = h.hits("getList", "", "");
+    let r = takedowns::pass(&h.ctx, &stop).await.map_err(e)?;
+    c.check(
+        "with backfill.list_takedowns off, a pass asks the AppView nothing and marks nothing",
+        r.checks == 0
+            && h.hits("getList", "", "") == asked_before
+            && !h.bool(&marked(gone)).await?,
+        format!("{r:?}"),
+    );
+
+    let pds = h.pds.clone();
+    h.set_cfg(|c| {
+        let t = &mut c.backfill.list_takedowns;
+        t.enabled = true;
+        t.appview_url = pds;
+        t.rps = 1000;
+        t.confirm_after = ConfigDuration::hours(1);
+        t.recheck = ConfigDuration::hours(24);
+        t.recheck_taken_down = ConfigDuration::hours(6);
+    });
+    h.ctx.net.set_limits(&h.ctx.cfg());
+    let r = takedowns::pass(&h.ctx, &stop).await.map_err(e)?;
+    c.check(
+        "on: one pass asks about every subscribed list; one \"List not found\" is a first miss and marks nothing; the served list has no miss",
+        r.checks >= 2
+            && h.i64(&misses(gone)).await? == 1
+            && !h.bool(&marked(gone)).await?
+            && h.i64(&misses(kept)).await? == 0
+            && h.bool(&format!("SELECT appview_checked_at IS NOT NULL FROM lists WHERE id = {kept}")).await?,
+        format!("{r:?}"),
+    );
+    let r = takedowns::pass(&h.ctx, &stop).await.map_err(e)?;
+    c.check(
+        "a pass right after asks nothing again: each list waits for its next check",
+        r.checks == 0,
+        format!("{r:?}"),
+    );
+    // A second miss within the hour does not count.
+    h.exec(&due_now(gone)).await?;
+    takedowns::pass(&h.ctx, &stop).await.map_err(e)?;
+    c.check(
+        "a second miss less than confirm_after after the first does not mark the list",
+        h.i64(&misses(gone)).await? == 1 && !h.bool(&marked(gone)).await?,
+        "one miss stands",
+    );
+    // An hour later.
+    h.exec(&format!(
+        "UPDATE lists SET appview_checked_at = appview_checked_at - interval '2 hours',
+                          appview_due_at = now() - interval '1 second' WHERE id = {gone}"
+    ))
+    .await?;
+    // A list never asked about, as in a first pass over every list,
+    // must not hold the confirming recheck back.
+    let fresh_rk = tid_now();
+    h.fh(&owner, Collection::List, &fresh_rk, list_v("fresh"))
+        .await?;
+    h.fh(
+        &sub,
+        Collection::ListBlock,
+        &tid_now(),
+        lb_v(&list_uri(&owner, &fresh_rk)),
+    )
+    .await?;
+    let fresh = h.list_id(&owner, &fresh_rk).await?;
+    let first = farsight_storage::takedowns::due(h.pool(), Utc::now(), 1)
+        .await
+        .map_err(e)?;
+    c.check(
+        "a due recheck is taken before a list never asked about",
+        first.len() == 1 && first[0].id == ListId::new(gone) && gone != fresh,
+        format!("{:?}", first.iter().map(|d| d.id).collect::<Vec<_>>()),
+    );
+    let r = takedowns::pass(&h.ctx, &stop).await.map_err(e)?;
+    let info = {
+        let mut conn = h.pool().acquire().await.map_err(e)?;
+        farsight_storage::queries::list_info(&mut conn, &Did::parse(&owner).map_err(e)?, &gone_rk)
+            .await
+            .map_err(e)?
+    };
+    c.check(
+        "two misses at least confirm_after apart mark the list; the other list is untouched and the list still counts its listblock",
+        r.marked == 1
+            && h.bool(&marked(gone)).await?
+            && !h.bool(&marked(kept)).await?
+            && info.as_ref().is_some_and(|i| i.taken_down_since.is_some() && i.listblock_count == 1),
+        format!("{r:?}"),
+    );
+    let rows = {
+        let mut conn = h.pool().acquire().await.map_err(e)?;
+        let sub_id = ActorId::new(h.id(&sub).await?);
+        farsight_storage::queries::check_rows(&mut conn, sub_id, &[])
+            .await
+            .map_err(e)?
+    };
+    c.check(
+        "checkBlocks' rows carry the mark: the marked list still blocks and says it is taken down, the other does not",
+        rows.lists.get(&ListId::new(gone)).is_some_and(|l| l.taken_down)
+            && rows.lists.get(&ListId::new(kept)).is_some_and(|l| !l.taken_down),
+        format!("{} lists", rows.lists.len()),
+    );
+    // The AppView fails: the mark stays, the pass says so.
+    w(&h.world).appview_down = true;
+    h.exec(&due_now(gone)).await?;
+    let r = takedowns::pass(&h.ctx, &stop).await.map_err(e)?;
+    let (errors, error): (i32, Option<String>) =
+        sqlx::query_as("SELECT last_errors, last_error FROM list_takedown_checks WHERE id = 1")
+            .fetch_one(h.pool())
+            .await
+            .map_err(e)?;
+    c.check(
+        "an AppView that answers 502 changes no mark; the pass records the inconclusive answers",
+        h.bool(&marked(gone)).await?
+            && r.errors >= 1
+            && errors >= 1
+            && error.as_deref() == Some("HTTP 502"),
+        format!("{r:?} {errors} {error:?}"),
+    );
+    w(&h.world).appview_down = false;
+    // Served again: cleared at the next check.
+    w(&h.world).appview_gone.clear();
+    h.exec(&due_now(gone)).await?;
+    let r = takedowns::pass(&h.ctx, &stop).await.map_err(e)?;
+    c.check(
+        "served again: the next check clears the mark and the misses",
+        r.cleared >= 1 && !h.bool(&marked(gone)).await? && h.i64(&misses(gone)).await? == 0,
+        format!("{r:?}"),
+    );
+    // Off again: every mark goes.
+    h.exec(&format!(
+        "UPDATE lists SET appview_absent_since = now() WHERE id = {kept}"
+    ))
+    .await?;
+    h.set_cfg(|c| c.backfill.list_takedowns.enabled = false);
+    let asked = h.hits("getList", "", "");
+    let r = takedowns::pass(&h.ctx, &stop).await.map_err(e)?;
+    c.check(
+        "turned off: the next pass clears every mark and asks nothing",
+        r.cleared >= 1 && !h.bool(&marked(kept)).await? && h.hits("getList", "", "") == asked,
+        format!("{r:?}"),
+    );
+    Ok(())
+}
+
 async fn check_gone(h: &H, c: &mut Checks) -> Res<()> {
     let status_of = |d: &str| format!("SELECT status::BIGINT FROM actors WHERE did = '{d}'");
     let blocks_of = |d: &str| {

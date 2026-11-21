@@ -127,6 +127,10 @@
           "type": "string",
           "description": "The list's name, truncated to 128 characters."
         },
+        "listTakenDown": {
+          "type": "boolean",
+          "description": "Present and true when the AppView this instance asks (`backfill.list_takedowns`) no longer serves the list although its record is present: it has been taken down by that AppView's moderation, which no longer enforces it. Farsight still counts the list; what to make of the mark is the caller's choice."
+        },
         "blocker": {
           "type": "string",
           "format": "did",

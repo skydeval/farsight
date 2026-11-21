@@ -7,6 +7,95 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 Before 1.0, a minor version may change addresses, settings or the
 database schema; each entry says so where it does.
 
+## [Unreleased]
+
+### Added
+
+- Account holders can withhold their own pages. Every public page's
+  header has a plain "Sign in" link to `/account`, where anyone can
+  sign in with their ATProto account (scope `atproto` only: it proves
+  who they are and gives Farsight no access to the account) and choose
+  whether this instance shows their account page and the pages of the
+  lists they own. A withheld page answers the same notice as an
+  excluded account's, and the account's profile card is not shown.
+  Rows naming the account on other pages and in the top lists stay, as
+  plain text with no link, avatar or card, so no count changes. The
+  API, the admin pages and the indexing are unchanged, and it applies
+  to this instance only. The choice is stored in a new table,
+  `public_optouts`, which holds the DID and nothing else; the admin
+  dashboard shows how many accounts opted out, and no page, log line or
+  metric names one. New setting `public_ui.self_optout`, on by default
+  on new and upgraded instances alike; it needs the public UI on and a
+  `server.hostname` that is a domain name. Turned off, the page and the
+  link go and stored opt-outs are still honoured. See
+  `docs/design/web-ui.md`.
+- **New outbound requests.** Each account holder's sign-in makes this
+  instance contact servers that the visitor's own handle or DID
+  document names: the handle's host, the PLC directory or the
+  `did:web` host, the account's server and its authorization server.
+  Like search's handle resolution, these are requests that anonymous
+  visitors can cause. They go through the safe outbound client and are
+  bounded by two new rate classes (`optout` per address, and
+  `optout_start` for the whole instance, which shares nothing with the
+  admin's sign-in or the pages' handle checks) and by a 10-second
+  deadline per step. Set `public_ui.self_optout = false` to have none.
+- The OAuth client metadata now names the instance
+  (`client_name` is `Farsight (<hostname>)`, for the admin's sign-in
+  too) and lists both callbacks, `/enter/callback` and
+  `/account/callback`. It is served while the admin UI is on or the
+  account holders' sign-in can run.
+- `/robots.txt` closes `/account` too. New metrics:
+  `farsight_public_optout_changes_total{to}` and the `self_opt_out`
+  reason of `farsight_public_ui_withheld_total`.
+- Lists an AppView has taken down can be marked. An AppView's
+  moderation can take a list down while the list's record stays in its
+  owner's repository, and the AppView then stops enforcing it.
+  - **How lists are checked.** With the new
+    `[backfill.list_takedowns]` section turned on, the backfill process
+    asks an AppView (`appview_url`, Bluesky's public AppView by default)
+    whether it still serves each list that is subscribed to as a block
+    list. A list it says it does not have, twice and at least
+    `confirm_after` (1 hour) apart, while Farsight holds its record, is
+    marked taken down. Each list is checked again daily, and a marked
+    one every 6 hours, so a takedown that is reversed clears.
+  - **The API.** Farsight keeps counting a marked list, and every
+    answer says it is marked:
+    - `checkBlocks` relations gain `takenDown`, the URIs of those of
+      `lists` that are marked;
+    - `getListMembers` and `getListsNaming` gain `takenDown: true`;
+    - `getIncomingListBlocks` items gain `listTakenDown: true`.
+
+    Callers that want to block as the AppView does can leave those
+    lists out. Nothing changes for callers that do not read the new
+    fields.
+  - **The public pages.** A marked list's page shows its name and
+    owner with a "Taken down" mark, and neither its members nor its
+    subscribers. Where it appears in an account's tables, its name is
+    plain text with the mark and no link.
+  - **Off by default.** No AppView is asked unless the operator turns
+    the section on, and turning it off clears every mark. With it on,
+    the backfill process makes requests to the AppView at `rps` a
+    second (2 by default).
+  - **Where to see it.** The admin dashboard shows how many lists are
+    marked and how the last pass went. New metrics:
+    `farsight_backfill_list_takedown_checks_total{outcome}`,
+    `farsight_backfill_lists_taken_down`,
+    `farsight_backfill_appview_request_seconds` and the
+    `list_taken_down` reason of `farsight_public_ui_withheld_total`.
+
+**Upgrade both binaries together.** This release adds migrations 2 and
+3 and schema version 3: a `farsight-backfill` of an earlier release
+waits for its own version forever once the new server has migrated.
+**A downgrade is not supported**: an earlier server refuses to start on
+the migrated database, and an earlier release refuses a config that
+sets `public_ui.self_optout` or `[backfill.list_takedowns]`. Undoing
+it by hand means:
+- dropping the `public_optouts` and `list_takedown_checks` tables and
+  the four `appview_*` columns of `lists`, with their two indexes;
+- deleting the rows of migrations 2 and 3 from `_sqlx_migrations`;
+- setting `schema_version` to 1;
+- removing the keys.
+
 ## [0.7.2] - 2026-11-13
 
 ### Changed

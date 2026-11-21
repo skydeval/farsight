@@ -10,20 +10,27 @@
 //! - **Off means absent.** With the toggle off, a public route answers
 //!   like any unknown route. (`/` is shared: it then leads to the admin
 //!   UI, or is a few lines of text.)
-//! - **No way out.** A public page links only to public pages and, when
-//!   the operator configures one, to the record viewer. It carries no
-//!   login link and names no admin route. Removed records are an admin
-//!   page ([`crate::history`]).
+//! - **No way out.** A public page links only to public pages, to the
+//!   record viewer when the operator configures one, and to the account
+//!   holders' own sign-in at `/account` ([`crate::privacy`]). It names no
+//!   admin route. Removed records are an admin page ([`crate::history`]).
 //! - **Responses do not depend on the caller.** A response is a function
 //!   of the path, the query string and the instance's state: no cookie is
 //!   read or set, and no request header changes the body. That is what
 //!   makes `Cache-Control: public` safe (see `docs/design/security.md`).
-//! - **One withheld rule.** An account that is hidden (see
+//!   The `/account*` responses are the exception: they read and set
+//!   cookies, and are `no-store, private`.
+//! - **One withheld rule, two tiers.** An account that is hidden (see
 //!   `docs/design/storage.md`) or in `public_ui.excluded_dids` has no
-//!   page and appears in no row, and the notice is the same for both.
-//! - **No writes.** The public UI never interns a row and never enqueues
-//!   backfill work. (A row shown as a bare DID asks the in-memory warming
-//!   worker for that account's handle; nothing is stored.)
+//!   page, appears in no row and has no card. An account whose holder
+//!   opted out (`public_optouts`) has no page and no card, and its rows
+//!   stay, quieted: its name is plain text, with no link, no avatar and
+//!   no card. The notice is the same for every reason.
+//! - **No writes.** A public page view never interns a row, never
+//!   enqueues backfill work and never writes. (A row shown as a bare DID
+//!   asks the in-memory warming worker for that account's handle; nothing
+//!   is stored.) `POST /account/set` writes one `public_optouts` row, or
+//!   removes it, and nothing else.
 //! - **No inline script.** Everything the pages run is the static script
 //!   and the vendored htmx; the CSP allows nothing else.
 
@@ -320,14 +327,33 @@ pub enum WithheldReason {
     HiddenStatus,
     /// In `public_ui.excluded_dids`.
     OperatorExcluded,
+    /// The account's holder asked for its pages to be withheld
+    /// (`public_optouts`). Never answered by [`Withheld::reason`]: that
+    /// rule also drops rows, and an opted-out account's rows stay. The
+    /// page handlers and the card read it themselves.
+    SelfOptOut,
+    /// A list's page, the list being marked taken down (the configured
+    /// AppView no longer serves it). Lists only; the list page reads it
+    /// itself.
+    ListTakenDown,
 }
 
 impl WithheldReason {
+    /// Every reason.
+    pub const ALL: [WithheldReason; 4] = [
+        WithheldReason::HiddenStatus,
+        WithheldReason::OperatorExcluded,
+        WithheldReason::SelfOptOut,
+        WithheldReason::ListTakenDown,
+    ];
+
     /// The `reason` label of `farsight_public_ui_withheld_total`.
     pub fn label(self) -> &'static str {
         match self {
             WithheldReason::HiddenStatus => "hidden_status",
             WithheldReason::OperatorExcluded => "operator_excluded",
+            WithheldReason::SelfOptOut => "self_opt_out",
+            WithheldReason::ListTakenDown => "list_taken_down",
         }
     }
 }
@@ -401,6 +427,9 @@ pub struct PublicState {
     pub counts: CountMemo,
     /// Page renders under way per client address.
     pub rendering: farsight_api::ratelimit::InFlight,
+    /// The account holders' sign-in: its flows, change grants and the
+    /// dashboard's count.
+    pub privacy: crate::privacy::PrivacyState,
 }
 
 impl PublicState {
@@ -494,12 +523,17 @@ pub struct Chrome {
     /// The home page: its bar has no search form and no guide button,
     /// because the page itself has both.
     pub home: bool,
+    /// The bar carries the plain "Sign in" link to `/account`
+    /// ([`crate::privacy::optout_live`]). A function of the config alone:
+    /// the bar is the same for every visitor.
+    pub sign_in: bool,
 }
 
 /// Builds the layout data of a page at `path` (no query string).
 pub fn chrome(cfg: &Config, og_title: &str, og_text: &'static str, path: &str) -> Chrome {
     let host = &cfg.server.hostname;
     Chrome {
+        sign_in: crate::privacy::optout_live(cfg),
         theme: cfg.public_ui.dark_mode_default.as_str(),
         og: OpenGraph {
             title: og_title.to_owned(),
@@ -990,12 +1024,14 @@ async fn list_route(
 }
 
 /// What crawlers may not fetch while the public UI is on and
-/// `crawlable`: the admin UI and sign-in, the wizard, the API, search and
-/// the card fragments, the health endpoints. `Allow` comes last for
-/// crawlers that take the first match rather than the longest.
+/// `crawlable`: the admin UI and sign-in, the account holders' sign-in,
+/// the wizard, the API, search and the card fragments, the health
+/// endpoints. `Allow` comes last for crawlers that take the first match
+/// rather than the longest.
 const ROBOTS_CRAWLABLE: &str = "User-agent: *\nDisallow: /admin\nDisallow: /enter\nDisallow: \
-                                /setup\nDisallow: /xrpc/\nDisallow: /search\nDisallow: \
-                                /card/\nDisallow: /health\nDisallow: /livez\nAllow: /\n";
+                                /account\nDisallow: /setup\nDisallow: /xrpc/\nDisallow: \
+                                /search\nDisallow: /card/\nDisallow: /health\nDisallow: \
+                                /livez\nAllow: /\n";
 
 /// The body of `/robots.txt`: nothing is offered to crawlers unless the
 /// public UI is on and `crawlable`.
@@ -1114,7 +1150,8 @@ mod tests {
         let lines: Vec<&str> = b.lines().collect();
         assert_eq!(lines[0], "User-agent: *");
         for closed in [
-            "/admin", "/enter", "/setup", "/xrpc/", "/search", "/card/", "/health", "/livez",
+            "/admin", "/enter", "/account", "/setup", "/xrpc/", "/search", "/card/", "/health",
+            "/livez",
         ] {
             assert!(
                 lines.contains(&format!("Disallow: {closed}").as_str()),
@@ -1175,6 +1212,78 @@ mod tests {
         }
         // No row: shown (sections render empty with their coverage).
         assert_eq!(w.reason("did:plc:other", None), None);
+    }
+
+    #[test]
+    fn the_opt_out_is_not_a_reason_rows_are_dropped_for() {
+        // `Withheld` knows only the operator's list and the statuses: no
+        // DID and no status makes it answer `SelfOptOut`, so `Shown::ok`,
+        // which goes by it, never drops an opted-out account's row.
+        let w = Withheld {
+            dids: Arc::new(["did:plc:excluded".to_owned()].into_iter().collect()),
+            ids: Arc::new(vec![ActorId::new(7)]),
+        };
+        let statuses = [
+            None,
+            Some(ActorStatus::Active),
+            Some(ActorStatus::Deactivated),
+            Some(ActorStatus::Takendown),
+            Some(ActorStatus::Suspended),
+            Some(ActorStatus::Deleted),
+            Some(ActorStatus::Throttled),
+            Some(ActorStatus::Desynchronized),
+            Some(ActorStatus::Unknown),
+        ];
+        for did in ["did:plc:excluded", "did:plc:optedout", "did:web:a.example"] {
+            for s in statuses {
+                assert_ne!(w.reason(did, s), Some(WithheldReason::SelfOptOut));
+            }
+        }
+        assert!(!w.excluded("did:plc:optedout"));
+        // It has its own metric label.
+        let labels: Vec<&str> = WithheldReason::ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "hidden_status",
+                "operator_excluded",
+                "self_opt_out",
+                "list_taken_down"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_bar_is_the_same_for_every_visitor() {
+        let mut c = Config::default();
+        c.access.public_ui = true;
+        c.server.hostname = "farsight.example".into();
+        // The bar is rendered from the layout data, which `chrome` makes
+        // from the config alone: it takes no request, so no `Host` header
+        // and no cookie reaches it. Two renders are the same bytes, and
+        // carry the plain link to `/account`, which is a link, not a form.
+        let bar = |c: &Config| {
+            let html = MessagePage {
+                c: chrome(c, "Farsight at farsight.example", OG_INSTANCE, "/"),
+                title: "t".into(),
+                message: "m".into(),
+                link: None,
+            }
+            .render()
+            .unwrap();
+            let nav = &html[html.find("<nav class=\"public-nav\"").unwrap()..];
+            nav[..nav.find("</nav>").unwrap()].to_owned()
+        };
+        let a = bar(&c);
+        assert_eq!(a, bar(&c));
+        assert!(a.contains("<a class=\"nav-sign-in\" href=\"/account\">Sign in</a>"));
+        assert_eq!(a.matches("<form").count(), 1, "the search form only");
+        // Off, or without a hostname that can be signed in on: no link.
+        c.public_ui.self_optout = false;
+        assert!(!bar(&c).contains("/account"));
+        c.public_ui.self_optout = true;
+        c.server.hostname = "127.0.0.1".into();
+        assert!(!bar(&c).contains("/account"));
     }
 
     #[test]

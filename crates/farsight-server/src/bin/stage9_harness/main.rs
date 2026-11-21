@@ -392,7 +392,7 @@ async fn check_both(c: &mut Checks, a: &Srv, cookie: &str, w: &World) -> Result<
     c.section("1a. public UI on, admin UI on");
     let home = a.get("/").await?;
     c.check(
-        "/ is the public home: 200, cacheable, its search form posts to /search, no admin or sign-in link",
+        "/ is the public home: 200, cacheable, its search form posts to /search, no admin link and no link to the admin's sign-in (the account holders' sign-in at /account is the one sign-in link)",
         home.status == 200
             && cc(&home) == "public, max-age=60"
             && home.text.contains("action=\"/search\"")
@@ -652,8 +652,10 @@ async fn check_public_only(c: &mut Checks, b: &Srv, cookie: &str, w: &World) -> 
         )
         .await?;
     c.check(
-        "the client metadata asked for under the instance's own hostname: the bare 404",
-        bare(&meta),
+        "the client metadata asked for under the instance's own hostname: served, for the account holders' sign-in at /account (public_ui.self_optout is on by default), the same document with both callbacks",
+        meta.status == 200
+            && meta.body["redirect_uris"][1]
+                == format!("https://{HOSTNAME}/account/callback").as_str(),
         brief(&meta),
     );
     let logout = b.post("/admin/logout", &[("cookie", cookie)], &[]).await?;
@@ -1395,10 +1397,11 @@ async fn check_robots_and_metadata(
     let ra = a.get("/robots.txt").await?;
     let lines: Vec<&str> = ra.text.lines().collect();
     let closed = [
-        "/admin", "/enter", "/setup", "/xrpc/", "/search", "/card/", "/health", "/livez",
+        "/admin", "/enter", "/account", "/setup", "/xrpc/", "/search", "/card/", "/health",
+        "/livez",
     ];
     c.check(
-        "public UI on and crawlable: the admin UI, sign-in, wizard, API, search, cards and health are closed; Allow: / comes last",
+        "public UI on and crawlable: the admin UI, both sign-ins, wizard, API, search, cards and health are closed; Allow: / comes last",
         ra.status == 200
             && cc(&ra) == "public, max-age=300"
             && lines.first() == Some(&"User-agent: *")
@@ -1428,11 +1431,12 @@ async fn check_robots_and_metadata(
     let ms = s.get_with(path, &[("host", HOSTNAME)]).await?;
     let root = format!("https://{HOSTNAME}/");
     c.check(
-        "the client metadata is the same document with the public UI on or off: client_uri is the hostname's root, the callback is /enter/callback",
+        "the client metadata is the same document with the public UI on or off: client_uri is the hostname's root, the callbacks are /enter/callback and /account/callback",
         ma.status == 200
             && ma.text == ms.text
             && ma.body["client_uri"] == root.as_str()
             && ma.body["redirect_uris"][0] == format!("https://{HOSTNAME}/enter/callback").as_str()
+            && ma.body["redirect_uris"][1] == format!("https://{HOSTNAME}/account/callback").as_str()
             && ma.body["client_id"] == format!("https://{HOSTNAME}{path}").as_str(),
         support::truncate(&ma.text, 200),
     );

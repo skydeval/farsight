@@ -1,0 +1,10 @@
+{% extends "public_base.html" %}
+{% block content %}
+<div class="card privacy">
+<h1>Your pages on this site</h1>
+<p class="privacy-choice">{% if hidden %}This site will not show your pages.{% else %}This site no longer hides your pages at your request.{% endif %}</p>
+<p>This site's own pages follow your choice at once. A copy kept by a cache in front of this site follows within a few minutes.</p>
+<p>Copies kept elsewhere, such as by search engines and archives, are not under this site's control.</p>
+<p><a href="/account">Back</a></p>
+</div>
+{% endblock %}

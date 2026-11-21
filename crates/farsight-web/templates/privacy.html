@@ -1,0 +1,14 @@
+{% extends "public_base.html" %}
+{% block content %}
+<div class="card privacy">
+<h1>Sign in</h1>
+{% if let Some(e) = error %}<p class="privacy-error" role="alert">{{ e }}</p>{% endif %}
+{% if form %}<form class="privacy-form" method="post" action="/account">
+<label for="account">Your handle or DID</label>
+<input type="text" id="account" name="account" value="{{ typed }}" maxlength="512" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="alice.example.com or did:plc:…" required>
+<button type="submit">Sign in</button>
+</form>
+<p class="muted">You are sent to your account's own sign-in page and come back here. Signing in only proves who you are. It gives Farsight no access to your account.</p>
+{% else %}<p>Sign in at <code>https://{{ hostname }}/account</code>.</p>{% endif %}
+</div>
+{% endblock %}

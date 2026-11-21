@@ -338,6 +338,8 @@ pub struct BackfillConfig {
     pub repair: RepairConfig,
     /// `[backfill.backlinks]`.
     pub backlinks: BacklinksConfig,
+    /// `[backfill.list_takedowns]`.
+    pub list_takedowns: ListTakedownsConfig,
 }
 
 impl Default for BackfillConfig {
@@ -384,6 +386,7 @@ impl Default for BackfillConfig {
             sweep: SweepConfig::default(),
             repair: RepairConfig::default(),
             backlinks: BacklinksConfig::default(),
+            list_takedowns: ListTakedownsConfig::default(),
         }
     }
 }
@@ -472,6 +475,46 @@ impl Default for BacklinksConfig {
             url: String::new(),
             max_refs: 200_000,
             lag_allowance: ConfigDuration::mins(5),
+        }
+    }
+}
+
+/// `[backfill.list_takedowns]`: asking an AppView whether it still
+/// serves each list that is subscribed to as a block list. A list it no
+/// longer serves although its record is present has been taken down by
+/// the AppView's moderation; Farsight marks it (`takenDown` in the API,
+/// a mark on the public pages) and keeps counting it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ListTakedownsConfig {
+    /// Whether the checks run. Off (the default), no AppView is asked and
+    /// no list is marked; turning it off clears the marks.
+    pub enabled: bool,
+    /// Base URL of the AppView asked (`app.bsky.graph.getList`).
+    pub appview_url: String,
+    /// Requests per second towards the AppView; positive. A budget of its
+    /// own.
+    pub rps: u32,
+    /// A list is marked after two answers at least this far apart that it
+    /// is not served, and only once its record is older than this. An
+    /// answer that gives nothing to go by is retried after it too.
+    pub confirm_after: ConfigDuration,
+    /// How often a served list is asked about again.
+    pub recheck: ConfigDuration,
+    /// How often a marked list is asked about again, so a takedown that
+    /// is reversed clears.
+    pub recheck_taken_down: ConfigDuration,
+}
+
+impl Default for ListTakedownsConfig {
+    fn default() -> Self {
+        ListTakedownsConfig {
+            enabled: false,
+            appview_url: "https://public.api.bsky.app".to_owned(),
+            rps: 2,
+            confirm_after: ConfigDuration::hours(1),
+            recheck: ConfigDuration::hours(24),
+            recheck_taken_down: ConfigDuration::hours(6),
         }
     }
 }
@@ -623,6 +666,11 @@ pub struct PublicUiConfig {
     /// [`crate::lodestar::BATCH`] accounts each; 0 = off, at most
     /// [`MAX_LODESTAR_SYNC_RPS`]. Does nothing without a lodestar URL.
     pub lodestar_sync_rps: u32,
+    /// Account holders may sign in at `/account` to withhold their own
+    /// account page and their lists' pages. Only while the public UI is on
+    /// and `server.hostname` is a domain name. Off removes the routes and
+    /// the header link; opt-outs already stored are still honoured.
+    pub self_optout: bool,
 }
 
 impl PublicUiConfig {
@@ -663,6 +711,7 @@ impl Default for PublicUiConfig {
             handle_rps: 20,
             handle_pass_rps: 0,
             lodestar_sync_rps: 1,
+            self_optout: true,
         }
     }
 }
@@ -1387,6 +1436,7 @@ impl Config {
                 "backfill.list_fetch_max_attempts",
                 b.list_fetch_max_attempts,
             ),
+            ("backfill.list_takedowns.rps", b.list_takedowns.rps),
         ] {
             if value == 0 {
                 return Err(invalid(key, "must be positive"));
@@ -1412,6 +1462,11 @@ impl Config {
             ("backfill.plc_url", b.plc_url.as_str(), true),
             ("backfill.lodestar_url", b.lodestar_url.as_str(), false),
             ("backfill.backlinks.url", b.backlinks.url.as_str(), false),
+            (
+                "backfill.list_takedowns.appview_url",
+                b.list_takedowns.appview_url.as_str(),
+                b.list_takedowns.enabled,
+            ),
         ] {
             if (required || !value.is_empty()) && !is_http_url(value) {
                 return Err(invalid(
@@ -1505,7 +1560,7 @@ impl Config {
         let t = &self.firehose.tuning;
         let b = &self.backfill;
         // (key, value, at least, at most)
-        let bounded: [(&str, ConfigDuration, Duration, Duration); 20] = [
+        let bounded: [(&str, ConfigDuration, Duration, Duration); 23] = [
             // Answers call the index current for this long after the
             // last applied event: hours of it would hide an outage.
             (
@@ -1607,6 +1662,26 @@ impl Config {
                 b.backlinks.lag_allowance,
                 Duration::ZERO,
                 DAY,
+            ),
+            // Zero would ask about the same list without pause; the
+            // checker's own pass runs once a minute anyway.
+            (
+                "backfill.list_takedowns.confirm_after",
+                b.list_takedowns.confirm_after,
+                SEC,
+                7 * DAY,
+            ),
+            (
+                "backfill.list_takedowns.recheck",
+                b.list_takedowns.recheck,
+                SEC,
+                MAX_CONFIG_DURATION,
+            ),
+            (
+                "backfill.list_takedowns.recheck_taken_down",
+                b.list_takedowns.recheck_taken_down,
+                SEC,
+                MAX_CONFIG_DURATION,
             ),
             (
                 "limits.list_grace",
@@ -1899,6 +1974,7 @@ mod tests {
         assert_eq!((p.rate_limit_rps, p.rate_limit_burst), (5, 20));
         assert_eq!(p.query_concurrency, 8);
         assert_eq!(p.handle_cache_ttl, ConfigDuration::hours(1));
+        assert!(p.self_optout);
         assert_eq!(
             c.firehose.urls,
             [

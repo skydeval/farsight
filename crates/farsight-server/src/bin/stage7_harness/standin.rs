@@ -1,6 +1,8 @@
 //! A stand-in ATProto identity and authorization server for the stage-7
 //! harness: a PLC directory, a PDS's protected-resource metadata, and an
 //! authorization server (metadata, PAR, authorize, token) in one process.
+//! It serves the admin's sign-in and the account holders' sign-in at
+//! `/account` alike: any did:plc it is asked for is an account on it.
 //!
 //! It enforces what the ATProto OAuth profile makes a server enforce —
 //! PAR only, PKCE S256, a valid ES256 DPoP proof on every POST with a
@@ -46,6 +48,9 @@ pub struct Knobs {
     pub drop_scope: bool,
     /// Metadata fields to overwrite (`null` removes one).
     pub metadata: Option<Value>,
+    /// The directory never answers for this DID (it answers after a
+    /// minute, past every deadline of the client).
+    pub hang_did: Option<String>,
 }
 
 /// One pushed authorization request.
@@ -284,6 +289,11 @@ impl Standin {
 type St = State<Arc<Standin>>;
 
 async fn did_document(State(st): St, Path(did): Path<String>) -> Response {
+    let hang = st.lock().knobs.hang_did.as_deref() == Some(did.as_str());
+    if hang {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
     if !did.starts_with("did:plc:") || did.contains("unknown") {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }

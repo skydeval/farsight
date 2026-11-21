@@ -43,6 +43,8 @@ pub fn register() {
         Class::UiLoginStart,
         Class::PublicUi,
         Class::PublicCard,
+        Class::Optout,
+        Class::OptoutStart,
     ] {
         metrics::counter!(RATE_LIMITED, "class" => c.label()).increment(0);
     }

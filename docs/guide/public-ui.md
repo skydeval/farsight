@@ -45,7 +45,23 @@ with neither interface, shows a few lines of text.
   under "Inactive accounts". You can withhold more accounts with
   `excluded_dids`: they have no page, appear in no row and get the
   same neutral notice. Exclusion changes what the public pages show, nothing
-  else: the API still returns the data.
+  else: the API still returns the data. Account holders can also
+  withhold their own pages: see "Account holders' sign-in" below.
+- **Lists an AppView has taken down.** If you turn on the taken-down
+  list checks (`[backfill.list_takedowns]` in the config, off by
+  default), the backfill process asks an AppView, Bluesky's public one
+  unless you name another, whether it still serves each subscribed
+  list. A list it no longer serves, although its record still exists,
+  is marked:
+  - its page shows its name, its owner and a "Taken down" mark, and
+    neither its members nor its subscribers;
+  - in an account's tables its name is plain text with the mark, and
+    not a link.
+
+  The API still counts the list and says it is marked. The admin
+  dashboard shows how many lists are marked and how the last check
+  went. See
+  [list-indexing.md](../design/list-indexing.md#lists-an-appview-has-taken-down).
 - **Outgoing blocks** (`show_outgoing_blocks`, off by default): the
   blocks an account has made ("Blocking"), and the lists it subscribes
   to as block lists ("Blocking Lists"; only lists this instance
@@ -104,6 +120,39 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
 - **The page's usual rule applies.** Excluded, deactivated, deleted and
   taken-down accounts are left out and the next ones move up; a
   suspended account is shown with its tag.
+
+## Account holders' sign-in
+
+With `self_optout` on (the default) and a hostname that is a domain
+name, every public page's bar ends with a plain **Sign in** link to
+`/account`. There anyone can sign in with their own ATProto account
+(the scope is `atproto` only: it proves who they are and gives
+Farsight no access to the account) and choose to **withhold their own
+pages** on this instance:
+
+- their account page and the pages of the lists they own answer the
+  same neutral notice as an excluded account's, and their profile card
+  is not shown;
+- rows naming them on other pages, and the top lists, keep them, as
+  plain text with no link, avatar or card, so the counts do not
+  change. Unlike `excluded_dids`, an opt-out does not remove rows;
+- the API, the admin pages and the indexing are unchanged.
+
+It applies to this instance only. Signing in again shows the choice
+and lets the holder reverse it. Your dashboard shows how many accounts
+have opted out and nothing about which: the table `public_optouts`
+holds the DID alone, and no log line or metric names one. Emptying the
+table shows every opted-out account's pages again, so do not.
+
+Each sign-in makes your instance contact the account's own servers:
+the handle's host, the DID document, and the account's authorization
+server. These requests go through the same safe client as everything
+else, are bounded by their own rate classes (`optout`, five a minute
+per address; `optout_start`, one a second for the whole instance) and
+by a 10-second deadline, and do not draw on the handle or card
+budgets. Set `self_optout = false` to remove the page and the link;
+opt-outs already stored are still honoured, but nobody can reverse
+one until it is on again.
 
 ## What visitors' browsers and Farsight fetch from others
 
@@ -233,7 +282,8 @@ They sit side by side on two tabs, "Last 24H" and "All Time"
 - **Times** are sent as UTC and shown in the visitor's own timezone by
   the page's script.
 - Pages are safe to cache at the edge (they do not depend on the
-  visitor), carry a strict Content-Security-Policy with no inline
+  visitor; the `/account` pages, which do, are never cached), carry a
+  strict Content-Security-Policy with no inline
   script, and need no JavaScript to read.
 - **Load from one visitor is bounded.** A table's count is read at
   most once in 30 seconds, whatever address the page is asked for
@@ -282,7 +332,11 @@ handle_rps = 20                   # handle checks per second, whole instance; 1-
 handle_pass_rps = 0               # background checks of every account, per second; 0 = off, at most 200
 lodestar_sync_rps = 1             # with backfill.lodestar_url: handle sync requests per second, 1,000 accounts each; 0 = off
 excluded_dids = []                # at most 10,000
+self_optout = true                # account holders may sign in at /account to withhold their own pages
 ```
+
+`self_optout` is not on the Public UI form; change it in the config
+editor or in `config.toml`.
 
 `handle_warming_enabled` and `record_viewer_url` also apply to the admin
 lookup and history pages, whether or not the public UI is on. There a

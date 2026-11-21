@@ -92,9 +92,11 @@ environment and the same loading rules. Without a configuration it
 idles and looks again every 5 seconds, which is how it waits out the
 setup wizard. With one, it waits until the database's `schema_version`
 equals the version it was built for (it polls every 5 seconds), then
-runs its scheduler, the sweep, the repair logic and a storage-budget
-monitor of its own. What it does is described in
-[backfill.md](backfill.md).
+runs its scheduler, the sweep, the repair logic, a storage-budget
+monitor of its own and, when `[backfill.list_takedowns]` is on, the
+taken-down list checks. What it does is described in
+[backfill.md](backfill.md) and, for the checks,
+[list-indexing.md](list-indexing.md#lists-an-appview-has-taken-down).
 
 It follows configuration changes by itself: it reloads on a
 `NOTIFY farsight_config` from the server, and every 60 seconds when
@@ -215,7 +217,8 @@ named when the process started, whatever a later save says
 follow a saved `plc_url` or `backfill.lodestar_url` at once.
 
 From the admin UI, a save that changes `[auth]`, `[net]`,
-`backfill.plc_url`, `backfill.lodestar_url` or `backfill.relay_url`,
+`backfill.plc_url`, `backfill.lodestar_url`, `backfill.relay_url` or
+`backfill.list_takedowns.appview_url`,
 or that opens `[access]`
 further, is stored only in a session that signed in within the last
 10 minutes
@@ -233,7 +236,9 @@ backfill process picks it up within a minute.
 
 The backfill process applies every change it can in place, the
 request limits (`backfill.per_host_*`, `backfill.per_domain_*`,
-`backfill.plc_rps`, `backfill.lodestar_rps`) among them. For a change
+`backfill.plc_rps`, `backfill.lodestar_rps`,
+`backfill.list_takedowns.rps`) among them, and all of
+`[backfill.list_takedowns]`, which the next pass reads. For a change
 of `storage.database_url`, `[metrics]`, `[net]`, `backfill.concurrency`,
 `backfill.plc_url`, `backfill.lodestar_url`, `limits.large_hosts` or `limits.cdn_ranges_extra`
 it rebuilds its tasks in-process: running jobs are stopped, their work
@@ -359,6 +364,21 @@ view is in [../guide/admin-ui.md](../guide/admin-ui.md).
 | `max_refs` | `200_000` | Reference cap of one discovery; a discovery that hits it is reported as truncated. |
 | `lag_allowance` | `"5m"` | Allowance for the backlink index's own lag. |
 
+### `[backfill.list_takedowns]`
+
+Asking an AppView whether it still serves each list that is subscribed
+to as a block list, and marking the lists it no longer serves
+([list-indexing.md](list-indexing.md#lists-an-appview-has-taken-down)).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Whether the checks run. Off, no AppView is asked and no list is marked; turning it off clears every mark at the next pass. |
+| `appview_url` | `"https://public.api.bsky.app"` | The AppView asked (`app.bsky.graph.getList`). An `http://` or `https://` URL; required while `enabled`. A change needs a fresh sign-in when saved from the admin UI. |
+| `rps` | `2` | Request rate towards the AppView. Positive. A budget of its own, apart from every other. |
+| `confirm_after` | `"1h"` | A list is marked after two "not found" answers at least this far apart, and only once its record's `createdAt` is older than this. An answer that gives nothing to go by is retried after it too. Between 1 s and 7 days. |
+| `recheck` | `"24h"` | How often a served list is asked about again. |
+| `recheck_taken_down` | `"6h"` | How often a marked list is asked about again, so that a takedown that is reversed clears. |
+
 ### `[access]`
 
 | Key | Default | Meaning |
@@ -409,6 +429,7 @@ in [web-ui.md](web-ui.md) and
 | `handle_rps` | `20` | Handle verifications started per second, for pages, cards and the warming worker together. 1 to 200. Each is up to two outbound requests. |
 | `handle_pass_rps` | `0` | Rate of the handle pass, which works through every account Farsight holds; `0` is off, at most 200. It has its own pace and does not draw on `handle_rps`. |
 | `lodestar_sync_rps` | `1` | Requests a second of the handle sync, which reads the handles of every account Farsight holds from `backfill.lodestar_url`, 1,000 accounts a request ([lodestar.md](lodestar.md#the-handle-sync)); `0` is off, at most 20. Does nothing without a lodestar URL. |
+| `self_optout` | `true` | Account holders may sign in at `/account` with their ATProto account (scope `atproto` only) and withhold their own account page and their lists' pages here; their rows on other pages stay, as plain text with no link, avatar or card ([web-ui.md](web-ui.md#the-account-holders-sign-in)). Only while the public UI is on and `server.hostname` is a domain name. Each sign-in makes this instance contact the hosts the visitor's handle or DID document names. `false` removes the routes and the header's "Sign in" link; opt-outs already stored are still honoured. On by default, on upgraded instances too. |
 
 `record_viewer_url`, when not empty, must be an absolute `http` or
 `https` URL with a host and no credentials, at most 500 characters,
@@ -713,7 +734,7 @@ of the API contract.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `farsight_task_panics_total` | counter | `task`: the task that panicked ([When a task panics](#when-a-task-panics)). Server: `ingest_reader`, `ingest_writer`, `ingest_counter_flush`, `ingest_seam_repair`, `ingest_gauges`, `counter_flush`, `coverage_snapshot`, `housekeeping`, `periodic_scheduler`, `metrics_listener`, `handle_warming`, `handle_warming_check`, `handle_pass`, `handle_pass_check`, `top_lists`, `sort_index_builder`, and the names of the periodic tasks. Backfill: `backfill_scheduler`, `backfill_job`, `backfill_sweep`, `backfill_feeder`, `backfill_budget_monitor`, `backfill_pending_timeouts`, `backfill_gauges`, `backfill_counter_flush`, `backfill_metrics_listener`. |
+| `farsight_task_panics_total` | counter | `task`: the task that panicked ([When a task panics](#when-a-task-panics)). Server: `ingest_reader`, `ingest_writer`, `ingest_counter_flush`, `ingest_seam_repair`, `ingest_gauges`, `counter_flush`, `coverage_snapshot`, `housekeeping`, `periodic_scheduler`, `metrics_listener`, `handle_warming`, `handle_warming_check`, `handle_pass`, `handle_pass_check`, `top_lists`, `sort_index_builder`, and the names of the periodic tasks. Backfill: `backfill_scheduler`, `backfill_job`, `backfill_sweep`, `backfill_feeder`, `backfill_budget_monitor`, `backfill_pending_timeouts`, `backfill_gauges`, `backfill_counter_flush`, `backfill_metrics_listener`, `backfill_list_takedowns`. |
 
 ### Firehose and ingest (server)
 
@@ -739,7 +760,7 @@ of the API contract.
 |---|---|---|
 | `farsight_query_requests_total` | counter | `endpoint` (the method name without its group, such as `checkBlocks`), `status` |
 | `farsight_query_duration_seconds` | histogram | `endpoint` |
-| `farsight_rate_limited_total` | counter | `class` (`anon_read`, `key_read`, `admin_backfill`, `key_backfill`, `ui_lookup`, `ui_login`, `ui_login_start`, `public_ui`, `public_ui_handle`, `public_ui_card`, `public_ui_card_budget`) |
+| `farsight_rate_limited_total` | counter | `class` (`anon_read`, `key_read`, `admin_backfill`, `key_backfill`, `ui_lookup`, `ui_login`, `ui_login_start`, `public_ui`, `public_ui_handle`, `public_ui_card`, `public_ui_card_budget`, `optout`, `optout_start`) |
 | `farsight_coverage_exceptions` | gauge | `kind` (the nine counters of `freshness.coverage.exceptions`, by their field names, such as `unreachableRepos`) |
 | `farsight_lists` | gauge | `state` (the nine tracking states of [list-indexing.md](list-indexing.md#list-state)) |
 | `farsight_coverage_snapshot_age_seconds` | gauge | Time since the coverage snapshot in use was read; past 30 s responses carry `coverage_stale` ([coverage.md](coverage.md#the-global-snapshot)) |
@@ -778,6 +799,9 @@ request. These counts are in memory only.
 | `farsight_backfill_lodestar_reads_total` | counter | `outcome` (`answered`, `fallback`) |
 | `farsight_backfill_sweep_plc_pages_total` | counter | `source` (`lodestar`, `export`) |
 | `farsight_backfill_sweep_plc_fallbacks_total` | counter | |
+| `farsight_backfill_appview_request_seconds` | histogram | |
+| `farsight_backfill_list_takedown_checks_total` | counter | `outcome` (`served`, `not_served`, `inconclusive`, `rate_limited`) |
+| `farsight_backfill_lists_taken_down` | gauge | |
 
 The `host` label names the 50 hosts with the most requests and puts
 the rest under `other`, so it has at most 51 values. Request counts
@@ -793,7 +817,8 @@ admin dashboard.
 | `farsight_public_ui_requests_total` | counter | `page` (`home`, `search`, `did`, `list`, `card`, `robots`), `status` (`2xx`, `3xx`, `4xx`, `5xx`) |
 | `farsight_public_ui_duration_seconds` | histogram | `page` |
 | `farsight_public_ui_handle_resolutions_total` | counter | `outcome` (`cached`, `resolved`, `unverified`, `failed`, `skipped`) |
-| `farsight_public_ui_withheld_total` | counter | `reason` (`hidden_status`, `operator_excluded`) |
+| `farsight_public_ui_withheld_total` | counter | `reason` (`hidden_status`, `operator_excluded`, `self_opt_out`, `list_taken_down`); a count of page views, no DID or list |
+| `farsight_public_optout_changes_total` | counter | `to` (`hidden`, `shown`): choices stored at `/account`; no DID |
 | `farsight_public_ui_cards_total` | counter | `outcome` (`served`, `rate_limited`, `plc_timeout`, `pds_failed`, `avatars_disabled`); admin cards are counted here too |
 | `farsight_handle_warming_total` | counter | `outcome` (`resolved`, `unverified`, `failed`, `cached`, `dropped`) |
 | `farsight_handle_warming_queue` | gauge | |
