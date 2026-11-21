@@ -83,6 +83,13 @@ database schema; each entry says so where it does.
     `farsight_backfill_appview_request_seconds` and the
     `list_taken_down` reason of `farsight_public_ui_withheld_total`.
 
+### Changed
+
+- The dependency check accepts RUSTSEC-2026-0543, which declares the
+  `chrono` crate unmaintained. No vulnerability is reported against it
+  and no newer release exists; Farsight uses it throughout for dates
+  and times, so replacing it is a change of its own.
+
 **Upgrade both binaries together.** This release adds migrations 2 and
 3 and schema version 3: a `farsight-backfill` of an earlier release
 waits for its own version forever once the new server has migrated.

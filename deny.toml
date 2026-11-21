@@ -23,6 +23,11 @@ ignore = [
     # askama.toml; it never sees runtime or network input. Every askama
     # release up to 0.16.1 still depends on it. Revisit when askama drops it.
     { id = "RUSTSEC-2026-0374", reason = "build-time only, through askama_derive; reads only the repo's askama.toml" },
+    # chrono is declared unmaintained, with no known vulnerability and no
+    # successor release. It is used at runtime throughout the workspace and
+    # through sqlx's `chrono` feature, so replacing it (jiff or time) is a
+    # change of its own. Revisit if a vulnerability is reported against it.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no known vulnerability; replacing it is a separate change" },
 ]
 
 [licenses]
