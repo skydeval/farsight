@@ -129,8 +129,11 @@ await probe("the bar is sticky, holds the search form and the three-state toggle
       value: input.value,
       buttons: [...nav.querySelectorAll(".theme-toggle button")].map((b) => b.getAttribute("data-theme-choice")),
       toggleShown: !nav.querySelector(".theme-toggle").hidden,
-      // Links that leave the public UI: anything but its pages at the root and anchors.
-      out: hrefs.filter((h) => !(h === "/" || ["/search", "/did/", "/list/", "#"].some((p) => h.startsWith(p)))),
+      // Links that leave the public UI: anything but its pages at the root, anchors,
+      // and the account holders' sign-in (/account), which is part of it.
+      out: hrefs.filter(
+        (h) => !(h === "/" || h === "/account" || ["/search", "/did/", "/list/", "#"].some((p) => h.startsWith(p))),
+      ),
       text: nav.textContent,
     };
   });
